@@ -67,6 +67,10 @@ const TS_ESCAPE_PREFIX: u64 = 0x0F;
 /// `last_alpha` before the first `11` header (and after `clear`).
 const NO_ALPHA: i32 = -1;
 
+/// Every this many samples the encoder counts decimal places even when `last_alpha` would do;
+/// see `write_value`.
+const HINT_RECHECK: u64 = 16;
+
 /// How `write_value` encoded each sample, for tests.
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
@@ -403,55 +407,96 @@ impl ChimpCompressor {
             return self.write_raw(v_long);
         }
 
-        // Normal or subnormal: attempt ELF erasure. A negative alpha means an integer, which
-        // `is_short_dyadic` already sent down the raw path (kept because `get_f_alpha` rejects
-        // it); more than `MAX_ALPHA` places do not fit the header; `Err` is a value the digit
-        // count cannot handle. All of those are stored raw, losslessly.
+        let e = ((v_long >> 52) & 0x7ff) as i32;
+
+        // Try the previous value's decimal places before counting this one's: quantized data
+        // keeps one alpha, so this usually skips the count. It also keeps a value with fewer
+        // places (100.2 after 100.23) under case `0`, which beats a header there and another
+        // back. The gate is the search path's: erase only what the decoder's `recover` gives
+        // back bit for bit, and never onto the stored Chimp value (that spells a repeat).
+        //
+        // The hint is skipped after a raw value: in full-precision data nearly every value is
+        // raw and the hint nearly always misses, while quantized data rarely misses there.
+        // Chimp holds the stored bit pattern of the last non-repeat value, which differs from
+        // that value only if it was erased (`delta != 0`).
+        //
+        // A hit says nothing about how many places the value really has, so a stream whose
+        // precision drops (nine places, then two) would stay at the larger alpha and keep
+        // mantissa bits it could erase. Every `HINT_RECHECK`th sample skips the hint and
+        // counts, which bounds that to one period.
+        //
+        // Both conditions read persisted state only (`count`, `last_value`, the Chimp state),
+        // so the stream stays a function of the codec state and the input: an encoder
+        // reloaded mid-chunk writes the same bytes as one that never stopped.
+        let hinted = self.last_alpha != NO_ALPHA
+            && self.chimp.state().stored_val != self.last_value.to_bits()
+            && !self.count.is_multiple_of(HINT_RECHECK);
+        if hinted && let Some((mask, _)) = erase_mask(self.last_alpha, e) {
+            let v_prime_long = mask & v_long;
+            if v_prime_long != v_long
+                && v_prime_long != self.chimp.state().stored_val
+                && try_recover(v_prime_long, self.last_alpha) == Some(v)
+            {
+                return self.write_same_alpha(v_prime_long);
+            }
+        }
+
+        // Normal or subnormal: count the decimal places. A negative alpha means an integer,
+        // which `is_short_dyadic` already sent down the raw path (kept because `get_f_alpha`
+        // rejects it); more than `MAX_ALPHA` places do not fit the header; `Err` is a value the
+        // digit count cannot handle. All of those are stored raw, losslessly.
         let alpha = match get_alpha(v) {
             Ok(alpha) if (0..=MAX_ALPHA).contains(&alpha) => alpha,
             _ => return self.write_raw(v_long),
         };
-        let e = ((v_long >> 52) & 0x7ff) as i32;
-        let g_alpha = get_f_alpha(alpha) + e - 1023;
-        let erase_bits = 52 - g_alpha;
-        // Java: `0xffffffffffffffffL << eraseBits` (shift is mod 64).
-        let mask = u64::MAX.wrapping_shl(erase_bits as u32);
-        let delta = (!mask) & v_long;
+        let same_alpha = alpha == self.last_alpha;
+        if same_alpha && hinted {
+            // The hint ran every check below for this alpha, and one failed.
+            return self.write_raw(v_long);
+        }
+        let Some((mask, _)) = erase_mask(alpha, e) else {
+            return self.write_raw(v_long);
+        };
         let v_prime_long = mask & v_long;
 
         // Erase only when it is provably reversible, with the decoder's own `recover`.
-        if delta == 0 || erase_bits <= 4 || try_recover(v_prime_long, alpha) != Some(v) {
+        if v_prime_long == v_long || try_recover(v_prime_long, alpha) != Some(v) {
             return self.write_raw(v_long);
         }
 
-        if alpha == self.last_alpha {
+        if same_alpha {
             if v_prime_long == self.chimp.state().stored_val {
                 // Case `0` over an unchanged Chimp value is how a repeat is spelled, and
                 // this value is not one — a distinct `v` can erase onto the previous raw bit
                 // pattern. Store it raw so the decoder cannot misread it as a repeat.
                 return self.write_raw(v_long);
             }
-            #[cfg(test)]
-            {
-                self.stats.same_alpha += 1;
-            }
-            // case `0`
-            self.chimp
-                .add_value_prefixed(&mut self.writer, 0, 1, v_prime_long)
-        } else {
-            // case `11` + 4-bit alpha
-            debug_assert!(
-                (0..=MAX_ALPHA).contains(&alpha),
-                "alpha must fit the 4-bit header"
-            );
-            #[cfg(test)]
-            {
-                self.stats.new_alpha += 1;
-            }
-            self.last_alpha = alpha;
-            self.chimp
-                .add_value_prefixed(&mut self.writer, (alpha as u64) | 0x30, 6, v_prime_long)
+            return self.write_same_alpha(v_prime_long);
         }
+
+        // case `11` + 4-bit alpha
+        debug_assert!(
+            (0..=MAX_ALPHA).contains(&alpha),
+            "alpha must fit the 4-bit header"
+        );
+        #[cfg(test)]
+        {
+            self.stats.new_alpha += 1;
+        }
+        self.last_alpha = alpha;
+        self.chimp
+            .add_value_prefixed(&mut self.writer, (alpha as u64) | 0x30, 6, v_prime_long)
+    }
+
+    /// Elf case `0`: `v_prime_long` erased to `last_alpha` decimal places.
+    #[inline(always)]
+    fn write_same_alpha(&mut self, v_prime_long: u64) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            self.stats.same_alpha += 1;
+        }
+        self.chimp
+            .add_value_prefixed(&mut self.writer, 0, 1, v_prime_long)
     }
 
     fn write_timestamp(&mut self, timestamp: Timestamp) -> io::Result<()> {
@@ -631,6 +676,19 @@ impl<'a> ChimpDecompressor<'a> {
         }
         Ok(out)
     }
+}
+
+/// The mask that keeps the mantissa bits `alpha` decimal places need in a value whose biased
+/// exponent is `exponent`, and how many low bits it erases. `None` when that is 4 bits or
+/// fewer: too few to pay for erasing.
+#[inline(always)]
+fn erase_mask(alpha: i32, exponent: i32) -> Option<(u64, i32)> {
+    let erase_bits = 52 - (get_f_alpha(alpha) + exponent - 1023);
+    if erase_bits <= 4 {
+        return None;
+    }
+    // Java: `0xffffffffffffffffL << eraseBits` (shift is mod 64).
+    Some((u64::MAX.wrapping_shl(erase_bits as u32), erase_bits))
 }
 
 /// Recover a value erased to `alpha` decimal places: round `|v'|` up to the next multiple
@@ -1050,6 +1108,124 @@ mod tests {
         assert_eq!(c.stats.raw, 0);
     }
 
+    #[test]
+    fn hint_reuses_alpha_for_values_with_fewer_digits() {
+        // 100.2 (one place) under last_alpha 2 must be case `0`, not a new header.
+        let mut c = ChimpCompressor::new();
+        c.add_sample(1000, 100.23).unwrap();
+        c.add_sample(2000, 100.2).unwrap();
+        c.add_sample(3000, 100.27).unwrap();
+        assert_eq!(c.stats.new_alpha, 1);
+        assert_eq!(c.stats.same_alpha, 2);
+        round_trip(&[
+            Sample::new(1000, 100.23),
+            Sample::new(2000, 100.2),
+            Sample::new(3000, 100.27),
+        ]);
+    }
+
+    /// A value with more places than `last_alpha` does not recover under it: the search runs
+    /// and writes a new header.
+    #[test]
+    fn hint_falls_back_to_the_search_for_more_digits() {
+        let mut c = ChimpCompressor::new();
+        c.add_sample(1000, 100.23).unwrap();
+        c.add_sample(2000, 100.234).unwrap();
+        c.add_sample(3000, 100.2).unwrap();
+        assert_eq!(c.stats.new_alpha, 2);
+        assert_eq!(c.stats.same_alpha, 1);
+        assert_eq!(c.last_alpha, 3);
+    }
+
+    /// After a raw value the hint is skipped and the count decides: 100.2 gets its own header.
+    #[test]
+    fn hint_is_skipped_after_a_raw_value() {
+        let mut c = ChimpCompressor::new();
+        c.add_sample(1000, 100.23).unwrap();
+        c.add_sample(2000, 100.5).unwrap();
+        c.add_sample(3000, 100.2).unwrap();
+        assert_eq!(c.stats.raw, 1);
+        assert_eq!(c.stats.new_alpha, 2);
+        assert_eq!(c.last_alpha, 1);
+    }
+
+    /// The hint reads only persisted state, so a reloaded encoder writes the same bytes as one
+    /// that never stopped (the digest covers the bytes).
+    #[test]
+    fn reloading_mid_stream_does_not_change_the_bytes() {
+        let mut values = mixed_dyadic_values();
+        values.truncate(400);
+        for block in 0..4 {
+            for i in 1..60 {
+                values.push(if block % 2 == 0 {
+                    100.0 + i as f64 * 0.01
+                } else {
+                    100.0 + i as f64 * 1e-9
+                });
+            }
+        }
+        let samples: Vec<Sample> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| Sample::new(i as Timestamp * 1000, *v))
+            .collect();
+        let mut whole = ChimpCompressor::new();
+        for s in &samples {
+            whole.add(*s).unwrap();
+        }
+        for split in (1..samples.len()).step_by(7) {
+            let mut c = ChimpCompressor::new();
+            for s in &samples[..split] {
+                c.add(*s).unwrap();
+            }
+            let mut buf = Vec::new();
+            c.serialize(&mut buf);
+            let mut restored = ChimpCompressor::deserialize(&buf).unwrap();
+            for s in &samples[split..] {
+                restored.add(*s).unwrap();
+            }
+            assert_eq!(restored.bytes(), whole.bytes(), "split at {split}");
+        }
+    }
+
+    /// Two-place values recover under nine places too, so only the periodic re-count moves
+    /// the encoder down to alpha 2, within one `HINT_RECHECK` period.
+    #[test]
+    fn precision_drop_is_picked_up_by_the_recheck() {
+        let mut samples = vec![Sample::new(0, 100.123456789)];
+        samples.extend(
+            (1..60)
+                .filter(|i| i % 5 != 0)
+                .map(|i| Sample::new(i * 1000, 100.0 + i as f64 * 0.01)),
+        );
+        let mut c = ChimpCompressor::new();
+        for s in &samples {
+            c.add(*s).unwrap();
+        }
+        assert_eq!(c.stats.new_alpha, 2);
+        assert_eq!(c.stats.raw, 0);
+        assert_eq!(c.last_alpha, 2);
+        round_trip(&samples);
+    }
+
+    #[test]
+    fn mixed_precision_stream_round_trips() {
+        let mut samples = Vec::new();
+        let mut ts = 0;
+        for block in 0..6 {
+            for i in 0..200 {
+                ts += 1000;
+                let v = if block % 2 == 0 {
+                    100.0 + (i as f64) * 0.01
+                } else {
+                    100.0 + (i as f64) * 1e-9
+                };
+                samples.push(Sample::new(ts, v));
+            }
+        }
+        round_trip(&samples);
+    }
+
     /// More decimal places than the 4-bit header holds: stored raw, and still lossless.
     #[test]
     fn values_with_more_than_fifteen_decimal_places_are_stored_raw() {
@@ -1167,8 +1343,9 @@ mod tests {
     ///
     /// `small` differs from the beta* stream only in the one 4-bit header (`100.23`: beta* 5 ->
     /// alpha 2). `mixed` went 13617 -> 13591 bytes: values with the same decimal places but
-    /// different magnitudes no longer need a new header. A change here is a format change; make
-    /// it on purpose and re-record.
+    /// different magnitudes no longer need a new header. Then 13591 -> 13569 with the
+    /// previous-alpha hint: values with fewer places than `last_alpha` stay under case `0`.
+    /// A change here is a format change; make it on purpose and re-record.
     #[test]
     fn streams_match_the_alpha_header_encoder_byte_for_byte() {
         let small = pack(&[
@@ -1196,7 +1373,7 @@ mod tests {
         );
 
         let mixed = pack(&mixed_dyadic_values());
-        assert_eq!(mixed.len(), 13591);
-        assert_eq!(fnv1a(&mixed), 0x0a03_008c_4b13_ccbf);
+        assert_eq!(mixed.len(), 13569);
+        assert_eq!(fnv1a(&mixed), 0xa59b_ad11_86ab_3370);
     }
 }

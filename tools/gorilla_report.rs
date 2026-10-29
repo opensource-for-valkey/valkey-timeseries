@@ -125,64 +125,115 @@ fn report<C: Chunk + GetSize>(
                 for sample in &mut samples {
                     sample.value += offset;
                 }
-                let first = samples[0].timestamp;
-                let last = samples[count - 1].timestamp;
-                let span = last - first;
-                let chunk = build(make, &samples);
-                // Validate the entire persisted stream before timing it, including after
-                // reloading and appending (the previous final sample must now decode).
-                let mut serialized = Vec::new();
-                chunk.serialize(&mut serialized);
-                let mut restored = C::deserialize(&serialized).expect("deserialize");
-                let extra = Sample::new(last + 1000, samples[count - 1].value + 1.0);
-                restored
-                    .add_sample(&extra)
-                    .expect("append after deserialize");
-                let decoded: Vec<_> = restored.iter().collect();
-                assert_eq!(decoded.len(), count + 1);
-                for (got, want) in decoded.iter().zip(samples.iter().chain([&extra])) {
-                    assert_eq!(got.timestamp, want.timestamp);
-                    assert_eq!(got.value.to_bits(), want.value.to_bits());
-                }
-                assert_eq!(restored.len(), count + 1);
-                let bulk = median(iterations, || build(make, black_box(&samples)));
-                let append = median(iterations, || {
-                    let mut c = make(max_size(count));
-                    for sample in black_box(&samples) {
-                        c.add_sample(sample).expect("append");
-                    }
-                    c
-                });
-                let decode = median(iterations, || {
-                    chunk.iter().for_each(|s| {
-                        black_box((s.timestamp, s.value));
-                    });
-                });
-                let range = median(iterations, || chunk.get_range(first, last).expect("range"));
-                let mid = median(iterations, || {
-                    chunk
-                        .range_iter(first + span * 45 / 100, first + span * 55 / 100)
-                        .for_each(|s| {
-                            black_box((s.timestamp, s.value));
-                        });
-                });
-                let tail = median(iterations, || {
-                    chunk
-                        .range_iter(first + span * 90 / 100, last)
-                        .for_each(|s| {
-                            black_box((s.timestamp, s.value));
-                        });
-                });
-                writeln!(
-                    writer,
-                    "{},{},{offset},{seed},{count},{},{},{bulk:.0},{append:.0},{decode:.0},{range:.0},{mid:.0},{tail:.0}",
+                measure(
+                    &mut writer,
                     workload.id(),
                     ts.id(),
-                    chunk.size(),
-                    chunk.get_size()
+                    offset,
+                    seed,
+                    &samples,
+                    iterations,
+                    make,
                 )?;
             }
         }
     }
+    // Alternating 200-sample blocks of two-place and nine-place decimals: the decimal-place
+    // count changes at every block boundary.
+    let blocks = (count / 200).max(6);
+    let mut ts = 0;
+    let mut samples = Vec::with_capacity(blocks * 200);
+    for block in 0..blocks {
+        for i in 0..200 {
+            ts += 1000;
+            let v = if block % 2 == 0 {
+                100.0 + (i as f64) * 0.01
+            } else {
+                100.0 + (i as f64) * 1e-9
+            };
+            samples.push(Sample::new(ts, v));
+        }
+    }
+    measure(
+        &mut writer,
+        "mixed_precision",
+        "regular",
+        0.0,
+        0,
+        &samples,
+        iterations,
+        make,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure<C: Chunk + GetSize>(
+    writer: &mut impl Write,
+    workload: &str,
+    ts: &str,
+    offset: f64,
+    seed: u64,
+    samples: &[Sample],
+    iterations: usize,
+    make: impl Fn(usize) -> C + Copy,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let count = samples.len();
+    let first = samples[0].timestamp;
+    let last = samples[count - 1].timestamp;
+    let span = last - first;
+    let chunk = build(make, samples);
+    // Validate the entire persisted stream before timing it, including after
+    // reloading and appending (the previous final sample must now decode).
+    let mut serialized = Vec::new();
+    chunk.serialize(&mut serialized);
+    let mut restored = C::deserialize(&serialized).expect("deserialize");
+    let extra = Sample::new(last + 1000, samples[count - 1].value + 1.0);
+    restored
+        .add_sample(&extra)
+        .expect("append after deserialize");
+    let decoded: Vec<_> = restored.iter().collect();
+    assert_eq!(decoded.len(), count + 1);
+    for (got, want) in decoded.iter().zip(samples.iter().chain([&extra])) {
+        assert_eq!(got.timestamp, want.timestamp);
+        assert_eq!(got.value.to_bits(), want.value.to_bits());
+    }
+    assert_eq!(restored.len(), count + 1);
+    let bulk = median(iterations, || build(make, black_box(samples)));
+    let append = median(iterations, || {
+        let mut c = make(max_size(count));
+        for sample in black_box(samples) {
+            c.add_sample(sample).expect("append");
+        }
+        c
+    });
+    let decode = median(iterations, || {
+        chunk.iter().for_each(|s| {
+            black_box((s.timestamp, s.value));
+        });
+    });
+    let range = median(iterations, || chunk.get_range(first, last).expect("range"));
+    let mid = median(iterations, || {
+        chunk
+            .range_iter(first + span * 45 / 100, first + span * 55 / 100)
+            .for_each(|s| {
+                black_box((s.timestamp, s.value));
+            });
+    });
+    let tail = median(iterations, || {
+        chunk
+            .range_iter(first + span * 90 / 100, last)
+            .for_each(|s| {
+                black_box((s.timestamp, s.value));
+            });
+    });
+    writeln!(
+        writer,
+        "{},{},{offset},{seed},{count},{},{},{bulk:.0},{append:.0},{decode:.0},{range:.0},{mid:.0},{tail:.0}",
+        workload,
+        ts,
+        chunk.size(),
+        chunk.get_size()
+    )?;
     Ok(())
 }
