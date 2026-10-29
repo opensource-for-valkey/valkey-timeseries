@@ -31,7 +31,9 @@ use valkey_module_macros::flush_event_handler;
 /// A later format bumps this and keeps [`MIN_TIMESERIES_TYPE_ENCODING_VERSION`] at the oldest
 /// version it can still read, so payloads from older nodes (RDB, `DUMP`, `TS._RESTORE`) keep
 /// loading.
-pub(crate) const TIMESERIES_TYPE_ENCODING_VERSION: i32 = 1;
+// Version 2 adds Gorilla's extended XOR windows. Version 1 streams remain
+// readable; older modules must reject new RDB/DUMP/AOF payloads before decoding.
+pub(crate) const TIMESERIES_TYPE_ENCODING_VERSION: i32 = 2;
 
 /// Oldest encoding version the loaders still accept.
 pub(crate) const MIN_TIMESERIES_TYPE_ENCODING_VERSION: i32 = 1;

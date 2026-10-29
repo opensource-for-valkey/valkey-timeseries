@@ -1,4 +1,5 @@
 import time
+import pytest
 from valkeytestframework.util.waiters import *
 from valkeytestframework.valkey_test_case import ValkeyAction
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
@@ -8,6 +9,27 @@ from valkeytestframework.conftest import resource_port_tracker
 
 class TestTimeseriesDumpRestore(ValkeyTimeSeriesTestCaseBase):
     """Tests for DUMP/RESTORE serialization of TimeSeries data"""
+
+    @pytest.mark.parametrize('offset', [1 << 30, 1 << 40, 1 << 50])
+    def test_gorilla_large_counter_dump_restore_and_append(self, offset):
+        """Extended XOR windows survive sealed chunks, RESTORE and continued writes."""
+        client = self.client
+        client.execute_command('TS.CREATE', 'large_counter', 'ENCODING', 'GORILLA',
+                               'CHUNK_SIZE', 512, 'DUPLICATE_POLICY', 'LAST')
+        with client.pipeline(transaction=False) as pipeline:
+            for i in range(1000):
+                pipeline.execute_command('TS.ADD', 'large_counter', 1000 * (i + 1), offset + i)
+            pipeline.execute()
+        payload = client.execute_command('DUMP', 'large_counter')
+        client.execute_command('RESTORE', 'large_restored', 0, payload)
+        client.execute_command('TS.ADD', 'large_restored', 1001000, offset + 1000)
+        # A duplicate rewrites a sealed chunk, exercising decode -> encode too.
+        client.execute_command('TS.ADD', 'large_restored', 2000, offset + 3)
+        actual = client.execute_command('TS.RANGE', 'large_restored', '-', '+')
+        assert len(actual) == 1001
+        for i, (timestamp, value) in enumerate(actual):
+            assert timestamp == 1000 * (i + 1)
+            assert float(value) == float(offset + (3 if i == 1 else i))
 
     def test_basic_dump_restore(self):
         """Test basic DUMP/RESTORE preserves all series properties"""

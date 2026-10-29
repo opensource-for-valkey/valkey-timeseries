@@ -19,6 +19,27 @@ pub struct GorillaIterator<'a> {
     last_idx: usize,
 }
 
+/// Compact, transient seek state for the opt-in evaluation tool. An index must
+/// borrow the encoder immutably so appends cannot invalidate its checkpoints.
+#[cfg(feature = "test-utils")]
+#[derive(Clone, Copy)]
+pub struct GorillaCheckpoint {
+    position: usize,
+    idx: usize,
+    timestamp: i64,
+    timestamp_delta: u64,
+    value: f64,
+    leading_bits: u8,
+    trailing_bits: u8,
+}
+
+#[cfg(feature = "test-utils")]
+impl GorillaCheckpoint {
+    pub fn timestamp(&self) -> i64 {
+        self.timestamp
+    }
+}
+
 #[cold]
 #[inline(never)]
 fn decoding_error(what: &str) -> TsdbError {
@@ -26,6 +47,35 @@ fn decoding_error(what: &str) -> TsdbError {
 }
 
 impl GorillaIterator<'_> {
+    #[cfg(feature = "test-utils")]
+    pub fn checkpoint(&self) -> GorillaCheckpoint {
+        GorillaCheckpoint {
+            position: self.reader.bit_position(),
+            idx: self.idx,
+            timestamp: self.timestamp,
+            timestamp_delta: self.timestamp_delta,
+            value: self.value,
+            leading_bits: self.leading_bits,
+            trailing_bits: self.trailing_bits,
+        }
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn resume(
+        encoder: &'_ GorillaEncoder,
+        checkpoint: GorillaCheckpoint,
+    ) -> std::io::Result<GorillaIterator<'_>> {
+        let mut iter = GorillaIterator::new(encoder);
+        iter.reader = BitStreamReader::from_bit_position(encoder.buf(), checkpoint.position)?;
+        iter.idx = checkpoint.idx;
+        iter.timestamp = checkpoint.timestamp;
+        iter.timestamp_delta = checkpoint.timestamp_delta;
+        iter.value = checkpoint.value;
+        iter.leading_bits = checkpoint.leading_bits;
+        iter.trailing_bits = checkpoint.trailing_bits;
+        Ok(iter)
+    }
+
     pub fn new(encoder: &'_ GorillaEncoder) -> GorillaIterator<'_> {
         let buf = encoder.buf();
         let num_samples = encoder.num_samples;
@@ -166,4 +216,28 @@ impl ExactSizeIterator for GorillaIterator<'_> {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn checkpoints_resume_at_every_bit_alignment() {
+        use super::{GorillaEncoder, GorillaIterator};
+        use crate::tests::generators::{
+            DatasetKey, TimestampModel, ValueWorkload, dataset_seed, generate_dataset,
+        };
+        for &model in TimestampModel::all() {
+            let key = DatasetKey::new(ValueWorkload::Noisy, model);
+            let samples = generate_dataset(key, 257, dataset_seed(key));
+            let mut encoder = GorillaEncoder::new();
+            for sample in &samples {
+                encoder.add_sample(sample).unwrap();
+            }
+            let mut iter = encoder.iter();
+            for i in 0..=samples.len() {
+                let resumed = GorillaIterator::resume(&encoder, iter.checkpoint()).unwrap();
+                let got: Vec<_> = resumed.map(Result::unwrap).collect();
+                assert_eq!(got, samples[i..]);
+                iter.next();
+            }
+        }
+    }
+}

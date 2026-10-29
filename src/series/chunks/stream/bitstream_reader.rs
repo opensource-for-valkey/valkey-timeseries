@@ -29,6 +29,25 @@ fn eof() -> io::Error {
 }
 
 impl<'a> BitStreamReader<'a> {
+    /// Evaluation support for sparse decoder checkpoints; not part of persistence.
+    #[cfg(feature = "test-utils")]
+    pub fn bit_position(&self) -> usize {
+        self.stream_offset * 8 - self.valid as usize
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn from_bit_position(stream: &'a [u8], position: usize) -> io::Result<Self> {
+        if position / 8 > stream.len()
+            || (position / 8 == stream.len() && !position.is_multiple_of(8))
+        {
+            return Err(eof());
+        }
+        let mut reader = Self::new(stream);
+        reader.stream_offset = position / 8;
+        reader.read_bits((position % 8) as u8)?;
+        Ok(reader)
+    }
+
     /// Creates a new BitStreamReader from a byte slice.
     pub fn new(b: &'a [u8]) -> Self {
         let last = if b.is_empty() { 0 } else { b[b.len() - 1] };

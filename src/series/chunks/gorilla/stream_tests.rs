@@ -28,6 +28,60 @@ fn assert_bit_exact(got: &[Sample], want: &[Sample]) {
     }
 }
 
+/// Captured from 3d2dc61c5 before changing the encoder. These independently pin
+/// legacy stream readability, including a full-width XOR and an unset window.
+#[test]
+fn legacy_streams_can_be_loaded_and_appended_to() {
+    for fixture in [
+        include_str!("fixtures/v1-periodic.txt"),
+        include_str!("fixtures/v1-counter.txt"),
+        include_str!("fixtures/v1-constant.txt"),
+    ] {
+        let mut lines = fixture.lines();
+        let wire = lines.next().unwrap();
+        let bytes: Vec<u8> = (0..wire.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&wire[i..i + 2], 16).unwrap())
+            .collect();
+        let mut expected: Vec<Sample> = lines
+            .map(|line| {
+                let (ts, bits) = line.split_once(' ').unwrap();
+                s(
+                    ts.parse().unwrap(),
+                    f64::from_bits(u64::from_str_radix(bits, 16).unwrap()),
+                )
+            })
+            .collect();
+        let mut loaded = GorillaEncoder::deserialize(&bytes).unwrap();
+        assert_bit_exact(
+            &loaded.iter().map(Result::unwrap).collect::<Vec<_>>(),
+            &expected,
+        );
+        // Make the previous last sample decode from the legacy stream rather
+        // than from metadata, and exercise a new window after a legacy prefix.
+        let last = *expected.last().unwrap();
+        // A one-bit mantissa change forces an extended window after the v1
+        // prefix. Append once more so that window is decoded from the stream,
+        // rather than returned through the final-sample metadata shortcut.
+        let extra = s(
+            last.timestamp + 1000,
+            f64::from_bits(last.value.to_bits() ^ 1),
+        );
+        loaded.add_sample(&extra).unwrap();
+        expected.push(extra);
+        let final_sample = s(extra.timestamp + 1000, extra.value + 1.0);
+        loaded.add_sample(&final_sample).unwrap();
+        expected.push(final_sample);
+        let mut saved = Vec::new();
+        loaded.serialize(&mut saved);
+        let resumed = GorillaEncoder::deserialize(&saved).unwrap();
+        assert_bit_exact(
+            &resumed.iter().map(Result::unwrap).collect::<Vec<_>>(),
+            &expected,
+        );
+    }
+}
+
 /// A stream cut at any byte boundary decodes every sample it still holds, bit-exactly,
 /// and then returns `Err` on the first sample it does not: never a wrong sample.
 ///
@@ -128,7 +182,7 @@ fn xor_pattern(lead: u32, sig: u32) -> u64 {
     ones << trailing
 }
 
-/// Every window the 5-bit leading count and 6-bit width can express, each written as a
+/// Every nonzero XOR window, including the extended leading count, written as a
 /// fresh window and then reused by a second sample with the same shape, round-trips
 /// bit-exactly, including the 64-wide payload that the width field encodes as 0.
 #[test]
@@ -136,7 +190,7 @@ fn every_xor_window_round_trips() {
     let mut samples = vec![s(0, 0.0)];
     let mut prev_bits = 0u64;
     let mut ts = 0i64;
-    for lead in 0..=31u32 {
+    for lead in 0..=63u32 {
         for sig in 1..=(64 - lead) {
             let xor = xor_pattern(lead, sig);
             // Two samples per window: one that opens it and one that reuses it. The
@@ -152,7 +206,7 @@ fn every_xor_window_round_trips() {
         }
     }
     // Sanity: the sweep exercised every pair, and the values are not all finite.
-    assert_eq!(samples.len(), 1 + 2 * (32 * 64 - (0..32).sum::<usize>()));
+    assert_eq!(samples.len(), 1 + 2 * (64 * 64 - (0..64).sum::<usize>()));
     assert!(samples.iter().any(|x| x.value.is_nan()));
 
     let mut enc = GorillaEncoder::new();
