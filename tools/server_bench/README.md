@@ -73,7 +73,9 @@ server_bench report       --run-dir DIR — regenerate results.csv / report.md f
 `COMPAT_REFERENCE_MODULE_VERSION` in `tests/reference_server.sh`, so the pin is
 single-sourced. `--self-check` accepts a second subject build as the "reference";
 the manifest records `comparison: self_check` and such runs are never a product
-comparison.
+comparison. With `SELF_CHECK_MODULE_PATH` set, the wrapper's "reference" process loads
+that module instead, which makes a self-check a paired A/B of two builds (noted as
+`deployment.reference_module`).
 
 ## Scenarios
 

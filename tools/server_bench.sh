@@ -29,6 +29,8 @@
 # Environment (all optional): VALKEY_SERVER_PATH, MODULE_PATH, PYTHON_BIN,
 # COMPAT_REFERENCE_MODE (auto|docker|binary), BENCH_CPUS / BENCH_CPUSET /
 # BENCH_MEM_LIMIT / BENCH_IO_THREADS / BENCH_VALKEY_IMAGE (docker-compose.bench.yml).
+# SELF_CHECK_MODULE_PATH: with --self-check, the module the "reference" process
+# loads (default: the subject's), which turns a self-check into a build A/B.
 #
 # Ownership: everything this script starts, it stops — and only that. An external
 # URL is used as-is; a reference container someone else started stays up. The
@@ -250,8 +252,8 @@ PY
 # Sets STARTED_URL; not a command substitution, so the ownership arrays it
 # appends to stay visible to cleanup().
 STARTED_URL=""
-start_subject_process() {  # $1=label
-    local port workdir pid
+start_subject_process() {  # $1=label [$2=module path]
+    local port workdir pid module="${2:-$MODULE_PATH_RESOLVED}"
     port="$(free_port)"
     workdir="$(mktemp -d "${TMPDIR:-/tmp}/server-bench-$1.XXXXXX")"
     OWNED_WORKDIRS+=("$workdir")
@@ -265,7 +267,7 @@ start_subject_process() {  # $1=label
         --port "$port" \
         --dir "$workdir" \
         --logfile "$workdir/server.log" \
-        --loadmodule "$MODULE_PATH_RESOLVED" \
+        --loadmodule "$module" \
         --enable-debug-command yes \
         --notify-keyspace-events "" \
         --maxmemory-policy noeviction \
@@ -374,10 +376,13 @@ fi
 REFERENCE_ARGS=()
 if [ "$SELF_CHECK" = true ]; then
     ensure_server
-    start_subject_process reference
+    reference_module="${SELF_CHECK_MODULE_PATH:-$MODULE_PATH_RESOLVED}"
+    [ -f "$reference_module" ] || die "SELF_CHECK_MODULE_PATH $reference_module not found"
+    start_subject_process reference "$reference_module"
     REFERENCE_URL="$STARTED_URL"
     REFERENCE_ARGS+=(--self-check --reference-owned)
     NOTES+=(--note "deployment.reference=process-self-check")
+    NOTES+=(--note "deployment.reference_module=$reference_module")
     DEPLOYMENT="self-check"
 else
     compat_reference_start || die "could not provide a reference server"
