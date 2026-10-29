@@ -1,9 +1,10 @@
-# Chimp streams, module encoding version 3
+# Chimp golden streams
 
 These fixtures were generated from this repository's encoder at
 `e2f28ab680d0dd1186c1ccead87bcdca5e9b97a7` (branch `perf/chimp-encoder`), the
-Chimp grammar that module encoding version 3 introduced. They contain no
-RedisTimeSeries source or test data.
+Chimp grammar as that branch left it. They carry no module encoding version: the
+grammar changed in place before any release. They contain no RedisTimeSeries
+source or test data.
 
 Each input is 32 samples from `generate_dataset`, using the named workload,
 `TimestampModel::Jitter`, and `dataset_seed` for that key. The first line is the
@@ -19,5 +20,5 @@ jittered timestamps, so it carries non-zero delta-of-deltas.
 The tests in `chimp_chunk_tests.rs` (`fixtures` module) re-encode the samples and
 compare the bytes, decode the bytes and compare every sample bit for bit, then
 append, serialize again and compare. A change to any of those outputs is a format
-change: it needs a new module encoding version and regenerated fixtures
-(`write_chimp_fixtures`, `#[ignore]`d).
+change: it needs regenerated fixtures (`write_chimp_fixtures`, `#[ignore]`d) and,
+once the module has been released, a new module encoding version.

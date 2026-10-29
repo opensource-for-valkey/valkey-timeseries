@@ -5,21 +5,23 @@ valkey-timeseries, their algorithms, performance characteristics, and a selectio
 rubric for choosing the right encoding based on your data.
 
 Compression figures (sizes, ratios, winners) come from the committed baseline,
-`benches/baselines/compression_baseline.csv`, as of module encoding version 3.
-Latency figures are historical: they predate the version-3 Chimp grammar and
-the Gorilla changes, and are marked where they appear. For the Gorilla changes
-and their fixed-sample A/B results, see
-[the Gorilla evaluation](../benchmarks/gorilla-evaluation.md); for the version-3
-Chimp encoder changes, measured the same way, see
+`benches/baselines/compression_baseline.csv`, which reflects the current Chimp
+grammar. Latency figures are historical: they predate the Chimp grammar change
+and the Gorilla changes, and are marked where they appear. For the Gorilla
+changes and their fixed-sample A/B results, see
+[the Gorilla evaluation](../benchmarks/gorilla-evaluation.md); for the Chimp
+encoder changes, measured the same way, see
 [the Chimp evaluation](../benchmarks/chimp-evaluation.md).
 
 **Persistence.** New RDB, DUMP and rewritten AOF payloads use module encoding
-version **3**, and this build reads version 3 only. Version 3 changed the Chimp
-bit grammar in place (see [Chimp](#3-chimp-elf-on-chimp-default)), so payloads
-from earlier builds (versions 1 and 2) are refused at load rather than misread,
-whatever their chunk encoding: the version belongs to the module type. Delete
-local `dump.rdb`/AOF files written by older builds, or export the logical samples
-(`TS.RANGE`) and re-ingest them. Older builds likewise refuse version-3 payloads.
+version **2**, and this build reads versions 1 and 2 (the Gorilla extended-window
+change, see [Gorilla](#2-gorilla)). The Chimp bit grammar was changed in place
+(see [Chimp](#3-chimp-elf-on-chimp-default)) **without a version bump**, because
+nothing has been released. Chimp chunks carry no grammar marker, so RDB, DUMP and
+AOF files containing Chimp series written by builds from before that change will
+not decode correctly, and no load-time error protects them. Delete local
+`dump.rdb`/AOF files written by those builds, or export the logical samples
+(`TS.RANGE`) and re-ingest them.
 
 ---
 
@@ -87,10 +89,10 @@ The current Gorilla evaluation and its measured tradeoffs are recorded in
 [the benchmark report](../benchmarks/gorilla-evaluation.md). Historical comparison
 numbers below predate that change; use the report for current A/B measurements.
 
-Gorilla's stream reader still decodes the pre-evaluation (version 1) window
-layout, which its golden fixtures pin, but persisted payloads load only at
-module encoding version 3 (see **Persistence** at the top of this page), so
-older RDB/DUMP/AOF files no longer reach it.
+New persistence payloads use module encoding version **2**. This build reads
+versions 1 and 2, including legacy Gorilla windows mixed with new windows after
+an append. Older module builds reject version 2 RDB/DUMP/AOF payloads. Upgrade
+readers before writers; a downgrade requires rebuilding data from logical samples.
 
 **Algorithm:** Two-stage compression based on the Facebook Gorilla paper
 (Pelkonen et al., 2015).
@@ -143,7 +145,7 @@ constant series.
 
 **Strengths:**
 - The fastest compressed encoder — 1.67× faster bulk encode and 1.74× faster
-  append than Chimp (historical, pre-version-3 measurement)
+  append than Chimp (historical, pre-grammar-change measurement)
 - Unbeatable on repetition: constants (0.25 B/sample, 64×), discrete sets
   (12×) and counters (9×) are all Gorilla wins, by 1.06–2.00× over Chimp
 - Delta-of-delta timestamps collapse regular intervals to 1 bit
@@ -151,7 +153,7 @@ constant series.
 
 **Weaknesses:**
 - ~18% slower to decode than Chimp, and ~21% slower to scan (historical,
-  pre-version-3 measurement)
+  pre-grammar-change measurement)
 - No special handling for decimal precision — floating-point noise in the low
   mantissa bits consumes bits. This is the single largest compression gap
   against Chimp (up to 4.24×) and it fires on most agent-reported telemetry
@@ -173,10 +175,11 @@ constant series.
 
 **Algorithm:** A two-layer codec combining ELF (Erasing-based Lossless
 Floating-point) erasure with Chimp XOR compression. Both layers started as ports
-of the published algorithms; module encoding version 3 changed the grammar in
-several places, noted below. The source of truth is `src/series/chunks/chimp/`
+of the published algorithms; the grammar has since been changed in place in
+several places, noted below (no encoding version bump; see **Persistence** at the
+top of this page). The source of truth is `src/series/chunks/chimp/`
 (`compressor.rs` for the ELF layer and timestamps, `encoder.rs` for Chimp), and
-golden version-3 streams in `src/series/chunks/chimp/fixtures/` pin it.
+golden streams in `src/series/chunks/chimp/fixtures/` pin the current grammar.
 
 ```
 Sample (timestamp, f64 value)
@@ -266,7 +269,7 @@ carried as payload padding. The encoder writes `01` when the XOR has more than
 instead, whatever the trailing zeros: whenever it and its payload are strictly
 shorter than that header and its payload.
 
-What version 3 changed from the published Chimp:
+What the grammar change altered from the published Chimp:
 
 - **`10` reuses the whole window.** The stored window is the last header's
   `(leading, trailing)` pair, and `10` writes the XOR's bits between them. The
@@ -303,7 +306,7 @@ zig-zagged delta-of-delta `d` behind a unary prefix:
 | `111110` | −2^31..2^31−1 | 38 |
 | `111111` | anything else | 70 |
 
-Version 3 added the 16-bit tier (21 bits) between the 12- and 32-bit ones, so a
+The grammar change added the 16-bit tier (21 bits) between the 12- and 32-bit ones, so a
 delta-of-delta beyond ±2,048 but within ±32,768 (milliseconds, for millisecond
 timestamps) no longer takes the 32-bit escape, which was 37 bits before; the two
 escapes each cost one bit more than they did (38 and 70, from 37 and 69). Because the delta-of-delta is zigzagged and signed,
@@ -317,7 +320,7 @@ escapes each cost one bit more than they did (38 and 70, from 37 and 69). Becaus
   of decimal places (e.g., `12.34`, `99.9`, `0.001`) compress 2.6–4.2× better
   than Gorilla because ELF erases the spurious low mantissa bits
 - ~18% faster decode and ~21% faster scan than Gorilla (historical,
-  pre-version-3 measurement)
+  pre-grammar-change measurement)
 - 2-bit fixed-width control flags enable efficient branch prediction
 - **The best choice when the workload is unknown.** Highest geometric-mean
   ratio (3.59 vs Gorilla's 3.16), most scenarios within 5% of best (24/28 vs
@@ -329,7 +332,7 @@ escapes each cost one bit more than they did (38 and 70, from 37 and 69). Becaus
 
 **Weaknesses:**
 - ~1.67× slower bulk encode and ~1.74× slower append than Gorilla (historical,
-  pre-version-3 measurement)
+  pre-grammar-change measurement)
 - Repetition costs double: 4 bits per sample against Gorilla's 2, which loses
   the constant workload by 2.00× and discrete by 1.35×
 - On unquantized floating-point data with random low mantissa bits, Chimp is a
@@ -459,8 +462,8 @@ default can go wrong. It was also the cheaper reader on all three read paths in
 the historical latency runs.
 
 The cost of that default is **encode speed**: Chimp was 1.67× slower on bulk
-encode and 1.74× slower on append than Gorilla (historical, pre-version-3
-measurement). If ingest is your binding
+encode and 1.74× slower on append than Gorilla (historical,
+pre-grammar-change measurement). If ingest is your binding
 constraint, or your series are dominated by repetition (constants, flags,
 discrete sets, integer counters), set `ts-encoding GORILLA` — Gorilla's wins are
 real, but narrow in scope.
@@ -523,7 +526,7 @@ go wrong.
 
 ### Latency summary
 
-Historical: measured before module encoding version 3 and before the Gorilla
+Historical: measured before the Chimp grammar change and before the Gorilla
 changes, and not re-measured here. 1,000 samples, medians across all workloads
 and timestamp models, expressed as a multiple of Uncompressed. Lower is better.
 

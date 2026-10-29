@@ -617,10 +617,10 @@ mod allocation {
     }
 }
 
-/// Golden streams for module encoding version 3. Each fixture pins the encoder (a fresh
+/// Golden streams for the current Chimp grammar. Each fixture pins the encoder (a fresh
 /// encode of its samples must reproduce its bytes) and the decoder (its bytes must decode
-/// to its samples), so any change to the Chimp grammar shows up here and needs a new
-/// encoding version.
+/// to its samples), so any change to the Chimp grammar shows up here and needs regenerated
+/// fixtures (and, once the module is released, a new encoding version).
 mod fixtures {
     use super::super::ChimpCompressor;
     use crate::common::Sample;
@@ -632,19 +632,19 @@ mod fixtures {
 
     const FIXTURES: [(&str, ValueWorkload, &str); 3] = [
         (
-            "v3-drift_q2.txt",
+            "chimp-drift_q2.txt",
             ValueWorkload::DriftQuantized,
-            include_str!("fixtures/v3-drift_q2.txt"),
+            include_str!("fixtures/chimp-drift_q2.txt"),
         ),
         (
-            "v3-counter.txt",
+            "chimp-counter.txt",
             ValueWorkload::Counter,
-            include_str!("fixtures/v3-counter.txt"),
+            include_str!("fixtures/chimp-counter.txt"),
         ),
         (
-            "v3-noisy.txt",
+            "chimp-noisy.txt",
             ValueWorkload::Noisy,
-            include_str!("fixtures/v3-noisy.txt"),
+            include_str!("fixtures/chimp-noisy.txt"),
         ),
     ];
 
@@ -701,7 +701,7 @@ mod fixtures {
     }
 
     /// Regenerates the fixtures from the current encoder. Run only for a deliberate format
-    /// change, together with a new module encoding version:
+    /// change:
     /// `cargo test --features enable-system-alloc write_chimp_fixtures -- --ignored`.
     #[test]
     #[ignore]
@@ -737,10 +737,10 @@ mod fixtures {
         }
     }
 
-    /// Version 3 streams decode bit-exactly, accept appends, and survive another
+    /// The golden streams decode bit-exactly, accept appends, and survive another
     /// serialize/deserialize; a fresh encode reproduces them byte for byte.
     #[test]
-    fn v3_streams_load_append_and_reencode() {
+    fn golden_streams_load_append_and_reencode() {
         for (name, _, fixture) in FIXTURES {
             let (wire, mut expected) = parse(fixture);
 

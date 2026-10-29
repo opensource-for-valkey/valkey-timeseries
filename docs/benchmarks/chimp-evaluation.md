@@ -39,11 +39,13 @@ The plan did not target constant series, and their regular-timestamp rows are un
 They are still about 2× Gorilla's bytes (516 vs 266 B per 1,000 regular samples), because
 a Chimp repeat costs 4 bits; with jittered or irregular timestamps the gap is 6–10 %.
 
-**Persistence.** The bit grammar changed in place. New RDB, DUMP and rewritten AOF payloads
-use module encoding version **3**, and this build reads version 3 only. Payloads from
-earlier builds (versions 1–2) are refused at load, whatever their chunk encoding, because
-the version belongs to the module type. Delete local `dump.rdb`/AOF files written by older
-builds, or re-ingest their logical samples.
+**Persistence.** The bit grammar changed in place, and the module encoding version was
+**not** bumped (it stays at 2, reading 1–2), because nothing has been released. Chimp
+chunks carry no grammar marker, so RDB, DUMP and AOF files containing Chimp series
+written by builds from before this change will not decode correctly, and no load-time
+error protects them. Delete local `dump.rdb`/AOF files written by those builds, or
+re-ingest their logical samples. (An earlier revision of this branch bumped the version
+to 3 and refused older payloads; that was reverted.)
 
 **Cluster fan-out.** The optional wire-version guard for fan-out chunks (plan Task 14) was
 **skipped by ruling**: the module is unreleased and a cluster runs one build. A cluster
@@ -81,7 +83,7 @@ rolling upgrade. Adding the guard is an independent follow-up.
 - **Timestamp tiers:** a 16-bit tier (`11110` + 16 bits = 21 bits) is added. Every tier
   except the 64-bit escape is written in one call. The 32- and 64-bit escapes cost 38 and 70 bits (previously 37 and
   69). Delta-of-delta zero stays 1 bit, so a repeated sample still costs 4 bits.
-- **Encoding version 3**, golden v3 fixtures and a refreshed compression baseline.
+- Golden fixtures for the current grammar (no encoding version) and a refreshed compression baseline.
 
 ## Measurements
 
@@ -329,15 +331,16 @@ These results are from the branch-final validation run at `114f171c0`.
     is byte-identical.
   - Chimp's compression geomean is 3.59 (was 3.35), against Gorilla's 3.16. The only Chimp
     row that grew is noisy/regular/1k, by 0.1 %.
-- Three golden v3 fixtures (drift_q2, counter, noisy) re-encode byte-exactly. They also
+- Three golden fixtures (drift_q2, counter, noisy) re-encode byte-exactly. They also
   reload and take an append (a repeat, an extended window, a NaN, large timestamp gaps),
   and the result matches an uninterrupted encode. Byte-level unit tests cover every
   timestamp tier.
-- Genuine DUMP payloads relabelled as versions 1 and 2 (with a valid CRC) are refused with
-  `Bad data format`; no key is created and the server stays up. `TS._RESTORE` rejects versions 0, 1, 2, 4, 99, −1 and
-  `x`.
-- Full integration suite: **1,573 passed, 0 failed**.
-- Compatibility suite: **2,854 passed, 0 failed, 2 skipped, 13 expected divergences**.
+- Genuine DUMP payloads relabelled as versions 0 and 3 (with a valid CRC) are refused with
+  `Bad data format`; no key is created and the server stays up. `TS._RESTORE` rejects
+  versions 0, 3, 99, −1 and `x`. The version gate is unchanged from before the branch
+  (versions 1–2 load).
+- Full integration suite: **1,573 passed, 0 failed** (run before the version gate was reverted to 2).
+- Compatibility suite: **2,854 passed, 0 failed, 2 skipped, 13 expected divergences** (same caveat).
   These are the previously registered ids; none is new. The 2 skips are the opt-in fuzzer.
 - Every case in this evaluation's A/B validated exact round trips, including after
   reload and append, in all five arms.

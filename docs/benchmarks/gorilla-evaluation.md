@@ -11,15 +11,11 @@ primarily a compression improvement with modest aggregate read improvements;
 it is **not a universal latency win**. Keep sparse seeking as an opt-in evaluator,
 without adding a production cache or per-append bookkeeping.
 
-At the time of this evaluation, new persistence writes used module encoding
-version **2** and the build read versions **1–2**. **Superseded:** the Chimp
-grammar change that followed moved the module to encoding version **3**, and the
-current build reads version 3 only, so version 1–2 RDB/DUMP/AOF payloads no
-longer load (see [Chunk encodings](../topics/encodings.md)). The version belongs
-to the module type, so this applies to series of every encoding. Gorilla's
-stream reader still decodes version 1 windows, as its golden fixtures check,
-but persisted payloads from those builds must be deleted or re-ingested from
-logical samples.
+New persistence writes use module encoding version **2**. This build reads
+versions **1–2**. Older module builds reject new version 2 payloads. This applies
+to every new RDB/DUMP payload and rewritten AOF, including series using other
+encodings, because the version belongs to the module type. Upgrade readers
+before writers; downgrade by exporting logical samples and recreating series.
 
 ## Changes retained
 
