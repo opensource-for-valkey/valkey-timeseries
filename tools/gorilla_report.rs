@@ -1,19 +1,25 @@
-//! Fixed-sample Gorilla A/B measurements, including large absolute counters.
+//! Fixed-sample Gorilla/Chimp A/B measurements, including large absolute counters.
 //!
 //! Build each revision, copy the binary, then alternate runs of the binaries:
 //! `cargo run --release --features enable-system-alloc,test-utils --bin gorilla_report --
 //! --out target/bench-reports/gorilla.csv --samples 1000 --iterations 300`.
+//! `--encoding chimp` measures the Chimp codec the same way; the default is `gorilla`.
 //! Times are local chunk microbenchmarks, not server performance measurements.
+//!
+//! The codec chunk is measured directly (monomorphized per encoding), not through
+//! `TimeSeriesChunk`: the enum dispatch adds ~14% to `decode_ns`, which would make Gorilla runs
+//! incomparable with the checked-in CSVs. Keep this file to APIs that exist in the baseline
+//! revision: it is copied into a baseline worktree as `examples/gorilla_report.rs`.
 
 use std::fs::File;
 use std::hint::black_box;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use get_size2::GetSize;
 use valkey_timeseries::common::Sample;
-use valkey_timeseries::series::chunks::{Chunk, ChunkOps, GorillaChunk};
+use valkey_timeseries::series::chunks::{ChimpChunk, Chunk, ChunkEncoding, GorillaChunk};
 use valkey_timeseries::tests::generators::{
     DatasetKey, TimestampModel, ValueWorkload, dataset_seed, generate_dataset,
 };
@@ -34,21 +40,34 @@ fn median<T>(iterations: usize, mut op: impl FnMut() -> T) -> f64 {
     times[times.len() / 2] as f64
 }
 
-fn build(samples: &[Sample]) -> GorillaChunk {
+fn max_size(count: usize) -> usize {
     // Every revision must process all samples, regardless of its compression ratio.
-    let mut chunk = GorillaChunk::with_max_size(samples.len().saturating_mul(24).max(4096));
+    count.saturating_mul(24).max(4096)
+}
+
+fn build<C: Chunk>(make: impl Fn(usize) -> C, samples: &[Sample]) -> C {
+    let mut chunk = make(max_size(samples.len()));
     chunk.set_data(samples).expect("encode");
     chunk
+}
+
+fn parse_encoding(name: &str) -> Option<ChunkEncoding> {
+    [ChunkEncoding::Gorilla, ChunkEncoding::Chimp]
+        .into_iter()
+        .find(|e| e.name().eq_ignore_ascii_case(name))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut out = PathBuf::from("target/bench-reports/gorilla.csv");
     let mut count = 1000;
     let mut iterations = 300;
+    let mut encoding = ChunkEncoding::Gorilla;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
-            println!("gorilla_report [--out FILE] [--samples N>=2] [--iterations N>0]");
+            println!(
+                "gorilla_report [--out FILE] [--samples N>=2] [--iterations N>0] [--encoding gorilla|chimp]"
+            );
             return Ok(());
         }
         let value = args.next().ok_or("expected a flag value")?;
@@ -56,6 +75,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--out" => out = value.into(),
             "--samples" => count = value.parse()?,
             "--iterations" => iterations = value.parse()?,
+            "--encoding" => {
+                encoding = parse_encoding(&value)
+                    .ok_or_else(|| format!("--encoding must be gorilla or chimp, got: {value}"))?
+            }
             _ => return Err(format!("unknown flag: {arg}").into()),
         }
     }
@@ -65,6 +88,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
+    match encoding {
+        ChunkEncoding::Gorilla => report(&out, count, iterations, GorillaChunk::with_max_size),
+        ChunkEncoding::Chimp => report(&out, count, iterations, ChimpChunk::with_max_size),
+        other => Err(format!("unsupported encoding: {other}").into()),
+    }
+}
+
+fn report<C: Chunk + GetSize>(
+    out: &Path,
+    count: usize,
+    iterations: usize,
+    make: impl Fn(usize) -> C + Copy,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = BufWriter::new(File::create(out)?);
     writeln!(
         writer,
@@ -92,12 +128,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let first = samples[0].timestamp;
                 let last = samples[count - 1].timestamp;
                 let span = last - first;
-                let chunk = build(&samples);
+                let chunk = build(make, &samples);
                 // Validate the entire persisted stream before timing it, including after
                 // reloading and appending (the previous final sample must now decode).
                 let mut serialized = Vec::new();
                 chunk.serialize(&mut serialized);
-                let mut restored = GorillaChunk::deserialize(&serialized).expect("deserialize");
+                let mut restored = C::deserialize(&serialized).expect("deserialize");
                 let extra = Sample::new(last + 1000, samples[count - 1].value + 1.0);
                 restored
                     .add_sample(&extra)
@@ -109,9 +145,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     assert_eq!(got.value.to_bits(), want.value.to_bits());
                 }
                 assert_eq!(restored.len(), count + 1);
-                let bulk = median(iterations, || build(black_box(&samples)));
+                let bulk = median(iterations, || build(make, black_box(&samples)));
                 let append = median(iterations, || {
-                    let mut c = GorillaChunk::with_max_size(count.saturating_mul(24).max(4096));
+                    let mut c = make(max_size(count));
                     for sample in black_box(&samples) {
                         c.add_sample(sample).expect("append");
                     }

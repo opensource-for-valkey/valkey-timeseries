@@ -172,6 +172,8 @@ example with the same release features. The report uses only APIs present in
 the baseline. Keep the resulting baseline and candidate executables, alternate
 their order across three rounds, and avoid concurrent compilation/testing.
 `--jobs 1` avoids memory contention from multiple fat-LTO links on this host.
+`--encoding chimp` runs the same measurements on the Chimp codec; the default is
+`gorilla`, so the commands above are unchanged.
 
 [1,000-sample medians](data/gorilla-1000.csv),
 [10,000-sample medians](data/gorilla-10000.csv),
