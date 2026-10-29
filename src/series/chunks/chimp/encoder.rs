@@ -219,6 +219,17 @@ impl Default for ChimpDec {
     }
 }
 
+/// Error for a `01` header whose leading count plus significant width exceeds 64 bits.
+/// Kept out of line so the hot decode arm stays small.
+#[cold]
+#[inline(never)]
+fn corrupt_trailing_window() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "corrupt chimp chunk: leading + width exceed 64",
+    )
+}
+
 impl ChimpDec {
     pub fn new() -> Self {
         Self {
@@ -288,6 +299,11 @@ impl ChimpDec {
                 if sig == 0 {
                     sig = 64;
                 }
+                // A valid header has lz + sig <= 64; reject a corrupt one before the
+                // subtraction below goes negative and the shift overflows.
+                if sig + self.stored_lz > 64 {
+                    return Err(corrupt_trailing_window());
+                }
                 inp.skip(11)?;
                 self.stored_tz = 64 - sig - self.stored_lz;
                 let mut value = inp.read_bits((64 - self.stored_lz - self.stored_tz) as u8)?;
@@ -301,5 +317,25 @@ impl ChimpDec {
             }
         }
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_trailing_window_header_is_rejected() {
+        // ELF-free Chimp stream: first value 64 raw bits, then flag 01, lz code 7 (=24),
+        // sig 0 (=64): 24 + 64 > 64 must be an error, not a shift by 232.
+        let mut w = BitStream::new();
+        w.write_bits(64, 1.5f64.to_bits()).unwrap();
+        w.write_bits(11, (0b01 << 9) | (7 << 6)).unwrap();
+        w.write_bits(64, 0).unwrap();
+        let mut r = BitStreamReader::new(w.bytes());
+        let mut dec = ChimpDec::new();
+        dec.read_value(&mut r).unwrap();
+        let err = dec.read_value(&mut r).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -394,6 +394,12 @@ impl ChimpCompressor {
                                 )?;
                             } else {
                                 // case `11` + 4-bit beta_star
+                                // `erase_bits > 4` above is what guarantees the header fits:
+                                // a beta_star of 16 or more leaves too few erasable bits.
+                                debug_assert!(
+                                    beta_star < 16,
+                                    "beta_star must fit the 4-bit header"
+                                );
                                 self.last_beta_star = beta_star;
                                 self.chimp.add_value_prefixed(
                                     &mut self.writer,
