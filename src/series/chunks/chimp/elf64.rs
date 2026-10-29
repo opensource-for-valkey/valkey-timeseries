@@ -11,8 +11,8 @@ const F: [i32; 21] = [
 
 /// `10^i` for every `i` whose result is finite (`10^308` is the largest). Indexing past the
 /// end is `inf`, which is what parsing `"1.0E309"` gave; the old 21-entry table fell back
-/// to `format!` + `parse` for anything larger, and the significant-digit search below could
-/// take that path 5,000 times for one tiny value (see `get_significant_count`).
+/// to `format!` + `parse` for anything larger, and the old significant-digit search could
+/// take that path 5,000 times for one tiny value.
 const MAP_10IP: [f64; 309] = [
     1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
     1e17, 1e18, 1e19, 1e20, 1e21, 1e22, 1e23, 1e24, 1e25, 1e26, 1e27, 1e28, 1e29, 1e30, 1e31, 1e32,
@@ -170,67 +170,153 @@ fn get_sp_and_10in_flag(v: f64) -> (i32, i32) {
     (sp, flag)
 }
 
-/// `getSignificantCount`: number of decimal significant digits of `v`.
-///
-/// Returns `Err` for unsupported magnitudes (negative scale lookup) or if the
-/// search exceeds a safety bound, so the caller can fall back to raw storage.
-fn get_significant_count(v: f64, sp: i32, last_beta_star: i32) -> Result<i32, ()> {
-    let mut i: i32;
-    if last_beta_star != i32::MAX && last_beta_star != 0 {
-        i = (last_beta_star - sp - 1).max(1);
-    } else if last_beta_star == i32::MAX {
-        i = 17 - sp - 1;
-    } else if sp >= 0 {
-        i = 1;
-    } else {
-        i = -sp;
-    }
+/// Most significant decimal digits the ELF layer counts. A value with more is stored raw: from
+/// 16 digits on `beta = alpha + sp + 1` leaves at most 3 erasable bits
+/// (`f(alpha) + E >= 3.32 (alpha + sp) - 1`), short of the `erase_bits > 4` the encoder needs.
+const MAX_SIGNIFICANT_DIGITS: i32 = 15;
 
-    // Once `v * 10^i` is past `i64::MAX` the cast saturates and `temp_long as f64` can
-    // never equal `temp` again (it only grows with `i`), so the search below would run to
-    // its guard for nothing. For a value like `1e-300` that was 5,000 iterations, each one
-    // formatting and parsing a power of ten: ~230 µs of main-thread time per sample, on the
-    // default encoding, from any client. Bail out at once instead; the outcome (`Err`, the
-    // value is stored raw) is what the exhausted guard produced.
-    const SATURATES: f64 = 9_223_372_036_854_775_808.0; // 2^63: `i64::MAX as f64`
-    let mut temp = v * get_10ip(i)?;
-    if temp > SATURATES {
+/// `10^MAX_SIGNIFICANT_DIGITS`: the first scaled value with too many digits.
+const DIGIT_LIMIT: u64 = 1_000_000_000_000_000;
+
+/// `(n / 10^z, z)` for the largest `z` with `10^z | n`; `(0, 0)` for `n == 0`.
+///
+/// Four conditional steps of 10^8, 10^4, 10^2 and 10 instead of a divide-by-ten loop: they
+/// cover every `z` below 16, and `n < DIGIT_LIMIT` keeps `z <= 14`. The divisions are by
+/// constants, so each step is a multiply-high and a select.
+#[inline]
+fn strip_decimal_zeros(n: u64) -> (u64, u32) {
+    #[inline(always)]
+    fn step(n: u64, z: u32, pow: u64, digits: u32) -> (u64, u32) {
+        let q = n / pow;
+        if q * pow == n {
+            (q, z + digits)
+        } else {
+            (n, z)
+        }
+    }
+    if n == 0 {
+        return (0, 0);
+    }
+    let (n, z) = step(n, 0, 100_000_000, 8);
+    let (n, z) = step(n, z, 10_000, 4);
+    let (n, z) = step(n, z, 100, 2);
+    step(n, z, 10, 1)
+}
+
+/// Number of decimal significant digits of `v` (`v > 0`, `sp` its scale position), or `Err`
+/// when it has more than [`MAX_SIGNIFICANT_DIGITS`] or its scale is outside the tables.
+///
+/// Top-down: `v * 10^(14 - sp)` lies below `10^15 < 2^53`, where doubles are an exact
+/// integer grid (spacing at most 1/8), so rounding it gives the 15-digit decimal nearest to
+/// `v`. A division tells whether that decimal reads back as `v`; if so, its trailing zeros
+/// are the digits `v` does not need. The result does not depend on the previous value, and
+/// there is no search loop: the old one climbed from the previous value's digit count one
+/// power of ten at a time and then stripped zeros one by one.
+///
+/// The division is only a correctly rounded `n / 10^i` while `10^i` is exact (`i <= 22`,
+/// i.e. `|v| >= 1e-8`). Past that it misjudges a fifth to a third of the short decimals, so
+/// it is skipped there and `try_recover` in `write_value` is the only exactness check. A value
+/// with more than 15 digits is then erased only if recovery gives it back bit for bit, so the
+/// stream stays lossless; otherwise it is stored raw.
+#[inline]
+fn significant_count(v: f64, sp: i32) -> Result<i32, ()> {
+    /// Largest `i` with `10^i` exactly representable.
+    const EXACT_POW10: i32 = 22;
+    let i = MAX_SIGNIFICANT_DIGITS - 1 - sp;
+    if i < 0 || i as usize >= MAP_10IP.len() {
         return Err(());
     }
-    let mut temp_long = temp as i64;
-    let mut guard = 0u32;
-    while temp_long as f64 != temp {
-        i += 1;
-        guard += 1;
-        if guard > 5000 {
-            return Err(());
-        }
-        temp = v * get_10ip(i)?;
-        if temp > SATURATES {
-            return Err(());
-        }
-        temp_long = temp as i64;
+    let scale = MAP_10IP[i as usize];
+    // `v * scale >= 0`; adding one half and truncating rounds it (exactly, below 2^52).
+    let n = (v * scale + 0.5) as u64;
+    if n >= DIGIT_LIMIT || (i <= EXACT_POW10 && n as f64 / scale != v) {
+        return Err(());
     }
-
-    if temp / get_10ip(i)? != v {
-        Ok(17)
-    } else {
-        while i > 0 && temp_long % 10 == 0 {
-            i -= 1;
-            temp_long /= 10;
-        }
-        Ok(sp + i + 1)
-    }
+    let (_, z) = strip_decimal_zeros(n);
+    Ok(MAX_SIGNIFICANT_DIGITS - z as i32)
 }
 
 /// `getAlphaAndBetaStar`: returns `(alpha, beta_star)`.
-pub fn get_alpha_and_beta_star(v: f64, last_beta_star: i32) -> Result<(i32, i32), ()> {
+///
+/// `alpha` is negative only for a multiple of ten with fewer significant digits than integer
+/// places, i.e. an integer.
+pub fn get_alpha_and_beta_star(v: f64) -> Result<(i32, i32), ()> {
     let v = if v < 0.0 { -v } else { v };
     let (sp, flag) = get_sp_and_10in_flag(v);
-    let beta = get_significant_count(v, sp, last_beta_star)?;
+    let beta = significant_count(v, sp)?;
     let alpha = beta - sp - 1;
     let beta_star = if flag == 1 { 0 } else { beta };
     Ok((alpha, beta_star))
+}
+
+/// The search [`get_alpha_and_beta_star`] replaced (2026-10-29), kept for the equivalence
+/// tests: a climb from the previous value's digit count, then a strip loop.
+#[cfg(test)]
+mod reference {
+    use super::{get_10ip, get_sp_and_10in_flag};
+
+    /// `getSignificantCount`: number of decimal significant digits of `v`.
+    ///
+    /// Returns `Err` for unsupported magnitudes (negative scale lookup) or if the
+    /// search exceeds a safety bound, so the caller can fall back to raw storage.
+    pub(super) fn get_significant_count(v: f64, sp: i32, last_beta_star: i32) -> Result<i32, ()> {
+        let mut i: i32;
+        if last_beta_star != i32::MAX && last_beta_star != 0 {
+            i = (last_beta_star - sp - 1).max(1);
+        } else if last_beta_star == i32::MAX {
+            i = 17 - sp - 1;
+        } else if sp >= 0 {
+            i = 1;
+        } else {
+            i = -sp;
+        }
+
+        // Once `v * 10^i` is past `i64::MAX` the cast saturates and `temp_long as f64` can
+        // never equal `temp` again (it only grows with `i`), so the search below would run to
+        // its guard for nothing. For a value like `1e-300` that was 5,000 iterations, each one
+        // formatting and parsing a power of ten: ~230 µs of main-thread time per sample, on the
+        // default encoding, from any client. Bail out at once instead; the outcome (`Err`, the
+        // value is stored raw) is what the exhausted guard produced.
+        const SATURATES: f64 = 9_223_372_036_854_775_808.0; // 2^63: `i64::MAX as f64`
+        let mut temp = v * get_10ip(i)?;
+        if temp > SATURATES {
+            return Err(());
+        }
+        let mut temp_long = temp as i64;
+        let mut guard = 0u32;
+        while temp_long as f64 != temp {
+            i += 1;
+            guard += 1;
+            if guard > 5000 {
+                return Err(());
+            }
+            temp = v * get_10ip(i)?;
+            if temp > SATURATES {
+                return Err(());
+            }
+            temp_long = temp as i64;
+        }
+
+        if temp / get_10ip(i)? != v {
+            Ok(17)
+        } else {
+            while i > 0 && temp_long % 10 == 0 {
+                i -= 1;
+                temp_long /= 10;
+            }
+            Ok(sp + i + 1)
+        }
+    }
+
+    /// `getAlphaAndBetaStar`: returns `(alpha, beta_star)`.
+    pub(super) fn get_alpha_and_beta_star(v: f64, last_beta_star: i32) -> Result<(i32, i32), ()> {
+        let v = if v < 0.0 { -v } else { v };
+        let (sp, flag) = get_sp_and_10in_flag(v);
+        let beta = get_significant_count(v, sp, last_beta_star)?;
+        let alpha = beta - sp - 1;
+        let beta_star = if flag == 1 { 0 } else { beta };
+        Ok((alpha, beta_star))
+    }
 }
 
 /// `roundUp`: recover the original value from an erased `v_prime`.
@@ -330,16 +416,19 @@ pub(crate) fn boundary_corpus() -> Vec<f64> {
 }
 
 /// The predicate `ChimpCompressor::write_value` evaluates before it chooses Elf case `0` or
-/// `11` over the raw case `10`: the same digit search, erase mask, `delta != 0 && erase_bits > 4`
+/// `11` over the raw case `10`: the same digit count, erase mask, `delta != 0 && erase_bits > 4`
 /// and recovery check, in the same order. Zero and the non-finite patterns never reach it.
 #[cfg(test)]
-pub(crate) fn elf_would_erase(v: f64, last_beta_star: i32) -> bool {
+pub(crate) fn elf_would_erase(v: f64) -> bool {
+    v != 0.0 && v.is_finite() && erases_with(v, get_alpha_and_beta_star(v))
+}
+
+/// `write_value`'s erase decision for `v` given a digit count result `(alpha, beta_star)`.
+#[cfg(test)]
+fn erases_with(v: f64, count: Result<(i32, i32), ()>) -> bool {
     use super::compressor::try_recover;
 
-    if v == 0.0 || !v.is_finite() {
-        return false;
-    }
-    let Ok((alpha, beta_star)) = get_alpha_and_beta_star(v, last_beta_star) else {
+    let Ok((alpha, beta_star)) = count else {
         return false;
     };
     if alpha < 0 {
@@ -375,63 +464,133 @@ mod tests {
         assert_eq!(get_10in(-1), Err(()));
     }
 
-    /// A search whose product overflows must fail fast (the value is then stored raw), not
-    /// run the 5,000-iteration guard. That is any magnitude below ~1e-292 on a fresh stream
-    /// (`last_beta_star == MAX` starts the search at `10^(16 - sp)`, past `10^308`) and a
-    /// subnormal from any state. Debug build, so the budget is generous: the old path took seconds here.
+    /// Magnitudes whose scale needs a power of ten past `MAP_10IP` (|v| below ~1e-294) and
+    /// subnormals fail at once (the value is then stored raw); nothing loops. Debug build, so
+    /// the budget is generous: the pre-2026-09 search took seconds here.
     #[test]
     fn overflowing_searches_fail_fast() {
-        let cases = [
-            (1e-300, i32::MAX),
-            (1e-295, i32::MAX),
-            (f64::MIN_POSITIVE, i32::MAX),
-            (5e-324, i32::MAX),
-            (5e-324, 0),
-            (5e-324, 5),
-            (5e-324, 17),
-        ];
+        let cases = [1e-300, 1e-295, f64::MIN_POSITIVE, 5e-324];
         let start = std::time::Instant::now();
         for _ in 0..5_000 {
-            for (v, last) in cases {
-                assert_eq!(
-                    get_alpha_and_beta_star(v, last),
-                    Err(()),
-                    "{v:e} last {last}"
-                );
+            for v in cases {
+                assert_eq!(get_alpha_and_beta_star(v), Err(()), "{v:e}");
             }
         }
         let elapsed = start.elapsed();
         assert!(
             elapsed.as_millis() < 500,
-            "40,000 overflowing searches took {elapsed:?}"
+            "20,000 overflowing searches took {elapsed:?}"
         );
     }
 
-    /// With a known `beta_star` a tiny power of ten is a fast, legitimate erasure: the
-    /// search starts near the right scale and never overflows.
+    /// The count scales `v` to 15 digits with one table power of ten, so the smallest power of
+    /// ten it can still count is `1e-294` (`10^(14 + 294)` is the last table entry). Anything
+    /// smaller is stored raw.
     #[test]
     fn tiny_powers_of_ten_erase_when_the_scale_is_known() {
-        assert_eq!(get_alpha_and_beta_star(1e-300, 0), Ok((300, 0)));
-        assert_eq!(get_alpha_and_beta_star(1e-300, 5), Ok((300, 0)));
+        assert_eq!(get_alpha_and_beta_star(1e-300), Err(()));
+        assert_eq!(get_alpha_and_beta_star(1e-295), Err(()));
+        assert_eq!(get_alpha_and_beta_star(1e-294), Ok((294, 0)));
     }
 
     /// Values in the range that used to go through the string-parse fallback still get
     /// the same digit counts.
     #[test]
     fn small_magnitudes_still_erase() {
-        assert_eq!(get_alpha_and_beta_star(1e-5, i32::MAX), Ok((5, 0)));
-        assert_eq!(get_alpha_and_beta_star(1.5e-5, i32::MAX), Ok((6, 2)));
-        assert_eq!(get_alpha_and_beta_star(1e-20, i32::MAX), Ok((20, 0)));
-        assert_eq!(get_alpha_and_beta_star(123.456, i32::MAX), Ok((3, 6)));
+        assert_eq!(get_alpha_and_beta_star(1e-5), Ok((5, 0)));
+        assert_eq!(get_alpha_and_beta_star(1.5e-5), Ok((6, 2)));
+        assert_eq!(get_alpha_and_beta_star(1e-20), Ok((20, 0)));
+        assert_eq!(get_alpha_and_beta_star(123.456), Ok((3, 6)));
+    }
+
+    #[test]
+    fn strip_decimal_zeros_exact() {
+        assert_eq!(strip_decimal_zeros(0), (0, 0));
+        assert_eq!(strip_decimal_zeros(7), (7, 0));
+        assert_eq!(strip_decimal_zeros(1_230_000), (123, 4));
+        assert_eq!(strip_decimal_zeros(100_000_000_000_000), (1, 14));
+        assert_eq!(strip_decimal_zeros(123_450_000_000_000), (12_345, 10));
+        assert_eq!(
+            strip_decimal_zeros(999_999_999_999_999),
+            (999_999_999_999_999, 0)
+        );
+        for z in 0..15 {
+            assert_eq!(strip_decimal_zeros(7 * 10u64.pow(z)), (7, z), "7e{z}");
+        }
+    }
+
+    /// The values of every generator workload and timestamp model at 1,000 samples, plus the
+    /// counter workload offset by 2^40 and 2^50 (as `gorilla_report` runs it).
+    fn matrix_values() -> Vec<f64> {
+        use crate::tests::generators::{
+            DatasetKey, TimestampModel, ValueWorkload, dataset_seed, generate_dataset,
+        };
+        let mut out = Vec::new();
+        for &workload in ValueWorkload::workloads() {
+            for &ts in TimestampModel::all() {
+                let key = DatasetKey::new(workload, ts);
+                let samples = generate_dataset(key, 1000, dataset_seed(key));
+                let offsets: &[f64] = if workload == ValueWorkload::Counter {
+                    &[0.0, (1u64 << 40) as f64, (1u64 << 50) as f64]
+                } else {
+                    &[0.0]
+                };
+                for &offset in offsets {
+                    out.extend(samples.iter().map(|s| s.value + offset));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether erasing `v` to `alpha` decimal places with the `write_value` mask leaves a value
+    /// the decoder's recovery turns back into `v`, bit for bit.
+    fn recovers(v: f64, alpha: i32, beta_star: i32) -> bool {
+        use super::super::compressor::try_recover;
+
+        let v_long = v.to_bits();
+        let e = ((v_long >> 52) & 0x7ff) as i32;
+        let erase_bits = 52 - (get_f_alpha(alpha) + e - 1023);
+        let mask = u64::MAX.wrapping_shl(erase_bits as u32);
+        try_recover(mask & v_long, beta_star).map(f64::to_bits) == Some(v_long)
+    }
+
+    #[test]
+    fn top_down_count_never_erases_less_than_the_reference() {
+        // On every value the old encoder erased, the new count finds the same or fewer
+        // digits, and the erased value still recovers. (Not "every value the old search
+        // gave beta* <= 15": that includes its beta* = 0 answers for values just below a
+        // power of ten >= 1e9, where `log10` rounds up; those never recovered.)
+        for v in boundary_corpus().into_iter().chain(matrix_values()) {
+            if v == 0.0 || !v.is_finite() {
+                continue; // `write_value` never searches these
+            }
+            for last in [i32::MAX, 0, 3, 5, 15] {
+                let old = reference::get_alpha_and_beta_star(v, last);
+                if let Ok((_, beta_old)) = old
+                    && erases_with(v, old)
+                {
+                    let Ok((alpha, beta_new)) = get_alpha_and_beta_star(v) else {
+                        // Past the power table: stored raw by design (see
+                        // `tiny_powers_of_ten_erase_when_the_scale_is_known`).
+                        assert!(v.abs() < 1e-294, "{v:e} (last {last}): new count failed");
+                        continue;
+                    };
+                    assert!(
+                        beta_new <= beta_old,
+                        "{v:e}: new {beta_new} > old {beta_old}"
+                    );
+                    assert!(recovers(v, alpha, beta_new), "{v:e} does not recover");
+                }
+            }
+        }
     }
 
     #[test]
     fn short_dyadic_values_never_erase() {
         for v in boundary_corpus() {
-            for last in [i32::MAX, 0, 1, 2, 5, 15] {
-                if is_short_dyadic(v.to_bits()) {
-                    assert!(!elf_would_erase(v, last), "{v:e} (last {last}) would erase");
-                }
+            if is_short_dyadic(v.to_bits()) {
+                assert!(!elf_would_erase(v), "{v:e} would erase");
             }
         }
     }
@@ -504,9 +663,7 @@ mod tests {
                     continue;
                 };
                 assert!(is_short_dyadic(v.to_bits()), "{v:e} (k {k})");
-                for last in [i32::MAX, 0, 1, 3, 7] {
-                    assert!(!elf_would_erase(v, last), "{v:e} (k {k}, last {last})");
-                }
+                assert!(!elf_would_erase(v), "{v:e} (k {k})");
             }
         }
     }
@@ -516,7 +673,7 @@ mod tests {
     #[test]
     fn fraction_bit_limit_is_tight() {
         let v = 17582400172190.2_f64;
-        assert!(elf_would_erase(v, i32::MAX));
+        assert!(elf_would_erase(v));
         assert!(!is_short_dyadic(v.to_bits()));
 
         // And for every wider fraction-bit count some value is erased and rejected.
@@ -529,7 +686,7 @@ mod tests {
                     continue;
                 };
                 assert!(!is_short_dyadic(v.to_bits()), "{v:e} (k {k})");
-                erased += usize::from(elf_would_erase(v, i32::MAX));
+                erased += usize::from(elf_would_erase(v));
             }
             if k >= 8 {
                 assert!(erased > 0, "no erased value found at k = {k}");

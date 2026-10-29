@@ -350,12 +350,12 @@ impl ChimpCompressor {
                 .add_value_prefixed(&mut self.writer, 0b10, 2, v_long)?;
         } else {
             // Normal or subnormal: attempt ELF erasure.
-            match get_alpha_and_beta_star(v, self.last_beta_star) {
+            match get_alpha_and_beta_star(v) {
                 Ok((alpha, beta_star)) => {
                     if alpha < 0 {
-                        // Negative alpha can arise from the significant-count
-                        // "bug cap" (beta = 17) for large magnitudes; such
-                        // values cannot be erased reversibly, so store raw.
+                        // Negative alpha means a multiple of ten: an integer, which
+                        // `is_short_dyadic` already sent down the raw path. Kept
+                        // because `get_f_alpha` rejects a negative alpha.
                         self.chimp
                             .add_value_prefixed(&mut self.writer, 0b10, 2, v_long)?;
                     } else {
@@ -1051,11 +1051,16 @@ mod tests {
         values
     }
 
-    /// Recorded from the encoder before the dyadic bypass existed: skipping the ELF search for
-    /// integers and short binary fractions must not change a single byte, including around
-    /// decimals the search does erase (the `mixed` stream has plenty of both).
+    /// Pins the Chimp stream byte for byte as of the top-down digit count (2026-10-29), for
+    /// integers and short binary fractions interleaved with decimals ELF erases.
+    ///
+    /// `small` is unchanged since it was recorded before the dyadic bypass, so it still shows
+    /// that the bypass is byte-neutral. `mixed` was re-recorded when the digit count stopped
+    /// depending on the previous value: 13641 -> 13617 bytes, because decimals the old search
+    /// read as 17 digits (float noise) now erase. A change here is a format change; make it on
+    /// purpose and re-record.
     #[test]
-    fn dyadic_streams_match_the_pre_bypass_encoder_byte_for_byte() {
+    fn streams_match_the_top_down_digit_count_encoder_byte_for_byte() {
         let small = pack(&[
             1.0,
             2.0,
@@ -1081,7 +1086,7 @@ mod tests {
         );
 
         let mixed = pack(&mixed_dyadic_values());
-        assert_eq!(mixed.len(), 13641);
-        assert_eq!(fnv1a(&mixed), 0xe64e_401f_c7af_ef31);
+        assert_eq!(mixed.len(), 13617);
+        assert_eq!(fnv1a(&mixed), 0x739f_a3aa_9118_ae4c);
     }
 }
