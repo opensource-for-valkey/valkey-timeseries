@@ -254,7 +254,7 @@ one under a 2-bit flag. The first value is 64 raw bits.
 | Flag | Fields | Bits | Meaning |
 |---|---|---:|---|
 | `00` | — | 2 | XOR is zero: the value repeats. The stored window is kept |
-| `01` | lz code (3), width (6), payload | 11 + width | New window with trailing zeros: leading zeros rounded down to a bucket, `width = 64 − lz − tz` (0 means 64) |
+| `01` | lz code (3), width (6), payload | 11 + width | New window with trailing zeros: leading zeros rounded down to a bucket, `width = 64 − lz − tz` (the decoder reads 0 as 64; the encoder never writes it) |
 | `01` | `111`, ext (6), width (6), payload | 17 + width | Extended window: an `ext` field of 41..=63 names an exact leading count `32 + (ext − 41)`, 32..=54 |
 | `10` | payload | 2 + width | Reuse the stored window: the same leading **and** trailing zeros |
 | `11` | lz code (3), payload | 5 + (64 − lz) | New window with no trailing zeros |
@@ -262,7 +262,9 @@ one under a 2-bit flag. The first value is 64 raw bits.
 The leading-zero code names one of eight buckets: 0, 8, 12, 16, 18, 20, 22, 24.
 An XOR's leading-zero count rounds down to a bucket, and the difference is
 carried as payload padding. The encoder writes `01` when the XOR has more than
-6 trailing zeros and `11` otherwise.
+6 trailing zeros and `11` otherwise. The extended `01` form is chosen by cost
+instead, whatever the trailing zeros: whenever it and its payload are strictly
+shorter than that header and its payload.
 
 What version 3 changed from the published Chimp:
 
