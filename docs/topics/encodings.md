@@ -4,6 +4,10 @@ This document describes the three time-series chunk encodings available in
 valkey-timeseries, their algorithms, performance characteristics, and a selection
 rubric for choosing the right encoding based on your data.
 
+The comparison tables are historical measurements. For the latest Gorilla
+changes, fixed-sample A/B results, and persistence upgrade requirements, see
+[the Gorilla evaluation](../benchmarks/gorilla-evaluation.md).
+
 ---
 
 ## Overview
@@ -66,6 +70,15 @@ range 64 B – 1 MiB, must be a multiple of 8).
 
 ### 2. Gorilla
 
+The current Gorilla evaluation and its measured tradeoffs are recorded in
+[the benchmark report](../benchmarks/gorilla-evaluation.md). Historical comparison
+numbers below predate that change; use the report for current A/B measurements.
+
+New persistence payloads use module encoding version **2**. This build reads
+versions 1 and 2, including legacy Gorilla windows mixed with new windows after
+an append. Older module builds reject version 2 RDB/DUMP/AOF payloads. Upgrade
+readers before writers; a downgrade requires rebuilding data from logical samples.
+
 **Algorithm:** Two-stage compression based on the Facebook Gorilla paper
 (Pelkonen et al., 2015).
 
@@ -79,12 +92,12 @@ range 64 B – 1 MiB, must be a multiple of 8).
    | dod range | total bits |
    |---|---|
    | `0` | 1 |
-   | ±3 | 7 |
-   | ±31 | 12 |
-   | ±255 | 17 |
-   | ±2,047 | 22 |
-   | ±131,071 | 30 |
-   | ±16,777,215 | 39 |
+   | ±15 | 7 |
+   | ±255 | 12 |
+   | ±4,095 | 17 |
+   | ±65,535 | 22 |
+   | ±8,388,607 | 30 |
+   | ±2,147,483,647 | 39 |
    | ±3.6e16 | 64 |
    | anything else | 72 |
 
@@ -92,10 +105,21 @@ range 64 B – 1 MiB, must be a multiple of 8).
 1. Sample 0: raw 64-bit IEEE 754 value
 2. Compute `xor = current ^ previous`
 3. If `xor == 0` (unchanged): **1 bit** — the cheapest repeat of any encoding here
-4. If the non-zero window fits within the previous leading/trailing zero bounds:
-   2 control bits + the significant bits
-5. Otherwise: 2 control bits + new leading zeros (5 bits) + significant count
-   (6 bits) + the significant bits
+4. If the XOR fits a previous 32–57-bit window, keep that window to avoid
+   frequent header changes on noisy values, unless an extended window can remove
+   leading-zero padding. For compact windows (at most 31 bits) and wide windows
+   (58–64 bits), compare the total costs of reuse and a fresh window, preferring
+   reuse on a tie. Reuse costs 2 bits plus the old width; an ordinary fresh window
+   costs 13 bits plus the new width.
+5. A fresh ordinary window uses 2 control bits, a 5-bit leading count and a
+   6-bit significant width (zero represents width 64).
+6. For more than 36 leading zeros, a fresh extended window can pay off: the
+   otherwise-invalid `(leading=31, width>33)` headers encode an extended
+   leading count, followed by a 5-bit significant width. A zero width code
+   represents leading=63. Its total cost is 18 bits plus the payload; subsequent
+   reuses still cost only 2 bits plus the width. Ordinary windows keep their
+   original header size. This targets large absolute counters and very small
+   mantissa changes without adding a bit to every window.
 
 A repeated value therefore costs **2 bits total** per sample (1 for the
 delta-of-delta, 1 for the XOR), which is what produces the 64× ratio on

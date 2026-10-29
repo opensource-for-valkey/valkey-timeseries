@@ -119,6 +119,15 @@ Smaller reads, `TS.CARD` without `FILTER_BY_RANGE`, and any of these commands is
 
 **What differs.** The persistence format used to store series state (across RDB, AOF, and any internal format) does not match RedisTimeSeries's.
 
+Within Valkey TimeSeries, this build writes module encoding version 2 and reads
+versions 1–2. Version 2 adds Gorilla extended XOR windows; existing version 1
+payloads remain readable and writable after loading. Older module builds reject
+new version 2 payloads, including RDB, DUMP/RESTORE, and rewritten AOF state.
+Upgrade readers before writers; downgrading persisted version 2 data requires
+exporting logical samples and recreating the series. Details and measured gains:
+[the Gorilla evaluation](docs/benchmarks/gorilla-evaluation.md).
+
+
 **Why.** The on-disk format is an internal implementation detail and is not part of the compatibility contract. Fixing it would constrain Valkey TimeSeries's ability to evolve its storage, chunk-encoding, and recovery strategies independently of RedisTimeSeries.
 
 **Migration impact.** RedisTimeSeries RDB files cannot be loaded directly by Valkey TimeSeries, and vice versa. RDB/DUMP migration is explicitly not on the roadmap: the formats are incompatible and no conversion tooling is planned. Migrations between the two must rebuild series from the underlying data, not by copying persisted data. Two working recipes:

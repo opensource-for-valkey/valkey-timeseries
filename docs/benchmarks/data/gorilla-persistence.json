@@ -1,0 +1,11 @@
+{
+  "legacy_rdb_load": true,
+  "legacy_dump_restore": true,
+  "append_after_legacy_load": true,
+  "new_rdb_reload": true,
+  "label_index_preserved": true,
+  "downgrade_rejected": true,
+  "downgrade_error": "Bad data format",
+  "samples_per_key": 1001,
+  "value_offset": 1125899906842624
+}
