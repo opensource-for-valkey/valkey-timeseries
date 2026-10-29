@@ -1,7 +1,7 @@
 """Persistence interop with RedisTimeSeries 8.10 (test plan §7.4).
 
 Both engines register the same module type name — `TSDB-TYPE` — with
-incompatible payload formats (ours: encver 2 (reads 1–2); RTS 8.10: encver 9). RTS→valkey
+incompatible payload formats (ours: encver 3 (reads 3); RTS 8.10: encver 9). RTS→valkey
 RDB/DUMP migration is explicitly NOT supported (owner decision, 2026-07-16;
 DIV-0010): there is no format converter and none is planned. Migration is by
 re-ingest (see COMPATIBILITY.md). This module pins the *defined-failure*

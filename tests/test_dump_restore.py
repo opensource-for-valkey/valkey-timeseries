@@ -4,11 +4,87 @@ from valkeytestframework.util.waiters import *
 from valkeytestframework.valkey_test_case import ValkeyAction
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
 from valkeytestframework.conftest import resource_port_tracker
+from valkey.exceptions import ResponseError
 
+
+# CRC-64/Jones (reflected), the DUMP payload footer checksum.
+_CRC_TBL = []
+for _i in range(256):
+    _crc = _i
+    for _ in range(8):
+        _crc = (_crc >> 1) ^ 0x95AC9329AC4BC9B5 if _crc & 1 else _crc >> 1
+    _CRC_TBL.append(_crc)
+
+
+def _with_encver(payload: bytes, encver: int) -> bytes:
+    """Rewrite a MODULE_2 DUMP payload's module-type encoding version and fix the CRC."""
+    assert payload[0] == 7, "expected RDB_TYPE_MODULE_2 opcode"
+    assert payload[1] == 0x81, "expected 64-bit length marker for the module id"
+    mid = int.from_bytes(payload[2:10], "big")
+    mid = (mid & ~0x3FF) | encver
+    body = payload[:2] + mid.to_bytes(8, "big") + payload[10:-8]
+    crc = 0
+    for b in body:
+        crc = _CRC_TBL[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return body + crc.to_bytes(8, "little")
 
 
 class TestTimeseriesDumpRestore(ValkeyTimeSeriesTestCaseBase):
     """Tests for DUMP/RESTORE serialization of TimeSeries data"""
+
+    @pytest.mark.parametrize('values', ['quantized', 'counter_2p50'])
+    def test_chimp_dump_restore_and_append(self, values):
+        """Decimal-place headers, reused windows and the timestamp tiers survive sealed
+        chunks, DUMP/RESTORE and continued writes."""
+        client = self.client
+        client.execute_command('TS.CREATE', 'src', 'ENCODING', 'CHIMP', 'CHUNK_SIZE', 512,
+                               'DUPLICATE_POLICY', 'LAST')
+
+        # Values go out as strings this test controls and are compared as parsed floats,
+        # so no Python arithmetic has to round-trip through the server's formatting.
+        def val(i):
+            if values == 'quantized':
+                return f'{100 + i / 100:.2f}'
+            return str((1 << 50) + 7 * i)
+
+        def ts(i):
+            return 1000 * (i + 1) + (i % 3) * 7  # jittered
+
+        expected = [(ts(i), val(i)) for i in range(1001)]
+        with client.pipeline(transaction=False) as p:
+            for t, v in expected[:1000]:
+                p.execute_command('TS.ADD', 'src', t, v)
+            p.execute()
+        payload = client.execute_command('DUMP', 'src')
+        client.execute_command('RESTORE', 'dst', 0, payload)
+        client.execute_command('TS.ADD', 'dst', *expected[1000])
+        # A duplicate rewrites a sealed chunk, exercising decode -> encode too.
+        rewritten = f'{101.01:.2f}' if values == 'quantized' else str((1 << 50) + 8)
+        client.execute_command('TS.ADD', 'dst', expected[1][0], rewritten)
+        expected[1] = (expected[1][0], rewritten)
+
+        actual = client.execute_command('TS.RANGE', 'dst', '-', '+')
+        assert len(actual) == len(expected)
+        for i, ((timestamp, value), (want_ts, want)) in enumerate(zip(actual, expected)):
+            assert timestamp == want_ts, (i, timestamp)
+            assert float(value) == float(want), (i, value, want)
+
+    @pytest.mark.parametrize('encver', [1, 2])
+    def test_restore_rejects_older_encoding_versions(self, encver):
+        """Payloads from before the version-3 format are refused, not misdecoded."""
+        client = self.client
+        client.execute_command('TS.CREATE', 'cur', 'ENCODING', 'CHIMP')
+        for i in range(100):
+            client.execute_command('TS.ADD', 'cur', 1000 + i, 1.5 + i / 100)
+        payload = client.execute_command('DUMP', 'cur')
+
+        # Sanity: the payload with its true version loads.
+        assert client.execute_command('RESTORE', 'cur_copy', 0, payload) == b'OK'
+
+        with pytest.raises(ResponseError, match='Bad data format'):
+            client.execute_command('RESTORE', f'old{encver}', 0, _with_encver(payload, encver))
+        assert client.execute_command('EXISTS', f'old{encver}') == 0
+        assert client.ping()
 
     @pytest.mark.parametrize('offset', [1 << 30, 1 << 40, 1 << 50])
     def test_gorilla_large_counter_dump_restore_and_append(self, offset):

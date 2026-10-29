@@ -165,7 +165,7 @@
   description: >
     RTS-produced RDB files and DUMP payloads cannot be loaded (and ours
     cannot be loaded by RTS). Both modules register the module type name
-    TSDB-TYPE with incompatible payload formats (ours encver 1, RTS 8.10
+    TSDB-TYPE with incompatible payload formats (ours encver 3, RTS 8.10
     encver 9); every load path fails cleanly by design — RESTORE errors
     without creating a key, an RTS RDB file is refused at startup with a
     clear log message, and the module's encoding-version guard rejects any

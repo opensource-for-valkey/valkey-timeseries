@@ -29,7 +29,8 @@ from valkeytestframework.conftest import resource_port_tracker
 
 # The module's payload encoding version (`TIMESERIES_TYPE_ENCODING_VERSION`), which TS._RESTORE
 # takes as its last argument. `_genuine_payload` checks it against what `aof_rewrite` emits.
-CURRENT_ENCVER = 1
+# It is also the oldest version the module reads: versions 1-2 are refused.
+CURRENT_ENCVER = 3
 
 
 class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseDebugMode):
@@ -149,7 +150,7 @@ class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseDebugMode):
         """A payload version this module cannot read is refused before it is parsed."""
         client = self.client
         payload = self._genuine_payload(key='encver_src')
-        for version in (0, 99, -1, 'x'):
+        for version in (0, 1, 2, 4, 99, -1, 'x'):
             with pytest.raises(Exception, match='unsupported TS._RESTORE payload encoding version'):
                 client.execute_command('TS._RESTORE', f'encver{version}', payload, version)
         with pytest.raises(Exception, match='wrong number of arguments'):

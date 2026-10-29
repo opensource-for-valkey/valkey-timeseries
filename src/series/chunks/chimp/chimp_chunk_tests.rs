@@ -616,3 +616,181 @@ mod allocation {
         assert!(right.encoder.get_heap_size() <= max_size + 32);
     }
 }
+
+/// Golden streams for module encoding version 3. Each fixture pins the encoder (a fresh
+/// encode of its samples must reproduce its bytes) and the decoder (its bytes must decode
+/// to its samples), so any change to the Chimp grammar shows up here and needs a new
+/// encoding version.
+mod fixtures {
+    use super::super::ChimpCompressor;
+    use crate::common::Sample;
+    use crate::tests::generators::{
+        DatasetKey, TimestampModel, ValueWorkload, dataset_seed, generate_dataset,
+    };
+
+    const SAMPLES: usize = 32;
+
+    const FIXTURES: [(&str, ValueWorkload, &str); 3] = [
+        (
+            "v3-drift_q2.txt",
+            ValueWorkload::DriftQuantized,
+            include_str!("fixtures/v3-drift_q2.txt"),
+        ),
+        (
+            "v3-counter.txt",
+            ValueWorkload::Counter,
+            include_str!("fixtures/v3-counter.txt"),
+        ),
+        (
+            "v3-noisy.txt",
+            ValueWorkload::Noisy,
+            include_str!("fixtures/v3-noisy.txt"),
+        ),
+    ];
+
+    fn dataset(workload: ValueWorkload) -> Vec<Sample> {
+        let key = DatasetKey::new(workload, TimestampModel::Jitter);
+        generate_dataset(key, SAMPLES, dataset_seed(key))
+    }
+
+    fn encode(samples: &[Sample]) -> ChimpCompressor {
+        let mut compressor = ChimpCompressor::new();
+        for sample in samples {
+            compressor.add(*sample).unwrap();
+        }
+        compressor
+    }
+
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn from_hex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// `(serialized bytes, samples)` from a fixture file.
+    fn parse(fixture: &str) -> (Vec<u8>, Vec<Sample>) {
+        let mut lines = fixture.lines();
+        let wire = from_hex(lines.next().unwrap());
+        let samples = lines
+            .map(|line| {
+                let (ts, bits) = line.split_once(' ').unwrap();
+                Sample::new(
+                    ts.parse().unwrap(),
+                    f64::from_bits(u64::from_str_radix(bits, 16).unwrap()),
+                )
+            })
+            .collect();
+        (wire, samples)
+    }
+
+    fn decode(compressor: &ChimpCompressor) -> Vec<Sample> {
+        compressor.iter().map(Result::unwrap).collect()
+    }
+
+    fn assert_bit_exact(got: &[Sample], want: &[Sample]) {
+        assert_eq!(got.len(), want.len(), "sample count");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert_eq!(g.timestamp, w.timestamp, "timestamp {i}");
+            assert_eq!(g.value.to_bits(), w.value.to_bits(), "value {i}");
+        }
+    }
+
+    /// Regenerates the fixtures from the current encoder. Run only for a deliberate format
+    /// change, together with a new module encoding version:
+    /// `cargo test --features enable-system-alloc write_chimp_fixtures -- --ignored`.
+    #[test]
+    #[ignore]
+    fn write_chimp_fixtures() {
+        let dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/series/chunks/chimp/fixtures"
+        );
+        for (name, workload, _) in FIXTURES {
+            let samples = dataset(workload);
+            let compressor = encode(&samples);
+            let mut wire = Vec::new();
+            compressor.serialize(&mut wire);
+            let mut out = to_hex(&wire);
+            out.push('\n');
+            for s in &samples {
+                out.push_str(&format!("{} {:016x}\n", s.timestamp, s.value.to_bits()));
+            }
+            std::fs::write(format!("{dir}/{name}"), out).unwrap();
+            eprintln!("{name}: {:?}", compressor.stats);
+        }
+    }
+
+    /// The fixture samples are still the generator's, so the encode check below compares
+    /// like with like.
+    #[test]
+    fn fixture_samples_match_the_generator() {
+        for (name, workload, fixture) in FIXTURES {
+            let (_, samples) = parse(fixture);
+            let generated = dataset(workload);
+            assert_eq!(samples.len(), SAMPLES, "{name}");
+            assert_bit_exact(&samples, &generated);
+        }
+    }
+
+    /// Version 3 streams decode bit-exactly, accept appends, and survive another
+    /// serialize/deserialize; a fresh encode reproduces them byte for byte.
+    #[test]
+    fn v3_streams_load_append_and_reencode() {
+        for (name, _, fixture) in FIXTURES {
+            let (wire, mut expected) = parse(fixture);
+
+            // Encoder: the same samples give the same bytes.
+            let mut fresh = Vec::new();
+            encode(&expected).serialize(&mut fresh);
+            assert_eq!(
+                to_hex(&fresh),
+                to_hex(&wire),
+                "{name}: encoder output changed"
+            );
+
+            // Decoder: the bytes give the samples.
+            let mut loaded = ChimpCompressor::deserialize(&wire).unwrap();
+            assert_bit_exact(&decode(&loaded), &expected);
+
+            // Append past the loaded state: a repeat, a quantized step, an integer, a large
+            // counter, a sign change, a NaN, and timestamps that reach the wider dod tiers.
+            let last = *expected.last().unwrap();
+            let extra = [
+                (1_000, last.value),
+                (1_000, ((last.value * 100.0).round() + 25.0) / 100.0),
+                (1_013, 1_000_000.0),
+                (70_000, (1u64 << 50) as f64 + 7.0),
+                (1_000, (1u64 << 50) as f64 + 14.0),
+                (5_000_000, -12.34),
+                (1, f64::NAN),
+                (1_000, 12.345),
+            ];
+            let mut ts = last.timestamp;
+            for (delta, value) in extra {
+                ts += delta;
+                let sample = Sample::new(ts, value);
+                loaded.add(sample).unwrap();
+                expected.push(sample);
+            }
+
+            let mut saved = Vec::new();
+            loaded.serialize(&mut saved);
+            let resumed = ChimpCompressor::deserialize(&saved).unwrap();
+            assert_bit_exact(&decode(&resumed), &expected);
+
+            // A reloaded encoder writes what one that never stopped would have.
+            let mut uninterrupted = Vec::new();
+            encode(&expected).serialize(&mut uninterrupted);
+            assert_eq!(
+                to_hex(&saved),
+                to_hex(&uninterrupted),
+                "{name}: resumed stream"
+            );
+        }
+    }
+}
