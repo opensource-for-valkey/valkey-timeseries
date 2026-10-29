@@ -1,7 +1,7 @@
 # Chimp streams, module encoding version 3
 
 These fixtures were generated from this repository's encoder at
-`ca97941e1505ec681c48b28156b8665325d25547` (branch `perf/chimp-encoder`), the
+`e2f28ab680d0dd1186c1ccead87bcdca5e9b97a7` (branch `perf/chimp-encoder`), the
 Chimp grammar that module encoding version 3 introduced. They contain no
 RedisTimeSeries source or test data.
 

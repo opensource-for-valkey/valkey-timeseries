@@ -2,7 +2,7 @@
 
 2026-10-29. Branch: `perf/chimp-encoder`.
 Baseline: `f6e446a359a30d8748d99a3a7f39dc4a62d66ae2` (branch start).
-Candidate: `9af061c18a1d7473aeb2b89a385422727c19f33b`.
+Candidate: `114f171c02cdebc7dbbde63f1be42b7eda8cb324`.
 
 ## Decision
 
@@ -316,7 +316,7 @@ a cap that no unshifted row may grow by more than 0.5 %:
 
 ## Validation
 
-These results are from the branch-final validation run at `9af061c18`.
+These results are from the branch-final validation run at `114f171c0`.
 - 1,776 unit tests passed, 0 failed, 2 ignored. 12 doctests passed, 5 ignored.
 - `cargo fmt --check` and Clippy (`--profile release --all-targets -D clippy::all`)
   passed, as did the production release build with `RUSTFLAGS="-D warnings"`.
