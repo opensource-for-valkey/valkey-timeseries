@@ -1337,6 +1337,129 @@ mod tests {
         round_trip(&samples);
     }
 
+    /// Counter + 2^50: consecutive XORs are a few low bits under ~60 leading zeros, which a
+    /// leading-zero code topping out at 24 pads by up to 36 bits per value.
+    #[test]
+    fn shifted_counter_payload_is_bounded() {
+        use crate::tests::generators::{
+            DatasetKey, TimestampModel, ValueWorkload, dataset_seed, generate_dataset,
+        };
+        // 5,636 B with the {0, 8, .., 24} table alone; 2,160 B with extended windows.
+        let key = DatasetKey::new(ValueWorkload::Counter, TimestampModel::Regular);
+        let mut samples = generate_dataset(key, 1000, dataset_seed(key));
+        for s in &mut samples {
+            s.value += (1u64 << 50) as f64;
+        }
+        let mut c = ChimpCompressor::new();
+        for s in &samples {
+            c.add(*s).unwrap();
+        }
+        assert!(c.bytes().len() < 2_500, "{} bytes", c.bytes().len());
+        round_trip(&samples);
+    }
+
+    /// The leading-zero counts of the XORs the encoder actually writes, per header, over the
+    /// gorilla_report matrix (12 workloads x 3 timestamp models, plus counters offset by
+    /// 2^30, 2^40 and 2^50). Input for choosing `LZ_BUCKETS` and the extended counts.
+    #[test]
+    #[ignore = "diagnostic: cargo test print_leading_zero_histogram -- --ignored --nocapture"]
+    fn print_leading_zero_histogram() {
+        use super::super::encoder::{LEADING_ZERO_LOG, LZ_BUCKETS, LeadingZeroLog};
+        use crate::tests::generators::{
+            DatasetKey, TimestampModel, ValueWorkload, dataset_seed, generate_dataset,
+        };
+        // nlz ranges for the summary columns.
+        const RANGES: [(usize, usize); 10] = [
+            (0, 7),
+            (8, 11),
+            (12, 15),
+            (16, 19),
+            (20, 23),
+            (24, 31),
+            (32, 39),
+            (40, 47),
+            (48, 55),
+            (56, 63),
+        ];
+        let mut cases = Vec::new();
+        for &w in ValueWorkload::workloads() {
+            for &t in TimestampModel::all() {
+                let offsets: &[u32] = if w == ValueWorkload::Counter {
+                    &[0, 30, 40, 50]
+                } else {
+                    &[0]
+                };
+                for &shift in offsets {
+                    cases.push((w, t, shift));
+                }
+            }
+        }
+        println!("LZ_BUCKETS = {LZ_BUCKETS:?}");
+        print!("case,bytes,xors,reuse,trailing,plain,pad_reuse,pad_trailing,pad_plain");
+        for (lo, hi) in RANGES {
+            print!(",nlz{lo}-{hi}");
+        }
+        println!();
+        let mut totals = [[0u64; 64]; 2];
+        for (w, t, shift) in cases {
+            let key = DatasetKey::new(w, t);
+            let mut samples = generate_dataset(key, 1000, dataset_seed(key));
+            if shift > 0 {
+                for s in &mut samples {
+                    s.value += (1u64 << shift) as f64;
+                }
+            }
+            LEADING_ZERO_LOG.set(Some(Box::new(LeadingZeroLog {
+                by_header: [[0; 64]; 3],
+                padding_bits: [0; 3],
+            })));
+            let mut c = ChimpCompressor::new();
+            for s in &samples {
+                c.add(*s).unwrap();
+            }
+            let log = LEADING_ZERO_LOG.take().unwrap();
+            let per_nlz: Vec<u64> = (0..64)
+                .map(|n| log.by_header.iter().map(|h| u64::from(h[n])).sum())
+                .collect();
+            for (n, count) in per_nlz.iter().enumerate() {
+                totals[usize::from(shift > 0)][n] += count;
+            }
+            let headers = log
+                .by_header
+                .map(|h| h.iter().map(|&x| u64::from(x)).sum::<u64>());
+            let name = if shift > 0 {
+                format!("{}/{}/2^{shift}", w.id(), t.id())
+            } else {
+                format!("{}/{}", w.id(), t.id())
+            };
+            print!(
+                "{name},{},{},{},{},{},{},{},{}",
+                c.bytes().len(),
+                per_nlz.iter().sum::<u64>(),
+                headers[0],
+                headers[1],
+                headers[2],
+                log.padding_bits[0],
+                log.padding_bits[1],
+                log.padding_bits[2]
+            );
+            for (lo, hi) in RANGES {
+                print!(",{}", per_nlz[lo..=hi].iter().sum::<u64>());
+            }
+            println!();
+        }
+        for (label, total) in ["unshifted", "shifted counters"].iter().zip(totals) {
+            println!("{label}: nonzero XORs by nlz (nlz:count)");
+            let line: Vec<String> = total
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c > 0)
+                .map(|(n, c)| format!("{n}:{c}"))
+                .collect();
+            println!("  {}", line.join(" "));
+        }
+    }
+
     #[test]
     fn tracks_first_and_last_timestamp() {
         let mut compressor = ChimpCompressor::new();
@@ -1410,16 +1533,18 @@ mod tests {
         values
     }
 
-    /// Pins the Chimp stream byte for byte as of the full-window flag (2026-10-29): Chimp's
-    /// `10` reuses the stored leading *and* trailing zeros, taken whenever the XOR fits and it
-    /// is no longer than a fresh header. Underneath, the ELF case `11` carries decimal places.
-    /// Integers and short binary fractions interleaved with decimals ELF erases.
+    /// Pins the Chimp stream byte for byte as of extended windows (2026-10-29): past the top
+    /// leading-zero bucket (24), a `01` header can name an exact count of 32..=54. Chimp's
+    /// `10` reuses the stored leading *and* trailing zeros; underneath, the ELF case `11`
+    /// carries decimal places. Integers and short binary fractions interleaved with decimals
+    /// ELF erases.
     ///
     /// History of `mixed`: 13617 -> 13591 bytes with the alpha header, 13591 -> 13569 with the
-    /// previous-alpha hint, 13569 -> 13169 with the full window (`small` 58 -> 57 bytes).
-    /// A change here is a format change; make it on purpose and re-record.
+    /// previous-alpha hint, 13569 -> 13169 with the full window (`small` 58 -> 57 bytes),
+    /// 13169 -> 13100 with extended windows.
+    /// The stream is the format: change it on purpose and re-record.
     #[test]
-    fn streams_match_the_full_window_encoder_byte_for_byte() {
+    fn streams_match_the_extended_window_encoder_byte_for_byte() {
         let small = pack(&[
             1.0,
             2.0,
@@ -1445,7 +1570,7 @@ mod tests {
         );
 
         let mixed = pack(&mixed_dyadic_values());
-        assert_eq!(mixed.len(), 13169);
-        assert_eq!(fnv1a(&mixed), 0xa825_7b0c_744b_c318);
+        assert_eq!(mixed.len(), 13100);
+        assert_eq!(fnv1a(&mixed), 0x4916_c241_acf0_c977);
     }
 }

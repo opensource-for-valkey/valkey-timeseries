@@ -366,7 +366,15 @@ fn test_deserialize_rejects_corrupt_codec_state() {
     };
     // Each case breaks one field; the same rewrite with valid values loads.
     let alpha = header.last_alpha;
-    for (a, lz, tz) in [(alpha, 0, 0), (-1, 0, 0), (15, 24, 39), (alpha, 64, 0)] {
+    // (32..=54 are extended windows.)
+    for (a, lz, tz) in [
+        (alpha, 0, 0),
+        (-1, 0, 0),
+        (15, 24, 39),
+        (alpha, 32, 31),
+        (alpha, 54, 9),
+        (alpha, 64, 0),
+    ] {
         assert!(
             ChimpChunk::deserialize(&with(a, lz, tz).write()).is_ok(),
             "{a} {lz} {tz}"
@@ -375,7 +383,8 @@ fn test_deserialize_rejects_corrupt_codec_state() {
     let mut cases = vec![(-2, 0, 0), (16, 0, 0), (1 << 40, 0, 0)];
     cases.extend([-1, 1, 25, 63, 65, i64::from(i32::MAX), (1 << 32) + 8].map(|lz| (alpha, lz, 0)));
     cases.extend([-1, 64, (1 << 32) + 2].map(|tz| (alpha, 0, tz)));
-    cases.extend([(24, 40), (8, 56), (64, 1)].map(|(lz, tz)| (alpha, lz, tz)));
+    cases.extend([31, 55].map(|lz| (alpha, lz, 0)));
+    cases.extend([(24, 40), (8, 56), (54, 10), (64, 1)].map(|(lz, tz)| (alpha, lz, tz)));
     for (a, lz, tz) in cases {
         let corrupt = with(a, lz, tz).write();
         assert!(
