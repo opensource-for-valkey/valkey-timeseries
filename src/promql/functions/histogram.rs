@@ -76,20 +76,6 @@ impl Bucket {
         let mut ts = self.ts.borrow_mut();
         ts.labels.set(LE, end_str.to_string());
     }
-
-    pub fn pop_timeseries(&mut self) -> Option<EvalSample> {
-        match self.ts.try_borrow_mut() {
-            Ok(refcell) => {
-                // you can do refcell.into_inner here
-                Some(refcell.to_owned())
-            }
-            Err(_) => {
-                // another Rc still exists, so you cannot take ownership of the value
-                debug_assert!(false, "Cannot borrow mutably");
-                None
-            }
-        }
-    }
 }
 
 fn vmrange_buckets_to_le(tss: Vec<EvalSample>) -> Vec<EvalSample> {
@@ -234,9 +220,13 @@ fn vmrange_buckets_to_le(tss: Vec<EvalSample>) -> Vec<EvalSample> {
             ts.value = count
         }
 
-        for xs in xss.iter_mut() {
-            if let Some(ts) = xs.pop_timeseries() {
-                rvs.push(ts);
+        // The group's other handles on these series are done with, so each
+        // series is moved out of its cell rather than cloned.
+        uniq_ts.clear();
+        for xs in xss.drain(..) {
+            match Rc::try_unwrap(xs.ts) {
+                Ok(ts) => rvs.push(ts.into_inner()),
+                Err(_) => debug_assert!(false, "a vmrange bucket is still shared"),
             }
         }
     }
@@ -302,7 +292,15 @@ fn classic_histograms(
 ) -> impl Iterator<Item = (EvalSample, Vec<ClassicBucket>)> {
     let mut histograms: FingerprintHashMap<(EvalSample, Vec<ClassicBucket>)> =
         FingerprintHashMap::default();
-    for mut ts in vmrange_buckets_to_le(series) {
+    // Converting re-collects every series; Prometheus-format input, which is
+    // almost all of it, passes through unchanged, so only convert when some
+    // series is a VictoriaMetrics bucket.
+    let series = if series.iter().any(|s| s.labels.get("vmrange").is_some()) {
+        vmrange_buckets_to_le(series)
+    } else {
+        series
+    };
+    for mut ts in series {
         let Some(upper_bound) = ts.labels.get(LE).and_then(|le| le.parse::<f64>().ok()) else {
             continue;
         };
@@ -559,6 +557,7 @@ pub(super) fn bucket_fraction(lower: f64, upper: f64, buckets: &mut Vec<ClassicB
 mod tests {
     use super::*;
     use crate::labels::Labels;
+    use crate::promql::EvalLabels;
 
     fn buckets(pairs: &[(f64, f64)]) -> Vec<ClassicBucket> {
         pairs
@@ -568,6 +567,60 @@ mod tests {
     }
 
     const INF: f64 = f64::INFINITY;
+
+    fn sample(labels: &[(&str, &str)], value: f64) -> EvalSample {
+        EvalSample {
+            timestamp_ms: 0,
+            value,
+            labels: EvalLabels::from_pairs(labels),
+            drop_name: false,
+        }
+    }
+
+    /// `(le, value)` of every output series, ordered by `le`.
+    fn le_values(series: Vec<EvalSample>) -> Vec<(String, f64)> {
+        let mut out: Vec<(String, f64)> = series
+            .into_iter()
+            .map(|s| (s.labels.get(LE).unwrap_or_default().to_string(), s.value))
+            .collect();
+        out.sort_by(|a, b| {
+            let bound = |le: &str| le.parse::<f64>().unwrap_or(f64::NAN);
+            bound(&a.0).total_cmp(&bound(&b.0))
+        });
+        out
+    }
+
+    /// VictoriaMetrics `vmrange` buckets become cumulative `le` buckets, with
+    /// a `+Inf` bucket closing the histogram.
+    #[test]
+    fn vmrange_buckets_become_cumulative_le_buckets() {
+        let out = vmrange_buckets_to_le(vec![
+            sample(&[("__name__", "h"), ("vmrange", "1...2")], 3.0),
+            sample(&[("__name__", "h"), ("vmrange", "0...1")], 2.0),
+        ]);
+        assert!(out.iter().all(|s| s.labels.get("vmrange").is_none()));
+        assert_eq!(
+            le_values(out),
+            vec![
+                ("1".to_string(), 2.0),
+                ("2".to_string(), 5.0),
+                ("+Inf".to_string(), 5.0),
+            ]
+        );
+    }
+
+    /// Prometheus-format buckets pass through the conversion unchanged.
+    #[test]
+    fn prometheus_buckets_pass_through() {
+        let input = vec![
+            sample(&[("__name__", "h"), ("le", "1")], 2.0),
+            sample(&[("__name__", "h"), ("le", "+Inf")], 5.0),
+        ];
+        assert_eq!(
+            le_values(vmrange_buckets_to_le(input.clone())),
+            le_values(input)
+        );
+    }
 
     #[test]
     fn out_of_range_phi_answers_before_the_buckets_are_read() {
