@@ -152,6 +152,23 @@ fn unwrap_vectors(expr: Expr) -> Expr {
         Expr::Call(mut fe) if fe.func.name == "vector" && fe.args.len() == 1 => {
             unwrap_vectors(*fe.args.args.remove(0))
         }
+        // `abs(vector(-1))` reads as `abs(-1)` here: a math or date function
+        // over a number folds to its value.
+        Expr::Call(mut fe) => {
+            fe.args.args = fe
+                .args
+                .args
+                .into_iter()
+                .map(|arg| Box::new(fold_constants(unwrap_vectors(*arg))))
+                .collect();
+            match PromqlFunctionKind::try_from(fe.func.name)
+                .ok()
+                .and_then(|kind| simplify_math_fn(&fe, kind))
+            {
+                Some(value) => Expr::from(value),
+                None => Expr::Call(fe),
+            }
+        }
         Expr::Binary(mut be)
             if (!be.op.is_comparison_operator() || be.return_bool())
                 && be.modifier.as_ref().is_none_or(|m| m.matching.is_none()) =>
@@ -202,13 +219,10 @@ fn handle_function_expr(fe: Call) -> Expr {
             }
         }
         Pi if arg_count == 0 => Expr::from(f64::PI()),
-        _ => {
-            if let Some(value) = simplify_math_fn(&fe, kind) {
-                Expr::from(value)
-            } else {
-                Expr::Call(fe)
-            }
-        }
+        // A math or date function takes an instant vector and returns one, so
+        // folding it to a number is sound only inside `scalar(...)`, where
+        // `unwrap_vectors` does it.
+        _ => Expr::Call(fe),
     }
 }
 
@@ -288,7 +302,7 @@ mod tests {
     }
 
     fn test_math_fn(name: &str, arg: f64, expected: f64) {
-        let expr = format!("{}(vector({}))", name, arg);
+        let expr = format!("scalar({}(vector({})))", name, arg);
         let simplified = fold_constants(parse(&expr).expect("parse failed")).prettify();
         let simplified_value = parse_number(&simplified).unwrap();
         if expected.is_nan() {
@@ -379,7 +393,7 @@ mod tests {
     }
 
     fn test_date_part_fn(name: &str, epoch_secs: f64, part: DateTimePart) {
-        let expr = format!("{name}(vector({epoch_secs}))");
+        let expr = format!("scalar({name}(vector({epoch_secs})))");
         let simplified = fold_constants(parse(&expr).expect("parse failed")).prettify();
         let expected = extract_datetime_part(epoch_secs, part).unwrap();
         let actual = parse_number(&simplified).unwrap();
@@ -411,10 +425,10 @@ mod tests {
         // NaN and ±Inf are not a point in time: the call must stay unfolded so
         // evaluation returns NaN, not a calendar value for some fallback instant.
         for arg in ["NaN", "Inf", "-Inf"] {
-            let expr = format!("year(vector({arg}))");
+            let expr = format!("scalar(year(vector({arg})))");
             let simplified = fold_constants(parse(&expr).expect("parse failed")).prettify();
             assert!(
-                simplified.starts_with("year("),
+                simplified.starts_with("scalar(year("),
                 "{expr} folded to {simplified}"
             );
         }

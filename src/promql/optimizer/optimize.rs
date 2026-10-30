@@ -598,11 +598,14 @@ mod tests {
             "-vector(1)",
             "sum(x) or vector(0)",
             "vector(1) + vector(2)",
+            "abs(vector(-1))",
+            "year(vector(1136239445))",
         ] {
             assert_string_simplify(query, query);
         }
         // Inside `scalar(...)` the two are interchangeable, so it still folds.
         assert_string_simplify("scalar(vector(1) + vector(2))", "3");
+        assert_string_simplify("scalar(abs(vector(-1)))", "1");
     }
 
     #[test]
