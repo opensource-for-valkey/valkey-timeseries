@@ -8,19 +8,20 @@ use crate::labels::filters::{
     FilterList, LabelFilter, OrFiltersList, PredicateMatch, PredicateValue, RegexMatcher,
     SeriesSelector,
 };
-use crate::labels::{InternedLabel, Label, Labels, MetricName, SeriesLabel, try_regex_predicate};
+use crate::labels::try_regex_predicate;
+use crate::promql::RangeSample;
 use crate::promql::engine::query_reader::AggregationParam;
 use crate::promql::exec::aggregations::{AggregationKind, PushdownStrategy};
 use crate::promql::exec::partial_aggregation::AggregationPartial;
 use crate::promql::exec::types::EvalLabels;
+use crate::promql::functions::RollupKind;
 use crate::promql::generated::{
     AggregationGrouping as ProtoAggregationGrouping, AggregationKind as ProtoAggregationKind,
-    AggregationPartialState as ProtoAggregationPartialState, InstantSample as ProtoInstantSample,
-    Label as ProtoLabel, RangeQueryResponse as ProtoRangeQueryResponse,
-    RangeSample as ProtoRangeSample, SeriesSelector as ProtoSeriesSelector,
+    AggregationPartialState as ProtoAggregationPartialState,
+    RangeQueryResponse as ProtoRangeQueryResponse, RangeSample as ProtoRangeSample,
+    RollupKind as ProtoRollupKind, SeriesSelector as ProtoSeriesSelector,
 };
 use crate::promql::hashers::FingerprintHashSet;
-use crate::promql::{EvalSample, RangeSample};
 use crate::series::chunks::{
     ChunkOps, TimeSeriesChunk, UncompressedChunk, samples_to_chunk_lossless,
 };
@@ -28,50 +29,6 @@ use promql_parser::label::{Labels as ModifierLabels, MatchOp as PromMatchOp, Mat
 use promql_parser::parser::{LabelModifier, VectorSelector};
 use regex::Regex;
 use valkey_module::{ValkeyError, ValkeyResult};
-
-impl From<InternedLabel<'_>> for ProtoLabel {
-    fn from(label: InternedLabel) -> Self {
-        ProtoLabel {
-            name: label.name().to_string(),
-            value: label.value().to_string(),
-        }
-    }
-}
-
-impl From<MetricName> for Vec<ProtoLabel> {
-    fn from(metric_name: MetricName) -> Self {
-        metric_name.iter().map(ProtoLabel::from).collect()
-    }
-}
-
-/// The same encoding for a materialized label set as the [`MetricName`] impl
-/// above produces for the index's own representation, so a series carries the
-/// same labels on the wire whichever side built it.
-impl From<&Labels> for Vec<ProtoLabel> {
-    fn from(labels: &Labels) -> Self {
-        labels.iter().map(ProtoLabel::from).collect()
-    }
-}
-
-impl From<ProtoInstantSample> for EvalSample {
-    fn from(proto: ProtoInstantSample) -> Self {
-        let labels = proto
-            .labels
-            .into_iter()
-            .map(|l| Label {
-                name: l.name,
-                value: l.value,
-            })
-            .collect();
-
-        EvalSample {
-            timestamp_ms: proto.timestamp,
-            value: proto.value,
-            labels: EvalLabels::shared(labels),
-            drop_name: false,
-        }
-    }
-}
 
 /// One shard's answer to a range read as it crossed the wire: each series'
 /// samples still in the chunk the shard packed them into, and its labels still
@@ -205,16 +162,6 @@ pub(in crate::promql) fn range_sample_to_proto(
     })
 }
 
-impl From<Matcher> for LabelFilter {
-    fn from(matcher: Matcher) -> Self {
-        let predicate = matcher_predicate(&matcher);
-        LabelFilter {
-            label: matcher.name,
-            matcher: predicate,
-        }
-    }
-}
-
 impl From<&Matcher> for LabelFilter {
     fn from(matcher: &Matcher) -> Self {
         LabelFilter {
@@ -257,51 +204,6 @@ fn regex_predicate(value: &str, parsed: &Regex) -> PredicateMatch {
     try_regex_predicate(value).unwrap_or_else(|_| {
         PredicateMatch::RegexEqual(RegexMatcher::new(parsed.clone(), value.to_string()))
     })
-}
-
-impl From<Matchers> for SeriesSelector {
-    fn from(matchers: Matchers) -> Self {
-        if !matchers.matchers.is_empty() {
-            let mut filters = FilterList::default();
-            for filter in matchers.matchers.into_iter().map(|m| m.into()) {
-                filters.push(filter);
-            }
-            SeriesSelector::And(filters)
-        } else if !matchers.or_matchers.is_empty() {
-            let mut or_list: OrFiltersList = OrFiltersList::default();
-            for and_filter in matchers.or_matchers.into_iter() {
-                let mut filters = FilterList::default();
-                for filter in and_filter.into_iter().map(|m| m.into()) {
-                    filters.push(filter);
-                }
-                or_list.push(filters);
-            }
-            SeriesSelector::Or(or_list)
-        } else {
-            // If there are no matchers, we can return an empty And selector (or we could define a separate variant for this case)
-            SeriesSelector::And(FilterList::default())
-        }
-    }
-}
-
-impl From<VectorSelector> for SeriesSelector {
-    fn from(vs: VectorSelector) -> Self {
-        let mut selector = SeriesSelector::from(vs.matchers);
-        if let Some(name) = vs.name {
-            let name_filter = LabelFilter::equals(METRIC_NAME_LABEL.to_string(), &name);
-            match &mut selector {
-                SeriesSelector::And(filters) => {
-                    filters.insert(0, name_filter);
-                }
-                SeriesSelector::Or(or_list) => {
-                    for filters in or_list.iter_mut() {
-                        filters.insert(0, name_filter.clone());
-                    }
-                }
-            }
-        }
-        selector
-    }
 }
 
 impl From<&VectorSelector> for SeriesSelector {
@@ -361,12 +263,6 @@ impl From<&Matchers> for ProtoSeriesSelector {
     }
 }
 
-impl From<VectorSelector> for ProtoSeriesSelector {
-    fn from(vs: VectorSelector) -> Self {
-        (&SeriesSelector::from(vs)).into()
-    }
-}
-
 impl From<&VectorSelector> for ProtoSeriesSelector {
     fn from(vs: &VectorSelector) -> Self {
         (&SeriesSelector::from(vs)).into()
@@ -378,59 +274,102 @@ impl From<&VectorSelector> for ProtoSeriesSelector {
 // modifier, the mergeable partial states, and the sample type the selection
 // operators ship.
 
-impl From<AggregationKind> for ProtoAggregationKind {
-    fn from(kind: AggregationKind) -> Self {
-        match kind {
-            AggregationKind::Sum => ProtoAggregationKind::Sum,
-            AggregationKind::Avg => ProtoAggregationKind::Avg,
-            AggregationKind::Min => ProtoAggregationKind::Min,
-            AggregationKind::Max => ProtoAggregationKind::Max,
-            AggregationKind::Count => ProtoAggregationKind::Count,
-            AggregationKind::Group => ProtoAggregationKind::Group,
-            AggregationKind::Stddev => ProtoAggregationKind::Stddev,
-            AggregationKind::Stdvar => ProtoAggregationKind::Stdvar,
-            AggregationKind::Topk => ProtoAggregationKind::Topk,
-            AggregationKind::Bottomk => ProtoAggregationKind::Bottomk,
-            AggregationKind::CountValues => ProtoAggregationKind::CountValues,
-            AggregationKind::Limitk => ProtoAggregationKind::Limitk,
-            AggregationKind::LimitRatio => ProtoAggregationKind::LimitRatio,
-            // Never sent: quantile has no decomposable form, so the
-            // coordinator does not push it down (`pushdown_strategy`).
-            AggregationKind::Quantile => unreachable!(
-                "BUG: quantile is not a push-down operator and has no wire representation"
-            ),
+/// The 1:1 mapping between an engine enum and its wire enum, stated once:
+/// `From<$kind> for $proto` and `TryFrom<$proto> for $kind` are both generated
+/// from the same list, so neither direction can drift from the other. The wire
+/// enum's `Unspecified` — what a peer that omits the field produces — maps to
+/// the `unspecified` error; `unmapped` variants have no wire form because the
+/// coordinator never pushes them down.
+macro_rules! wire_enum_map {
+    (
+        $kind:ty => $proto:ty;
+        unspecified => $unspecified:expr;
+        unmapped => [$($unmapped:ident),* $(,)?];
+        $( $variant:ident => $proto_variant:ident ),+ $(,)?
+    ) => {
+        impl From<$kind> for $proto {
+            fn from(kind: $kind) -> Self {
+                match kind {
+                    $( <$kind>::$variant => <$proto>::$proto_variant, )+
+                    $( <$kind>::$unmapped => unreachable!(
+                        "BUG: {} is not a push-down operator and has no wire representation",
+                        stringify!($unmapped)
+                    ), )*
+                }
+            }
         }
-    }
+
+        impl TryFrom<$proto> for $kind {
+            type Error = ValkeyError;
+
+            fn try_from(kind: $proto) -> Result<Self, Self::Error> {
+                match kind {
+                    $( <$proto>::$proto_variant => Ok(<$kind>::$variant), )+
+                    <$proto>::Unspecified => Err($unspecified),
+                }
+            }
+        }
+    };
 }
 
-/// `None` for `AGGREGATION_KIND_UNSPECIFIED` — the value a peer produces when it
-/// omits the field. Callers treat that the same way they treat an operator they
-/// do not recognize: answer `applied = false` and let the coordinator aggregate.
-impl TryFrom<ProtoAggregationKind> for AggregationKind {
-    type Error = ValkeyError;
+// `AGGREGATION_KIND_UNSPECIFIED` is the value a peer produces when it omits the
+// field. Callers treat that the same way they treat an operator they do not
+// recognize: answer `applied = false` and let the coordinator aggregate.
+// Quantile is never sent: it has no decomposable form, so the coordinator does
+// not push it down (`pushdown_strategy`).
+wire_enum_map! {
+    AggregationKind => ProtoAggregationKind;
+    unspecified => ValkeyError::Str("TSDB: aggregation push-down request carries no operator");
+    unmapped => [Quantile];
+    Sum => Sum,
+    Avg => Avg,
+    Min => Min,
+    Max => Max,
+    Count => Count,
+    Group => Group,
+    Stddev => Stddev,
+    Stdvar => Stdvar,
+    Topk => Topk,
+    Bottomk => Bottomk,
+    CountValues => CountValues,
+    Limitk => Limitk,
+    LimitRatio => LimitRatio,
+}
 
-    fn try_from(kind: ProtoAggregationKind) -> Result<Self, Self::Error> {
-        Ok(match kind {
-            ProtoAggregationKind::Sum => AggregationKind::Sum,
-            ProtoAggregationKind::Avg => AggregationKind::Avg,
-            ProtoAggregationKind::Min => AggregationKind::Min,
-            ProtoAggregationKind::Max => AggregationKind::Max,
-            ProtoAggregationKind::Count => AggregationKind::Count,
-            ProtoAggregationKind::Group => AggregationKind::Group,
-            ProtoAggregationKind::Stddev => AggregationKind::Stddev,
-            ProtoAggregationKind::Stdvar => AggregationKind::Stdvar,
-            ProtoAggregationKind::Topk => AggregationKind::Topk,
-            ProtoAggregationKind::Bottomk => AggregationKind::Bottomk,
-            ProtoAggregationKind::CountValues => AggregationKind::CountValues,
-            ProtoAggregationKind::Limitk => AggregationKind::Limitk,
-            ProtoAggregationKind::LimitRatio => AggregationKind::LimitRatio,
-            ProtoAggregationKind::Unspecified => {
-                return Err(ValkeyError::Str(
-                    "TSDB: aggregation push-down request carries no operator",
-                ));
-            }
-        })
-    }
+// `ROLLUP_KIND_UNSPECIFIED` — the value a peer produces when it omits the
+// field — is refused like any other value this node does not know: a rollup
+// message with no function in it is a corrupt request, not a stepped one.
+wire_enum_map! {
+    RollupKind => ProtoRollupKind;
+    unspecified => ValkeyError::Str("TSDB: grid push-down request carries a rollup with no function");
+    unmapped => [];
+    SumOverTime => SumOverTime,
+    CountOverTime => CountOverTime,
+    LastOverTime => LastOverTime,
+    AvgOverTime => AvgOverTime,
+    MinOverTime => MinOverTime,
+    MaxOverTime => MaxOverTime,
+    StddevOverTime => StddevOverTime,
+    StdvarOverTime => StdvarOverTime,
+    MadOverTime => MadOverTime,
+    PresentOverTime => PresentOverTime,
+    FirstOverTime => FirstOverTime,
+    QuantileOverTime => QuantileOverTime,
+    TsOfFirstOverTime => TsOfFirstOverTime,
+    TsOfLastOverTime => TsOfLastOverTime,
+    TsOfMinOverTime => TsOfMinOverTime,
+    TsOfMaxOverTime => TsOfMaxOverTime,
+    Rate => Rate,
+    Increase => Increase,
+    Delta => Delta,
+    IRate => Irate,
+    IDelta => Idelta,
+    Deriv => Deriv,
+    Resets => Resets,
+    Changes => Changes,
+    StateDurationOverTime => StateDurationOverTime,
+    StateCountOverTime => StateCountOverTime,
+    RangeOverTime => RangeOverTime,
 }
 
 impl From<&LabelModifier> for ProtoAggregationGrouping {
@@ -568,34 +507,44 @@ impl From<ProtoAggregationPartialState> for AggregationPartial {
     }
 }
 
-impl From<EvalSample> for ProtoInstantSample {
-    fn from(sample: EvalSample) -> Self {
-        ProtoInstantSample {
-            labels: sample.labels.iter().map(ProtoLabel::from).collect(),
-            value: sample.value,
-            timestamp: sample.timestamp_ms,
-            label_name_refs: Vec::new(),
-            label_value_refs: Vec::new(),
-        }
-    }
-}
-
-/// Rebuild the label set of a group from the wire.
-impl From<&EvalLabels> for Vec<ProtoLabel> {
-    fn from(labels: &EvalLabels) -> Self {
-        labels.iter().map(ProtoLabel::from).collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::common::Sample;
     use crate::labels::filters::MatchOp;
+    use crate::promql::generated::Label as ProtoLabel;
     use crate::series::chunks::ChunkOps;
     use promql_parser::label::{MatchOp as PromMatchOp, Matcher, Matchers};
     use promql_parser::parser::{Expr, VectorSelector};
     use prost::Message;
+
+    /// Every wire value of the aggregation kind maps to one engine kind and
+    /// back, and the unspecified value is refused: a variant added on one side
+    /// without the other fails here rather than on a peer.
+    #[test]
+    fn aggregation_kinds_round_trip_through_the_wire() {
+        let wire: Vec<ProtoAggregationKind> = (1..64)
+            .filter_map(|raw| ProtoAggregationKind::try_from(raw).ok())
+            .collect();
+        assert!(wire.len() >= 13, "{} wire kinds", wire.len());
+        for proto in wire {
+            let kind = AggregationKind::try_from(proto).unwrap();
+            assert_eq!(ProtoAggregationKind::from(kind), proto);
+        }
+        assert!(AggregationKind::try_from(ProtoAggregationKind::Unspecified).is_err());
+    }
+
+    /// Every pushable rollup has a wire form that comes back as itself.
+    #[test]
+    fn rollup_kinds_round_trip_through_the_wire() {
+        for kind in RollupKind::all() {
+            assert_eq!(
+                RollupKind::try_from(ProtoRollupKind::from(kind)).unwrap(),
+                kind
+            );
+        }
+        assert!(RollupKind::try_from(ProtoRollupKind::Unspecified).is_err());
+    }
 
     fn series(samples: Vec<Sample>) -> RangeSample<EvalLabels> {
         RangeSample {
@@ -883,7 +832,7 @@ mod tests {
             PredicateValue::from(values.iter().map(|v| v.to_string()).collect::<Vec<_>>())
         };
 
-        let filter = LabelFilter::from(Matcher::new(re(r"a|b\.c"), "host", r"a|b\.c"));
+        let filter = LabelFilter::from(&Matcher::new(re(r"a|b\.c"), "host", r"a|b\.c"));
         assert_eq!(filter.matcher, PredicateMatch::Equal(list(&["a", "b.c"])));
         assert!(filter.matches("b.c"));
         assert!(!filter.matches("bxc"));
@@ -921,7 +870,7 @@ mod tests {
             at: None,
         };
 
-        let selector = SeriesSelector::from(vs);
+        let selector = SeriesSelector::from(&vs);
         match selector {
             SeriesSelector::And(filters) => {
                 assert_eq!(filters.len(), 2);
@@ -948,7 +897,7 @@ mod tests {
             at: None,
         };
 
-        let selector = SeriesSelector::from(vs);
+        let selector = SeriesSelector::from(&vs);
         match selector {
             SeriesSelector::And(filters) => {
                 assert_eq!(filters.len(), 1);
@@ -973,7 +922,7 @@ mod tests {
             at: None,
         };
 
-        let selector = SeriesSelector::from(vs);
+        let selector = SeriesSelector::from(&vs);
         match selector {
             SeriesSelector::Or(or_list) => {
                 assert_eq!(or_list.len(), 2);

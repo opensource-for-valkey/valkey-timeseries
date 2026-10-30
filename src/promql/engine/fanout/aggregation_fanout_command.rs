@@ -793,7 +793,10 @@ mod tests {
         let mut cmd = command(aggregation.clone());
         let stray = AggregationQueryResponse {
             partials: Vec::new(),
-            samples: vec![sample(&[("job", "a")], 1.0).into()],
+            samples: vec![ProtoInstantSample {
+                value: 1.0,
+                ..Default::default()
+            }],
             applied: true,
             labels: None,
         };

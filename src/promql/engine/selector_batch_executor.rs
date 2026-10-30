@@ -1172,7 +1172,7 @@ impl LocalRead {
             deliver_task_result(&responder, Err(QueryError::Timeout));
             return None;
         }
-        let selector = SeriesSelector::from(matchers);
+        let selector = SeriesSelector::from(&matchers);
         match SeriesCursor::plan(db, SeriesSelection::Matching(&[selector]), None) {
             Ok(cursor) => Some(Self {
                 cursor,
