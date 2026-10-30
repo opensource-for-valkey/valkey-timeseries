@@ -770,8 +770,8 @@ impl PromQLFunction for QuantileOverTimeFunction {
         let phi_arg = iter.next().unwrap();
         let range_arg = iter.next().unwrap();
 
-        let phi = expect_scalar(phi_arg, "quantiles_over_time", "phi")?;
-        let range = expect_range_vector(range_arg, "quantiles_over_time")?;
+        let phi = expect_scalar(phi_arg, "quantile_over_time", "phi")?;
+        let range = expect_range_vector(range_arg, "quantile_over_time")?;
 
         Ok(ExprResult::InstantVector(eval_rollups(
             ctx,

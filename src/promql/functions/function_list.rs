@@ -4,7 +4,9 @@ use crate::promql::functions::date_functions::{
 };
 use crate::promql::functions::deriv::DerivFunction;
 use crate::promql::functions::histogram::{HistogramFractionFunctions, HistogramQuantileFunction};
-use crate::promql::functions::holt_winters::DoubleExponentialSmoothingFunction;
+use crate::promql::functions::holt_winters::{
+    DoubleExponentialSmoothingFunction, HoltWintersFunction,
+};
 use crate::promql::functions::idelta::IDeltaFunction;
 use crate::promql::functions::irate::IRateFunction;
 use crate::promql::functions::labels::{LabelJoinFunction, LabelReplaceFunction};
@@ -266,11 +268,7 @@ macro_rules! promql_function_list {
                 DoubleExponentialSmoothingFunction
             ),
             (FirstOverTime, "first_over_time", FirstOverTimeFunction),
-            (
-                HoltWinters,
-                "holt_winters",
-                DoubleExponentialSmoothingFunction
-            ),
+            (HoltWinters, "holt_winters", HoltWintersFunction),
             (IRate, "irate", IRateFunction),
             (IDelta, "idelta", IDeltaFunction),
             (LastOverTime, "last_over_time", LastOverTimeFunction),

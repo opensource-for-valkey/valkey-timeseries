@@ -16,7 +16,23 @@ impl PromQLFunction for DoubleExponentialSmoothingFunction {
     }
 
     fn apply_args(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
-        eval_double_exponential_smoothing(args, ctx.evaluation_ts)
+        eval_double_exponential_smoothing("double_exponential_smoothing", args, ctx.evaluation_ts)
+    }
+}
+
+/// `holt_winters`, the name `double_exponential_smoothing` had before
+/// Prometheus 3.0: the same evaluation, reporting errors under the name the
+/// query used.
+#[derive(Copy, Clone)]
+pub(in crate::promql) struct HoltWintersFunction;
+
+impl PromQLFunction for HoltWintersFunction {
+    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
+        Err(exact_arity_error("holt_winters", 3, 1))
+    }
+
+    fn apply_args(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
+        eval_double_exponential_smoothing("holt_winters", args, ctx.evaluation_ts)
     }
 }
 
@@ -58,25 +74,28 @@ fn calculate_double_exponential_smoothing_value(
     Some(level)
 }
 
-const FUNCTION_NAME: &str = "double_exponential_smoothing_value";
+/// `function_name` is the name the query called — `double_exponential_smoothing`
+/// or `holt_winters` — so an error is reported against it.
 fn eval_double_exponential_smoothing(
+    function_name: &str,
     args: Vec<PromQLArg>,
     eval_timestamp_ms: i64,
 ) -> EvalResult<ExprResult> {
-    expect_exact_arg_count(FUNCTION_NAME, 3, args.len())?;
+    expect_exact_arg_count(function_name, 3, args.len())?;
     let mut args = args.into_iter();
-    let series = expect_range_vector(args.next().expect("checked arg count"), FUNCTION_NAME)?;
+    let series = expect_range_vector(args.next().expect("checked arg count"), function_name)?;
     let smoothing_factor =
-        expect_scalar(args.next().expect("checked arg count"), FUNCTION_NAME, "sf")?;
-    let trend_factor = expect_scalar(args.next().expect("checked arg count"), FUNCTION_NAME, "tf")?;
+        expect_scalar(args.next().expect("checked arg count"), function_name, "sf")?;
+    let trend_factor = expect_scalar(args.next().expect("checked arg count"), function_name, "tf")?;
 
-    if !(0.0..=1.0).contains(&smoothing_factor) {
+    // Both bounds exclusive, as Prometheus checks them; a NaN factor fails too.
+    if !(smoothing_factor > 0.0 && smoothing_factor < 1.0) {
         let msg = format!("invalid smoothing factor. Expected 0 < sf < 1, got {smoothing_factor}");
         return Err(EvaluationError::ArgumentError(msg));
     }
 
-    if !(0.0..=1.0).contains(&trend_factor) {
-        let msg = format!("invalid smoothing factor. Expected 0 < sf < 1, got {trend_factor}");
+    if !(trend_factor > 0.0 && trend_factor < 1.0) {
+        let msg = format!("invalid trend factor. Expected 0 < tf < 1, got {trend_factor}");
         return Err(EvaluationError::ArgumentError(msg));
     }
 
@@ -102,8 +121,53 @@ fn eval_double_exponential_smoothing(
 
 #[cfg(test)]
 mod tests {
-    use super::calculate_double_exponential_smoothing_value;
+    use super::{calculate_double_exponential_smoothing_value, eval_double_exponential_smoothing};
     use crate::common::Sample;
+    use crate::promql::functions::PromQLArg;
+
+    /// Prometheus checks both factors with exclusive bounds — `0 < sf < 1`,
+    /// `0 < tf < 1` — and its error names the factor that failed. Ours must
+    /// also name the function the user called, since two names share the
+    /// implementation.
+    #[test]
+    fn factor_bounds_are_exclusive_and_errors_name_the_function() {
+        let call = |name: &str, sf: f64, tf: f64| {
+            eval_double_exponential_smoothing(
+                name,
+                vec![
+                    PromQLArg::RangeVector(Vec::new()),
+                    PromQLArg::Scalar(sf),
+                    PromQLArg::Scalar(tf),
+                ],
+                0,
+            )
+        };
+        for (sf, tf, factor) in [
+            (0.0, 0.5, "smoothing factor"),
+            (1.0, 0.5, "smoothing factor"),
+            (0.5, 0.0, "trend factor"),
+            (0.5, 1.0, "trend factor"),
+        ] {
+            let msg = call("holt_winters", sf, tf).unwrap_err().to_string();
+            assert!(msg.contains(factor), "sf={sf} tf={tf}: {msg}");
+        }
+        assert!(call("holt_winters", 0.5, 0.5).is_ok());
+        assert!(call("double_exponential_smoothing", 0.01, 0.1).is_ok());
+
+        // A wrong argument type is reported against the name that was called.
+        let msg = eval_double_exponential_smoothing(
+            "holt_winters",
+            vec![
+                PromQLArg::Scalar(1.0),
+                PromQLArg::Scalar(0.5),
+                PromQLArg::Scalar(0.5),
+            ],
+            0,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("holt_winters"), "{msg}");
+    }
 
     /// The two-pass shape the fused loop replaced: a non-finite scan, then
     /// the recurrence. Kept as the oracle so the fused loop is pinned
