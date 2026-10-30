@@ -595,26 +595,11 @@ fn remaining_budget(timeout: Duration, deadline: Option<Timestamp>, now: Timesta
     timeout.min(left)
 }
 
-fn validate_max_series_(series_count: usize, max_series: usize) -> QueryResult<()> {
-    if let Err(msg) = validate_max_series(series_count, max_series) {
-        log_warning(&msg);
-        return Err(QueryError::Execution(msg));
-    }
-    Ok(())
-}
-
-fn validate_max_points_per_series(
-    points_count: usize,
-    max_points: Option<usize>,
-) -> QueryResult<()> {
-    if let Some(max) = max_points
-        && max > 0
-        && let Err(err) = validate_max_points(points_count, Some(max))
-    {
-        log_warning(&err);
-        return Err(QueryError::Execution(err));
-    }
-    Ok(())
+/// A limit refusal, logged on its way out: the one place a read's limit
+/// errors are reported to the server log.
+fn warned(err: QueryError) -> QueryError {
+    log_warning(err.to_string());
+    err
 }
 
 fn deliver_task_result(
@@ -664,7 +649,8 @@ fn execute_cluster_vector_selector(
         let query_result = match result {
             Ok(()) => {
                 let samples = cmd.into_samples();
-                validate_max_series_(samples.len(), max_series)
+                validate_max_series(samples.len(), max_series)
+                    .map_err(warned)
                     .map(|_| SelectorOutput::Vector(samples))
             }
             Err(e) => Err(selector_fanout_failure("instant", e)),
@@ -707,28 +693,31 @@ fn execute_cluster_range_selector(
                 let responses = cmd.get_responses();
                 let series_count = responses.iter().map(|r| r.series.len()).sum();
 
-                validate_max_series_(series_count, max_series).and_then(|_| {
-                    // The chunks know their length without being decoded, so
-                    // the limits are checked before any sample is materialized.
-                    let responses = responses
-                        .into_iter()
-                        .map(|resp| {
-                            WireRangeResponse::try_from(resp).map_err(|e| {
-                                QueryError::Execution(format!(
-                                    "undecodable range series in cluster response: {e}"
-                                ))
+                validate_max_series(series_count, max_series)
+                    .map_err(warned)
+                    .and_then(|_| {
+                        // The chunks know their length without being decoded, so
+                        // the limits are checked before any sample is materialized.
+                        let responses = responses
+                            .into_iter()
+                            .map(|resp| {
+                                WireRangeResponse::try_from(resp).map_err(|e| {
+                                    QueryError::Execution(format!(
+                                        "undecodable range series in cluster response: {e}"
+                                    ))
+                                })
                             })
-                        })
-                        .collect::<QueryResult<Vec<_>>>()?;
-                    let series = || responses.iter().flat_map(|r| r.series());
-                    validate_max_samples(series().map(|s| s.chunk.len()).sum(), max_samples)?;
-                    for s in series() {
-                        validate_max_points_per_series(s.chunk.len(), max_points_per_series)?;
-                    }
-                    // Still packed: the requester resolves and decodes them
-                    // in parallel.
-                    Ok(SelectorOutput::WireMatrix(responses))
-                })
+                            .collect::<QueryResult<Vec<_>>>()?;
+                        let series = || responses.iter().flat_map(|r| r.series());
+                        validate_max_samples(series().map(|s| s.chunk.len()).sum(), max_samples)?;
+                        for s in series() {
+                            validate_max_points(s.chunk.len(), max_points_per_series)
+                                .map_err(warned)?;
+                        }
+                        // Still packed: the requester resolves and decodes them
+                        // in parallel.
+                        Ok(SelectorOutput::WireMatrix(responses))
+                    })
             }
             Err(e) => Err(selector_fanout_failure("range", e)),
         };
@@ -776,7 +765,7 @@ fn execute_cluster_aggregation(
                 .and_then(|samples| {
                     // The aggregated vector, not the input, is what this bounds:
                     // one sample per group.
-                    validate_max_series_(samples.len(), max_series)?;
+                    validate_max_series(samples.len(), max_series).map_err(warned)?;
                     let samples = samples
                         .into_iter()
                         .map(|s| InstantSample {
@@ -855,9 +844,9 @@ fn execute_cluster_grid(
                     | GridOutcome::Raw(series) => series.iter().map(|s| s.samples.len()).collect(),
                     GridOutcome::Unsupported => Vec::new(),
                 };
-                validate_max_series_(points.len(), max_series)?;
+                validate_max_series(points.len(), max_series).map_err(warned)?;
                 for count in points {
-                    validate_max_points_per_series(count, max_points_per_series)?;
+                    validate_max_points(count, max_points_per_series).map_err(warned)?;
                 }
                 Ok(SelectorOutput::Grid(outcome))
             }),
@@ -1377,25 +1366,29 @@ impl LocalRead {
                 // contributes nothing, so it must not count against the limit.
                 // The cluster paths filter first for the same reason. No
                 // per-series point limit: an instant read yields one sample.
-                validate_max_series_(samples.len(), self.options.max_series).map(|()| {
-                    if aggregation {
-                        SelectorOutput::Aggregation(AggregationOutcome::Raw(samples))
-                    } else {
-                        SelectorOutput::Vector(samples)
-                    }
-                })
+                validate_max_series(samples.len(), self.options.max_series)
+                    .map_err(warned)
+                    .map(|()| {
+                        if aggregation {
+                            SelectorOutput::Aggregation(AggregationOutcome::Raw(samples))
+                        } else {
+                            SelectorOutput::Vector(samples)
+                        }
+                    })
             }
             ReadState::Range { ranges, grid, .. } => {
                 // The series the query returns, as above. This is also the path
                 // a single-node grid query takes, so it must agree with the
                 // pushed-down one about which queries `max_series` rejects.
-                validate_max_series_(ranges.len(), self.options.max_series).map(|()| {
-                    if grid {
-                        SelectorOutput::Grid(GridOutcome::Raw(ranges))
-                    } else {
-                        SelectorOutput::Matrix(ranges)
-                    }
-                })
+                validate_max_series(ranges.len(), self.options.max_series)
+                    .map_err(warned)
+                    .map(|()| {
+                        if grid {
+                            SelectorOutput::Grid(GridOutcome::Raw(ranges))
+                        } else {
+                            SelectorOutput::Matrix(ranges)
+                        }
+                    })
             }
             ReadState::Profile {
                 builder, overflow, ..
@@ -1433,8 +1426,7 @@ fn decode_snapshot_batch(
             let samples = match get_snapshot_range(&snapshot, max_points) {
                 Ok(samples) => samples,
                 Err(err) => {
-                    log_warning(&err);
-                    return Some(Err(QueryError::Execution(err)));
+                    return Some(Err(warned(err)));
                 }
             };
             if let Err(err) = budget.charge(samples.len()) {

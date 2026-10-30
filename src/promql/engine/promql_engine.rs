@@ -156,7 +156,7 @@ pub fn evaluate_instant(
 
     // The result, not only each read: an operator can return more series than
     // any read did (`a or b`, `count_values`, `label_replace`).
-    validate_max_series(result.series_count(), opts.max_series).map_err(QueryError::Execution)?;
+    validate_max_series(result.series_count(), opts.max_series)?;
     // What the query returns, past what it loaded: see `charge_result_points`.
     evaluator.charge_result_points(result.point_count())?;
 
@@ -342,7 +342,7 @@ pub fn evaluate_range(
         // accumulate series no single step had: `count_values` over a thousand
         // series makes one per distinct value per step. Checked per chunk, so a
         // query past it stops evaluating instead of finishing first.
-        validate_max_series(series_map.len(), opts.max_series).map_err(QueryError::Execution)?;
+        validate_max_series(series_map.len(), opts.max_series)?;
         // The reply's size is checked once more, exactly, when the result is
         // whole; this floor stops a result that will be refused then from
         // being built to the end first.
