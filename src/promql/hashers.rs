@@ -1,12 +1,10 @@
 use crate::common::time::system_time_to_millis;
 use crate::labels::{
-    HasFingerprint, LABEL_SEP, LabelHasher, SeriesFingerprint, create_hasher,
-    create_unseeded_hasher, hash_key_value,
+    HasFingerprint, LABEL_SEP, LabelHasher, SeriesFingerprint, create_hasher, hash_key_value,
 };
 use crate::promql::engine::query_reader::{AggregationParam, GridAggregation, GridRollup};
 use crate::promql::exec::aggregations::AggregationKind;
 use crate::promql::functions::RollupKind;
-use crate::promql::generated::Label as ProtoLabel;
 use crate::promql::time::duration_ms;
 use promql_parser::label::{MatchOp, Matcher};
 use promql_parser::parser::{AtModifier, LabelModifier, Offset, VectorSelector};
@@ -17,7 +15,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 /// Hashable representation of Offset
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub(in crate::promql) enum OffsetKey {
+enum OffsetKey {
     Pos(i64),
     Neg(i64),
 }
@@ -33,7 +31,7 @@ impl From<&Offset> for OffsetKey {
 
 /// Hashable representation of AtModifier
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub(in crate::promql) enum AtKey {
+enum AtKey {
     At(i64),
     Start,
     End,
@@ -46,16 +44,6 @@ impl From<&AtModifier> for AtKey {
             AtModifier::Start => AtKey::Start,
             AtModifier::End => AtKey::End,
         }
-    }
-}
-
-impl HasFingerprint for [ProtoLabel] {
-    fn fingerprint(&self) -> SeriesFingerprint {
-        let mut hasher = create_hasher();
-        for label in self {
-            hash_key_value(&mut hasher, &label.name, &label.value);
-        }
-        hasher.finish_128()
     }
 }
 
@@ -75,7 +63,7 @@ impl HasFingerprint for Matcher {
     }
 }
 
-pub(in crate::promql) fn update_hasher_for_vector_selector(
+fn update_hasher_for_vector_selector(
     vs: &VectorSelector,
     hasher: &mut LabelHasher,
 ) {
@@ -337,23 +325,3 @@ impl GridPreloadKey {
     }
 }
 
-impl HasFingerprint for PreloadKey {
-    fn fingerprint(&self) -> SeriesFingerprint {
-        let mut hasher = create_unseeded_hasher();
-        hasher.write(self.selector.0.to_le_bytes().as_ref());
-        if let Some(offset) = &self.offset {
-            match offset {
-                OffsetKey::Pos(p) => hasher.write(&p.to_le_bytes()),
-                OffsetKey::Neg(p) => hasher.write(&p.to_le_bytes()),
-            }
-        }
-        if let Some(at) = &self.at {
-            match at {
-                AtKey::Start => hasher.write(b"-"),
-                AtKey::End => hasher.write(b"+"),
-                AtKey::At(v) => hasher.write(&v.to_le_bytes()),
-            }
-        }
-        hasher.finish_128()
-    }
-}

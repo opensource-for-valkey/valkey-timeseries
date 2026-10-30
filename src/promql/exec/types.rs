@@ -19,11 +19,9 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum EvaluationError {
-    StorageError(String),
     InternalError(String),
     ArgumentError(String),
     DuplicateLabelSet,
-    UnsupportedFunction(String),
     /// A `QueryError` surfaced by a `QueryReader` (or nested query evaluation),
     /// wrapped without loss so that converting back to `QueryError` preserves
     /// the original kind (e.g. `Timeout` stays `Timeout`).
@@ -39,14 +37,10 @@ impl From<QueryError> for EvaluationError {
 impl Display for EvaluationError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            EvaluationError::StorageError(err) => write!(f, "PromQL evaluation error: {err}"),
             EvaluationError::InternalError(err) => write!(f, "PromQL internal error: {err}"),
             EvaluationError::ArgumentError(err) => write!(f, "PromQL argument error: {err}"),
             EvaluationError::DuplicateLabelSet => {
                 write!(f, "vector cannot contain metrics with the same labelset")
-            }
-            EvaluationError::UnsupportedFunction(func_name) => {
-                write!(f, "PromQL unknown function: {func_name}")
             }
             EvaluationError::Query(err) => write!(f, "{err}"),
         }
