@@ -171,6 +171,7 @@ pub struct SteppedSeries {
 impl SteppedSeries {
     /// The points as `(step, value)` samples — the form the per-`(group, step)`
     /// fold takes, where the sample's own timestamp no longer matters.
+    #[cfg(test)]
     pub(in crate::promql) fn into_step_values(self) -> RangeSample<EvalLabels> {
         RangeSample {
             labels: self.labels,
@@ -209,6 +210,7 @@ impl GridSeries {
     }
 
     /// Every entry as sparse `(step, value)` samples, whichever stage made it.
+    #[cfg(test)]
     pub(in crate::promql) fn into_step_values(self) -> Vec<RangeSample<EvalLabels>> {
         match self {
             GridSeries::Stepped(series) => series
@@ -481,7 +483,7 @@ impl GridSink {
         deadline: &Deadline,
     ) -> EvalResult<usize> {
         match self {
-            GridSink::Selection(selection) => selection.apply(output.into_step_values(), deadline),
+            GridSink::Selection(selection) => selection.apply_grid(output, deadline),
             GridSink::Series(_) | GridSink::Partials(_) => self.merge(request, output, deadline),
         }
     }
@@ -503,9 +505,7 @@ impl GridSink {
                 added
             }
             GridSink::Partials(partials) => Self::fold(partials, request, output, deadline)?,
-            GridSink::Selection(selection) => {
-                selection.merge(output.into_step_values(), deadline)?
-            }
+            GridSink::Selection(selection) => selection.merge_grid(output, deadline)?,
         })
     }
 
@@ -519,7 +519,7 @@ impl GridSink {
             .aggregation
             .as_ref()
             .and_then(|aggregation| aggregation.modifier.as_ref());
-        partials.accumulate(modifier, output.into_step_values(), deadline)
+        partials.accumulate_grid(modifier, output, deadline)
     }
 
     /// Everything taken, as the request's outcome. A fused sink walks every
