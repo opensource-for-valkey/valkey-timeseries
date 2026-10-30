@@ -137,10 +137,6 @@ make_datetime_function!(
 pub(in crate::promql) struct TimeFunction;
 
 impl PromQLFunction for TimeFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(exact_arity_error("time", 0, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
         if !args.is_empty() {
             return Err(exact_arity_error("time", 0, args.len()));

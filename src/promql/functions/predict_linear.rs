@@ -11,10 +11,6 @@ use crate::promql::{EvalContext, EvalResult, ExprResult};
 pub(in crate::promql) struct PredictLinearFunction;
 
 impl PromQLFunction for PredictLinearFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(min_arity_error("predict_linear", 2, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
         if args.len() != 2 {
             return Err(min_arity_error("predict_linear", 2, args.len()));

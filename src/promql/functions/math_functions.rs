@@ -65,10 +65,6 @@ make_unary_function!(TanhFunction, f64::tanh);
 pub(in crate::promql) struct PiFunction;
 
 impl PromQLFunction for PiFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(exact_arity_error("pi", 0, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
         if !args.is_empty() {
             return Err(exact_arity_error("pi", 0, args.len()));
@@ -141,10 +137,6 @@ impl PromQLFunction for RoundFunction {
 pub(in crate::promql) struct ClampMaxFunction;
 
 impl PromQLFunction for ClampMaxFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(exact_arity_error("clamp_max", 2, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         let (vector, max) = two_args("clamp_max", args)?;
         let mut samples = vector.into_instant_vector()?;
@@ -161,10 +153,6 @@ impl PromQLFunction for ClampMaxFunction {
 pub(in crate::promql) struct ClampMinFunction;
 
 impl PromQLFunction for ClampMinFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(exact_arity_error("clamp_min", 2, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         let (vector, min) = two_args("clamp_min", args)?;
         let mut samples = vector.into_instant_vector()?;
@@ -181,10 +169,6 @@ impl PromQLFunction for ClampMinFunction {
 pub(in crate::promql) struct ClampFunction;
 
 impl PromQLFunction for ClampFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(exact_arity_error("clamp", 3, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         let (vector, min, max) = three_args("clamp", args)?;
         let mut samples = vector.into_instant_vector()?;
@@ -207,10 +191,6 @@ impl PromQLFunction for ClampFunction {
 pub(in crate::promql) struct MaxOfFunction;
 
 impl PromQLFunction for MaxOfFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(exact_arity_error("max_of", 2, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         let (a, b) = two_args("max_of", args)?;
         Ok(ExprResult::Scalar(max_with_nan(
@@ -225,10 +205,6 @@ impl PromQLFunction for MaxOfFunction {
 pub(in crate::promql) struct MinOfFunction;
 
 impl PromQLFunction for MinOfFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(exact_arity_error("min_of", 2, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         let (a, b) = two_args("min_of", args)?;
         Ok(ExprResult::Scalar(min_with_nan(

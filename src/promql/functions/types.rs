@@ -128,7 +128,17 @@ pub(crate) trait PromQLFunction {
     /// Apply the function to the input samples.
     /// `ctx` provides the evaluation context (timestamp, query range, step, etc.).
     /// Returns an `ExprResult` (typically `ExprResult::InstantVector`).
-    fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult>;
+    ///
+    /// Only the one-argument functions implement this. The evaluator always
+    /// enters through [`Self::apply_call`], after the parser has checked the
+    /// arity and the evaluator the argument types, so a function taking any
+    /// other number of arguments overrides [`Self::apply_args`] or
+    /// [`Self::apply_call`] instead and never sees this default.
+    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
+        Err(EvaluationError::InternalError(
+            "function does not take exactly one argument".to_string(),
+        ))
+    }
 
     /// Apply the function to one or more evaluated arguments.
     ///

@@ -1,8 +1,6 @@
 use crate::common::Sample;
 use crate::promql::functions::rollups::eval_series;
-use crate::promql::functions::utils::{
-    exact_arity_error, expect_exact_arg_count, expect_range_vector, expect_scalar,
-};
+use crate::promql::functions::utils::{expect_exact_arg_count, expect_range_vector, expect_scalar};
 use crate::promql::functions::{PromQLArg, PromQLFunction};
 use crate::promql::{EvalContext, EvalResult, EvaluationError, ExprResult};
 
@@ -10,10 +8,6 @@ use crate::promql::{EvalContext, EvalResult, EvaluationError, ExprResult};
 pub(in crate::promql) struct DoubleExponentialSmoothingFunction;
 
 impl PromQLFunction for DoubleExponentialSmoothingFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(exact_arity_error("double_exponential_smoothing", 3, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
         eval_double_exponential_smoothing("double_exponential_smoothing", args, ctx)
     }
@@ -26,10 +20,6 @@ impl PromQLFunction for DoubleExponentialSmoothingFunction {
 pub(in crate::promql) struct HoltWintersFunction;
 
 impl PromQLFunction for HoltWintersFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(exact_arity_error("holt_winters", 3, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
         eval_double_exponential_smoothing("holt_winters", args, ctx)
     }

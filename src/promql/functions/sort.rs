@@ -35,10 +35,6 @@ impl PromQLFunction for SortDescFunction {
 pub(in crate::promql) struct SortByLabelFunction;
 
 impl PromQLFunction for SortByLabelFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(min_arity_error("sort_by_label", 2, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         sort_by_label(args, false)
     }
@@ -51,10 +47,6 @@ impl PromQLFunction for SortByLabelFunction {
 pub(in crate::promql) struct SortByLabelDescFunction;
 
 impl PromQLFunction for SortByLabelDescFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(min_arity_error("sort_by_label_desc", 2, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         sort_by_label(args, true)
     }

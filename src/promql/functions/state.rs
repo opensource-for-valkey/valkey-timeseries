@@ -18,8 +18,8 @@ use crate::parser::duration::parse_positive_duration_value;
 use crate::promql::functions::rollups::{eval_rollups, eval_rollups_basic};
 use crate::promql::functions::types::RollupWindow;
 use crate::promql::functions::utils::{
-    exact_arity_error, expect_exact_arg_count, expect_min_arg_count, expect_range_vector,
-    expect_scalar, expect_string, max_arity_error, min_arity_error,
+    expect_exact_arg_count, expect_min_arg_count, expect_range_vector, expect_scalar,
+    expect_string, max_arity_error,
 };
 use crate::promql::functions::{PromQLArg, PromQLFunction};
 use crate::promql::{EvalContext, EvalResult, EvaluationError, ExprResult};
@@ -72,10 +72,6 @@ fn expect_state(arg: PromQLArg, name: &str) -> EvalResult<f64> {
 pub(in crate::promql) struct StateDurationOverTimeFunction;
 
 impl PromQLFunction for StateDurationOverTimeFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(min_arity_error(DURATION_NAME, 2, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
         expect_min_arg_count(DURATION_NAME, 2, args.len())?;
         if args.len() > 3 {
@@ -101,10 +97,6 @@ impl PromQLFunction for StateDurationOverTimeFunction {
 pub(in crate::promql) struct StateCountOverTimeFunction;
 
 impl PromQLFunction for StateCountOverTimeFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(exact_arity_error(COUNT_NAME, 2, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
         expect_exact_arg_count(COUNT_NAME, 2, args.len())?;
         let mut iter = args.into_iter();

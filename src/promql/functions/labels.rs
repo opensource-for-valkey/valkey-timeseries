@@ -2,8 +2,7 @@ use crate::labels::build_with_repeat_fallback;
 use crate::promql::binops::ensure_unique_labelsets;
 use crate::promql::functions::types::{PromQLArg, PromQLFunction};
 use crate::promql::functions::utils::{
-    exact_arity_error, expect_exact_arg_count, expect_min_arg_count, expect_string,
-    is_valid_label_name, min_arity_error,
+    expect_exact_arg_count, expect_min_arg_count, expect_string, is_valid_label_name,
 };
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvaluationError, ExprResult};
 use ahash::AHashMap;
@@ -143,10 +142,6 @@ fn apply_label_replace_to_samples(
 }
 
 impl PromQLFunction for LabelReplaceFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(exact_arity_error("label_replace", 5, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         expect_exact_arg_count("label_replace", 5, args.len())?;
 
@@ -207,10 +202,6 @@ impl Default for LabelReplaceFunction {
 pub(in crate::promql) struct LabelJoinFunction;
 
 impl PromQLFunction for LabelJoinFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(min_arity_error("label_join", 3, 1))
-    }
-
     fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         let actual_args = args.len();
         expect_min_arg_count("label_join", 3, actual_args)?;

@@ -17,7 +17,7 @@ use crate::promql::functions::utils::{
     exact_arity_error, expect_exact_arg_count, expect_range_vector, expect_scalar,
     labels_for_absent,
 };
-use crate::promql::{EvalContext, EvalResult, EvalSample, EvaluationError, ExprResult};
+use crate::promql::{EvalContext, EvalResult, EvalSample, ExprResult};
 use promql_parser::parser::Expr;
 use promql_parser::parser::Function;
 use promql_parser::parser::value::ValueType;
@@ -442,13 +442,6 @@ macro_rules! make_rollup_function {
         pub(in crate::promql) struct $type_name;
 
         impl PromQLFunction for $type_name {
-            fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-                Err(EvaluationError::ArgumentError(format!(
-                    "invalid invocation of rollup function '{}'",
-                    $name
-                )))
-            }
-
             fn apply_call(
                 &self,
                 args: Vec<PromQLArg>,
@@ -466,13 +459,6 @@ macro_rules! basic_rollup_function {
         pub(in crate::promql) struct $type_name;
 
         impl PromQLFunction for $type_name {
-            fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-                Err(EvaluationError::ArgumentError(format!(
-                    "invalid invocation of rollup function '{}'",
-                    $name
-                )))
-            }
-
             fn apply_call(
                 &self,
                 args: Vec<PromQLArg>,
@@ -748,10 +734,6 @@ impl PromQLFunction for AbsentOverTimeFunction {
 pub(in crate::promql) struct QuantileOverTimeFunction;
 
 impl PromQLFunction for QuantileOverTimeFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(exact_arity_error("quantile_over_time", 2, 0))
-    }
-
     fn apply_call(
         &self,
         args: Vec<PromQLArg>,
