@@ -1004,6 +1004,7 @@ fn run_local_batch(tasks: Vec<SelectorTask>) {
         }
 
         for (read, batch) in reads.iter_mut().zip(copied) {
+            read.profile_taken();
             if let Some(batch) = batch
                 && isolate_panic("range decode", || read.decode(batch)).is_none()
             {
@@ -1071,6 +1072,10 @@ enum ReadState {
         walk: ProfileWalk,
         builder: LabelProfileBuilder,
         overflow: bool,
+        /// The label sets a hold took, shared from storage by refcount: added
+        /// to `builder` once the lock is released ([`LocalRead::profile_taken`]),
+        /// so a hold does not spend its time hashing labels into the profile.
+        taken: Vec<EvalLabels>,
     },
 }
 
@@ -1161,6 +1166,7 @@ impl LocalRead {
                     walk: ProfileWalk::new(pc.window, profiled_series_cap(&pc.options)),
                     builder: LabelProfileBuilder::new(),
                     overflow: false,
+                    taken: Vec::new(),
                 };
                 (pc.matchers, pc.options, state)
             }
@@ -1284,8 +1290,9 @@ impl LocalRead {
                 }
                 ReadState::Profile {
                     walk,
-                    builder,
                     overflow,
+                    taken,
+                    ..
                 } => {
                     // Every key of a batch is opened before the first is
                     // stepped, so the batch is no larger than the walk may
@@ -1302,10 +1309,8 @@ impl LocalRead {
                                     *overflow = true;
                                     break;
                                 }
-                                // The builder copies what it keeps.
-                                ProfileStep::Take => {
-                                    builder.add_series(s.labels.iter().map(|l| (l.name, l.value)))
-                                }
+                                // A refcount bump; profiled after the hold.
+                                ProfileStep::Take => taken.push(EvalLabels::interned(&s.labels)),
                             }
                         }
                         Ok(())
@@ -1322,6 +1327,15 @@ impl LocalRead {
         match over_budget {
             Some(err) => Err(err),
             None => Ok(copied),
+        }
+    }
+
+    /// Off the lock: add the label sets the last hold took to the profile.
+    fn profile_taken(&mut self) {
+        if let ReadState::Profile { builder, taken, .. } = &mut self.state {
+            for labels in taken.drain(..) {
+                builder.add_series(labels.iter().map(|l| (l.name, l.value)));
+            }
         }
     }
 
