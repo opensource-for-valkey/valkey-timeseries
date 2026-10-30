@@ -616,8 +616,9 @@ fn rollup_ts_of_min(rfa: &RollupWindow, _param: Option<f64>) -> f64 {
         .copied()
         .zip(rfa.timestamps.iter().copied())
     {
-        // Get the last timestamp for the minimum value as most users expect.
-        if v <= min_value {
+        // Get the last timestamp for the minimum value as most users expect. A
+        // NaN seed is replaced by the first real value, as in `rollup_min`.
+        if v <= min_value || min_value.is_nan() {
             min_value = v;
             min_timestamp = ts;
         }
@@ -635,8 +636,9 @@ fn rollup_ts_of_max(rfa: &RollupWindow, _param: Option<f64>) -> f64 {
         .copied()
         .zip(rfa.timestamps.iter().copied())
     {
-        // Get the last timestamp for the maximum value as most users expect.
-        if v >= max_value {
+        // Get the last timestamp for the maximum value as most users expect. A
+        // NaN seed is replaced by the first real value, as in `rollup_max`.
+        if v >= max_value || max_value.is_nan() {
             max_value = v;
             max_timestamp = ts;
         }
@@ -791,6 +793,31 @@ pub(in crate::promql) fn get_extended_rollup_functions() -> Vec<Function> {
 mod tests {
     use super::*;
     use crate::promql::functions::rollups::window_samples;
+
+    /// A NaN first sample must not pin the timestamp: `ts_of_min_over_time` and
+    /// `ts_of_max_over_time` replace a NaN seed with the first real value, as
+    /// `min_over_time`/`max_over_time` (and Prometheus) do. Ties still report
+    /// the last timestamp, the documented `<=`/`>=` rule.
+    #[test]
+    fn ts_of_extrema_replace_a_nan_seed() {
+        let values = [f64::NAN, 3.0, 1.0, 1.0];
+        let timestamps = [10_i64, 20, 30, 40];
+        let window = RollupWindow {
+            values: &values,
+            timestamps: &timestamps,
+        };
+        assert_eq!(rollup_ts_of_min(&window, None), 0.04);
+        assert_eq!(rollup_ts_of_max(&window, None), 0.02);
+
+        // All NaN: the seed is replaced at every sample, so the last one wins.
+        let nans = [f64::NAN, f64::NAN];
+        let window = RollupWindow {
+            values: &nans,
+            timestamps: &[10, 20],
+        };
+        assert_eq!(rollup_ts_of_min(&window, None), 0.02);
+        assert_eq!(rollup_ts_of_max(&window, None), 0.02);
+    }
 
     /// A kind's name must round-trip: with two dozen hand-written entries in
     /// `from_function_name`, a typo would silently make one function
