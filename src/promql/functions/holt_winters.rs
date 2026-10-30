@@ -1,11 +1,10 @@
 use crate::common::Sample;
-use crate::common::threads::IntoParRayon;
+use crate::promql::functions::rollups::eval_series;
 use crate::promql::functions::utils::{
     exact_arity_error, expect_exact_arg_count, expect_range_vector, expect_scalar,
 };
 use crate::promql::functions::{PromQLArg, PromQLFunction};
-use crate::promql::{EvalContext, EvalResult, EvalSample, EvaluationError, ExprResult};
-use orx_parallel::Par;
+use crate::promql::{EvalContext, EvalResult, EvaluationError, ExprResult};
 
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct DoubleExponentialSmoothingFunction;
@@ -16,7 +15,7 @@ impl PromQLFunction for DoubleExponentialSmoothingFunction {
     }
 
     fn apply_args(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
-        eval_double_exponential_smoothing("double_exponential_smoothing", args, ctx.evaluation_ts)
+        eval_double_exponential_smoothing("double_exponential_smoothing", args, ctx)
     }
 }
 
@@ -32,7 +31,7 @@ impl PromQLFunction for HoltWintersFunction {
     }
 
     fn apply_args(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
-        eval_double_exponential_smoothing("holt_winters", args, ctx.evaluation_ts)
+        eval_double_exponential_smoothing("holt_winters", args, ctx)
     }
 }
 
@@ -79,7 +78,7 @@ fn calculate_double_exponential_smoothing_value(
 fn eval_double_exponential_smoothing(
     function_name: &str,
     args: Vec<PromQLArg>,
-    eval_timestamp_ms: i64,
+    ctx: &EvalContext,
 ) -> EvalResult<ExprResult> {
     expect_exact_arg_count(function_name, 3, args.len())?;
     let mut args = args.into_iter();
@@ -99,30 +98,16 @@ fn eval_double_exponential_smoothing(
         return Err(EvaluationError::ArgumentError(msg));
     }
 
-    let out = series
-        .into_par_rayon()
-        .filter_map(|s| {
-            let value = calculate_double_exponential_smoothing_value(
-                &s.values,
-                smoothing_factor,
-                trend_factor,
-            )?;
-            Some(EvalSample {
-                timestamp_ms: eval_timestamp_ms,
-                labels: s.labels,
-                value,
-                drop_name: false,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    Ok(ExprResult::InstantVector(out))
+    Ok(ExprResult::InstantVector(eval_series(ctx, series, |s| {
+        calculate_double_exponential_smoothing_value(&s.values, smoothing_factor, trend_factor)
+    })?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{calculate_double_exponential_smoothing_value, eval_double_exponential_smoothing};
     use crate::common::Sample;
+    use crate::promql::EvalContext;
     use crate::promql::functions::PromQLArg;
 
     /// Prometheus checks both factors with exclusive bounds — `0 < sf < 1`,
@@ -139,7 +124,7 @@ mod tests {
                     PromQLArg::Scalar(sf),
                     PromQLArg::Scalar(tf),
                 ],
-                0,
+                &EvalContext::default(),
             )
         };
         for (sf, tf, factor) in [
@@ -162,7 +147,7 @@ mod tests {
                 PromQLArg::Scalar(0.5),
                 PromQLArg::Scalar(0.5),
             ],
-            0,
+            &EvalContext::default(),
         )
         .unwrap_err()
         .to_string();

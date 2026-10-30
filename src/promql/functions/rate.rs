@@ -1,8 +1,7 @@
 use crate::common::Sample;
-use crate::common::threads::IntoParRayon;
+use crate::promql::functions::rollups::eval_series;
 use crate::promql::functions::{PromQLArg, PromQLFunction};
-use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult};
-use orx_parallel::Par;
+use crate::promql::{EvalContext, EvalResult, EvalSamples, ExprResult};
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::promql) enum RateKind {
@@ -17,7 +16,7 @@ pub(in crate::promql) struct RateFunction;
 
 impl PromQLFunction for RateFunction {
     fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
-        calculate_rate(arg, ctx.evaluation_ts, RateKind::Rate)
+        calculate_rate(arg, ctx, RateKind::Rate)
     }
 }
 
@@ -26,7 +25,7 @@ pub(in crate::promql) struct DeltaFunction;
 
 impl PromQLFunction for DeltaFunction {
     fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
-        calculate_rate(arg, ctx.evaluation_ts, RateKind::Delta)
+        calculate_rate(arg, ctx, RateKind::Delta)
     }
 }
 
@@ -35,30 +34,15 @@ pub(in crate::promql) struct IncreaseFunction;
 
 impl PromQLFunction for IncreaseFunction {
     fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
-        calculate_rate(arg, ctx.evaluation_ts, RateKind::Increase)
+        calculate_rate(arg, ctx, RateKind::Increase)
     }
 }
 
-fn calculate_rate(
-    arg: PromQLArg,
-    eval_timestamp_ms: i64,
-    kind: RateKind,
-) -> EvalResult<ExprResult> {
-    let samples = arg.into_range_vector()?;
-    let result = samples
-        .into_par_rayon()
-        .filter_map(|sample_series| {
-            let value = extrapolated_rate(&sample_series, kind)?;
-            Some(EvalSample {
-                timestamp_ms: eval_timestamp_ms,
-                value,
-                labels: sample_series.labels,
-                drop_name: false,
-            })
-        })
-        .collect();
-
-    Ok(ExprResult::InstantVector(result))
+fn calculate_rate(arg: PromQLArg, ctx: &EvalContext, kind: RateKind) -> EvalResult<ExprResult> {
+    let series = arg.into_range_vector()?;
+    Ok(ExprResult::InstantVector(eval_series(ctx, series, |s| {
+        extrapolated_rate(s, kind)
+    })?))
 }
 
 fn counter_increase_value(samples: &[Sample]) -> Option<f64> {

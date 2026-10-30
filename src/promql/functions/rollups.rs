@@ -26,55 +26,67 @@ use crate::promql::functions::types::RollupWindow;
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples};
 use orx_parallel::{Par, ParResult};
 
-/// Evaluate `rollup_fn` over each series' window, one value per series.
+/// The one per-series driver behind every range-vector function: `f` reduces
+/// each series to a value, or declines it, and the value is stamped with the
+/// query's evaluation timestamp — a shifted selector still reports at the step
+/// the client asked for. The series keeps its labels and pending `__name__`
+/// drop.
 ///
-/// The window is the one the matrix selector loaded: it ends at
-/// [`EvalSamples::range_end_ms`], which already carries any `@`/`offset`
-/// adjustment. The output is stamped with the query's evaluation timestamp
-/// instead, so a shifted selector still reports at the step the client asked
-/// for — the same rule [`crate::promql::functions::rate`] follows.
-///
-/// Series whose window holds no samples are dropped rather than emitted as NaN.
-pub(super) fn eval_rollups(
+/// The deadline is checked per series, weighted by its samples, before `f`
+/// runs over them: never inside `f`, whose loop over one series' samples is the
+/// one the compiler vectorizes. Empty series and declined ones produce nothing,
+/// which is how the caller tells "nothing to reduce" from "reduced to NaN".
+pub(super) fn eval_series<F>(
     ctx: &EvalContext,
-    range_vec: Vec<EvalSamples>,
-    optional_param: Option<f64>,
-    rollup_fn: fn(&RollupWindow, Option<f64>) -> f64,
-) -> EvalResult<Vec<EvalSample>> {
-    // Checked per series, weighted by its samples, outside the rollup's own loop over them.
+    series: Vec<EvalSamples>,
+    f: F,
+) -> EvalResult<Vec<EvalSample>>
+where
+    F: Fn(&EvalSamples) -> Option<f64> + Sync,
+{
     let deadline = ctx.deadline;
-    range_vec
+    series
         .into_par_rayon()
         .map(|series| -> EvalResult<Option<EvalSample>> {
             deadline.checkpoint(series.values.len() + SERIES_WORK)?;
-            Ok(exec_series_rollup(ctx, series, optional_param, rollup_fn))
+            if series.values.is_empty() {
+                return Ok(None);
+            }
+            let Some(value) = f(&series) else {
+                return Ok(None);
+            };
+            Ok(Some(EvalSample {
+                timestamp_ms: ctx.evaluation_ts,
+                value,
+                labels: series.labels,
+                drop_name: series.drop_name,
+            }))
         })
         .into_fallible()
         .filter_map(|sample| sample)
         .collect::<Vec<_>>()
 }
 
-/// Evaluate one series' rollup at the end of the window the selector loaded.
-fn exec_series_rollup(
+/// Evaluate `rollup_fn` over each series' window, one value per series.
+///
+/// The window is the one the matrix selector loaded: it ends at
+/// [`EvalSamples::range_end_ms`], which already carries any `@`/`offset`
+/// adjustment. Series whose window holds no samples are dropped rather than
+/// emitted as NaN.
+pub(super) fn eval_rollups(
     ctx: &EvalContext,
-    series: EvalSamples,
+    range_vec: Vec<EvalSamples>,
     optional_param: Option<f64>,
     rollup_fn: fn(&RollupWindow, Option<f64>) -> f64,
-) -> Option<EvalSample> {
-    let value = rollup_window_value(
-        &series.values,
-        series.range_end_ms,
-        series.range_ms,
-        optional_param,
-        rollup_fn,
-    )?;
-
-    Some(EvalSample {
-        // The window ends at `range_end_ms`, but the sample belongs to the step.
-        timestamp_ms: ctx.evaluation_ts,
-        value,
-        labels: series.labels,
-        drop_name: series.drop_name,
+) -> EvalResult<Vec<EvalSample>> {
+    eval_series(ctx, range_vec, |series| {
+        rollup_window_value(
+            &series.values,
+            series.range_end_ms,
+            series.range_ms,
+            optional_param,
+            rollup_fn,
+        )
     })
 }
 
@@ -225,31 +237,13 @@ pub(super) fn eval_rollups_basic<F>(
 where
     F: Fn(&[Sample]) -> Option<f64> + Sync,
 {
-    // Checked per series, weighted by its samples, outside `f`'s loop over them.
-    let deadline = ctx.deadline;
-    series_data
-        .into_par_rayon()
-        .map(|series| -> EvalResult<Option<EvalSample>> {
-            deadline.checkpoint(series.values.len() + SERIES_WORK)?;
-            let Some(window) = window_samples(&series.values, series.range_end_ms, series.range_ms)
-            else {
-                return Ok(None);
-            };
-
-            let Some(value) = f(window) else {
-                return Ok(None);
-            };
-
-            Ok(Some(EvalSample {
-                timestamp_ms: ctx.evaluation_ts,
-                value,
-                labels: series.labels,
-                drop_name: series.drop_name,
-            }))
-        })
-        .into_fallible()
-        .filter_map(|sample| sample)
-        .collect::<Vec<_>>()
+    eval_series(ctx, series_data, |series| {
+        f(window_samples(
+            &series.values,
+            series.range_end_ms,
+            series.range_ms,
+        )?)
+    })
 }
 
 /// The samples of `series` inside `(window_end - window_ms, window_end]`, or

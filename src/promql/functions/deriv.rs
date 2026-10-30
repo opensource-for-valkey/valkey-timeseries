@@ -1,9 +1,8 @@
 use crate::common::Sample;
-use crate::common::threads::IntoParRayon;
 use crate::promql::common::math::sample_regression;
+use crate::promql::functions::rollups::eval_series;
 use crate::promql::functions::{PromQLArg, PromQLFunction};
-use crate::promql::{EvalContext, EvalResult, EvalSample, ExprResult};
-use orx_parallel::Par;
+use crate::promql::{EvalContext, EvalResult, ExprResult};
 
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct DerivFunction;
@@ -11,21 +10,9 @@ pub(in crate::promql) struct DerivFunction;
 impl PromQLFunction for DerivFunction {
     fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
         let series = arg.into_range_vector()?;
-
-        let out = series
-            .into_par_rayon()
-            .filter_map(|series| {
-                let value = rollup_deriv(&series.values)?;
-                Some(EvalSample {
-                    labels: series.labels,
-                    timestamp_ms: ctx.evaluation_ts,
-                    value,
-                    drop_name: false,
-                })
-            })
-            .collect();
-
-        Ok(ExprResult::InstantVector(out))
+        Ok(ExprResult::InstantVector(eval_series(ctx, series, |s| {
+            rollup_deriv(&s.values)
+        })?))
     }
 }
 
