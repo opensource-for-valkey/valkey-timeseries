@@ -252,8 +252,11 @@ impl PartialGroups {
         let kind = self.kind;
         for sample in samples {
             deadline.checkpoint(SERIES_WORK)?;
-            let labels = sample.labels.compute_grouping_labels(modifier);
-            self.entry(labels).update(kind, sample.value);
+            // Key every sample without allocating; build the group's labels
+            // only when the group is new (see `compute_grouping_key`).
+            let key = sample.labels.compute_grouping_key(modifier);
+            self.entry_with(key, || sample.labels.compute_grouping_labels(modifier))
+                .update(kind, sample.value);
         }
         Ok(())
     }
@@ -267,6 +270,16 @@ impl PartialGroups {
     /// The accumulated states, for transport to the coordinator.
     pub fn into_partials(self) -> impl Iterator<Item = (EvalLabels, AggregationPartial)> {
         self.groups.into_iter().map(|(_, entry)| entry)
+    }
+
+    /// [`Self::into_partials`] with each group's fingerprint, for a caller that
+    /// regroups them and would otherwise hash every label set again.
+    fn into_keyed(
+        self,
+    ) -> impl Iterator<Item = (SeriesFingerprint, EvalLabels, AggregationPartial)> {
+        self.groups
+            .into_iter()
+            .map(|(key, (labels, state))| (key, labels, state))
     }
 
     /// Finalize every group into a result sample stamped at `eval_time`, as
@@ -294,18 +307,18 @@ impl PartialGroups {
             .1
     }
 
-    /// [`Self::entry`] for a caller that already holds `labels`' fingerprint,
-    /// so the labels are only cloned when the group is first seen.
-    fn entry_keyed(
+    /// [`Self::entry`] for a caller that already holds the group's fingerprint,
+    /// so its labels are only built when the group is first seen.
+    fn entry_with(
         &mut self,
         key: SeriesFingerprint,
-        labels: &EvalLabels,
+        labels: impl FnOnce() -> EvalLabels,
     ) -> &mut AggregationPartial {
         let kind = self.kind;
         &mut self
             .groups
             .entry(key)
-            .or_insert_with(|| (labels.clone(), AggregationPartial::empty(kind)))
+            .or_insert_with(|| (labels(), AggregationPartial::empty(kind)))
             .1
     }
 }
@@ -353,17 +366,24 @@ impl SteppedPartialGroups {
         let mut added = 0;
         for s in series {
             deadline.checkpoint(SERIES_WORK + s.samples.len())?;
-            // One group per series, however many steps it spans: resolve the
-            // group and hash it once, not once per point.
-            let labels = s.labels.compute_grouping_labels(modifier);
-            let key = labels.fingerprint();
+            // One group per series, however many steps it spans: hash it once,
+            // not once per point, and build its labels only if some step has
+            // not seen the group yet.
+            let key = s.labels.compute_grouping_key(modifier);
+            let mut labels: Option<EvalLabels> = None;
             for point in s.samples {
                 let groups = self
                     .steps
                     .entry(point.timestamp)
                     .or_insert_with(|| PartialGroups::new(kind));
                 let before = groups.groups.len();
-                groups.entry_keyed(key, &labels).update(kind, point.value);
+                groups
+                    .entry_with(key, || {
+                        labels
+                            .get_or_insert_with(|| s.labels.compute_grouping_labels(modifier))
+                            .clone()
+                    })
+                    .update(kind, point.value);
                 added += groups.groups.len() - before;
             }
         }
@@ -409,8 +429,7 @@ impl SteppedPartialGroups {
 
         for (step_ts, groups) in self.steps {
             deadline.checkpoint(SERIES_WORK + groups.groups.len())?;
-            for (labels, state) in groups.into_partials() {
-                let key = labels.fingerprint();
+            for (key, labels, state) in groups.into_keyed() {
                 by_group
                     .entry(key)
                     .or_insert_with(|| (labels, Vec::new()))
@@ -824,6 +843,37 @@ mod tests {
                 (EvalLabels::from_pairs(&[("job", "b"), ("v", "1")]), 4.0),
             ]
         );
+    }
+
+    /// Series of one group fold into one entry per group, its points one per
+    /// step in order, whichever series reached a step first.
+    #[test]
+    fn stepped_finalize_groups_by_label_set() {
+        let series = |i: &str, points: &[(Timestamp, f64)]| RangeSample {
+            labels: EvalLabels::from_pairs(&[("i", i), ("job", "a")]),
+            samples: points.iter().map(|&(t, v)| Sample::new(t, v)).collect(),
+        };
+        let mut groups = SteppedPartialGroups::new(AggregationKind::Sum);
+        let added = groups
+            .accumulate(
+                Some(&by(&["job"])),
+                vec![
+                    series("1", &[(10, 1.0), (20, 2.0)]),
+                    series("2", &[(20, 5.0), (30, 7.0)]),
+                ],
+                &Deadline::default(),
+            )
+            .unwrap();
+        assert_eq!(added, 3, "one state per (group, step)");
+        let out = groups.finalize(&Deadline::default()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].labels, EvalLabels::from_pairs(&[("job", "a")]));
+        let points: Vec<(Timestamp, f64)> = out[0]
+            .samples
+            .iter()
+            .map(|s| (s.timestamp, s.value))
+            .collect();
+        assert_eq!(points, vec![(10, 1.0), (20, 7.0), (30, 7.0)]);
     }
 
     /// Only quantile lacks a decomposable form.
