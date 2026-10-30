@@ -8,6 +8,7 @@ use crate::promql::deadline::Deadline;
 use crate::promql::engine::query_reader::AggregationParam;
 use crate::promql::exec::aggregations::AggregationKind;
 use crate::promql::exec::pipeline::for_each_step_sample;
+use crate::promql::generated::GridSeries as ProtoGridSeries;
 use crate::series::chunks::WIRE_COMPRESSION_MIN_SAMPLES;
 
 const RANGE_MS: i64 = 60_000;

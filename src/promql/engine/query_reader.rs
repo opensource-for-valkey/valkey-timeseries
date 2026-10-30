@@ -3,6 +3,7 @@ use crate::common::{Sample, Timestamp};
 use crate::promql::EvalLabels;
 use crate::promql::deadline::{Deadline, SERIES_WORK};
 use crate::promql::engine::label_profile::{LabelProfile, ProfileWindow};
+use crate::promql::engine::sample_budget::SampleBudget;
 use crate::promql::exec::aggregations::{AggregationKind, PushdownStrategy};
 use crate::promql::exec::partial_aggregation::{SteppedPartialGroups, SteppedSelection};
 use crate::promql::exec::pipeline::for_each_step_sample;
@@ -524,6 +525,22 @@ impl GridSink {
     /// Everything taken, as the request's outcome. A fused sink walks every
     /// state or candidate it accumulated to finalize them, `deadline` checked
     /// as it goes.
+    /// [`Self::take`], charging `budget` for what the sink now holds beyond
+    /// the `read` raw samples the output was built from, which the read
+    /// already charged. The one place a staged chunk is accounted, on the
+    /// shard and on the coordinator alike.
+    pub(in crate::promql) fn take_charged(
+        &mut self,
+        request: &GridRequest,
+        output: GridSeries,
+        read: usize,
+        deadline: &Deadline,
+        budget: &SampleBudget,
+    ) -> QueryResult<()> {
+        let added = self.take(request, output, deadline)?;
+        budget.charge(added.saturating_sub(read))
+    }
+
     pub(in crate::promql) fn finish(self, deadline: &Deadline) -> EvalResult<GridOutcome> {
         Ok(match self {
             GridSink::Series(series) => series.into(),

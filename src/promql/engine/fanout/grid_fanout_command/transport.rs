@@ -171,11 +171,18 @@ pub(super) fn transport_plan(
         .iter()
         .map(|series| ships_raw(window_ends, series))
         .collect();
-    let staged_groups = staged_groups(request, windows.iter().zip(&plan).filter(|(_, r)| !**r));
-    let raw: Vec<&RangeSample<EvalLabels>> = windows
+    let staged_groups = staged_groups(
+        request,
+        windows
+            .iter()
+            .zip(&plan)
+            .filter_map(|(series, &is_raw)| (!is_raw).then_some(series)),
+    );
+    let raw: Vec<RangeSample<EvalLabels>> = windows
         .iter()
         .zip(&plan)
-        .filter_map(|(series, &is_raw)| is_raw.then_some(series))
+        .filter(|(_, is_raw)| **is_raw)
+        .map(|(series, _)| series.clone())
         .collect();
     let mut promoted = promoted_raw(request, window_ends, &raw, &staged_groups).into_iter();
     for is_raw in plan.iter_mut().filter(|is_raw| **is_raw) {
@@ -192,12 +199,12 @@ pub(super) fn transport_plan(
 /// staged series a batch at a time need not keep them.
 pub(super) fn staged_groups<'a>(
     request: &GridRequest,
-    staged: impl Iterator<Item = (&'a RangeSample<EvalLabels>, &'a bool)>,
+    staged: impl Iterator<Item = &'a RangeSample<EvalLabels>>,
 ) -> FingerprintHashSet {
     let mut groups = FingerprintHashSet::default();
     if let Some(aggregation) = reduction(request) {
         let modifier = aggregation.modifier.as_ref();
-        groups.extend(staged.map(|(series, _)| series.labels.compute_grouping_key(modifier)));
+        groups.extend(staged.map(|series| series.labels.compute_grouping_key(modifier)));
     }
     groups
 }
@@ -218,7 +225,7 @@ fn reduction(request: &GridRequest) -> Option<&GridAggregation> {
 pub(super) fn promoted_raw(
     request: &GridRequest,
     window_ends: &[i64],
-    raw: &[&RangeSample<EvalLabels>],
+    raw: &[RangeSample<EvalLabels>],
     staged_groups: &FingerprintHashSet,
 ) -> Vec<bool> {
     let Some(aggregation) = reduction(request) else {

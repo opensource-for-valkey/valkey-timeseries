@@ -20,7 +20,7 @@ pub(super) fn encode_columns(
     with_lag: bool,
 ) -> (Vec<u8>, Vec<f64>, Vec<i64>) {
     let mut presence = vec![0u8; window_ends.len().div_ceil(8)];
-    let mut values = Vec::new();
+    let mut values = Vec::with_capacity(points.size_hint().0);
     let mut lags = Vec::new();
     let mut cursor = 0usize;
     for (step_ts, sample_ts, value) in points {
@@ -48,27 +48,29 @@ pub(super) fn decode_columns<'a>(
     window_ends: &'a [i64],
     series: &'a ProtoGridSeries,
 ) -> Result<impl Iterator<Item = (i64, i64, f64)> + 'a, String> {
-    let present: Vec<usize> = series
+    // Validated from the bitmap alone — a popcount and the highest set bit —
+    // so the present windows are walked once, lazily, by the caller.
+    let present = series
         .presence
         .iter()
-        .enumerate()
-        .flat_map(|(byte, bits)| {
-            (0..8)
-                .filter(move |bit| bits & (1 << bit) != 0)
-                .map(move |bit| byte * 8 + bit)
-        })
-        .collect();
-    if present.last().is_some_and(|&i| i >= window_ends.len()) {
+        .map(|bits| bits.count_ones() as usize)
+        .sum::<usize>();
+    let highest = series
+        .presence
+        .iter()
+        .rposition(|&bits| bits != 0)
+        .map(|byte| byte * 8 + 7 - series.presence[byte].leading_zeros() as usize);
+    if let Some(highest) = highest
+        && highest >= window_ends.len()
+    {
         return Err(format!(
-            "presence bitmap addresses window {} of {}",
-            present.last().unwrap(),
+            "presence bitmap addresses window {highest} of {}",
             window_ends.len()
         ));
     }
-    if present.len() != series.values.len() {
+    if present != series.values.len() {
         return Err(format!(
-            "{} present windows but {} values",
-            present.len(),
+            "{present} present windows but {} values",
             series.values.len()
         ));
     }
@@ -79,7 +81,12 @@ pub(super) fn decode_columns<'a>(
             series.sample_lag.len()
         ));
     }
-    Ok(present.into_iter().enumerate().map(move |(k, i)| {
+    let present = series.presence.iter().enumerate().flat_map(|(byte, bits)| {
+        (0..8)
+            .filter(move |bit| bits & (1 << bit) != 0)
+            .map(move |bit| byte * 8 + bit)
+    });
+    Ok(present.enumerate().map(move |(k, i)| {
         let step_ts = window_ends[i];
         let lag = series.sample_lag.get(k).copied().unwrap_or(0);
         // The lag comes from a peer; a corrupt one must not wrap the timestamp.
@@ -95,17 +102,39 @@ pub(super) fn columnar_series(
     series: Vec<RangeSample<EvalLabels>>,
     symbols: &mut SymbolTableBuilder,
 ) -> Vec<ProtoGridSeries> {
-    series
-        .into_iter()
-        .map(|s| {
-            let (presence, values, sample_lag) = encode_columns(
-                window_ends,
+    columnar_series_from(
+        window_ends,
+        series.into_iter().map(|s| {
+            (
+                s.labels,
                 s.samples
-                    .iter()
+                    .into_iter()
                     .map(|p| (p.timestamp, p.timestamp, p.value)),
-                false,
-            );
-            let (label_name_refs, label_value_refs) = symbols.intern_eval(&s.labels);
+            )
+        }),
+        false,
+        symbols,
+    )
+}
+
+/// Every entry's `(step, sample timestamp, value)` points as a columnar
+/// series, the one encoder behind every shape a grid response ships: rollup
+/// output and selection picks ([`columnar_series`]), and stepped selections,
+/// whose picks carry their own timestamp as a lag when `with_lag` asks.
+pub(super) fn columnar_series_from<I>(
+    window_ends: &[i64],
+    entries: impl IntoIterator<Item = (EvalLabels, I)>,
+    with_lag: bool,
+    symbols: &mut SymbolTableBuilder,
+) -> Vec<ProtoGridSeries>
+where
+    I: Iterator<Item = (i64, i64, f64)>,
+{
+    entries
+        .into_iter()
+        .map(|(labels, points)| {
+            let (presence, values, sample_lag) = encode_columns(window_ends, points, with_lag);
+            let (label_name_refs, label_value_refs) = symbols.intern_eval(&labels);
             ProtoGridSeries {
                 labels: Vec::new(),
                 presence,

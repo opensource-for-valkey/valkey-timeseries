@@ -51,8 +51,7 @@ use crate::promql::functions::RollupKind;
 use crate::promql::generated::{
     AggregationKind as ProtoAggregationKind, GridAggregation as ProtoGridAggregation,
     GridGroupPartial, GridQuery, GridQueryResponse, GridRollup as ProtoGridRollup,
-    GridSeries as ProtoGridSeries, RollupKind as ProtoRollupKind,
-    SeriesSelector as ProtoSeriesSelector,
+    RollupKind as ProtoRollupKind, SeriesSelector as ProtoSeriesSelector,
 };
 use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::model::RangeSample;
@@ -68,7 +67,7 @@ mod columns;
 mod tests;
 mod transport;
 
-use columns::{columnar_series, decode_columns, encode_columns};
+use columns::{columnar_series, columnar_series_from, decode_columns};
 use transport::ships_raw;
 
 pub(in crate::promql) struct GridFanoutCommand {
@@ -202,8 +201,7 @@ impl GridFanoutCommand {
         }
         let deadline = &deadline;
         request.per_series_chunked(&window_ends, raw, deadline, |chunk, read| {
-            let added = sink.take(&request, chunk, deadline)?;
-            budget.charge(added.saturating_sub(read))
+            sink.take_charged(&request, chunk, read, deadline, &budget)
         })?;
         sink.finish(deadline).map_err(QueryError::from)
     }
@@ -553,7 +551,7 @@ impl<'a> ShardGrid<'a> {
     /// there are steps ([`ships_raw`]), so its stage output is never the
     /// larger, and a sparse series that would expand waits for
     /// [`Self::finish`], which ships it raw or folds it. What `staged` holds is
-    /// still charged past the spans staged into it ([`Self::stage`]): a fused
+    /// still charged past the spans staged into it ([`GridSink::take_charged`]): a fused
     /// selection's candidates need not be fewer than its input.
     ///
     /// Fails only for a fused selection: it refuses its parameter, or the
@@ -563,39 +561,16 @@ impl<'a> ShardGrid<'a> {
             .into_iter()
             .partition(|series| ships_raw(self.window_ends, series));
         self.raw.extend(raw);
-        self.staged_groups.extend(transport::staged_groups(
-            self.request,
-            staged.iter().map(|series| (series, &false)),
-        ));
+        self.staged_groups
+            .extend(transport::staged_groups(self.request, staged.iter()));
         if !staged.is_empty() {
             let read = staged.iter().map(|series| series.samples.len()).sum();
             let output = self.request.per_series(self.window_ends, staged);
-            Self::stage(
-                &mut self.staged,
-                self.request,
-                output,
-                read,
-                self.budget,
-                &self.deadline,
-            )
-            .map_err(shard_error)?;
+            self.staged
+                .take_charged(self.request, output, read, &self.deadline, self.budget)
+                .map_err(shard_error)?;
         }
         Ok(())
-    }
-
-    /// Take one batch of stage output, charging `budget` for what the sink now
-    /// holds beyond the `read` raw samples the batch was built from, which the
-    /// read already charged.
-    fn stage(
-        staged: &mut GridSink,
-        request: &GridRequest,
-        output: GridSeries,
-        read: usize,
-        budget: &SampleBudget,
-        deadline: &Deadline,
-    ) -> QueryResult<()> {
-        let added = staged.take(request, output, deadline)?;
-        budget.charge(added.saturating_sub(read))
     }
 
     /// The response, once every batch is in: the raw spans that stay raw, and
@@ -609,10 +584,8 @@ impl<'a> ShardGrid<'a> {
         let request = self.request;
         let window_ends = self.window_ends;
         let candidates = std::mem::take(&mut self.raw);
-        let promoted = {
-            let candidates: Vec<&RangeSample<EvalLabels>> = candidates.iter().collect();
-            transport::promoted_raw(request, window_ends, &candidates, &self.staged_groups)
-        };
+        let promoted =
+            transport::promoted_raw(request, window_ends, &candidates, &self.staged_groups);
         let mut raw = Vec::with_capacity(candidates.len());
         let mut folded = Vec::new();
         for (series, promote) in candidates.into_iter().zip(promoted) {
@@ -625,7 +598,7 @@ impl<'a> ShardGrid<'a> {
         let (staged, budget, deadline) = (&mut self.staged, self.budget, &self.deadline);
         request
             .per_series_chunked(window_ends, folded, deadline, |output, read| {
-                Self::stage(staged, request, output, read, budget, deadline)
+                staged.take_charged(request, output, read, deadline, budget)
             })
             .map_err(shard_error)?;
         respond(request, window_ends, raw, self.staged, &self.deadline)
@@ -648,8 +621,39 @@ fn respond(
         .map(|series| range_sample_to_proto(series, &mut symbols))
         .collect::<ValkeyResult<Vec<_>>>()?;
 
-    let staged = match staged {
-        GridSink::Series(series) => series,
+    let (series, partials) = match staged {
+        // A stepped selection carries each pick's own timestamp as a lag when
+        // the request asked for it; nothing else has one.
+        GridSink::Series(GridSeries::Stepped(series)) => (
+            columnar_series_from(
+                window_ends,
+                series.into_iter().map(|s| {
+                    (
+                        s.labels,
+                        s.points
+                            .into_iter()
+                            .map(|p| (p.step_ts, p.sample.timestamp, p.sample.value)),
+                    )
+                }),
+                request.sample_timestamps,
+                &mut symbols,
+            ),
+            Vec::new(),
+        ),
+        GridSink::Series(GridSeries::Rolled(series)) => (
+            columnar_series(window_ends, series, &mut symbols),
+            Vec::new(),
+        ),
+        // A fused selecting or counting operator: its picks over everything
+        // staged here — k series per step, or one count per value — ship as
+        // candidates rather than every series.
+        GridSink::Selection(selection) => {
+            let selected = selection.finalize(deadline).map_err(shard_error)?;
+            (
+                columnar_series(window_ends, selected, &mut symbols),
+                Vec::new(),
+            )
+        }
         // A fused reduction: the partials were folded as the series were staged.
         GridSink::Partials(groups) => {
             let partials = groups
@@ -665,55 +669,13 @@ fn respond(
                     }
                 })
                 .collect();
-            return Ok(GridQueryResponse {
-                series: Vec::new(),
-                partials,
-                raw,
-                labels: Some(symbols.finish()),
-            });
+            (Vec::new(), partials)
         }
-        // A fused selecting or counting operator: its picks over everything
-        // staged here — k series per step, or one count per value — ship as
-        // candidates rather than every series.
-        GridSink::Selection(selection) => {
-            let selected = selection.finalize(deadline).map_err(shard_error)?;
-            return Ok(GridQueryResponse {
-                series: columnar_series(window_ends, selected, &mut symbols),
-                partials: Vec::new(),
-                raw,
-                labels: Some(symbols.finish()),
-            });
-        }
-    };
-
-    let series = match staged {
-        GridSeries::Stepped(series) => series
-            .into_iter()
-            .map(|s| {
-                let (presence, values, sample_lag) = encode_columns(
-                    window_ends,
-                    s.points
-                        .iter()
-                        .map(|p| (p.step_ts, p.sample.timestamp, p.sample.value)),
-                    request.sample_timestamps,
-                );
-                let (label_name_refs, label_value_refs) = symbols.intern_eval(&s.labels);
-                ProtoGridSeries {
-                    labels: Vec::new(),
-                    presence,
-                    values,
-                    sample_lag,
-                    label_name_refs,
-                    label_value_refs,
-                }
-            })
-            .collect(),
-        GridSeries::Rolled(series) => columnar_series(window_ends, series, &mut symbols),
     };
 
     Ok(GridQueryResponse {
         series,
-        partials: Vec::new(),
+        partials,
         raw,
         labels: Some(symbols.finish()),
     })
