@@ -440,17 +440,36 @@ mod tests {
     fn range_duplicate_selectors_are_deduplicated() {
         let (counting, reader) = build_reader();
         // Both operands share one PreloadKey, so one fetch serves both sides
-        // at every step — and one label profile, asked before planning,
-        // serves both operands of the binary operation.
+        // at every step. They share one profile too, which could change
+        // nothing, so none is asked for.
         run_range(reader, "a + a");
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
                 query_grid: 1,
-                label_profile: 1,
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn range_one_selector_at_two_offsets_asks_for_no_profile() {
+        let (counting, reader) = build_reader();
+        // `SelectorKey` leaves out the offset: both operands are one profile.
+        run_range(reader, "a - a offset 5m");
+        assert_eq!(counting.counts().label_profile, 0);
+    }
+
+    #[test]
+    fn range_one_selector_under_nested_subqueries_asks_for_no_profile() {
+        let (counting, reader) = build_reader();
+        // Nor the matrix range, the subqueries or the functions around it.
+        run_range(
+            reader,
+            "max_over_time(max_over_time(rate(a[1m])[5m:1m])[30m:5m]) \
+             - min_over_time(max_over_time(rate(a[1m])[5m:1m])[30m:5m])",
+        );
+        assert_eq!(counting.counts().label_profile, 0);
     }
 
     #[test]
@@ -611,7 +630,6 @@ mod tests {
             counting.counts(),
             ReaderCallCounts {
                 query_grid: 1,
-                label_profile: 1, // one selector, one profile (short-circuit candidate)
                 ..Default::default()
             }
         );
@@ -690,7 +708,6 @@ mod tests {
             ReaderCallCounts {
                 query_range: 1,
                 query_grid: 1,
-                label_profile: 1,
                 ..Default::default()
             }
         );

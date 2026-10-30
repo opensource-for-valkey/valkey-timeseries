@@ -27,8 +27,9 @@
 //! matrix range, and each enclosing subquery's grid applied — so a series
 //! that stopped reporting before it (a rolled-out pod) is left out, but one
 //! with a sample anywhere in it is in, at whichever step. A selector that
-//! occurs more than once is profiled once, over the hull of its windows.
-//! Unauthorized series are counted too. Where a profile is unavailable, the
+//! occurs more than once is profiled once, over the hull of its windows, and
+//! one that is the only selector (`cpu - cpu offset 5m`) is not profiled at
+//! all. Unauthorized series are counted too. Where a profile is unavailable, the
 //! leaf behaves exactly as in the static pass.
 
 use crate::common::logging::log_debug;
@@ -258,6 +259,12 @@ impl ProfiledLeaves {
                 }
             }
         }
+        // One profile shared by every leaf can neither narrow (its filters
+        // hold for every series it is pushed into) nor short-circuit (the
+        // operands are empty together or not at all), so skip the read.
+        if unique.len() == 1 {
+            return Ok(Self::empty());
+        }
         let windows = unique
             .iter()
             .map(|(key, (_, window))| (*key, *window))
@@ -296,7 +303,17 @@ impl ProfiledLeaves {
         })
     }
 
-    /// No selector sits under an operation the push-down applies to.
+    fn empty() -> Self {
+        Self {
+            by_node: AHashMap::new(),
+            profiles: AHashMap::new(),
+            windows: AHashMap::new(),
+            derived: RefCell::default(),
+        }
+    }
+
+    /// No selector sits under an operation the push-down applies to, or
+    /// none whose profile could change the tree.
     fn is_empty(&self) -> bool {
         self.by_node.is_empty()
     }
@@ -749,8 +766,9 @@ mod tests {
             rewrite("cpu - cpu offset 5m", &reader),
             "cpu - cpu offset 5m"
         );
-        // One profile for the two occurrences.
-        assert_eq!(reader.asked.lock().unwrap().len(), 1);
+        // One profile would serve both occurrences, and could change
+        // nothing, so none is asked for.
+        assert!(reader.asked.lock().unwrap().is_empty());
     }
 
     /// With the static optimizer on, a range query gets its rewrites but not
@@ -1339,12 +1357,17 @@ mod tests {
 
     #[test]
     fn a_selector_occurring_twice_is_profiled_once_over_the_hull() {
+        // `y` keeps the pass from skipping a tree of one profile.
+        let query = "(x - x offset 1h) * y";
         let reader = TableReader::new(vec![]);
-        rewrite("x - x offset 1h", &reader);
-        assert_eq!(reader.asked.lock().unwrap().len(), 1);
+        rewrite(query, &reader);
+        assert_eq!(reader.asked.lock().unwrap().len(), 2);
         assert_eq!(
-            windows("x - x offset 1h"),
-            vec![window("x", -LOOKBACK, 2 * HOUR)]
+            windows(query),
+            vec![
+                window("x", -LOOKBACK, 2 * HOUR),
+                window("y", HOUR - LOOKBACK, 2 * HOUR)
+            ]
         );
     }
 
