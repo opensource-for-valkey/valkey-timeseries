@@ -81,13 +81,7 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
         ctx: &FanoutContext,
         req: InstantQuery,
     ) -> ValkeyResult<InstantQueryResponse> {
-        let Some(selector) = req.selector else {
-            ctx.log_warning("Received instant query with no selector, returning empty response");
-            return Ok(InstantQueryResponse {
-                samples: vec![],
-                labels: Some(Default::default()),
-            });
-        };
+        let selector = super::required(req.selector, "selector")?;
         let series_selector: SeriesSelector = (&selector).try_into()?;
         // The response is the samples read, so the budget is held until it is returned.
         let read = shard_read(ctx)?;
@@ -121,12 +115,14 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
         super::time_budget_from_wire(req.time_budget_ms)
     }
 
-    fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
+    fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult {
         let symbol_table = resp.labels.unwrap_or_default();
         let mut resolver = symbol_table::EvalLabelResolver::new(&symbol_table);
         self.results.reserve(resp.samples.len());
         for mut s in resp.samples {
-            let labels = resolver.resolve(&mut s)?;
+            let labels = resolver
+                .resolve(&mut s)
+                .map_err(|why| super::peer_error(target, "returned malformed labels", why))?;
             let fingerprint = labels.fingerprint();
             if !self.seen.insert(fingerprint) {
                 // error. we have a duplicate

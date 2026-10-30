@@ -138,12 +138,7 @@ impl FanoutCommand for LabelProfileFanoutCommand {
         req: LabelProfileQuery,
     ) -> ValkeyResult<LabelProfileResponse> {
         let window = window_from_wire(&req);
-        let Some(selector) = req.selector else {
-            ctx.log_warning(
-                "Received label profile query with no selector, returning empty response",
-            );
-            return Ok(LabelProfileResponse::default());
-        };
+        let selector = super::required(req.selector, "selector")?;
         let series_selector: SeriesSelector = (&selector).try_into()?;
         // Locks per batch of matched series, not for the whole read.
         Ok(

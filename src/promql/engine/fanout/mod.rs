@@ -19,7 +19,7 @@ pub(in crate::promql) use type_conversions::{
 use valkey_module::{ValkeyError, ValkeyResult};
 
 use crate::error_consts;
-use crate::fanout::{ErrorKind, FanoutContext, FanoutError, register_fanout_operation};
+use crate::fanout::{ErrorKind, FanoutContext, FanoutError, NodeInfo, register_fanout_operation};
 use crate::promql::QueryError;
 use crate::promql::deadline::Deadline;
 
@@ -40,6 +40,25 @@ pub(super) fn shard_error(err: impl Into<QueryError>) -> ValkeyError {
         QueryError::Execution(message) => ValkeyError::String(message),
         other => ValkeyError::String(other.to_string()),
     }
+}
+
+/// A field a fan-out request must carry, or the error the shard answers with.
+/// A request without it is corrupt, not empty: refusing it keeps a malformed
+/// peer from reading as "nothing matched here".
+pub(super) fn required<T>(field: Option<T>, what: &str) -> ValkeyResult<T> {
+    field.ok_or_else(|| ValkeyError::String(format!("TSDB: fan-out request has no {what}")))
+}
+
+/// A peer's answer this node could not use, reported against the peer.
+pub(super) fn peer_error(
+    target: &NodeInfo,
+    what: &str,
+    why: impl std::fmt::Display,
+) -> FanoutError {
+    FanoutError::custom(format!(
+        "TSDB: peer {} {what}: {why}",
+        target.socket_address
+    ))
 }
 
 impl From<FanoutError> for QueryError {
@@ -108,6 +127,15 @@ mod tests {
     /// What a shard's refusal becomes on the coordinator, through the string it travels as.
     fn across_the_fanout(err: impl ToString) -> QueryError {
         FanoutError::from(err.to_string().as_str()).into()
+    }
+
+    /// A request missing a field it must carry is refused, naming the field,
+    /// rather than answered as if it matched nothing.
+    #[test]
+    fn required_refuses_a_missing_field() {
+        let err = required(None::<u8>, "selector").unwrap_err();
+        assert!(err.to_string().contains("no selector"), "{err}");
+        assert_eq!(required(Some(3u8), "selector").unwrap(), 3);
     }
 
     #[test]

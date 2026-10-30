@@ -218,11 +218,8 @@ impl FanoutCommand for GridFanoutCommand {
     }
 
     fn get_local_response(ctx: &FanoutContext, req: GridQuery) -> ValkeyResult<GridQueryResponse> {
-        let Some(selector) = req.selector.clone() else {
-            ctx.log_warning("Received grid query with no selector, returning empty response");
-            return Ok(GridQueryResponse::default());
-        };
-        let series_selector: SeriesSelector = (&selector).try_into()?;
+        let selector = super::required(req.selector.as_ref(), "selector")?;
+        let series_selector: SeriesSelector = selector.try_into()?;
         let request = decode_request(&req)?;
 
         let window_ends = grid_window_ends(
@@ -297,12 +294,8 @@ impl FanoutCommand for GridFanoutCommand {
         // resolved to interned labels: each distinct pair once per response.
         let table = resp.labels.take().unwrap_or_default();
         let mut resolver = EvalLabelResolver::new(&table);
-        let malformed = |why: ValkeyError| {
-            FanoutError::custom(format!(
-                "TSDB: peer {} returned malformed labels: {why}",
-                target.socket_address,
-            ))
-        };
+        let malformed =
+            |why: ValkeyError| super::peer_error(target, "returned malformed labels", why);
 
         // Corrupt-peer defenses. A request fused with a reduction is answered
         // in partials; every other request in series — a fused selection's
@@ -351,10 +344,7 @@ impl FanoutCommand for GridFanoutCommand {
             for mut series in resp.series {
                 let labels = resolver.resolve(&mut series).map_err(malformed)?;
                 let points = decode_columns(&self.window_ends, &series).map_err(|why| {
-                    FanoutError::custom(format!(
-                        "TSDB: peer {} returned a malformed grid series: {why}",
-                        target.socket_address,
-                    ))
+                    super::peer_error(target, "returned a malformed grid series", why)
                 })?;
                 match &mut output {
                     GridSeries::Rolled(rolled) => rolled.push(RangeSample {
@@ -389,10 +379,7 @@ impl FanoutCommand for GridFanoutCommand {
             .into_iter()
             .map(|raw| {
                 let series = range_sample_from_proto(raw, &mut resolver).map_err(|why| {
-                    FanoutError::custom(format!(
-                        "TSDB: peer {} returned an undecodable raw series: {why}",
-                        target.socket_address,
-                    ))
+                    super::peer_error(target, "returned an undecodable raw series", why)
                 })?;
                 raw_samples += series.samples.len();
                 Ok(series)

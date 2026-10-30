@@ -240,7 +240,9 @@ impl AggregationFanoutCommand {
             unreachable!("BUG: partial states arrive only for a reduction");
         };
         for mut partial in partials {
-            let labels = resolver.resolve(&mut partial)?;
+            let labels = resolver
+                .resolve(&mut partial)
+                .map_err(|why| super::peer_error(target, "returned malformed labels", why))?;
             let state = decode_peer_partial(
                 partial.state,
                 target,
@@ -268,18 +270,8 @@ impl FanoutCommand for AggregationFanoutCommand {
         ctx: &FanoutContext,
         req: AggregationQuery,
     ) -> ValkeyResult<AggregationQueryResponse> {
-        let Some(query) = req.query else {
-            ctx.log_warning(
-                "Received aggregation query with no instant-vector parameters, returning empty response",
-            );
-            return Ok(AggregationQueryResponse::default());
-        };
-        let Some(selector) = query.selector else {
-            ctx.log_warning(
-                "Received aggregation query with no selector, returning empty response",
-            );
-            return Ok(AggregationQueryResponse::default());
-        };
+        let query = super::required(req.query, "instant-vector parameters")?;
+        let selector = super::required(query.selector, "selector")?;
         let series_selector: SeriesSelector = (&selector).try_into()?;
         // Held to the end, through the aggregation: the coordinator counts only the groups
         // that come back, so this is all that counts the input while it is held here.
@@ -372,8 +364,12 @@ impl FanoutCommand for AggregationFanoutCommand {
         let mut resolver = symbol_table::EvalLabelResolver::new(&labels);
         let samples = std::mem::take(&mut resp.samples)
             .into_iter()
-            .map(|s| resolver.resolve_sample(s))
-            .collect::<ValkeyResult<Vec<EvalSample>>>()?;
+            .map(|s| {
+                resolver
+                    .resolve_sample(s)
+                    .map_err(|why| super::peer_error(target, "returned malformed labels", why))
+            })
+            .collect::<Result<Vec<EvalSample>, FanoutError>>()?;
         if !resp.applied {
             // Self-describing response from a peer that did not aggregate.
             self.raw.extend(samples);

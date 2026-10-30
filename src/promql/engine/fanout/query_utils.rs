@@ -73,7 +73,7 @@ impl<'b, T> ChargedSamples<'b, T> {
             // its words, and lets the sample through if the count was stale after all.
             self.budget
                 .check_ahead(self.uncharged + 1)
-                .map_err(budget_error)?;
+                .map_err(super::shard_error)?;
             self.room = self.uncharged + self.budget.room();
         }
         self.samples.push(sample);
@@ -86,7 +86,7 @@ impl<'b, T> ChargedSamples<'b, T> {
 
     fn charge(&mut self) -> ValkeyResult<()> {
         let samples = std::mem::take(&mut self.uncharged);
-        self.budget.charge(samples).map_err(budget_error)?;
+        self.budget.charge(samples).map_err(super::shard_error)?;
         self.room = self.budget.room();
         Ok(())
     }
@@ -96,11 +96,6 @@ impl<'b, T> ChargedSamples<'b, T> {
         self.charge()?;
         Ok(self.samples)
     }
-}
-
-/// A sample-budget refusal as a shard read reports it, in the words the coordinator relays.
-fn budget_error(err: crate::promql::QueryError) -> valkey_module::ValkeyError {
-    valkey_module::ValkeyError::String(err.to_string())
 }
 
 /// The newest sample in the lookback window `(timestamp - lookback_delta, timestamp]` of
@@ -343,7 +338,7 @@ where
                 pending = pending.saturating_add(snapshot.min_samples());
                 read.budget
                     .check_ahead(pending)
-                    .map_err(|err| valkey_module::ValkeyError::String(err.to_string()))?;
+                    .map_err(super::shard_error)?;
                 copied.push((labels(s), snapshot));
             }
             Ok(copied)
@@ -405,13 +400,11 @@ pub(super) fn local_grid_windows<S: GilSource + ?Sized>(
             let candidates = snapshots
                 .into_par_rayon()
                 .map(|(labels, snapshot)| {
-                    if !decode_within_budget(budget, &snapshot).map_err(|err| err.to_string())? {
-                        return Ok(None);
+                    if !decode_within_budget(budget, &snapshot)? {
+                        return Ok::<_, QueryError>(None);
                     }
                     let samples = snapshot.get_range();
-                    budget
-                        .charge(samples.len())
-                        .map_err(|err| err.to_string())?;
+                    budget.charge(samples.len())?;
                     // A snapshot with chunks can still hold nothing inside the
                     // span: the chunks only overlap it.
                     Ok((!samples.is_empty())
@@ -419,7 +412,7 @@ pub(super) fn local_grid_windows<S: GilSource + ?Sized>(
                 })
                 .into_fallible()
                 .collect::<Vec<_>>()
-                .map_err(valkey_module::ValkeyError::String)?;
+                .map_err(super::shard_error)?;
             let windows = bounds.admit(candidates);
             if bounds.over_series() {
                 // `finish` refuses the read whatever the rest holds.
@@ -567,28 +560,25 @@ pub(super) fn handle_range_query<S: GilSource + ?Sized>(
             let batch = snapshots
                 .into_par_rayon()
                 .map(|(labels, snapshot)| {
-                    if !decode_within_budget(budget, &snapshot).map_err(|err| err.to_string())? {
-                        return Ok(None);
+                    if !decode_within_budget(budget, &snapshot)? {
+                        return Ok::<_, QueryError>(None);
                     }
                     // Streams against the per-series point limit, so an
                     // over-wide span is rejected having kept at most the
                     // permitted samples.
-                    let series_samples =
-                        get_snapshot_range(&snapshot, max_points).map_err(|e| e.to_string())?;
-                    budget
-                        .charge(series_samples.len())
-                        .map_err(|err| err.to_string())?;
+                    let series_samples = get_snapshot_range(&snapshot, max_points)?;
+                    budget.charge(series_samples.len())?;
                     if series_samples.is_empty() {
                         return Ok(None);
                     }
                     let data = serialize_chunk(samples_to_chunk_lossless(series_samples))
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| QueryError::Execution(e.to_string()))?;
                     Ok(Some((labels, data)))
                 })
                 .into_fallible()
                 .filter_map(|range| range)
                 .collect::<Vec<_>>()
-                .map_err(valkey_module::ValkeyError::String)?;
+                .map_err(super::shard_error)?;
             ranges.extend(batch);
             // Refused below whatever the rest holds: copy no more batches.
             Ok(if exceeds_max_series(ranges.len(), max_series as usize) {
