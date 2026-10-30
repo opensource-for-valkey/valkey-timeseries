@@ -49,13 +49,12 @@ fn optimize_statement(
     if options.optimize_queries {
         // Keep this at the shared evaluation boundary so command handlers and
         // the convenience API apply precisely the same optional rewrites.
-        let expr = stmt.expr.clone();
+        let expr = std::mem::replace(&mut stmt.expr, promql_parser::parser::Expr::from(0.0));
         stmt.expr = if push_down_filters {
             optimize_expr(expr)
         } else {
             simplify_expr(expr)
-        }
-        .map_err(|e| QueryError::InvalidQuery(format!("optimization error: {e}")))?;
+        };
     }
     Ok(())
 }

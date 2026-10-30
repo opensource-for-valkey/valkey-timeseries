@@ -216,7 +216,7 @@ mod tests {
     #[case(r#"foo{x="y",a="b",c="d" or c="d",a="b"}"#, r#"{a="b",c="d"}"#)]
     fn test_get_common_label_filters(#[case] q: &str, #[case] result_expected: &str) {
         let e = parse_selector(q);
-        let expr = optimize_expr(e).expect("unexpected error in optimize()");
+        let expr = optimize_expr(e);
 
         let mut lfs = get_common_label_filters(&expr);
         lfs.sort_by(|a, b| a.name.cmp(&b.name));
@@ -722,7 +722,7 @@ mod tests {
     fn validate_optimized(q: &str, expected: &str) {
         let e = parse_selector(q);
         let _orig = e.to_string();
-        let e_optimized = optimize_expr(e.clone()).expect("unexpected error in optimize()");
+        let e_optimized = optimize_expr(e.clone());
         let e_expected = parse_selector(expected);
 
         assert_eq!(

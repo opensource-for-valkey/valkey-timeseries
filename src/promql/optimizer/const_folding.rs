@@ -28,24 +28,15 @@ pub(super) fn fold_constants(expr: Expr) -> Expr {
 }
 
 fn handle_unary_expr(ue: UnaryExpr) -> Expr {
-    let mut ue = ue;
-    match *ue.expr {
-        Expr::NumberLiteral(n) => {
-            return Expr::from(-n.val);
-        }
-        Expr::Unary(u2) => {
-            // Fully evaluate the inner UnaryExpr before applying the outer negation.
-            let inner_result = handle_unary_expr(u2);
-            if let Expr::NumberLiteral(n) = inner_result {
-                // inner produced a numeric constant; apply the outer negation
-                return Expr::from(-n.val);
-            }
-            // inner could not be reduced to a literal; preserve the nested structure
-            ue.expr = Box::new(inner_result);
-        }
-        _ => {}
+    // Fold the operand first, whatever it is — a literal, a nested negation,
+    // a parenthesized constant expression — and negate it if it became a
+    // number.
+    match fold_constants(*ue.expr) {
+        Expr::NumberLiteral(n) => Expr::from(-n.val),
+        operand => Expr::Unary(UnaryExpr {
+            expr: Box::new(operand),
+        }),
     }
-    Expr::Unary(ue)
 }
 
 fn handle_binop_internal(be: Expr) -> Expr {
@@ -196,15 +187,11 @@ pub(crate) fn extract_datetime_part(epoch_secs: f64, part: DateTimePart) -> Opti
 }
 
 fn handle_aggregation_expr(ae: AggregateExpr) -> Expr {
-    if let Some(param) = ae.param {
-        let arg = fold_constants(*param);
-        let ae = AggregateExpr {
-            param: Some(Box::new(arg)),
-            ..ae
-        };
-        return Expr::Aggregate(ae);
-    };
-    Expr::Aggregate(ae)
+    Expr::Aggregate(AggregateExpr {
+        expr: Box::new(fold_constants(*ae.expr)),
+        param: ae.param.map(|param| Box::new(fold_constants(*param))),
+        ..ae
+    })
 }
 
 fn handle_rollup_expr(re: SubqueryExpr) -> Expr {
@@ -236,6 +223,28 @@ mod tests {
             "Mismatch simplifying {input_expr}\n  Expected:{expected_expr}\n  Got:{}",
             simplified.prettify()
         );
+    }
+
+    /// Constants fold wherever they sit: inside an aggregation's operand and
+    /// under a unary minus, not only at the top of a binary expression. A
+    /// vector-typed operand is never folded away (`x * NaN` stays).
+    #[test]
+    fn folds_inside_aggregations_and_under_unary_minus() {
+        test_simplify("sum(x * (1 + 2))", "sum(x * 3)");
+        test_simplify(
+            "sum by (job) (rate(m[5m]) / (2 * 30))",
+            "sum by (job) (rate(m[5m]) / 60)",
+        );
+        test_simplify("sum(x * NaN)", "sum(x * NaN)");
+
+        let Expr::NumberLiteral(n) = fold_constants(parse("-(1 + 2)").unwrap()) else {
+            panic!("-(1 + 2) did not fold to a number");
+        };
+        assert_eq!(n.val, -3.0);
+        let Expr::NumberLiteral(n) = fold_constants(parse("-(-(2 * 2))").unwrap()) else {
+            panic!("-(-(2 * 2)) did not fold to a number");
+        };
+        assert_eq!(n.val, 4.0);
     }
 
     #[test]

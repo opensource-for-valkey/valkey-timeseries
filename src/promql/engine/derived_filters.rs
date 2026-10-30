@@ -785,7 +785,7 @@ mod tests {
         ]);
         let rewrite_simplified = |query: &str| {
             let expr = promql_parser::parser::parse(query).unwrap();
-            let mut expr = crate::promql::optimizer::simplify_expr(expr).unwrap();
+            let mut expr = crate::promql::optimizer::simplify_expr(expr);
             derive_filters_in_place(&mut expr, &reader, &grid(), options()).unwrap();
             expr.to_string()
         };

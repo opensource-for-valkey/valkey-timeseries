@@ -18,7 +18,6 @@
 // https://github.com/apache/arrow-datafusion/tree/main/datafusion/optimizer/src
 // https://github.com/apache/arrow-datafusion/blob/e222bd627b6e7974133364fed4600d74b4da6811/datafusion/optimizer/src/utils.rs
 
-use crate::parser::ParseResult;
 use crate::promql::optimizer::const_folding::fold_constants;
 use crate::promql::optimizer::filter_pushdown::pushdown_filters_in_place;
 use crate::promql::optimizer::utils::{expr_contains, is_null, is_number, is_op_with};
@@ -42,12 +41,12 @@ use promql_parser::parser::{BinaryExpr, Expr, ParenExpr};
 ///
 /// `b > 2`
 ///
-pub fn optimize_expr(expr: Expr) -> ParseResult<Expr> {
-    let mut expr = simplify_expr(expr)?;
+pub fn optimize_expr(expr: Expr) -> Expr {
+    let mut expr = simplify_expr(expr);
 
     // push down filters
     pushdown_filters_in_place(&mut expr);
-    Ok(expr)
+    expr
 }
 
 /// [`optimize_expr`] without the filter push-down: constant folding and the
@@ -56,7 +55,7 @@ pub fn optimize_expr(expr: Expr) -> ParseResult<Expr> {
 /// For a range query the data-derived pass (`engine::derived_filters`)
 /// pushes written filters too, but only where the index shows they prune;
 /// pushing them blindly first would leave matchers that pass cannot remove.
-pub fn simplify_expr(expr: Expr) -> ParseResult<Expr> {
+pub fn simplify_expr(expr: Expr) -> Expr {
     const MAX_OPTIMIZATION_PASSES: usize = 4;
 
     let mut expr = expr;
@@ -67,7 +66,7 @@ pub fn simplify_expr(expr: Expr) -> ParseResult<Expr> {
             break;
         }
     }
-    Ok(expr)
+    expr
 }
 
 /// Apply algebraic optimization rules to a binary expression.
@@ -583,12 +582,8 @@ mod tests {
     // ----- Simplifier tests -------
     // ------------------------------
 
-    fn try_simplify(expr: Expr) -> ParseResult<Expr> {
-        optimize_expr(expr)
-    }
-
     fn simplify(expr: Expr) -> Expr {
-        try_simplify(expr).unwrap()
+        optimize_expr(expr)
     }
 
     #[test]
