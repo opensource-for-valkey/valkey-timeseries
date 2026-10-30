@@ -4,7 +4,7 @@ use crate::promql::engine::label_profile::{LabelProfile, ProfileWindow};
 #[cfg(test)]
 use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
 use crate::promql::engine::query_reader::{
-    AggregationOutcome, AggregationRequest, GridOutcome, GridRequest,
+    AggregationOutcome, AggregationRequest, GridOutcome, GridRequest, raw_grid_read,
 };
 use crate::promql::engine::selector_batch_executor::SelectorBatchExecutor;
 use crate::promql::{InstantSample, QueryOptions, QueryResult, RangeSample};
@@ -101,7 +101,6 @@ impl QueryReader for ValkeySeriesQuerier {
         request: &GridRequest,
         options: QueryOptions,
     ) -> QueryResult<GridOutcome> {
-        let matchers: Matchers = normalize_selector(selector);
         // The toggle governs shipping the grid to *shards*: off, the raw span
         // comes back through the ordinary range fanout and the caller evaluates
         // it with the kernels a shard would have used — the same answer, at the
@@ -109,20 +108,9 @@ impl QueryReader for ValkeySeriesQuerier {
         // answered locally (`GridOutcome::Raw`) either way, which is also the
         // path the in-memory querier gives the PromQL conformance suite.
         if self.clustered && !crate::config::is_fanout_rollup_pushdown_enabled() {
-            let Some((start_ms, end_ms)) = request.fetch_bounds() else {
-                return Ok(GridOutcome::Raw(Vec::new()));
-            };
-            return SERIES_SELECTOR
-                .query_range(
-                    matchers,
-                    start_ms,
-                    end_ms,
-                    options,
-                    self.caller_user.clone(),
-                    self.hash_tags.clone(),
-                )
-                .map(GridOutcome::Raw);
+            return raw_grid_read(self, selector, request, options);
         }
+        let matchers: Matchers = normalize_selector(selector);
         SERIES_SELECTOR.query_grid(
             matchers,
             request.clone(),

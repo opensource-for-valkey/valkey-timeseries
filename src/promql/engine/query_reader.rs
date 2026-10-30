@@ -642,6 +642,25 @@ impl GridOutcome {
     }
 }
 
+/// A grid request answered from an ordinary range read: the span its windows
+/// cover, read raw, for the caller to run the kernels over
+/// ([`GridOutcome::Raw`]). What a source with nothing to push down to does —
+/// the trait default below, and the Valkey querier when shard push-down is
+/// switched off. A request with no windows reads nothing.
+pub(in crate::promql) fn raw_grid_read<R: QueryReader + ?Sized>(
+    reader: &R,
+    selector: &VectorSelector,
+    request: &GridRequest,
+    options: QueryOptions,
+) -> QueryResult<GridOutcome> {
+    let Some((start_ms, end_ms)) = request.fetch_bounds() else {
+        return Ok(GridOutcome::Raw(Vec::new()));
+    };
+    reader
+        .query_range(selector, start_ms, end_ms, options)
+        .map(GridOutcome::Raw)
+}
+
 pub trait QueryReader: Send + Sync {
     /// Query instant samples at `timestamp`.
     /// `deadline` is an optional absolute Instant by which the operation should complete.
@@ -694,11 +713,7 @@ pub trait QueryReader: Send + Sync {
         request: &GridRequest,
         options: QueryOptions,
     ) -> QueryResult<GridOutcome> {
-        let Some((start_ms, end_ms)) = request.fetch_bounds() else {
-            return Ok(GridOutcome::Raw(Vec::new()));
-        };
-        self.query_range(selector, start_ms, end_ms, options)
-            .map(GridOutcome::Raw)
+        raw_grid_read(self, selector, request, options)
     }
 
     /// The labels of the series `selector` matches, from the index rather
