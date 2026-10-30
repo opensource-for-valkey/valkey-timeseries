@@ -86,10 +86,6 @@ pub(in crate::promql) fn eval_datetime_function(
     }
 }
 
-fn sample_value(part: DateTimePart, dt: DateTime<Utc>) -> f64 {
-    part.extract(dt)
-}
-
 macro_rules! make_datetime_function {
     ( $name: ident, $func_name: literal, $part: expr ) => {
         #[derive(Copy, Clone)]
@@ -111,7 +107,7 @@ macro_rules! make_datetime_function {
                     0 => Ok(ExprResult::InstantVector(vec![EvalSample {
                         timestamp_ms: ctx.evaluation_ts,
                         value: datetime_from_millis(ctx.evaluation_ts)
-                            .map(|dt| sample_value($part, dt))
+                            .map(|dt| $part.extract(dt))
                             .unwrap_or(f64::NAN),
                         labels: EvalLabels::default(),
                         drop_name: false,

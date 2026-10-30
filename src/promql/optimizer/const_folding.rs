@@ -1,4 +1,3 @@
-use crate::parser::number::parse_number;
 use crate::promql::binops::apply_binary_op;
 use crate::promql::functions::{DateTimePart, PromqlFunctionKind, datetime_from_seconds};
 use num_traits::FloatConst;
@@ -102,12 +101,9 @@ fn get_single_scalar_arg(fe: &Call) -> Option<f64> {
     if fe.args.len() == 1 {
         match &*fe.args.args[0] {
             Expr::NumberLiteral(n) => return Some(n.val),
-            Expr::StringLiteral(s) => return parse_number(&s.val).ok(),
             Expr::Call(fe) if fe.func.name == "vector" && fe.args.len() == 1 => {
-                match &*fe.args.args[0] {
-                    Expr::NumberLiteral(n) => return Some(n.val),
-                    Expr::StringLiteral(s) => return parse_number(&s.val).ok(),
-                    _ => {}
+                if let Expr::NumberLiteral(n) = &*fe.args.args[0] {
+                    return Some(n.val);
                 }
             }
             _ => {}
@@ -118,10 +114,6 @@ fn get_single_scalar_arg(fe: &Call) -> Option<f64> {
 
 fn simplify_math_fn(fe: &Call, func: PromqlFunctionKind) -> Option<f64> {
     use PromqlFunctionKind::*;
-    let arg_count = fe.args.len();
-    if func == Pi && arg_count == 0 {
-        return Some(f64::PI());
-    }
     let arg = get_single_scalar_arg(fe)?;
     match func {
         Abs => Some(arg.abs()),
@@ -227,6 +219,7 @@ fn handle_rollup_expr(re: SubqueryExpr) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::number::parse_number;
     use promql_parser::parser::parse;
 
     // ------------------------------

@@ -39,7 +39,7 @@ use crate::promql::engine::label_profile::{LabelProfile, LabelValueProfile, Prof
 use crate::promql::engine::{QueryOptions, QueryReader};
 use crate::promql::exec::planner::PreloadGrid;
 use crate::promql::hashers::SelectorKey;
-use crate::promql::optimizer::pushdown::{LeafFilters, pushdown_filters_in_place_with};
+use crate::promql::optimizer::filter_pushdown::{LeafFilters, pushdown_filters_in_place_with};
 use crate::promql::time::{duration_ms, selector_bounds};
 use crate::promql::utils::subquery_step_ms;
 use crate::promql::{QueryError, QueryResult};

@@ -96,7 +96,6 @@ macro_rules! impl_promql_function_impl {
         use $crate::promql::functions::types::{FunctionCallContext, PromQLFunction};
         use $crate::promql::model::EvalContext;
 
-        #[allow(clippy::large_enum_variant)]
         #[derive(Copy, Clone)]
         pub(in crate::promql) enum PromQLFunctionImpl {
             $( $Variant($Ty), )*

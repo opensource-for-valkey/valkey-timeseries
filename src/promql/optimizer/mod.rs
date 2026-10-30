@@ -1,8 +1,8 @@
 mod const_folding;
-mod optimize;
-pub mod pushdown;
+pub mod filter_pushdown;
 #[cfg(test)]
-mod pushdown_tests;
+mod filter_pushdown_tests;
+mod optimize;
 mod utils;
 
 pub use optimize::{optimize_expr, simplify_expr};

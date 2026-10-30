@@ -20,7 +20,7 @@
 
 use crate::parser::ParseResult;
 use crate::promql::optimizer::const_folding::fold_constants;
-use crate::promql::optimizer::pushdown::pushdown_filters_in_place;
+use crate::promql::optimizer::filter_pushdown::pushdown_filters_in_place;
 use crate::promql::optimizer::utils::{expr_contains, is_null, is_number, is_op_with};
 use promql_parser::label::{Matcher, Matchers};
 use promql_parser::parser::token::{T_ADD, T_DIV, T_LAND, T_LOR, T_MUL, TokenType};
@@ -198,14 +198,11 @@ fn optimize_binary(binary: BinaryExpr) -> Expr {
     }
 }
 
-/// Simplifies [`Expr`]s by applying algebraic transformation rules
-///
-/// Example transformations that are applied:
-/// * `expr == bool 1` and `expr != false` to `expr` when `expr` is of boolean type
-/// * `expr != true` to `!expr` when `expr` is of boolean type
-/// * `1 == bool 1` to `1`
-/// * `0 == bool 1` to `0`
-/// * `expr == NaN` and `expr != NaN` to `NaN`
+/// One post-order pass of the algebraic rules over `expr`: binary operators
+/// through `optimize_binary_expr`, selectors through `dedupe_matchers`, and
+/// parentheses stripped where a simplified operand no longer needs them.
+/// Constant folding is `const_folding`'s job and runs before this in
+/// `simplify_expr`.
 fn optimize_internal(expr: Expr) -> Expr {
     match expr {
         Expr::Paren(p) => {

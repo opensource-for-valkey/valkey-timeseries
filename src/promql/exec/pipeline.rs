@@ -3,8 +3,8 @@
 //! All evaluator-backed query paths (instant vector selector, matrix selector,
 //! subquery vector-selector fast path) share the same logical execution model:
 //!
-//! 1. **Plan** – compute concrete time bounds, bucket list, path-specific parameters
-//! 2. **LoadSamples** – load sample data for explicit (bucket, series) work items
+//! 1. **Plan** – compute concrete time bounds and path-specific parameters
+//! 2. **LoadSamples** – read the selected series over those bounds
 //! 3. **ShapeSamples** – merge/filter/dedup into evaluator-ready per-series structures
 //! 4. **Evaluate** – run PromQL expression semantics on prepared in-memory inputs
 //!
@@ -55,10 +55,8 @@ pub(crate) struct QueryPlan {
 // ---------------------------------------------------------------------------
 
 impl QueryPlan {
-    /// Construct a plan for instant vector selector.
-    ///
-    /// Buckets sorted newest-first so that cross-bucket fingerprint dedup
-    /// can short-circuit on the first bucket that has data for a series.
+    /// Construct a plan for an instant vector selector: the lookback window
+    /// ending at the (modifier-adjusted) evaluation timestamp.
     pub(crate) fn for_instant_vector(
         adjusted_eval_ts_ms: Timestamp,
         lookback_delta_ms: Timestamp,
@@ -366,7 +364,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn instant_plan_sorts_buckets_newest_first() {
+    fn instant_plan_spans_the_lookback_window() {
         let plan = QueryPlan::for_instant_vector(500_000, 60_000);
         assert_eq!(plan.sample_start_ms, 500_000 - 60_000);
         assert_eq!(plan.sample_end_ms, 500_000);
