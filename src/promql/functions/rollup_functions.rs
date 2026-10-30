@@ -343,22 +343,14 @@ impl RollupKind {
         self,
         samples: &[Sample],
         window_ms: i64,
-        lookback_ms: i64,
-        step_ms: i64,
         window_ends: impl IntoIterator<Item = Timestamp>,
         param: Option<f64>,
         unit_ms: Option<i64>,
     ) -> Vec<Sample> {
         match self.implementation() {
-            RollupImpl::Windowed(f) => rollup_series_over_grid(
-                samples,
-                window_ms,
-                lookback_ms,
-                step_ms,
-                window_ends,
-                param,
-                f,
-            ),
+            RollupImpl::Windowed(f) => {
+                rollup_series_over_grid(samples, window_ms, window_ends, param, f)
+            }
             RollupImpl::WholeWindow(f) => {
                 Self::over_windows(samples, window_ms, window_ends, |window, _| Some(f(window)))
             }
@@ -834,9 +826,8 @@ mod tests {
     /// that is all the matrix selector loaded. The pushed-down path hands it the
     /// union of the grid's windows and lets it slice, because loading each
     /// window separately is the transfer the push-down exists to avoid. A rollup
-    /// that read the surrounding samples — [`RollupWindow`] offers them as
-    /// `prev_value`, `real_prev_value` and `real_next_value` — would answer
-    /// differently on the two paths for the same query.
+    /// that read the surrounding samples would answer differently on the two
+    /// paths for the same query.
     ///
     /// So every [`RollupKind`] must reduce a window identically with and without
     /// its neighbours in view. A function that cannot is not eligible for
@@ -856,22 +847,15 @@ mod tests {
             let (param, unit_ms) = kind.test_params();
 
             // The whole series in view, sliced per window — the grid path.
-            let with_context = kind.eval_windows(
-                &series,
-                window_ms,
-                0,
-                30_000,
-                ends.iter().copied(),
-                param,
-                unit_ms,
-            );
+            let with_context =
+                kind.eval_windows(&series, window_ms, ends.iter().copied(), param, unit_ms);
 
             // One window at a time, nothing else in view — the local path.
             let isolated: Vec<Sample> = ends
                 .iter()
                 .filter_map(|&end| {
                     let window = window_samples(&series, end, window_ms)?;
-                    kind.eval_windows(window, window_ms, 0, 30_000, [end], param, unit_ms)
+                    kind.eval_windows(window, window_ms, [end], param, unit_ms)
                         .pop()
                 })
                 .collect();
@@ -900,20 +884,13 @@ mod tests {
         let ends: Vec<Timestamp> = (0..=400_000).step_by(5_000).collect();
         let kind = RollupKind::StateDurationOverTime;
         for unit_ms in [None, Some(60_000)] {
-            let with_context = kind.eval_windows(
-                &series,
-                window_ms,
-                0,
-                5_000,
-                ends.iter().copied(),
-                Some(1.0),
-                unit_ms,
-            );
+            let with_context =
+                kind.eval_windows(&series, window_ms, ends.iter().copied(), Some(1.0), unit_ms);
             let isolated: Vec<Sample> = ends
                 .iter()
                 .filter_map(|&end| {
                     let window = window_samples(&series, end, window_ms)?;
-                    kind.eval_windows(window, window_ms, 0, 5_000, [end], Some(1.0), unit_ms)
+                    kind.eval_windows(window, window_ms, [end], Some(1.0), unit_ms)
                         .pop()
                 })
                 .collect();
@@ -941,20 +918,13 @@ mod tests {
         let window_ms = 25_000;
         let ends: Vec<Timestamp> = (0..=400_000).step_by(5_000).collect();
         let kind = RollupKind::StateCountOverTime;
-        let with_context = kind.eval_windows(
-            &series,
-            window_ms,
-            0,
-            5_000,
-            ends.iter().copied(),
-            Some(1.0),
-            None,
-        );
+        let with_context =
+            kind.eval_windows(&series, window_ms, ends.iter().copied(), Some(1.0), None);
         let isolated: Vec<Sample> = ends
             .iter()
             .filter_map(|&end| {
                 let window = window_samples(&series, end, window_ms)?;
-                kind.eval_windows(window, window_ms, 0, 5_000, [end], Some(1.0), None)
+                kind.eval_windows(window, window_ms, [end], Some(1.0), None)
                     .pop()
             })
             .collect();
@@ -991,7 +961,6 @@ mod tests {
             let window = RollupWindow {
                 values,
                 timestamps: &timestamps,
-                ..RollupWindow::default()
             };
             let want = rollup_max(&window, None) - rollup_min(&window, None);
             let got = rollup_range(&window, None);

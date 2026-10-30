@@ -159,35 +159,20 @@ pub(crate) trait PromQLFunction {
     }
 }
 
-/// One window's view for a rollup function.
+/// One window's view for a rollup function: the samples inside
+/// `(t - range, t]`, de-interleaved into parallel arrays.
 ///
-/// **`prev_value`, `real_prev_value` and `real_next_value` are only populated
-/// when the caller supplied samples outside the window**, and how much context a
-/// caller supplies differs by path: the local per-step path loads exactly
-/// `(t - range, t]` and so never fills them, while the pushed-down grid path
-/// loads the union of the grid's windows and fills them for every interior
-/// window. A rollup whose value depended on them would therefore answer
-/// differently depending on whether push-down was available — which is why
-/// [`crate::promql::functions::RollupKind`] may only contain functions that
-/// ignore them. `every_kind_ignores_samples_outside_the_window` enforces this.
+/// Nothing outside the window is offered. The local per-step path loads
+/// exactly the window, while the pushed-down grid path slices it out of the
+/// union of a grid's windows, so a kernel that could see its neighbours would
+/// answer differently depending on whether push-down was available.
+/// `every_kind_ignores_samples_outside_the_window` pins that the two paths
+/// agree for every [`crate::promql::functions::RollupKind`].
 #[derive(Default, Clone, Debug)]
 pub(super) struct RollupWindow<'a> {
-    /// The value preceding values if it fits the staleness interval.
-    pub(super) prev_value: f64,
-
-    /// The timestamp for prev_value.
-    pub(super) prev_timestamp: Timestamp,
-
     /// Values that fit the window.
     pub(crate) values: &'a [f64],
 
     /// Timestamps for values.
     pub(crate) timestamps: &'a [Timestamp],
-
-    /// Real value preceding value
-    /// Populated if the preceding value is within the staleness interval.
-    pub(super) real_prev_value: f64,
-
-    /// Real value that goes after values.
-    pub(crate) real_next_value: f64,
 }

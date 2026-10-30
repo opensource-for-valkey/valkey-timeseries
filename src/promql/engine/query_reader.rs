@@ -329,8 +329,6 @@ impl GridRequest {
                 let points = rollup.kind.eval_windows(
                     &s.samples,
                     rollup.range_ms,
-                    self.lookback_delta_ms,
-                    self.step_ms,
                     window_ends.iter().copied(),
                     rollup.param,
                     rollup.unit_ms,
