@@ -423,10 +423,34 @@ impl EvalLabels {
         self.get(key).is_some()
     }
 
-    /// Insert or update a label by `&str` key (convenience wrapper around
-    /// `insert` that accepts `&str` instead of `String`).
+    /// Insert or update a label by `&str` key.
+    ///
+    /// An `Interned` set stays interned: one new interned entry is spliced
+    /// into a copy of the slice, as [`Self::copy_label_from`] does, and setting
+    /// a label to the value it already has changes nothing. Going through
+    /// `insert` instead materialized every label as owned `String`s, per
+    /// sample per step for `label_replace`/`label_join`.
     pub(crate) fn set(&mut self, key: &str, value: String) {
-        self.insert(key.to_string(), value);
+        let EvalLabels::Interned(split) = self else {
+            self.insert(key.to_string(), value);
+            return;
+        };
+        let labels: Vec<InternedString> = match split.binary_search_by(|l| l.name().cmp(key)) {
+            Ok(i) if split[i].value() == value => return,
+            Ok(i) => {
+                let mut labels = split.to_vec();
+                labels[i] = InternedString::new_pair(key, &value);
+                labels
+            }
+            Err(i) => {
+                let mut labels = Vec::with_capacity(split.len() + 1);
+                labels.extend_from_slice(&split[..i]);
+                labels.push(InternedString::new_pair(key, &value));
+                labels.extend_from_slice(&split[i..]);
+                labels
+            }
+        };
+        *self = EvalLabels::Interned(Arc::from(labels));
     }
 
     /// Set `name` to its value in `source`, or remove it when `source` has
@@ -1415,6 +1439,34 @@ mod copy_label_tests {
 
     fn interned(pairs: &[(&str, &str)]) -> EvalLabels {
         EvalLabels::interned(&MetricName::from_pairs(pairs.iter().copied()))
+    }
+
+    /// `label_replace`/`label_join` write through `set`: on an interned set it
+    /// must splice one interned entry in, not materialize every label as owned
+    /// strings, and the result must equal the owned path's.
+    #[test]
+    fn set_keeps_an_interned_set_interned() {
+        let mut labels = interned(&[("a", "1"), ("c", "3")]);
+        let mut owned = EvalLabels::from_pairs(&[("a", "1"), ("c", "3")]);
+        for (name, value) in [("b", "2"), ("a", "9"), ("a", "9"), ("d", "4")] {
+            labels.set(name, value.to_string());
+            owned.set(name, value.to_string());
+            assert!(
+                matches!(labels, EvalLabels::Interned(_)),
+                "set({name}) left the interned variant"
+            );
+            assert_eq!(pairs(&labels), pairs(&owned), "after set({name}, {value})");
+            assert_eq!(labels, owned);
+        }
+        assert_eq!(
+            pairs(&labels),
+            vec![
+                ("a".to_string(), "9".to_string()),
+                ("b".to_string(), "2".to_string()),
+                ("c".to_string(), "3".to_string()),
+                ("d".to_string(), "4".to_string()),
+            ]
+        );
     }
 
     fn pairs(labels: &EvalLabels) -> Vec<(String, String)> {
