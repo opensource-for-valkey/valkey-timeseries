@@ -10,7 +10,7 @@ use crate::common::module_options::{HANDLE_IO_ERRORS, declare_module_options};
 use crate::common::threads::init_thread_pool;
 use crate::config::register_config;
 use crate::fanout::{init_fanout, is_clustered};
-use crate::promql::register_promql;
+use crate::promql::register_promql_fanout;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::ThreadId;
 use valkey_module::{Context, Status, ValkeyString, Version, valkey_module};
@@ -176,6 +176,11 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
         return Status::Err;
     }
 
+    if let Err(e) = crate::promql::register_parser_functions() {
+        ctx.log_warning(&format!("Failed to register PromQL functions: {e}"));
+        return Status::Err;
+    }
+
     if let Err(e) = register_server_event_handlers(ctx) {
         let msg = format!("Failed to register server event handlers: {e}");
         ctx.log_warning(&msg);
@@ -189,7 +194,7 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
             ctx.log_warning(&msg);
             return Status::Err;
         };
-        if let Err(e) = register_promql() {
+        if let Err(e) = register_promql_fanout() {
             let msg = format!("Failed to register promql: {e}");
             ctx.log_warning(&msg);
             return Status::Err;

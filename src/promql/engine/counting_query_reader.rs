@@ -22,7 +22,7 @@ use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationRequest, GridOutcome, GridRequest,
 };
 use crate::promql::model::{InstantSample, RangeSample};
-use crate::promql::{PromqlResult, QueryOptions};
+use crate::promql::{QueryOptions, QueryResult};
 use promql_parser::parser::VectorSelector;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -100,7 +100,7 @@ impl QueryReader for CountingQueryReader {
         selector: &VectorSelector,
         timestamp: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
+    ) -> QueryResult<Vec<InstantSample<EvalLabels>>> {
         self.query_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.query(selector, timestamp, options)
     }
@@ -111,7 +111,7 @@ impl QueryReader for CountingQueryReader {
         start_ms: i64,
         end_ms: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
+    ) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
         self.query_range_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.query_range(selector, start_ms, end_ms, options)
     }
@@ -122,7 +122,7 @@ impl QueryReader for CountingQueryReader {
         timestamp: i64,
         aggregation: &AggregationRequest,
         options: QueryOptions,
-    ) -> PromqlResult<AggregationOutcome> {
+    ) -> QueryResult<AggregationOutcome> {
         self.query_aggregation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner
             .query_aggregation(selector, timestamp, aggregation, options)
@@ -133,7 +133,7 @@ impl QueryReader for CountingQueryReader {
         selector: &VectorSelector,
         request: &GridRequest,
         options: QueryOptions,
-    ) -> PromqlResult<GridOutcome> {
+    ) -> QueryResult<GridOutcome> {
         self.query_grid_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.query_grid(selector, request, options)
     }
@@ -143,7 +143,7 @@ impl QueryReader for CountingQueryReader {
         selector: &VectorSelector,
         window: Option<ProfileWindow>,
         options: QueryOptions,
-    ) -> PromqlResult<Option<LabelProfile>> {
+    ) -> QueryResult<Option<LabelProfile>> {
         self.label_profile_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.label_profile(selector, window, options)
     }
@@ -440,17 +440,36 @@ mod tests {
     fn range_duplicate_selectors_are_deduplicated() {
         let (counting, reader) = build_reader();
         // Both operands share one PreloadKey, so one fetch serves both sides
-        // at every step — and one label profile, asked before planning,
-        // serves both operands of the binary operation.
+        // at every step. They share one profile too, which could change
+        // nothing, so none is asked for.
         run_range(reader, "a + a");
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
                 query_grid: 1,
-                label_profile: 1,
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn range_one_selector_at_two_offsets_asks_for_no_profile() {
+        let (counting, reader) = build_reader();
+        // `SelectorKey` leaves out the offset: both operands are one profile.
+        run_range(reader, "a - a offset 5m");
+        assert_eq!(counting.counts().label_profile, 0);
+    }
+
+    #[test]
+    fn range_one_selector_under_nested_subqueries_asks_for_no_profile() {
+        let (counting, reader) = build_reader();
+        // Nor the matrix range, the subqueries or the functions around it.
+        run_range(
+            reader,
+            "max_over_time(max_over_time(rate(a[1m])[5m:1m])[30m:5m]) \
+             - min_over_time(max_over_time(rate(a[1m])[5m:1m])[30m:5m])",
+        );
+        assert_eq!(counting.counts().label_profile, 0);
     }
 
     #[test]
@@ -611,7 +630,6 @@ mod tests {
             counting.counts(),
             ReaderCallCounts {
                 query_grid: 1,
-                label_profile: 1, // one selector, one profile (short-circuit candidate)
                 ..Default::default()
             }
         );
@@ -690,7 +708,6 @@ mod tests {
             ReaderCallCounts {
                 query_range: 1,
                 query_grid: 1,
-                label_profile: 1,
                 ..Default::default()
             }
         );
@@ -709,7 +726,7 @@ mod tests {
             selector: &promql_parser::parser::VectorSelector,
             timestamp: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::model::InstantSample<EvalLabels>>>
+        ) -> crate::promql::QueryResult<Vec<crate::promql::model::InstantSample<EvalLabels>>>
         {
             self.inner.query(selector, timestamp, options)
         }
@@ -720,7 +737,7 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::model::RangeSample<EvalLabels>>>
+        ) -> crate::promql::QueryResult<Vec<crate::promql::model::RangeSample<EvalLabels>>>
         {
             self.inner.query_range(selector, start_ms, end_ms, options)
         }
@@ -763,7 +780,7 @@ mod tests {
             selector: &promql_parser::parser::VectorSelector,
             timestamp: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::model::InstantSample<EvalLabels>>>
+        ) -> crate::promql::QueryResult<Vec<crate::promql::model::InstantSample<EvalLabels>>>
         {
             self.inner.query(selector, timestamp, options)
         }
@@ -774,7 +791,7 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::model::RangeSample<EvalLabels>>>
+        ) -> crate::promql::QueryResult<Vec<crate::promql::model::RangeSample<EvalLabels>>>
         {
             if end_ms - start_ms > self.max_span_ms {
                 return Err(crate::promql::QueryError::Execution(
@@ -950,7 +967,7 @@ mod tests {
             selector: &VectorSelector,
             timestamp: i64,
             options: QueryOptions,
-        ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
+        ) -> QueryResult<Vec<InstantSample<EvalLabels>>> {
             self.inner.query(selector, timestamp, options)
         }
 
@@ -960,7 +977,7 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
             options: QueryOptions,
-        ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
+        ) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
             self.inner.query_range(selector, start_ms, end_ms, options)
         }
 
@@ -970,7 +987,7 @@ mod tests {
             timestamp: i64,
             aggregation: &AggregationRequest,
             options: QueryOptions,
-        ) -> PromqlResult<AggregationOutcome> {
+        ) -> QueryResult<AggregationOutcome> {
             self.inner
                 .query_aggregation(selector, timestamp, aggregation, options)
         }
@@ -980,7 +997,7 @@ mod tests {
             selector: &VectorSelector,
             request: &GridRequest,
             options: QueryOptions,
-        ) -> PromqlResult<GridOutcome> {
+        ) -> QueryResult<GridOutcome> {
             if request.query_end - request.query_start > self.max_span_ms {
                 return Err(crate::promql::engine::sample_budget::too_many_samples(1, 1));
             }
@@ -992,7 +1009,7 @@ mod tests {
             selector: &VectorSelector,
             window: Option<ProfileWindow>,
             options: QueryOptions,
-        ) -> PromqlResult<Option<LabelProfile>> {
+        ) -> QueryResult<Option<LabelProfile>> {
             self.inner.label_profile(selector, window, options)
         }
     }

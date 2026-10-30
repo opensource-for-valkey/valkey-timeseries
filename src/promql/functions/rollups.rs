@@ -24,62 +24,105 @@ use crate::common::{Sample, Timestamp};
 use crate::promql::deadline::SERIES_WORK;
 use crate::promql::functions::types::RollupWindow;
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples};
-use num_traits::Zero;
 use orx_parallel::{Par, ParResult};
 
-/// Evaluate `rollup_fn` over each series' window, one value per series.
+/// The one per-series driver behind every range-vector function: `f` reduces
+/// each series to a value, or declines it, and the value is stamped with the
+/// query's evaluation timestamp — a shifted selector still reports at the step
+/// the client asked for. The series keeps its labels and pending `__name__`
+/// drop.
 ///
-/// The window is the one the matrix selector loaded: it ends at
-/// [`EvalSamples::range_end_ms`], which already carries any `@`/`offset`
-/// adjustment. The output is stamped with the query's evaluation timestamp
-/// instead, so a shifted selector still reports at the step the client asked
-/// for — the same rule [`crate::promql::functions::rate`] follows.
-///
-/// Series whose window holds no samples are dropped rather than emitted as NaN.
-pub(super) fn eval_rollups(
+/// The deadline is checked per series, weighted by its samples, before `f`
+/// runs over them: never inside `f`, whose loop over one series' samples is the
+/// one the compiler vectorizes. Empty series and declined ones produce nothing,
+/// which is how the caller tells "nothing to reduce" from "reduced to NaN".
+pub(super) fn eval_series<F>(
     ctx: &EvalContext,
-    range_vec: Vec<EvalSamples>,
-    optional_param: Option<f64>,
-    rollup_fn: fn(&RollupWindow, Option<f64>) -> f64,
-) -> EvalResult<Vec<EvalSample>> {
-    // Checked per series, weighted by its samples, outside the rollup's own loop over them.
+    series: Vec<EvalSamples>,
+    f: F,
+) -> EvalResult<Vec<EvalSample>>
+where
+    F: Fn(&EvalSamples) -> Option<f64> + Sync,
+{
     let deadline = ctx.deadline;
-    range_vec
+    series
         .into_par_rayon()
         .map(|series| -> EvalResult<Option<EvalSample>> {
             deadline.checkpoint(series.values.len() + SERIES_WORK)?;
-            Ok(exec_series_rollup(ctx, series, optional_param, rollup_fn))
+            if series.values.is_empty() {
+                return Ok(None);
+            }
+            let Some(value) = f(&series) else {
+                return Ok(None);
+            };
+            Ok(Some(EvalSample {
+                timestamp_ms: ctx.evaluation_ts,
+                value,
+                labels: series.labels,
+                drop_name: series.drop_name,
+            }))
         })
         .into_fallible()
         .filter_map(|sample| sample)
         .collect::<Vec<_>>()
 }
 
-/// Evaluate one series' rollup at the end of the window the selector loaded.
-fn exec_series_rollup(
+/// Evaluate `rollup_fn` over each series' window, one value per series.
+///
+/// The window is the one the matrix selector loaded: it ends at
+/// [`EvalSamples::range_end_ms`], which already carries any `@`/`offset`
+/// adjustment. Series whose window holds no samples are dropped rather than
+/// emitted as NaN.
+pub(super) fn eval_rollups(
     ctx: &EvalContext,
-    series: EvalSamples,
+    range_vec: Vec<EvalSamples>,
     optional_param: Option<f64>,
     rollup_fn: fn(&RollupWindow, Option<f64>) -> f64,
-) -> Option<EvalSample> {
-    let value = rollup_series_over_grid(
-        &series.values,
-        series.range_ms,
-        ctx.lookback_delta_ms,
-        ctx.step_ms,
-        [series.range_end_ms],
-        optional_param,
-        rollup_fn,
-    )
-    .pop()?;
-
-    Some(EvalSample {
-        // The window ends at `range_end_ms`, but the sample belongs to the step.
-        timestamp_ms: ctx.evaluation_ts,
-        value: value.value,
-        labels: series.labels,
-        drop_name: series.drop_name,
+) -> EvalResult<Vec<EvalSample>> {
+    eval_series(ctx, range_vec, |series| {
+        rollup_window_value(
+            &series.values,
+            series.range_end_ms,
+            series.range_ms,
+            optional_param,
+            rollup_fn,
+        )
     })
+}
+
+/// `rollup_fn` over the one window of `samples` ending at `window_end`, or
+/// `None` when that window is empty — the local per-step path, which has one
+/// window per series and no grid to amortize a pass over.
+///
+/// Only the window is de-interleaved, not the series around it. Same window
+/// rule as [`rollup_series_over_grid`]: `test_basic_and_vectorized_windows_agree`
+/// pins the two.
+pub(in crate::promql) fn rollup_window_value(
+    samples: &[Sample],
+    window_end: Timestamp,
+    window_ms: i64,
+    optional_param: Option<f64>,
+    rollup_fn: fn(&RollupWindow, Option<f64>) -> f64,
+) -> Option<f64> {
+    let window = window_samples(samples, window_end, window_ms)?;
+    let (values, timestamps) = deinterleave(window);
+    let window = RollupWindow {
+        values: &values,
+        timestamps: &timestamps,
+    };
+    Some(rollup_fn(&window, optional_param))
+}
+
+/// `samples` as parallel value and timestamp arrays: better cache locality for
+/// the kernels, and contiguous `f64`s for the compiler to vectorize over.
+fn deinterleave(samples: &[Sample]) -> (Vec<f64>, Vec<Timestamp>) {
+    let mut values: Vec<f64> = Vec::with_capacity(samples.len());
+    let mut timestamps: Vec<Timestamp> = Vec::with_capacity(samples.len());
+    for sample in samples {
+        values.push(sample.value);
+        timestamps.push(sample.timestamp);
+    }
+    (values, timestamps)
 }
 
 /// Evaluate `rollup_fn` for one series over the windows ending at each of
@@ -90,14 +133,9 @@ fn exec_series_rollup(
 /// length is *not* the number of window ends.
 ///
 /// `samples` must be sorted ascending by timestamp (the storage invariant).
-/// `step_ms` only bounds how far before the window start a preceding sample may
-/// sit and still be offered to `rollup_fn` as `prev_value`; pass 0 for a
-/// single-instant evaluation.
 pub(in crate::promql) fn rollup_series_over_grid(
     samples: &[Sample],
     window_ms: i64,
-    lookback_ms: i64,
-    step_ms: i64,
     window_ends: impl IntoIterator<Item = Timestamp>,
     optional_param: Option<f64>,
     rollup_fn: fn(&RollupWindow, Option<f64>) -> f64,
@@ -106,16 +144,8 @@ pub(in crate::promql) fn rollup_series_over_grid(
         return Vec::new();
     }
 
-    // De-interleave into parallel arrays: better cache locality, and it lets the
-    // compiler use SIMD for the rollup arithmetic.
-    let mut values: Vec<f64> = Vec::with_capacity(samples.len());
-    let mut timestamps: Vec<Timestamp> = Vec::with_capacity(samples.len());
-    for sample in samples {
-        values.push(sample.value);
-        timestamps.push(sample.timestamp);
-    }
-
-    let prev_step = if step_ms > 0 { step_ms } else { 1 };
+    // One de-interleave for every window of the grid.
+    let (values, timestamps) = deinterleave(samples);
     let mut cursor = 0usize;
 
     window_ends
@@ -135,43 +165,9 @@ pub(in crate::promql) fn rollup_series_over_grid(
                 return None;
             }
 
-            let mut window = RollupWindow {
-                prev_value: f64::NAN,
-                prev_timestamp: t_start.saturating_sub(prev_step),
-                real_prev_value: f64::NAN,
+            let window = RollupWindow {
                 values: &values[i..j],
                 timestamps: &timestamps[i..j],
-                ..Default::default()
-            };
-
-            if i > 0 {
-                let prev_idx = i - 1;
-                let prev_ts = timestamps[prev_idx];
-
-                if prev_ts > window.prev_timestamp {
-                    window.prev_value = values[prev_idx];
-                    window.prev_timestamp = prev_ts;
-                }
-
-                // Set real_prev_value if lookback_delta == 0, or if the distance
-                // between the datapoint in the previous interval and the start of
-                // this one does not exceed lookback_delta.
-                // https://github.com/VictoriaMetrics/VictoriaMetrics/issues/894
-                // https://github.com/VictoriaMetrics/VictoriaMetrics/issues/8045
-                // https://github.com/VictoriaMetrics/VictoriaMetrics/issues/8935
-                //
-                // Use the actual timestamp of the preceding sample for the
-                // staleness check, not a synthetic value of 0 or t_start.
-                let curr_timestamp = window.timestamps[0];
-                if lookback_ms.is_zero() || curr_timestamp.saturating_sub(prev_ts) < lookback_ms {
-                    window.real_prev_value = values[prev_idx];
-                }
-            }
-
-            window.real_next_value = if j < values.len() {
-                values[j]
-            } else {
-                f64::NAN
             };
 
             Some(Sample {
@@ -230,36 +226,24 @@ fn seek_first_timestamp_idx_after(
 ///
 /// Window selection and the empty-window rule are the same as
 /// [`rollup_series_over_grid`]; see that function for why the grid belongs to the
-/// caller.
+/// caller. `f` may also decline a non-empty window (`None`), which drops the
+/// series from the result like an empty window does — declining is not the same
+/// as answering NaN.
 pub(super) fn eval_rollups_basic<F>(
     ctx: &EvalContext,
     series_data: Vec<EvalSamples>,
     f: F,
 ) -> EvalResult<Vec<EvalSample>>
 where
-    F: Fn(&[Sample]) -> f64 + Sync,
+    F: Fn(&[Sample]) -> Option<f64> + Sync,
 {
-    // Checked per series, weighted by its samples, outside `f`'s loop over them.
-    let deadline = ctx.deadline;
-    series_data
-        .into_par_rayon()
-        .map(|series| -> EvalResult<Option<EvalSample>> {
-            deadline.checkpoint(series.values.len() + SERIES_WORK)?;
-            let Some(window) = window_samples(&series.values, series.range_end_ms, series.range_ms)
-            else {
-                return Ok(None);
-            };
-
-            Ok(Some(EvalSample {
-                timestamp_ms: ctx.evaluation_ts,
-                value: f(window),
-                labels: series.labels,
-                drop_name: series.drop_name,
-            }))
-        })
-        .into_fallible()
-        .filter_map(|sample| sample)
-        .collect::<Vec<_>>()
+    eval_series(ctx, series_data, |series| {
+        f(window_samples(
+            &series.values,
+            series.range_end_ms,
+            series.range_ms,
+        )?)
+    })
 }
 
 /// The samples of `series` inside `(window_end - window_ms, window_end]`, or
@@ -320,13 +304,10 @@ mod tests {
         let ends: Vec<Timestamp> = (0..=80).step_by(5).collect();
 
         for window_ms in [1, 10, 25, 100] {
-            let grid =
-                rollup_series_over_grid(&series, window_ms, 0, 5, ends.iter().copied(), None, sum);
+            let grid = rollup_series_over_grid(&series, window_ms, ends.iter().copied(), None, sum);
             let one_at_a_time: Vec<Sample> = ends
                 .iter()
-                .flat_map(|&end| {
-                    rollup_series_over_grid(&series, window_ms, 0, 5, [end], None, sum)
-                })
+                .flat_map(|&end| rollup_series_over_grid(&series, window_ms, [end], None, sum))
                 .collect();
             assert_eq!(grid, one_at_a_time, "window_ms={window_ms}");
         }
@@ -338,7 +319,7 @@ mod tests {
         let series = samples(&[(10, 1.0), (20, 2.0), (30, 3.0)]);
 
         // Window (10, 30] excludes the sample at exactly 10.
-        let out = rollup_series_over_grid(&series, 20, 0, 0, [30], None, count);
+        let out = rollup_series_over_grid(&series, 20, [30], None, count);
         assert_eq!(
             out,
             vec![Sample {
@@ -348,7 +329,7 @@ mod tests {
         );
 
         // Window (9, 29] includes 10 and 20 but not 30.
-        let out = rollup_series_over_grid(&series, 20, 0, 0, [29], None, count);
+        let out = rollup_series_over_grid(&series, 20, [29], None, count);
         assert_eq!(
             out,
             vec![Sample {
@@ -364,7 +345,7 @@ mod tests {
         let series = samples(&[(10, 1.0), (100, 2.0)]);
         let ends: Vec<Timestamp> = vec![10, 40, 70, 100];
 
-        let out = rollup_series_over_grid(&series, 10, 0, 30, ends.iter().copied(), None, count);
+        let out = rollup_series_over_grid(&series, 10, ends.iter().copied(), None, count);
         assert_eq!(
             out,
             vec![
@@ -380,14 +361,14 @@ mod tests {
             "steps 40 and 70 have no samples and must be absent, not NaN"
         );
 
-        assert!(rollup_series_over_grid(&[], 10, 0, 0, [10], None, count).is_empty());
+        assert!(rollup_series_over_grid(&[], 10, [10], None, count).is_empty());
     }
 
     /// A NaN *value* is a real output; only an empty window is absent.
     #[test]
     fn test_nan_value_is_distinct_from_missing_window() {
         let series = samples(&[(10, f64::NAN)]);
-        let out = rollup_series_over_grid(&series, 10, 0, 0, [10, 100], None, sum);
+        let out = rollup_series_over_grid(&series, 10, [10, 100], None, sum);
         assert_eq!(out.len(), 1, "only the window holding the NaN sample emits");
         assert_eq!(out[0].timestamp, 10);
         assert!(out[0].value.is_nan());
@@ -405,7 +386,7 @@ mod tests {
             .collect();
         let ends: Vec<Timestamp> = (100..=1000).step_by(100).collect();
 
-        let out = rollup_series_over_grid(&series, 500, 0, 100, ends.iter().copied(), None, count);
+        let out = rollup_series_over_grid(&series, 500, ends.iter().copied(), None, count);
 
         // Window (end-500, end] holds one sample per 10ms, capped by the series
         // start at t=10.
@@ -426,10 +407,9 @@ mod tests {
         for window_ms in [1, 5, 20, 200] {
             for end in [0, 10, 25, 30, 89, 90, 300] {
                 let basic = window_samples(&series, end, window_ms).map(<[Sample]>::len);
-                let vectorized =
-                    rollup_series_over_grid(&series, window_ms, 0, 0, [end], None, count)
-                        .first()
-                        .map(|s| s.value as usize);
+                let vectorized = rollup_series_over_grid(&series, window_ms, [end], None, count)
+                    .first()
+                    .map(|s| s.value as usize);
                 assert_eq!(basic, vectorized, "window_ms={window_ms} end={end}");
             }
         }

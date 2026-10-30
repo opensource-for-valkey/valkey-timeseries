@@ -11,7 +11,7 @@ use crate::promql::engine::label_profile::{
 use crate::promql::engine::query_reader::{AggregationOutcome, AggregationRequest};
 use crate::promql::model::InstantSample;
 use crate::promql::time::duration_ms;
-use crate::promql::{PromqlResult, QueryError, QueryOptions, RangeSample};
+use crate::promql::{QueryError, QueryOptions, QueryResult, RangeSample};
 use crate::series::index::Postings;
 use crate::series::{SeriesRef, TimeSeries};
 use ahash::AHashMap;
@@ -103,7 +103,7 @@ impl MemorySeriesQuerier {
         }
     }
 
-    fn select_series<F, R>(&self, selector: &VectorSelector, f: F) -> PromqlResult<Vec<R>>
+    fn select_series<F, R>(&self, selector: &VectorSelector, f: F) -> QueryResult<Vec<R>>
     where
         F: Fn(&TimeSeries) -> ValkeyResult<Option<R>> + Send + Sync + Clone,
         R: Send + Sync,
@@ -142,7 +142,7 @@ impl QueryReader for MemorySeriesQuerier {
         selector: &VectorSelector,
         timestamp: i64,
         _options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
+    ) -> QueryResult<Vec<InstantSample<EvalLabels>>> {
         // Mock querier ignores the deadline for now (cooperative cancellation could be
         // implemented in tests by checking `_deadline`), and behaves like the
         // original implementation.
@@ -179,7 +179,7 @@ impl QueryReader for MemorySeriesQuerier {
         start_ms: i64,
         end_ms: i64,
         _options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
+    ) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
         // As with `query`, this mock ignores the deadline and returns the full range.
         self.select_series(selector, |ts| {
             let labels = EvalLabels::interned(&ts.labels);
@@ -209,7 +209,7 @@ impl QueryReader for MemorySeriesQuerier {
         timestamp: i64,
         _aggregation: &AggregationRequest,
         options: QueryOptions,
-    ) -> PromqlResult<AggregationOutcome> {
+    ) -> QueryResult<AggregationOutcome> {
         self.query(selector, timestamp, options)
             .map(AggregationOutcome::Raw)
     }
@@ -219,7 +219,7 @@ impl QueryReader for MemorySeriesQuerier {
         selector: &VectorSelector,
         window: Option<ProfileWindow>,
         options: QueryOptions,
-    ) -> PromqlResult<Option<LabelProfile>> {
+    ) -> QueryResult<Option<LabelProfile>> {
         let inner = self.inner.read().unwrap();
         let selector: SeriesSelector = SeriesSelector::from(selector);
         let ids = inner

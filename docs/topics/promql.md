@@ -136,6 +136,102 @@ PromQL behavior should be treated as the module’s implemented subset rather th
 guarantee that every function or sample type supported by an external Prometheus release
 is available.
 
+### Functions beyond Prometheus
+
+These have no Prometheus counterpart. They are experimental, and available only when
+`ts-promql-enable-experimental-functions` is on.
+
+**`state_duration_over_time(v range-vector, state scalar [, unit string])`** — how long
+each series has been in `state`, the PromQL form of Flux's
+[`stateDuration()`](https://docs.influxdata.com/influxdb/v2/query-data/flux/monitor-states/).
+For each window it measures the run of consecutive samples equal to `state` that ends at
+the window's last sample, from the run's first sample to its last. It returns `0` when only
+the last sample is in `state`.
+
+A series whose last sample is not in `state` is left out of the result, as PromQL does
+whenever a function has no answer. Flux writes `-1` there instead. So `count(...)` counts the
+series currently in `state`, `sum`/`avg`/`max` see only real durations, and a range query has
+a gap wherever the series was out of `state`. To list the series that have samples but are
+not in `state`, use `present_over_time(x[w]) unless state_duration_over_time(x[w], s)`.
+
+- `unit` is an optional duration string such as `"1s"` (the default), `"500ms"`, `"1m"`,
+  `"1h"`, or `"1h30m"`. The result is divided by it without rounding, so a 90 s run with
+  `"1m"` gives `1.5`. A unit suffix is required (`"60"` is rejected), and so is a unit
+  greater than zero.
+- A `NaN` sample never equals `state`, so it ends the run. `state` itself must not be `NaN`.
+- The answer can never be longer than the range: `state_duration_over_time(x[5m], 1)` can't
+  report more than 5 minutes. To alert on "in `state` for more than *T*", use a range of at
+  least *T* plus one sample interval.
+- Each window is measured separately. A run that started before the window is measured from
+  the window's first sample, and time between the last sample and the evaluation time is
+  not counted.
+- The result drops `__name__`, as other range-vector functions do.
+- In cluster mode it is pushed down to the shards like the other rollups (see
+  [overview](../overview.md)); the answer is the same either way.
+
+```
+# Seconds each "up" series has been in state 1, over the last hour.
+state_duration_over_time(up[1h], 1)
+
+# Server down for more than 30 minutes, measured in minutes.
+state_duration_over_time(up[2h], 1, "1m") > 30
+
+# Minutes memory utilization has been above 90% over the last 2 hours.
+state_duration_over_time(
+  (node_memory_utilization_ratio > bool 0.90)[2h], 1, "1m"
+)
+```
+
+**`state_count_over_time(v range-vector, state scalar)`** — how many consecutive samples
+each series has been in `state`, the PromQL form of Flux's
+[`stateCount()`](https://docs.influxdata.com/influxdb/v2/query-data/flux/monitor-states/).
+For each window it counts the run of samples equal to `state` that ends at the window's last
+sample: `1` when only the last sample is in `state`.
+
+A series whose last sample is not in `state` answers **`0`**. That differs from
+`state_duration_over_time`, which leaves such a series out, and from Flux, which writes
+`-1`. For a duration, `0` already means "entered the state at the last sample"; for a count
+it means nothing else, so it can say "not in state". As a result:
+
+- `count(state_count_over_time(...))` counts every series with data. To count the series in
+  `state`, use `count(state_count_over_time(...) > 0)`.
+- `avg` includes the zeros. `sum` and `max` are unaffected.
+- A range query has no gaps: the count falls to `0` while a series is out of `state`.
+- A window with no samples still gives no result, so "no data" stays distinct from `0`.
+
+The other rules match `state_duration_over_time`: a `NaN` sample ends the run, `state` must
+not be `NaN`, each window is counted on its own (so the answer can't exceed the number of
+samples the range holds), the result drops `__name__`, and in cluster mode it is pushed down
+to the shards. There is no `unit` argument.
+
+```
+# Series that have reported state 1 for at least the last five samples.
+state_count_over_time(up[10m], 1) >= 5
+
+# How many series are in state 0 right now.
+count(state_count_over_time(up[5m], 0) > 0)
+```
+
+**`range_over_time(v range-vector)`** — the spread of each series' samples in the window,
+`max_over_time(v) - min_over_time(v)`, from VictoriaMetrics' MetricsQL. It reads the window
+once rather than twice, and gives the same answer as the two-function form:
+
+- A `NaN` sample is skipped when a real value is in the window, as in `min_over_time` and
+  `max_over_time`. A window of only `NaN` samples answers `NaN`.
+- Infinities subtract as IEEE 754 says: a window holding `-Inf` and `+Inf` answers `+Inf`,
+  and a window of only `+Inf` answers `NaN`.
+- A window with one sample, or with all samples equal, answers `0`. A window with no samples
+  gives no result.
+- The result drops `__name__`, and in cluster mode it is pushed down to the shards.
+
+```
+# How far each temperature sensor swung over the last hour.
+range_over_time(temperature_celsius[1h])
+
+# Series whose value moved by more than 10 in the last 5 minutes.
+range_over_time(queue_depth[5m]) > 10
+```
+
 ## Support, conformance, and deviations from Prometheus
 
 Valkey TimeSeries follows the PromQL expression model and aims to match Prometheus

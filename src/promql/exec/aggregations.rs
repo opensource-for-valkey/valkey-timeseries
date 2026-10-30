@@ -58,37 +58,26 @@ pub(in crate::promql) enum PushdownStrategy {
 }
 
 impl AggregationKind {
-    pub(in crate::promql) fn is_reduction(&self) -> bool {
-        matches!(
-            self,
-            AggregationKind::Sum
-                | AggregationKind::Avg
-                | AggregationKind::Min
-                | AggregationKind::Max
-                | AggregationKind::Count
-                | AggregationKind::Group
-                | AggregationKind::Stddev
-                | AggregationKind::Stdvar
-        )
-    }
-
     /// How this operator can be pushed down to the shards, or `None` when it
     /// has no decomposable form and must see the whole input on one node:
     /// `quantile` interpolates between a group's values, so no partial state
     /// smaller than the values themselves exists.
     pub(in crate::promql) fn pushdown_strategy(&self) -> Option<PushdownStrategy> {
-        if self.is_reduction() {
-            return Some(PushdownStrategy::Reduce);
-        }
         match self {
+            AggregationKind::Sum
+            | AggregationKind::Avg
+            | AggregationKind::Min
+            | AggregationKind::Max
+            | AggregationKind::Count
+            | AggregationKind::Group
+            | AggregationKind::Stddev
+            | AggregationKind::Stdvar => Some(PushdownStrategy::Reduce),
             AggregationKind::Topk
             | AggregationKind::Bottomk
             | AggregationKind::Limitk
             | AggregationKind::LimitRatio => Some(PushdownStrategy::Select),
             AggregationKind::CountValues => Some(PushdownStrategy::CountValues),
             AggregationKind::Quantile => None,
-            // Covered by is_reduction above.
-            _ => Some(PushdownStrategy::Reduce),
         }
     }
 }
@@ -535,7 +524,6 @@ fn eval_limit_ratio(
     let groups = group_samples(modifier, samples, deadline)?;
     let mut out = Vec::new();
 
-    // todo: parallelize
     for (_, group) in groups.into_iter() {
         out.extend(select_limit_ratio(group.members, k)?);
     }

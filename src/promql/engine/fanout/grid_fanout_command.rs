@@ -51,8 +51,7 @@ use crate::promql::functions::RollupKind;
 use crate::promql::generated::{
     AggregationKind as ProtoAggregationKind, GridAggregation as ProtoGridAggregation,
     GridGroupPartial, GridQuery, GridQueryResponse, GridRollup as ProtoGridRollup,
-    GridSeries as ProtoGridSeries, RollupKind as ProtoRollupKind,
-    SeriesSelector as ProtoSeriesSelector,
+    RollupKind as ProtoRollupKind, SeriesSelector as ProtoSeriesSelector,
 };
 use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::model::RangeSample;
@@ -68,80 +67,8 @@ mod columns;
 mod tests;
 mod transport;
 
-use columns::{columnar_series, decode_columns, encode_columns};
+use columns::{columnar_series, columnar_series_from, decode_columns};
 use transport::ships_raw;
-
-impl From<RollupKind> for ProtoRollupKind {
-    fn from(kind: RollupKind) -> Self {
-        match kind {
-            RollupKind::SumOverTime => ProtoRollupKind::SumOverTime,
-            RollupKind::CountOverTime => ProtoRollupKind::CountOverTime,
-            RollupKind::LastOverTime => ProtoRollupKind::LastOverTime,
-            RollupKind::AvgOverTime => ProtoRollupKind::AvgOverTime,
-            RollupKind::MinOverTime => ProtoRollupKind::MinOverTime,
-            RollupKind::MaxOverTime => ProtoRollupKind::MaxOverTime,
-            RollupKind::StddevOverTime => ProtoRollupKind::StddevOverTime,
-            RollupKind::StdvarOverTime => ProtoRollupKind::StdvarOverTime,
-            RollupKind::MadOverTime => ProtoRollupKind::MadOverTime,
-            RollupKind::PresentOverTime => ProtoRollupKind::PresentOverTime,
-            RollupKind::FirstOverTime => ProtoRollupKind::FirstOverTime,
-            RollupKind::QuantileOverTime => ProtoRollupKind::QuantileOverTime,
-            RollupKind::TsOfFirstOverTime => ProtoRollupKind::TsOfFirstOverTime,
-            RollupKind::TsOfLastOverTime => ProtoRollupKind::TsOfLastOverTime,
-            RollupKind::TsOfMinOverTime => ProtoRollupKind::TsOfMinOverTime,
-            RollupKind::TsOfMaxOverTime => ProtoRollupKind::TsOfMaxOverTime,
-            RollupKind::Rate => ProtoRollupKind::Rate,
-            RollupKind::Increase => ProtoRollupKind::Increase,
-            RollupKind::Delta => ProtoRollupKind::Delta,
-            RollupKind::IRate => ProtoRollupKind::Irate,
-            RollupKind::IDelta => ProtoRollupKind::Idelta,
-            RollupKind::Deriv => ProtoRollupKind::Deriv,
-            RollupKind::Resets => ProtoRollupKind::Resets,
-            RollupKind::Changes => ProtoRollupKind::Changes,
-        }
-    }
-}
-
-/// `ROLLUP_KIND_UNSPECIFIED` — the value a peer produces when it omits the
-/// field — is refused like any other value this node does not know: a rollup
-/// message with no function in it is a corrupt request, not a stepped one.
-impl TryFrom<ProtoRollupKind> for RollupKind {
-    type Error = ValkeyError;
-
-    fn try_from(kind: ProtoRollupKind) -> Result<Self, Self::Error> {
-        Ok(match kind {
-            ProtoRollupKind::SumOverTime => RollupKind::SumOverTime,
-            ProtoRollupKind::CountOverTime => RollupKind::CountOverTime,
-            ProtoRollupKind::LastOverTime => RollupKind::LastOverTime,
-            ProtoRollupKind::AvgOverTime => RollupKind::AvgOverTime,
-            ProtoRollupKind::MinOverTime => RollupKind::MinOverTime,
-            ProtoRollupKind::MaxOverTime => RollupKind::MaxOverTime,
-            ProtoRollupKind::StddevOverTime => RollupKind::StddevOverTime,
-            ProtoRollupKind::StdvarOverTime => RollupKind::StdvarOverTime,
-            ProtoRollupKind::MadOverTime => RollupKind::MadOverTime,
-            ProtoRollupKind::PresentOverTime => RollupKind::PresentOverTime,
-            ProtoRollupKind::FirstOverTime => RollupKind::FirstOverTime,
-            ProtoRollupKind::QuantileOverTime => RollupKind::QuantileOverTime,
-            ProtoRollupKind::TsOfFirstOverTime => RollupKind::TsOfFirstOverTime,
-            ProtoRollupKind::TsOfLastOverTime => RollupKind::TsOfLastOverTime,
-            ProtoRollupKind::TsOfMinOverTime => RollupKind::TsOfMinOverTime,
-            ProtoRollupKind::TsOfMaxOverTime => RollupKind::TsOfMaxOverTime,
-            ProtoRollupKind::Rate => RollupKind::Rate,
-            ProtoRollupKind::Increase => RollupKind::Increase,
-            ProtoRollupKind::Delta => RollupKind::Delta,
-            ProtoRollupKind::Irate => RollupKind::IRate,
-            ProtoRollupKind::Idelta => RollupKind::IDelta,
-            ProtoRollupKind::Deriv => RollupKind::Deriv,
-            ProtoRollupKind::Resets => RollupKind::Resets,
-            ProtoRollupKind::Changes => RollupKind::Changes,
-            ProtoRollupKind::Unspecified => {
-                return Err(ValkeyError::Str(
-                    "TSDB: grid push-down request carries a rollup with no function",
-                ));
-            }
-        })
-    }
-}
 
 pub(in crate::promql) struct GridFanoutCommand {
     matchers: Matchers,
@@ -274,8 +201,7 @@ impl GridFanoutCommand {
         }
         let deadline = &deadline;
         request.per_series_chunked(&window_ends, raw, deadline, |chunk, read| {
-            let added = sink.take(&request, chunk, deadline)?;
-            budget.charge(added.saturating_sub(read))
+            sink.take_charged(&request, chunk, read, deadline, &budget)
         })?;
         sink.finish(deadline).map_err(QueryError::from)
     }
@@ -290,11 +216,8 @@ impl FanoutCommand for GridFanoutCommand {
     }
 
     fn get_local_response(ctx: &FanoutContext, req: GridQuery) -> ValkeyResult<GridQueryResponse> {
-        let Some(selector) = req.selector.clone() else {
-            ctx.log_warning("Received grid query with no selector, returning empty response");
-            return Ok(GridQueryResponse::default());
-        };
-        let series_selector: SeriesSelector = (&selector).try_into()?;
+        let selector = super::required(req.selector.as_ref(), "selector")?;
+        let series_selector: SeriesSelector = selector.try_into()?;
         let request = decode_request(&req)?;
 
         let window_ends = grid_window_ends(
@@ -341,6 +264,7 @@ impl FanoutCommand for GridFanoutCommand {
                 kind: ProtoRollupKind::from(rollup.kind) as i32,
                 range_ms: rollup.range_ms,
                 scalar_param: rollup.param,
+                unit_ms: rollup.unit_ms,
             }),
             aggregation: self.request.aggregation.as_ref().map(|agg| {
                 let (scalar_param, label_param) = aggregation_param_to_wire(agg.param.as_ref());
@@ -368,12 +292,8 @@ impl FanoutCommand for GridFanoutCommand {
         // resolved to interned labels: each distinct pair once per response.
         let table = resp.labels.take().unwrap_or_default();
         let mut resolver = EvalLabelResolver::new(&table);
-        let malformed = |why: ValkeyError| {
-            FanoutError::custom(format!(
-                "TSDB: peer {} returned malformed labels: {why}",
-                target.socket_address,
-            ))
-        };
+        let malformed =
+            |why: ValkeyError| super::peer_error(target, "returned malformed labels", why);
 
         // Corrupt-peer defenses. A request fused with a reduction is answered
         // in partials; every other request in series — a fused selection's
@@ -422,10 +342,7 @@ impl FanoutCommand for GridFanoutCommand {
             for mut series in resp.series {
                 let labels = resolver.resolve(&mut series).map_err(malformed)?;
                 let points = decode_columns(&self.window_ends, &series).map_err(|why| {
-                    FanoutError::custom(format!(
-                        "TSDB: peer {} returned a malformed grid series: {why}",
-                        target.socket_address,
-                    ))
+                    super::peer_error(target, "returned a malformed grid series", why)
                 })?;
                 match &mut output {
                     GridSeries::Rolled(rolled) => rolled.push(RangeSample {
@@ -460,10 +377,7 @@ impl FanoutCommand for GridFanoutCommand {
             .into_iter()
             .map(|raw| {
                 let series = range_sample_from_proto(raw, &mut resolver).map_err(|why| {
-                    FanoutError::custom(format!(
-                        "TSDB: peer {} returned an undecodable raw series: {why}",
-                        target.socket_address,
-                    ))
+                    super::peer_error(target, "returned an undecodable raw series", why)
                 })?;
                 raw_samples += series.samples.len();
                 Ok(series)
@@ -506,10 +420,15 @@ fn decode_request(req: &GridQuery) -> ValkeyResult<GridRequest> {
                     ))
                 })
                 .and_then(RollupKind::try_from)?;
+            // Parameters no coordinator of this build sends: refused rather than
+            // answered, since the answer could not match the local one.
+            kind.check_params(rollup.scalar_param, rollup.unit_ms)
+                .map_err(|e| ValkeyError::String(format!("TSDB: grid push-down request: {e}")))?;
             Ok::<_, ValkeyError>(GridRollup {
                 kind,
                 range_ms: rollup.range_ms,
                 param: rollup.scalar_param,
+                unit_ms: rollup.unit_ms,
             })
         })
         .transpose()?;
@@ -632,7 +551,7 @@ impl<'a> ShardGrid<'a> {
     /// there are steps ([`ships_raw`]), so its stage output is never the
     /// larger, and a sparse series that would expand waits for
     /// [`Self::finish`], which ships it raw or folds it. What `staged` holds is
-    /// still charged past the spans staged into it ([`Self::stage`]): a fused
+    /// still charged past the spans staged into it ([`GridSink::take_charged`]): a fused
     /// selection's candidates need not be fewer than its input.
     ///
     /// Fails only for a fused selection: it refuses its parameter, or the
@@ -642,39 +561,16 @@ impl<'a> ShardGrid<'a> {
             .into_iter()
             .partition(|series| ships_raw(self.window_ends, series));
         self.raw.extend(raw);
-        self.staged_groups.extend(transport::staged_groups(
-            self.request,
-            staged.iter().map(|series| (series, &false)),
-        ));
+        self.staged_groups
+            .extend(transport::staged_groups(self.request, staged.iter()));
         if !staged.is_empty() {
             let read = staged.iter().map(|series| series.samples.len()).sum();
             let output = self.request.per_series(self.window_ends, staged);
-            Self::stage(
-                &mut self.staged,
-                self.request,
-                output,
-                read,
-                self.budget,
-                &self.deadline,
-            )
-            .map_err(shard_error)?;
+            self.staged
+                .take_charged(self.request, output, read, &self.deadline, self.budget)
+                .map_err(shard_error)?;
         }
         Ok(())
-    }
-
-    /// Take one batch of stage output, charging `budget` for what the sink now
-    /// holds beyond the `read` raw samples the batch was built from, which the
-    /// read already charged.
-    fn stage(
-        staged: &mut GridSink,
-        request: &GridRequest,
-        output: GridSeries,
-        read: usize,
-        budget: &SampleBudget,
-        deadline: &Deadline,
-    ) -> QueryResult<()> {
-        let added = staged.take(request, output, deadline)?;
-        budget.charge(added.saturating_sub(read))
     }
 
     /// The response, once every batch is in: the raw spans that stay raw, and
@@ -688,10 +584,8 @@ impl<'a> ShardGrid<'a> {
         let request = self.request;
         let window_ends = self.window_ends;
         let candidates = std::mem::take(&mut self.raw);
-        let promoted = {
-            let candidates: Vec<&RangeSample<EvalLabels>> = candidates.iter().collect();
-            transport::promoted_raw(request, window_ends, &candidates, &self.staged_groups)
-        };
+        let promoted =
+            transport::promoted_raw(request, window_ends, &candidates, &self.staged_groups);
         let mut raw = Vec::with_capacity(candidates.len());
         let mut folded = Vec::new();
         for (series, promote) in candidates.into_iter().zip(promoted) {
@@ -704,7 +598,7 @@ impl<'a> ShardGrid<'a> {
         let (staged, budget, deadline) = (&mut self.staged, self.budget, &self.deadline);
         request
             .per_series_chunked(window_ends, folded, deadline, |output, read| {
-                Self::stage(staged, request, output, read, budget, deadline)
+                staged.take_charged(request, output, read, deadline, budget)
             })
             .map_err(shard_error)?;
         respond(request, window_ends, raw, self.staged, &self.deadline)
@@ -727,8 +621,39 @@ fn respond(
         .map(|series| range_sample_to_proto(series, &mut symbols))
         .collect::<ValkeyResult<Vec<_>>>()?;
 
-    let staged = match staged {
-        GridSink::Series(series) => series,
+    let (series, partials) = match staged {
+        // A stepped selection carries each pick's own timestamp as a lag when
+        // the request asked for it; nothing else has one.
+        GridSink::Series(GridSeries::Stepped(series)) => (
+            columnar_series_from(
+                window_ends,
+                series.into_iter().map(|s| {
+                    (
+                        s.labels,
+                        s.points
+                            .into_iter()
+                            .map(|p| (p.step_ts, p.sample.timestamp, p.sample.value)),
+                    )
+                }),
+                request.sample_timestamps,
+                &mut symbols,
+            ),
+            Vec::new(),
+        ),
+        GridSink::Series(GridSeries::Rolled(series)) => (
+            columnar_series(window_ends, series, &mut symbols),
+            Vec::new(),
+        ),
+        // A fused selecting or counting operator: its picks over everything
+        // staged here — k series per step, or one count per value — ship as
+        // candidates rather than every series.
+        GridSink::Selection(selection) => {
+            let selected = selection.finalize(deadline).map_err(shard_error)?;
+            (
+                columnar_series(window_ends, selected, &mut symbols),
+                Vec::new(),
+            )
+        }
         // A fused reduction: the partials were folded as the series were staged.
         GridSink::Partials(groups) => {
             let partials = groups
@@ -744,55 +669,13 @@ fn respond(
                     }
                 })
                 .collect();
-            return Ok(GridQueryResponse {
-                series: Vec::new(),
-                partials,
-                raw,
-                labels: Some(symbols.finish()),
-            });
+            (Vec::new(), partials)
         }
-        // A fused selecting or counting operator: its picks over everything
-        // staged here — k series per step, or one count per value — ship as
-        // candidates rather than every series.
-        GridSink::Selection(selection) => {
-            let selected = selection.finalize(deadline).map_err(shard_error)?;
-            return Ok(GridQueryResponse {
-                series: columnar_series(window_ends, selected, &mut symbols),
-                partials: Vec::new(),
-                raw,
-                labels: Some(symbols.finish()),
-            });
-        }
-    };
-
-    let series = match staged {
-        GridSeries::Stepped(series) => series
-            .into_iter()
-            .map(|s| {
-                let (presence, values, sample_lag) = encode_columns(
-                    window_ends,
-                    s.points
-                        .iter()
-                        .map(|p| (p.step_ts, p.sample.timestamp, p.sample.value)),
-                    request.sample_timestamps,
-                );
-                let (label_name_refs, label_value_refs) = symbols.intern_eval(&s.labels);
-                ProtoGridSeries {
-                    labels: Vec::new(),
-                    presence,
-                    values,
-                    sample_lag,
-                    label_name_refs,
-                    label_value_refs,
-                }
-            })
-            .collect(),
-        GridSeries::Rolled(series) => columnar_series(window_ends, series, &mut symbols),
     };
 
     Ok(GridQueryResponse {
         series,
-        partials: Vec::new(),
+        partials,
         raw,
         labels: Some(symbols.finish()),
     })

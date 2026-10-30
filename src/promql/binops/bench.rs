@@ -4,7 +4,7 @@
 //! Criterion's untimed setup, and `run()` returns its result so the output is
 //! freed untimed too.
 
-use super::binop_scalar_vector::eval_binop_scalar_vector;
+use super::binop_vector_scalar::eval_binop_scalar_vector;
 use super::binop_vector_scalar::eval_binop_vector_scalar;
 use super::binop_vector_vector::eval_binop_vector_vector;
 use crate::labels::Label;

@@ -3,8 +3,8 @@
 //! All evaluator-backed query paths (instant vector selector, matrix selector,
 //! subquery vector-selector fast path) share the same logical execution model:
 //!
-//! 1. **Plan** – compute concrete time bounds, bucket list, path-specific parameters
-//! 2. **LoadSamples** – load sample data for explicit (bucket, series) work items
+//! 1. **Plan** – compute concrete time bounds and path-specific parameters
+//! 2. **LoadSamples** – read the selected series over those bounds
 //! 3. **ShapeSamples** – merge/filter/dedup into evaluator-ready per-series structures
 //! 4. **Evaluate** – run PromQL expression semantics on prepared in-memory inputs
 //!
@@ -15,11 +15,10 @@ use crate::common::{Sample, Timestamp};
 use crate::promql::engine::QueryReader;
 #[cfg(test)]
 use crate::promql::exec::types::EvalLabels;
-use crate::promql::time::grid_step_count;
+use crate::promql::time::{grid_step_count, step_times};
 use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult, QueryOptions};
 use orx_parallel::Par;
 use promql_parser::parser::VectorSelector;
-use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Phase artifact types
@@ -56,10 +55,8 @@ pub(crate) struct QueryPlan {
 // ---------------------------------------------------------------------------
 
 impl QueryPlan {
-    /// Construct a plan for instant vector selector.
-    ///
-    /// Buckets sorted newest-first so that cross-bucket fingerprint dedup
-    /// can short-circuit on the first bucket that has data for a series.
+    /// Construct a plan for an instant vector selector: the lookback window
+    /// ending at the (modifier-adjusted) evaluation timestamp.
     pub(crate) fn for_instant_vector(
         adjusted_eval_ts_ms: Timestamp,
         lookback_delta_ms: Timestamp,
@@ -216,7 +213,7 @@ fn shape_subquery_results(series_data: Vec<EvalSamples>, plan: &QueryPlan) -> Ve
             }
 
             let mut step_samples = Vec::with_capacity(expected_steps);
-            let steps = (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize);
+            let steps = step_times(aligned_start_ms, subquery_end_ms, step_ms);
             for_each_step_sample(
                 &sample.values,
                 steps,
@@ -268,7 +265,7 @@ pub(crate) fn execute_selector_pipeline<R: QueryReader + ?Sized>(
     // to filter for the last item on the worker nodes instead of shipping the data only to filter
     // out on the requester. The `query` method on the reader should handle this
     if let QueryPathKind::InstantVector { lookback_delta_ms } = plan.path_kind {
-        options.lookback_delta = Duration::from_millis(lookback_delta_ms as u64);
+        options = options.with_lookback_ms(lookback_delta_ms);
         let series_data = reader
             .query(selector, plan.sample_end_ms, options)?
             .into_iter()
@@ -367,7 +364,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn instant_plan_sorts_buckets_newest_first() {
+    fn instant_plan_spans_the_lookback_window() {
         let plan = QueryPlan::for_instant_vector(500_000, 60_000);
         assert_eq!(plan.sample_start_ms, 500_000 - 60_000);
         assert_eq!(plan.sample_end_ms, 500_000);

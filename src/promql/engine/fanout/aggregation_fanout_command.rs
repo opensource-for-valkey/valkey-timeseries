@@ -53,7 +53,6 @@ pub(in crate::promql) struct InstantVectorParams {
     pub timestamp: Timestamp,
     pub lookback_delta: u64,
     pub max_series: u64,
-    pub max_points_per_series: u64,
 }
 
 impl Default for InstantVectorParams {
@@ -67,7 +66,38 @@ impl Default for InstantVectorParams {
             timestamp: 0,
             lookback_delta,
             max_series: 0,
-            max_points_per_series: 0,
+        }
+    }
+}
+
+/// What the shards' output accumulates into, decided by the operator's
+/// push-down strategy — the same shape [`crate::promql::engine::query_reader::GridSink`]
+/// gives a grid request.
+enum AggregationSink {
+    /// [`PushdownStrategy::Reduce`]: the shards' partial states, merged per
+    /// group as they arrive. Boxed: the map's inline storage is a few KiB,
+    /// against a `Vec` header in the other variant.
+    Partials(Box<PartialGroups>),
+    /// [`PushdownStrategy::Select`]/[`PushdownStrategy::CountValues`]: the
+    /// shards' locally selected samples or per-value counts, re-selected or
+    /// summed once every shard has answered.
+    Candidates(Vec<EvalSample>),
+}
+
+impl AggregationSink {
+    /// # Panics
+    /// If `kind` has no push-down strategy. Callers must check
+    /// [`AggregationKind::pushdown_strategy`] first — that check is also how
+    /// they decide to push down at all.
+    fn for_kind(kind: AggregationKind) -> Self {
+        match kind
+            .pushdown_strategy()
+            .expect("BUG: aggregation operator cannot be pushed down")
+        {
+            PushdownStrategy::Reduce => Self::Partials(Box::new(PartialGroups::new(kind))),
+            PushdownStrategy::Select | PushdownStrategy::CountValues => {
+                Self::Candidates(Vec::new())
+            }
         }
     }
 }
@@ -75,14 +105,9 @@ impl Default for InstantVectorParams {
 pub(in crate::promql) struct AggregationFanoutCommand {
     vector: InstantVectorParams,
     aggregation: AggregationRequest,
-    strategy: PushdownStrategy,
     timeout: Duration,
-    /// [`PushdownStrategy::Reduce`]: the shards' partial states, merged per
-    /// group as they arrive.
-    partials: PartialGroups,
-    /// [`PushdownStrategy::Select`]/[`PushdownStrategy::CountValues`]: the
-    /// shards' locally selected samples or per-value counts.
-    samples: Vec<EvalSample>,
+    /// Where the shards' output goes, by the operator's strategy.
+    sink: AggregationSink,
     /// Raw instant-vector samples from a shard that did not apply the operator
     /// (`applied == false`), folded in by [`Self::into_result`].
     raw: Vec<EvalSample>,
@@ -112,11 +137,9 @@ impl Default for AggregationFanoutCommand {
         };
         Self {
             vector: InstantVectorParams::default(),
-            strategy: PushdownStrategy::Reduce,
-            partials: PartialGroups::new(aggregation.kind),
+            sink: AggregationSink::for_kind(aggregation.kind),
             aggregation,
             timeout: get_cluster_command_timeout(),
-            samples: Vec::new(),
             raw: Vec::new(),
             unsupported_peer: false,
             deadline: Deadline::default(),
@@ -127,32 +150,19 @@ impl Default for AggregationFanoutCommand {
 
 impl AggregationFanoutCommand {
     /// # Panics
-    /// If `aggregation` has no push-down strategy. Callers must check
-    /// [`AggregationKind::pushdown_strategy`] first — that check is also how
-    /// they decide to push down at all.
+    /// If `aggregation` has no push-down strategy; see
+    /// [`AggregationSink::for_kind`].
     pub fn new(
         vector: InstantVectorParams,
         aggregation: AggregationRequest,
         timeout: Duration,
         deadline: Deadline,
     ) -> Self {
-        let strategy = aggregation
-            .kind
-            .pushdown_strategy()
-            .expect("BUG: aggregation operator cannot be pushed down");
-        let kind = aggregation.kind;
         Self {
             vector,
+            sink: AggregationSink::for_kind(aggregation.kind),
             aggregation,
-            strategy,
             timeout,
-            // Only consulted for the Reduce strategy; harmless otherwise.
-            partials: PartialGroups::new(if kind.is_reduction() {
-                kind
-            } else {
-                AggregationKind::Sum
-            }),
-            samples: Vec::new(),
             raw: Vec::new(),
             unsupported_peer: false,
             deadline,
@@ -180,43 +190,42 @@ impl AggregationFanoutCommand {
         } = self.aggregation;
         let raw = std::mem::take(&mut self.raw);
 
-        match self.strategy {
-            PushdownStrategy::Reduce => {
+        match self.sink {
+            AggregationSink::Partials(mut partials) => {
                 // A shard that shipped raw samples is compensated by running
                 // the shard-side accumulation here.
                 if !raw.is_empty() {
-                    self.partials.accumulate(modifier.as_ref(), raw, deadline)?;
+                    partials.accumulate(modifier.as_ref(), raw, deadline)?;
                 }
-                Ok(self.partials.finalize(eval_time))
+                Ok(partials.finalize(eval_time))
             }
-            PushdownStrategy::Select => {
+            AggregationSink::Candidates(mut candidates) => {
+                let param = param.as_ref().map(AggregationParam::to_expr_result);
+                if kind.pushdown_strategy() == Some(PushdownStrategy::CountValues) {
+                    if !raw.is_empty() {
+                        // Count the raw samples first, then merge those counts.
+                        candidates.extend(apply_aggregation(
+                            kind,
+                            modifier.as_ref(),
+                            param,
+                            raw,
+                            eval_time,
+                            deadline,
+                        )?);
+                    }
+                    return Ok(merge_count_values(candidates));
+                }
                 // The selection is idempotent, so raw samples simply join the
                 // candidate pool: re-selecting over the union is the answer.
-                let mut candidates = std::mem::take(&mut self.samples);
                 candidates.extend(raw);
                 apply_aggregation(
                     kind,
                     modifier.as_ref(),
-                    param.as_ref().map(AggregationParam::to_expr_result),
+                    param,
                     candidates,
                     eval_time,
                     deadline,
                 )
-            }
-            PushdownStrategy::CountValues => {
-                let mut counts = std::mem::take(&mut self.samples);
-                if !raw.is_empty() {
-                    // Count the raw samples first, then merge those counts.
-                    counts.extend(apply_aggregation(
-                        kind,
-                        modifier.as_ref(),
-                        param.as_ref().map(AggregationParam::to_expr_result),
-                        raw,
-                        eval_time,
-                        deadline,
-                    )?);
-                }
-                Ok(merge_count_values(counts))
             }
         }
     }
@@ -227,14 +236,19 @@ impl AggregationFanoutCommand {
         resolver: &mut symbol_table::EvalLabelResolver<'_>,
         target: &NodeInfo,
     ) -> FanoutCommandResult {
+        let AggregationSink::Partials(groups) = &mut self.sink else {
+            unreachable!("BUG: partial states arrive only for a reduction");
+        };
         for mut partial in partials {
-            let labels = resolver.resolve(&mut partial)?;
+            let labels = resolver
+                .resolve(&mut partial)
+                .map_err(|why| super::peer_error(target, "returned malformed labels", why))?;
             let state = decode_peer_partial(
                 partial.state,
                 target,
                 format_args!("a pushed-down {:?} reduction", self.aggregation.kind),
             )?;
-            self.partials.merge(labels, state);
+            groups.merge(labels, state);
             if let Err(err) = self.deadline.checkpoint(SERIES_WORK) {
                 self.stopped = Some(err);
                 return Ok(());
@@ -256,18 +270,8 @@ impl FanoutCommand for AggregationFanoutCommand {
         ctx: &FanoutContext,
         req: AggregationQuery,
     ) -> ValkeyResult<AggregationQueryResponse> {
-        let Some(query) = req.query else {
-            ctx.log_warning(
-                "Received aggregation query with no instant-vector parameters, returning empty response",
-            );
-            return Ok(AggregationQueryResponse::default());
-        };
-        let Some(selector) = query.selector else {
-            ctx.log_warning(
-                "Received aggregation query with no selector, returning empty response",
-            );
-            return Ok(AggregationQueryResponse::default());
-        };
+        let query = super::required(req.query, "instant-vector parameters")?;
+        let selector = super::required(query.selector, "selector")?;
         let series_selector: SeriesSelector = (&selector).try_into()?;
         // Held to the end, through the aggregation: the coordinator counts only the groups
         // that come back, so this is all that counts the input while it is held here.
@@ -336,7 +340,6 @@ impl FanoutCommand for AggregationFanoutCommand {
             timestamp: self.vector.timestamp,
             lookback_delta: self.vector.lookback_delta,
             max_series: self.vector.max_series,
-            max_points_per_series: self.vector.max_points_per_series,
             time_budget_ms: super::time_budget_to_wire(self.timeout),
         };
 
@@ -361,16 +364,20 @@ impl FanoutCommand for AggregationFanoutCommand {
         let mut resolver = symbol_table::EvalLabelResolver::new(&labels);
         let samples = std::mem::take(&mut resp.samples)
             .into_iter()
-            .map(|s| resolver.resolve_sample(s))
-            .collect::<ValkeyResult<Vec<EvalSample>>>()?;
+            .map(|s| {
+                resolver
+                    .resolve_sample(s)
+                    .map_err(|why| super::peer_error(target, "returned malformed labels", why))
+            })
+            .collect::<Result<Vec<EvalSample>, FanoutError>>()?;
         if !resp.applied {
             // Self-describing response from a peer that did not aggregate.
             self.raw.extend(samples);
             return Ok(());
         }
 
-        match self.strategy {
-            PushdownStrategy::Reduce => {
+        match &mut self.sink {
+            AggregationSink::Partials(_) => {
                 // Corrupt-peer defense: a reduction response carries partials
                 // only. Aggregating stray samples as if they were reduced
                 // values would silently double-count.
@@ -385,7 +392,7 @@ impl FanoutCommand for AggregationFanoutCommand {
                 }
                 self.accumulate_partials(resp.partials, &mut resolver, target)?;
             }
-            PushdownStrategy::Select | PushdownStrategy::CountValues => {
+            AggregationSink::Candidates(candidates) => {
                 if !resp.partials.is_empty() {
                     return Err(wrong_payload(
                         target,
@@ -395,7 +402,7 @@ impl FanoutCommand for AggregationFanoutCommand {
                         "samples",
                     ));
                 }
-                self.samples.extend(samples);
+                candidates.extend(samples);
             }
         }
         Ok(())
@@ -723,7 +730,6 @@ mod tests {
             timestamp: EVAL_TS,
             lookback_delta: 300_000,
             max_series: 1_000,
-            max_points_per_series: 11_000,
             ..Default::default()
         };
         let aggregation = AggregationRequest {
@@ -760,7 +766,6 @@ mod tests {
         assert_eq!(query.timestamp, EVAL_TS);
         assert_eq!(query.lookback_delta, 300_000);
         assert_eq!(query.max_series, 1_000);
-        assert_eq!(query.max_points_per_series, 11_000);
         assert!(query.selector.is_some());
     }
 
@@ -793,7 +798,10 @@ mod tests {
         let mut cmd = command(aggregation.clone());
         let stray = AggregationQueryResponse {
             partials: Vec::new(),
-            samples: vec![sample(&[("job", "a")], 1.0).into()],
+            samples: vec![ProtoInstantSample {
+                value: 1.0,
+                ..Default::default()
+            }],
             applied: true,
             labels: None,
         };

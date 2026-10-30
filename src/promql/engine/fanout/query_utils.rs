@@ -5,8 +5,6 @@ use crate::common::threads::IntoParRayon;
 use crate::common::{Sample, Timestamp};
 use crate::fanout::FanoutContext;
 use crate::labels::filters::SeriesSelector;
-use crate::promql::EvalLabels;
-use crate::promql::EvalSample;
 use crate::promql::deadline::{Deadline, SERIES_WORK};
 use crate::promql::engine::label_profile::{
     LabelProfile, LabelProfileBuilder, ProfileStep, ProfileWalk, ProfileWindow,
@@ -21,6 +19,7 @@ use crate::promql::engine::{
 use crate::promql::generated::{
     InstantQueryResponse, InstantSample, RangeQueryResponse, RangeSample,
 };
+use crate::promql::{EvalLabels, EvalSample, QueryError, QueryResult};
 use crate::series::chunks::samples_to_chunk_lossless;
 use crate::series::index::{
     BatchLimit, DEFAULT_BATCH_COPY_BYTES, DEFAULT_SERIES_BATCH_SIZE, for_each_series,
@@ -74,7 +73,7 @@ impl<'b, T> ChargedSamples<'b, T> {
             // its words, and lets the sample through if the count was stale after all.
             self.budget
                 .check_ahead(self.uncharged + 1)
-                .map_err(budget_error)?;
+                .map_err(super::shard_error)?;
             self.room = self.uncharged + self.budget.room();
         }
         self.samples.push(sample);
@@ -87,7 +86,7 @@ impl<'b, T> ChargedSamples<'b, T> {
 
     fn charge(&mut self) -> ValkeyResult<()> {
         let samples = std::mem::take(&mut self.uncharged);
-        self.budget.charge(samples).map_err(budget_error)?;
+        self.budget.charge(samples).map_err(super::shard_error)?;
         self.room = self.budget.room();
         Ok(())
     }
@@ -97,11 +96,6 @@ impl<'b, T> ChargedSamples<'b, T> {
         self.charge()?;
         Ok(self.samples)
     }
-}
-
-/// A sample-budget refusal as a shard read reports it, in the words the coordinator relays.
-fn budget_error(err: crate::promql::QueryError) -> valkey_module::ValkeyError {
-    valkey_module::ValkeyError::String(err.to_string())
 }
 
 /// The newest sample in the lookback window `(timestamp - lookback_delta, timestamp]` of
@@ -151,8 +145,7 @@ where
         },
     )?;
     let samples = samples.finish()?;
-    validate_max_series(samples.len(), max_series as usize)
-        .map_err(valkey_module::ValkeyError::String)?;
+    validate_max_series(samples.len(), max_series as usize).map_err(super::shard_error)?;
     Ok(samples)
 }
 
@@ -169,7 +162,6 @@ pub(super) fn handle_instant_query<S: GilSource + ?Sized>(
     timestamp: Timestamp,
     lookback_delta: u64,
     max_series: u64,
-    _max_points_per_series: u64,
     read: &ShardRead,
 ) -> ValkeyResult<InstantQueryResponse> {
     let mut symbol_table = symbol_table::SymbolTableBuilder::default();
@@ -346,7 +338,7 @@ where
                 pending = pending.saturating_add(snapshot.min_samples());
                 read.budget
                     .check_ahead(pending)
-                    .map_err(|err| valkey_module::ValkeyError::String(err.to_string()))?;
+                    .map_err(super::shard_error)?;
                 copied.push((labels(s), snapshot));
             }
             Ok(copied)
@@ -408,13 +400,11 @@ pub(super) fn local_grid_windows<S: GilSource + ?Sized>(
             let candidates = snapshots
                 .into_par_rayon()
                 .map(|(labels, snapshot)| {
-                    if !decode_within_budget(budget, &snapshot).map_err(|err| err.to_string())? {
-                        return Ok(None);
+                    if !decode_within_budget(budget, &snapshot)? {
+                        return Ok::<_, QueryError>(None);
                     }
                     let samples = snapshot.get_range();
-                    budget
-                        .charge(samples.len())
-                        .map_err(|err| err.to_string())?;
+                    budget.charge(samples.len())?;
                     // A snapshot with chunks can still hold nothing inside the
                     // span: the chunks only overlap it.
                     Ok((!samples.is_empty())
@@ -422,7 +412,7 @@ pub(super) fn local_grid_windows<S: GilSource + ?Sized>(
                 })
                 .into_fallible()
                 .collect::<Vec<_>>()
-                .map_err(valkey_module::ValkeyError::String)?;
+                .map_err(super::shard_error)?;
             let windows = bounds.admit(candidates);
             if bounds.over_series() {
                 // `finish` refuses the read whatever the rest holds.
@@ -435,7 +425,7 @@ pub(super) fn local_grid_windows<S: GilSource + ?Sized>(
         },
     )?;
 
-    bounds.finish().map_err(valkey_module::ValkeyError::String)
+    bounds.finish().map_err(super::shard_error)
 }
 
 /// What a read this node performs on another node's behalf runs under, from one read of
@@ -485,7 +475,7 @@ struct WindowBounds {
     max_series: u64,
     max_points: Option<usize>,
     returned: usize,
-    over_points: Option<String>,
+    over_points: Option<QueryError>,
 }
 
 impl WindowBounds {
@@ -522,7 +512,7 @@ impl WindowBounds {
     }
 
     /// The verdict over every batch admitted.
-    fn finish(self) -> Result<(), String> {
+    fn finish(self) -> QueryResult<()> {
         validate_max_series(self.returned, self.max_series as usize)?;
         self.over_points.map_or(Ok(()), Err)
     }
@@ -570,27 +560,25 @@ pub(super) fn handle_range_query<S: GilSource + ?Sized>(
             let batch = snapshots
                 .into_par_rayon()
                 .map(|(labels, snapshot)| {
-                    if !decode_within_budget(budget, &snapshot).map_err(|err| err.to_string())? {
-                        return Ok(None);
+                    if !decode_within_budget(budget, &snapshot)? {
+                        return Ok::<_, QueryError>(None);
                     }
                     // Streams against the per-series point limit, so an
                     // over-wide span is rejected having kept at most the
                     // permitted samples.
                     let series_samples = get_snapshot_range(&snapshot, max_points)?;
-                    budget
-                        .charge(series_samples.len())
-                        .map_err(|err| err.to_string())?;
+                    budget.charge(series_samples.len())?;
                     if series_samples.is_empty() {
                         return Ok(None);
                     }
                     let data = serialize_chunk(samples_to_chunk_lossless(series_samples))
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| QueryError::Execution(e.to_string()))?;
                     Ok(Some((labels, data)))
                 })
                 .into_fallible()
                 .filter_map(|range| range)
                 .collect::<Vec<_>>()
-                .map_err(valkey_module::ValkeyError::String)?;
+                .map_err(super::shard_error)?;
             ranges.extend(batch);
             // Refused below whatever the rest holds: copy no more batches.
             Ok(if exceeds_max_series(ranges.len(), max_series as usize) {
@@ -601,8 +589,7 @@ pub(super) fn handle_range_query<S: GilSource + ?Sized>(
         },
     )?;
 
-    validate_max_series(ranges.len(), max_series as usize)
-        .map_err(valkey_module::ValkeyError::String)?;
+    validate_max_series(ranges.len(), max_series as usize).map_err(super::shard_error)?;
 
     // Labels go into the response's symbol table by identity, as for an
     // instant query: serially, since the table is one per response, and after
@@ -638,7 +625,7 @@ mod tests {
         candidates: Vec<Option<RangeSample<EvalLabels>>>,
         max_series: u64,
         max_points_per_series: u64,
-    ) -> Result<Vec<RangeSample<EvalLabels>>, String> {
+    ) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
         let mut bounds = WindowBounds::new(max_series, max_points_per_series);
         let windows = bounds.admit(candidates);
         bounds.finish().map(|()| windows)
@@ -658,7 +645,10 @@ mod tests {
             samples.push(i).unwrap();
         }
         let err = samples.push(3).unwrap_err().to_string();
-        assert!(err.contains("ts-promql-max-samples-per-query"), "{err}");
+        assert!(
+            err.to_string().contains("ts-promql-max-samples-per-query"),
+            "{err}"
+        );
         assert_eq!(samples.len(), 3, "the refused sample is not kept");
         assert_eq!(samples.finish().unwrap(), vec![0, 1, 2]);
         assert_eq!(budget.loaded(), 3);
@@ -680,7 +670,10 @@ mod tests {
             "one batch charged so far"
         );
         let err = samples.push(limit).unwrap_err().to_string();
-        assert!(err.contains("ts-promql-max-samples-per-query"), "{err}");
+        assert!(
+            err.to_string().contains("ts-promql-max-samples-per-query"),
+            "{err}"
+        );
         assert_eq!(samples.finish().unwrap().len(), limit);
         assert_eq!(budget.loaded(), limit);
     }
@@ -756,7 +749,10 @@ mod tests {
 
         let err = bound_windows(candidates, 100, 0).expect_err("101 returned > 100");
 
-        assert!(err.contains("101 > 100"), "unexpected message: {err}");
+        assert!(
+            err.to_string().contains("101 > 100"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
@@ -765,7 +761,10 @@ mod tests {
 
         let err = bound_windows(candidates, 0, 4).expect_err("5 points > 4");
 
-        assert!(err.contains("5 > 4"), "unexpected message: {err}");
+        assert!(
+            err.to_string().contains("5 > 4"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
@@ -789,7 +788,10 @@ mod tests {
 
         let err = bounds.finish().expect_err("120 returned > 100");
 
-        assert!(err.contains("120 > 100"), "unexpected message: {err}");
+        assert!(
+            err.to_string().contains("120 > 100"),
+            "unexpected message: {err}"
+        );
     }
 
     /// A batch over the point limit early in the read does not pre-empt the
@@ -807,7 +809,7 @@ mod tests {
         bounds.admit(vec![filled("d", 1)]);
         assert!(bounds.over_series());
         let err = bounds.finish().unwrap_err();
-        assert!(err.ends_with(": 4 > 3"), "{err}");
+        assert!(err.to_string().ends_with(": 4 > 3"), "{err}");
 
         let mut unlimited = WindowBounds::new(0, 0);
         unlimited.admit((0..10).map(|i| filled(&i.to_string(), 1)).collect());
@@ -833,7 +835,10 @@ mod tests {
 
         let err = bounds.finish().expect_err("3 returned > 2");
 
-        assert!(err.contains("3 > 2"), "unexpected message: {err}");
+        assert!(
+            err.to_string().contains("3 > 2"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
@@ -845,6 +850,9 @@ mod tests {
 
         let err = bounds.finish().expect_err("5 points > 4");
 
-        assert!(err.contains("5 > 4"), "unexpected message: {err}");
+        assert!(
+            err.to_string().contains("5 > 4"),
+            "unexpected message: {err}"
+        );
     }
 }

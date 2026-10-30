@@ -13,7 +13,7 @@ use crate::promql::engine::query_reader::{
 };
 use crate::promql::engine::{QueryReader, evaluate_instant, evaluate_range};
 use crate::promql::model::{InstantSample, QueryValue, RangeSample};
-use crate::promql::{EvalLabels, PromqlResult, QueryOptions};
+use crate::promql::{EvalLabels, QueryOptions, QueryResult};
 use promql_parser::parser::{EvalStmt, VectorSelector, parse};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,7 +31,7 @@ impl QueryReader for NoGridPushdown {
         selector: &VectorSelector,
         timestamp: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
+    ) -> QueryResult<Vec<InstantSample<EvalLabels>>> {
         self.inner.query(selector, timestamp, options)
     }
 
@@ -41,7 +41,7 @@ impl QueryReader for NoGridPushdown {
         start_ms: i64,
         end_ms: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
+    ) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
         self.inner.query_range(selector, start_ms, end_ms, options)
     }
 
@@ -51,7 +51,7 @@ impl QueryReader for NoGridPushdown {
         timestamp: i64,
         aggregation: &AggregationRequest,
         options: QueryOptions,
-    ) -> PromqlResult<AggregationOutcome> {
+    ) -> QueryResult<AggregationOutcome> {
         self.inner
             .query_aggregation(selector, timestamp, aggregation, options)
     }
@@ -61,7 +61,7 @@ impl QueryReader for NoGridPushdown {
         _selector: &VectorSelector,
         _request: &GridRequest,
         _options: QueryOptions,
-    ) -> PromqlResult<GridOutcome> {
+    ) -> QueryResult<GridOutcome> {
         self.grid_calls.fetch_add(1, Ordering::Relaxed);
         Ok(GridOutcome::Unsupported)
     }
@@ -71,7 +71,7 @@ impl QueryReader for NoGridPushdown {
         selector: &VectorSelector,
         window: Option<ProfileWindow>,
         options: QueryOptions,
-    ) -> PromqlResult<Option<LabelProfile>> {
+    ) -> QueryResult<Option<LabelProfile>> {
         self.inner.label_profile(selector, window, options)
     }
 }

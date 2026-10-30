@@ -2,7 +2,7 @@ use crate::common::Timestamp;
 use crate::promql::exec::pipeline::compute_subquery_alignment;
 use crate::promql::model::EvalContext;
 use crate::promql::time::{apply_time_modifiers_ms, duration_ms, grid_step_count, step_times};
-use promql_parser::parser::{Expr, SubqueryExpr};
+use promql_parser::parser::{AtModifier, Expr, Offset, SubqueryExpr};
 
 /// Immutable description of the step grid preloading must cover.
 ///
@@ -57,6 +57,18 @@ impl PreloadGrid {
         step_times(self.start_ms, self.end_ms, self.step_ms)
     }
 
+    /// `ts` with `at`/`offset` applied, `@ start()`/`@ end()` resolving
+    /// against this grid's *at* bounds — the enclosing query's, for a subquery
+    /// grid — exactly as the per-step path resolves them from its context.
+    pub(crate) fn modified_ts(
+        &self,
+        at: Option<&AtModifier>,
+        offset: Option<&Offset>,
+        ts: Timestamp,
+    ) -> Timestamp {
+        apply_time_modifiers_ms(at, offset, self.at_start_ms, self.at_end_ms, ts)
+    }
+
     pub(crate) fn expected_steps(&self) -> usize {
         grid_step_count(self.start_ms, self.end_ms, self.step_ms) as usize
     }
@@ -89,15 +101,8 @@ impl PreloadGrid {
         }
         let first = self.steps().next()?;
         let last = self.last_step()?;
-        let resolve = |ts: Timestamp| {
-            apply_time_modifiers_ms(
-                subquery.at.as_ref(),
-                subquery.offset.as_ref(),
-                self.at_start_ms,
-                self.at_end_ms,
-                ts,
-            )
-        };
+        let resolve =
+            |ts: Timestamp| self.modified_ts(subquery.at.as_ref(), subquery.offset.as_ref(), ts);
         let (first_end, last_end) = (resolve(first), resolve(last));
         let (earliest_end, latest_end) = (first_end.min(last_end), first_end.max(last_end));
         let (aligned_start_ms, _, _, _) = compute_subquery_alignment(

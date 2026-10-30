@@ -21,7 +21,7 @@ impl BitSet {
         self.len
     }
 
-    /// Panics if `idx >= len`.
+    /// `idx` must be below [`Self::len`]; checked in debug builds only.
     #[inline]
     pub fn get(&self, idx: usize) -> bool {
         debug_assert!(

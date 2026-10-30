@@ -1,15 +1,17 @@
 //! `TS._DEBUG`: internal, undocumented-API introspection, gated on `debug-mode`.
 //!
 //! [`ts_debug`] holds the entry point and dispatcher; each larger subcommand has its own module.
-//! `METRICS`, `STRINGPOOLSTATS` and `INDEXMEMORY` report this node unless given `CLUSTER`, which
-//! fans them out across the cluster; their fanout commands live here too and are registered with
-//! the rest in `commands::register_fanout_operations`.
+//! `METRICS`, `STRINGPOOLSTATS`, `INDEXMEMORY` and `CLEAR_QUERY_CACHE` act on this node unless
+//! given `CLUSTER`, which fans them out across the cluster; their fanout commands live here too
+//! and are registered with the rest in `commands::register_fanout_operations`.
 
 mod configs;
 mod index_memory;
 mod index_memory_fanout_command;
 mod metrics;
 mod metrics_fanout_command;
+mod query_cache;
+mod query_cache_fanout_command;
 mod string_pool_stats;
 mod string_pool_stats_fanout_command;
 mod target;
@@ -21,6 +23,7 @@ use valkey_module::{ValkeyError, ValkeyResult};
 
 pub(super) use index_memory_fanout_command::IndexMemoryFanoutCommand;
 pub(super) use metrics_fanout_command::MetricsFanoutCommand;
+pub(super) use query_cache_fanout_command::ClearQueryCacheFanoutCommand;
 pub(super) use string_pool_stats_fanout_command::StringPoolStatsFanoutCommand;
 pub use ts_debug::ts_debug_cmd;
 

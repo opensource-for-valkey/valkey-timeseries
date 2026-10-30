@@ -6,7 +6,6 @@ use crate::labels::{
     HasFingerprint, InternedLabel, Labels, MetricName, SeriesFingerprint, fingerprint_labels,
     hash_label,
 };
-use crate::promql::error::QueryError;
 use crate::promql::exec::bitset::BitSet;
 use crate::promql::hashers::{GridPreloadKey, MatrixPreloadKey, PreloadKey};
 use ahash::RandomState;
@@ -16,46 +15,6 @@ use promql_parser::parser::value::ValueType;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-
-#[derive(Debug, Clone)]
-pub enum EvaluationError {
-    StorageError(String),
-    InternalError(String),
-    ArgumentError(String),
-    DuplicateLabelSet,
-    UnsupportedFunction(String),
-    /// A `QueryError` surfaced by a `QueryReader` (or nested query evaluation),
-    /// wrapped without loss so that converting back to `QueryError` preserves
-    /// the original kind (e.g. `Timeout` stays `Timeout`).
-    Query(QueryError),
-}
-
-impl From<QueryError> for EvaluationError {
-    fn from(err: QueryError) -> Self {
-        EvaluationError::Query(err)
-    }
-}
-
-impl Display for EvaluationError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EvaluationError::StorageError(err) => write!(f, "PromQL evaluation error: {err}"),
-            EvaluationError::InternalError(err) => write!(f, "PromQL internal error: {err}"),
-            EvaluationError::ArgumentError(err) => write!(f, "PromQL argument error: {err}"),
-            EvaluationError::DuplicateLabelSet => {
-                write!(f, "vector cannot contain metrics with the same labelset")
-            }
-            EvaluationError::UnsupportedFunction(func_name) => {
-                write!(f, "PromQL unknown function: {func_name}")
-            }
-            EvaluationError::Query(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl std::error::Error for EvaluationError {}
-
-pub(crate) type EvalResult<T> = Result<T, EvaluationError>;
 
 /// No series: the end of a successor chain, or no step seen yet.
 const NO_SERIES: usize = usize::MAX;
@@ -464,10 +423,34 @@ impl EvalLabels {
         self.get(key).is_some()
     }
 
-    /// Insert or update a label by `&str` key (convenience wrapper around
-    /// `insert` that accepts `&str` instead of `String`).
+    /// Insert or update a label by `&str` key.
+    ///
+    /// An `Interned` set stays interned: one new interned entry is spliced
+    /// into a copy of the slice, as [`Self::copy_label_from`] does, and setting
+    /// a label to the value it already has changes nothing. Going through
+    /// `insert` instead materialized every label as owned `String`s, per
+    /// sample per step for `label_replace`/`label_join`.
     pub(crate) fn set(&mut self, key: &str, value: String) {
-        self.insert(key.to_string(), value);
+        let EvalLabels::Interned(split) = self else {
+            self.insert(key.to_string(), value);
+            return;
+        };
+        let labels: Vec<InternedString> = match split.binary_search_by(|l| l.name().cmp(key)) {
+            Ok(i) if split[i].value() == value => return,
+            Ok(i) => {
+                let mut labels = split.to_vec();
+                labels[i] = InternedString::new_pair(key, &value);
+                labels
+            }
+            Err(i) => {
+                let mut labels = Vec::with_capacity(split.len() + 1);
+                labels.extend_from_slice(&split[..i]);
+                labels.push(InternedString::new_pair(key, &value));
+                labels.extend_from_slice(&split[i..]);
+                labels
+            }
+        };
+        *self = EvalLabels::Interned(Arc::from(labels));
     }
 
     /// Set `name` to its value in `source`, or remove it when `source` has
@@ -1456,6 +1439,34 @@ mod copy_label_tests {
 
     fn interned(pairs: &[(&str, &str)]) -> EvalLabels {
         EvalLabels::interned(&MetricName::from_pairs(pairs.iter().copied()))
+    }
+
+    /// `label_replace`/`label_join` write through `set`: on an interned set it
+    /// must splice one interned entry in, not materialize every label as owned
+    /// strings, and the result must equal the owned path's.
+    #[test]
+    fn set_keeps_an_interned_set_interned() {
+        let mut labels = interned(&[("a", "1"), ("c", "3")]);
+        let mut owned = EvalLabels::from_pairs(&[("a", "1"), ("c", "3")]);
+        for (name, value) in [("b", "2"), ("a", "9"), ("a", "9"), ("d", "4")] {
+            labels.set(name, value.to_string());
+            owned.set(name, value.to_string());
+            assert!(
+                matches!(labels, EvalLabels::Interned(_)),
+                "set({name}) left the interned variant"
+            );
+            assert_eq!(pairs(&labels), pairs(&owned), "after set({name}, {value})");
+            assert_eq!(labels, owned);
+        }
+        assert_eq!(
+            pairs(&labels),
+            vec![
+                ("a".to_string(), "9".to_string()),
+                ("b".to_string(), "2".to_string()),
+                ("c".to_string(), "3".to_string()),
+                ("d".to_string(), "4".to_string()),
+            ]
+        );
     }
 
     fn pairs(labels: &EvalLabels) -> Vec<(String, String)> {

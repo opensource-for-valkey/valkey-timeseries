@@ -3,14 +3,36 @@ use super::labels::changes_metric_schema;
 use crate::promql::{EvalResult, EvalSample, ExprResult};
 use promql_parser::parser::BinaryExpr;
 
+/// `vector <op> scalar`: the scalar is the right-hand side.
 pub(super) fn eval_binop_vector_scalar(
     expr: &BinaryExpr,
     vector: Vec<EvalSample>,
     scalar: f64,
 ) -> EvalResult<ExprResult> {
+    let apply = binary_op_fn(expr.op)?;
+    Ok(eval_vector(expr, vector, |value| apply(value, scalar)))
+}
+
+/// `scalar <op> vector`: the scalar is the left-hand side.
+pub(super) fn eval_binop_scalar_vector(
+    expr: &BinaryExpr,
+    scalar: f64,
+    vector: Vec<EvalSample>,
+) -> EvalResult<ExprResult> {
+    let apply = binary_op_fn(expr.op)?;
+    Ok(eval_vector(expr, vector, |value| apply(scalar, value)))
+}
+
+/// Shared body for both operand orders. `apply` is generic rather than a
+/// runtime flag so each caller gets its own monomorphized per-sample loop with
+/// the operand order already resolved, as `binop_range_scalar::eval_range` does
+/// for range vectors.
+fn eval_vector<F>(expr: &BinaryExpr, vector: Vec<EvalSample>, apply: F) -> ExprResult
+where
+    F: Fn(f64) -> f64,
+{
     // With `bool` modifier, comparison ops return 0/1 for all pairs instead of filtering
     let return_bool = expr.return_bool();
-    let apply = binary_op_fn(expr.op)?;
     let mut result = vector;
 
     if expr.op.is_comparison_operator() && !return_bool {
@@ -20,17 +42,17 @@ pub(super) fn eval_binop_vector_scalar(
         // `return_bool` is false by the branch condition.
         // A passing sample keeps its original value. Only `bool` comparisons
         // rewrite values to 0/1.
-        result.retain(|sample| apply(sample.value, scalar) != 0.0);
+        result.retain(|sample| apply(sample.value) != 0.0);
     } else {
         // Every sample survives, so walk in place rather than paying for `retain_mut`.
         let should_drop_name = changes_metric_schema(expr.op) || return_bool;
         for sample in &mut result {
-            sample.value = apply(sample.value, scalar);
+            sample.value = apply(sample.value);
             sample.drop_name |= should_drop_name;
         }
     }
 
-    Ok(ExprResult::InstantVector(result))
+    ExprResult::InstantVector(result)
 }
 
 #[cfg(test)]
@@ -75,6 +97,51 @@ mod tests {
                 "op {op:?} must mark __name__ for dropping"
             );
         }
+    }
+
+    /// The two entry points differ only in operand order, which the shared
+    /// body must not lose: `10 - m` is not `m - 10`, and `10 > m` keeps the
+    /// samples `m > 10` drops.
+    #[test]
+    fn operand_order_follows_the_entry_point() {
+        use promql_parser::parser::token::T_SUB;
+
+        let sub = BinaryExpr {
+            op: TokenType::new(T_SUB),
+            lhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+            rhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+            modifier: None,
+        };
+        let values = |result: EvalResult<ExprResult>| -> Vec<f64> {
+            match result {
+                Ok(ExprResult::InstantVector(v)) => v.iter().map(|s| s.value).collect(),
+                other => panic!("expected InstantVector, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            values(eval_binop_vector_scalar(&sub, vec![sample(3.0)], 10.0)),
+            vec![-7.0]
+        );
+        assert_eq!(
+            values(eval_binop_scalar_vector(&sub, 10.0, vec![sample(3.0)])),
+            vec![7.0]
+        );
+
+        let gtr = BinaryExpr {
+            op: TokenType::new(T_GTR),
+            lhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+            rhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+            modifier: None,
+        };
+        let input = || vec![sample(1.0), sample(5.0)];
+        assert_eq!(
+            values(eval_binop_vector_scalar(&gtr, input(), 3.0)),
+            vec![5.0]
+        );
+        assert_eq!(
+            values(eval_binop_scalar_vector(&gtr, 3.0, input())),
+            vec![1.0]
+        );
     }
 
     /// Prometheus semantics: a filtering comparison keeps the *original* sample

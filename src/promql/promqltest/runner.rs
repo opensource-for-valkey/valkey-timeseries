@@ -1,10 +1,13 @@
 use crate::common::time::system_time_to_millis;
+use crate::promql::QueryOptions;
 use crate::promql::QueryValue;
 use crate::promql::engine::promql_engine::PromqlQuerier;
 use crate::promql::engine::test_utils::MemorySeriesQuerier;
 use crate::promql::promqltest::assert::{StepGrid, assert_results, assert_results_on_grid};
 use crate::promql::promqltest::dsl::*;
-use crate::promql::promqltest::evaluator::{eval_instant, eval_range};
+use crate::promql::promqltest::evaluator::{
+    eval_instant, eval_range, optimized_query_options, test_query_options,
+};
 use crate::promql::promqltest::loader::load_series;
 use std::sync::Arc;
 
@@ -14,11 +17,22 @@ use std::sync::Arc;
 
 /// Run a single test file (matches Prometheus RunTest)
 pub fn run_test(name: &str, content: &str) -> Result<(), String> {
-    run_test_with_storage(name, content, &new_test_storage)
+    run_test_with_storage(name, content, &new_test_storage, &test_query_options())
+}
+
+/// [`run_test`] with the static optimizer on (`ts-promql-optimize-queries`):
+/// its rewrites must not change any result.
+pub fn run_test_optimized(name: &str, content: &str) -> Result<(), String> {
+    run_test_with_storage(name, content, &new_test_storage, &optimized_query_options())
 }
 
 /// Run a single test file with custom storage (matches Prometheus RunTestWithStorage)
-fn run_test_with_storage<F>(name: &str, content: &str, storage_factory: &F) -> Result<(), String>
+fn run_test_with_storage<F>(
+    name: &str,
+    content: &str,
+    storage_factory: &F,
+    options: &QueryOptions,
+) -> Result<(), String>
 where
     F: Fn() -> (PromqlQuerier, Arc<MemorySeriesQuerier>),
 {
@@ -72,6 +86,7 @@ where
                         eval_cmd.end,
                         eval_cmd.step,
                         &eval_cmd.query,
+                        options,
                     );
 
                     let outcome = if eval_cmd.expect_fail {
@@ -106,7 +121,7 @@ where
             Command::EvalInstant(eval_cmd) => {
                 if !ignoring {
                     eval_count += 1;
-                    let result = eval_instant(&tsdb, eval_cmd.time, &eval_cmd.query);
+                    let result = eval_instant(&tsdb, eval_cmd.time, &eval_cmd.query, options);
 
                     let outcome = if eval_cmd.expect_fail {
                         match result {
@@ -184,8 +199,13 @@ mod tests {
         load_series(Arc::clone(&storage), Duration::from_secs(60), &series).unwrap();
 
         // then
-        let result =
-            eval_instant(&tsdb, UNIX_EPOCH + Duration::from_secs(60), "test_metric").unwrap();
+        let result = eval_instant(
+            &tsdb,
+            UNIX_EPOCH + Duration::from_secs(60),
+            "test_metric",
+            &test_query_options(),
+        )
+        .unwrap();
         let QueryValue::Vector(result) = result else {
             panic!("Expected instant vector result");
         };
@@ -204,7 +224,13 @@ mod tests {
         load_series(Arc::clone(&storage), Duration::from_secs(60), &series).unwrap();
 
         // when
-        let result = eval_instant(&tsdb, UNIX_EPOCH + Duration::from_secs(120), "metric").unwrap();
+        let result = eval_instant(
+            &tsdb,
+            UNIX_EPOCH + Duration::from_secs(120),
+            "metric",
+            &test_query_options(),
+        )
+        .unwrap();
         let result = result.into_matrix().unwrap();
 
         // then

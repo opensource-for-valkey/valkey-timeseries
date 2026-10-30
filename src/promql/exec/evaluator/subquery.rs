@@ -9,13 +9,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         subquery: &SubqueryExpr,
         ctx: &EvalContext,
     ) -> EvalResult<ExprResult> {
-        let adjusted_eval_ts = apply_time_modifiers_ms(
-            subquery.at.as_ref(),
-            subquery.offset.as_ref(),
-            ctx.query_start,
-            ctx.query_end,
-            ctx.evaluation_ts,
-        );
+        let adjusted_eval_ts = ctx.modified_eval_ts(subquery.at.as_ref(), subquery.offset.as_ref());
 
         // Calculate subquery time range: [adjusted_eval_ts - range, adjusted_eval_ts]
         let subquery_end_ms = adjusted_eval_ts;

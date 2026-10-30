@@ -1,7 +1,7 @@
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
-use crate::promql::QueryResult;
 use crate::promql::engine::sample_budget::{SampleBudget, too_many_samples};
+use crate::promql::{QueryError, QueryResult};
 use crate::series::RangeSnapshot;
 
 pub(crate) const MAX_SERIES_ERROR_MSG: &str = error_consts::PROMQL_MAX_SERIES_ERROR;
@@ -30,12 +30,12 @@ pub(in crate::promql) fn exceeds_max_series(series_count: usize, max_series: usi
 pub(in crate::promql) fn validate_max_series(
     series_count: usize,
     max_series: usize,
-) -> Result<(), String> {
+) -> QueryResult<()> {
     if exceeds_max_series(series_count, max_series) {
-        Err(format!(
+        Err(QueryError::Execution(format!(
             "{}: {} > {}",
             MAX_SERIES_ERROR_MSG, series_count, max_series
-        ))
+        )))
     } else {
         Ok(())
     }
@@ -53,7 +53,7 @@ pub(in crate::promql) fn validate_max_series(
 pub(in crate::promql) fn get_snapshot_range(
     snapshot: &RangeSnapshot,
     max_points_per_series: Option<usize>,
-) -> Result<Vec<Sample>, String> {
+) -> QueryResult<Vec<Sample>> {
     let points_count = match max_points_per_series {
         Some(count) if count > 0 => count,
         _ => return Ok(snapshot.get_range()),
@@ -93,15 +93,15 @@ pub(in crate::promql) fn decode_within_budget(
 pub(in crate::promql) fn validate_max_points(
     points_count: usize,
     max_points: Option<usize>,
-) -> Result<(), String> {
+) -> QueryResult<()> {
     if let Some(max) = max_points
         && max > 0
         && points_count > max
     {
-        Err(format!(
+        Err(QueryError::Execution(format!(
             "{}: {} > {}",
             MAX_POINTS_PER_SERIES_ERROR_MSG, points_count, max
-        ))
+        )))
     } else {
         Ok(())
     }
@@ -164,7 +164,7 @@ mod tests {
         let error = get_snapshot_range(&series.snapshot_range(5, 7), Some(2))
             .expect_err("three in-range samples exceed the two-point limit");
 
-        assert!(error.contains("3 > 2"));
+        assert!(error.to_string().contains("3 > 2"));
     }
 
     /// One chunk holding samples at 0 and 10, so `[3, 7]` overlaps it with nothing inside.

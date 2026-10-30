@@ -10,19 +10,22 @@ use crate::promql::functions::rate::{RateKind, extrapolated_rate_window};
 use crate::promql::functions::rollups::{
     eval_rollups, eval_rollups_basic, rollup_series_over_grid, window_samples,
 };
+use crate::promql::functions::state::{rollup_state_count, state_duration_window};
 use crate::promql::functions::types::FunctionCallContext;
 use crate::promql::functions::types::RollupWindow;
 use crate::promql::functions::utils::{
     exact_arity_error, expect_exact_arg_count, expect_range_vector, expect_scalar,
     labels_for_absent,
 };
-use crate::promql::{EvalContext, EvalResult, EvalSample, EvaluationError, ExprResult};
+use crate::promql::{EvalContext, EvalResult, EvalSample, ExprResult};
 use promql_parser::parser::Expr;
+use promql_parser::parser::Function;
+use promql_parser::parser::value::ValueType;
 // https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/app/vmselect/promql/rollup.go
 
 /// A range-vector function that a shard can evaluate on its own.
 ///
-/// A PromQL series lives entirely on one shard, so a rollup over that series'
+/// A timeseries lives entirely on one shard, so a rollup over that series'
 /// own window needs no cross-shard merge algebra: the shard computes the final
 /// value and the coordinator concatenates. That locality — not decomposability —
 /// is the membership rule for this enum. A function belongs here when its output
@@ -61,6 +64,9 @@ pub enum RollupKind {
     Deriv,
     Resets,
     Changes,
+    StateDurationOverTime,
+    StateCountOverTime,
+    RangeOverTime,
 }
 
 /// How a rollup reduces one window, mirroring the shapes the local evaluation
@@ -80,7 +86,15 @@ enum RollupImpl {
     /// extrapolate to the window edges, so where those edges are changes the
     /// answer even when the samples do not.
     WindowAware(fn(&[Sample], i64, Timestamp) -> Option<f64>),
+    /// Reads whole `Sample`s with the scalar parameter and an output unit, and
+    /// may decline — `state_duration_over_time`'s shape: its `state` is the
+    /// parameter, and a window whose last sample is not in it has no answer.
+    WholeWindowWithUnit(UnitRollupFn),
 }
+
+/// A whole-window reduction taking the scalar parameter and a unit in
+/// milliseconds, which may decline to answer.
+type UnitRollupFn = fn(&[Sample], Option<f64>, Option<i64>) -> Option<f64>;
 
 impl RollupKind {
     /// The kind for a PromQL function name, or `None` when that function cannot
@@ -122,7 +136,10 @@ impl RollupKind {
             "idelta" => RollupKind::IDelta,
             "deriv" => RollupKind::Deriv,
             "resets" => RollupKind::Resets,
-            "changes" => RollupKind::Changes
+            "changes" => RollupKind::Changes,
+            "state_duration_over_time" => RollupKind::StateDurationOverTime,
+            "state_count_over_time" => RollupKind::StateCountOverTime,
+            "range_over_time" => RollupKind::RangeOverTime
         )
         .copied()
     }
@@ -158,7 +175,53 @@ impl RollupKind {
             Deriv => "deriv",
             Resets => "resets",
             Changes => "changes",
+            StateDurationOverTime => "state_duration_over_time",
+            StateCountOverTime => "state_count_over_time",
+            RangeOverTime => "range_over_time",
         }
+    }
+
+    /// A valid `(param, unit_ms)` for this kind, for tests that build one
+    /// request or query per kind.
+    #[cfg(test)]
+    pub(in crate::promql) fn test_params(self) -> (Option<f64>, Option<i64>) {
+        match self {
+            RollupKind::QuantileOverTime => (Some(0.9), None),
+            RollupKind::StateDurationOverTime => (Some(1.0), Some(60_000)),
+            RollupKind::StateCountOverTime => (Some(1.0), None),
+            _ => (None, None),
+        }
+    }
+
+    /// Whether a request carrying `param` and `unit_ms` for this kind is one
+    /// that reproduces the local answer.
+    ///
+    /// The coordinator keeps anything this refuses local, so the local path
+    /// reports the error the user should see (a `NaN` state, say); a shard
+    /// refuses the request outright, since no coordinator of this build sends
+    /// one. Only `state_duration_over_time` takes a unit; it and
+    /// `state_count_over_time` need a state.
+    pub(in crate::promql) fn check_params(
+        self,
+        param: Option<f64>,
+        unit_ms: Option<i64>,
+    ) -> Result<(), String> {
+        let takes_unit = self == RollupKind::StateDurationOverTime;
+        match unit_ms {
+            Some(_) if !takes_unit => return Err(format!("{self:?} takes no unit")),
+            Some(unit_ms) if unit_ms <= 0 => {
+                return Err(format!("{self:?} unit must be positive, got {unit_ms} ms"));
+            }
+            _ => {}
+        }
+        let takes_state = matches!(
+            self,
+            RollupKind::StateDurationOverTime | RollupKind::StateCountOverTime
+        );
+        if takes_state && param.is_none_or(f64::is_nan) {
+            return Err(format!("{self:?} needs a state that is not NaN"));
+        }
+        Ok(())
     }
 
     /// Every kind, for exhaustive testing. A new variant that is not listed here
@@ -192,16 +255,41 @@ impl RollupKind {
             Deriv,
             Resets,
             Changes,
+            StateDurationOverTime,
+            StateCountOverTime,
+            RangeOverTime,
         ];
         for kind in all {
             // Exhaustive: adding a variant without adding it above fails to
             // compile here.
             match kind {
-                SumOverTime | CountOverTime | LastOverTime | AvgOverTime | MinOverTime
-                | MaxOverTime | StddevOverTime | StdvarOverTime | MadOverTime | PresentOverTime
-                | FirstOverTime | QuantileOverTime | TsOfFirstOverTime | TsOfLastOverTime
-                | TsOfMinOverTime | TsOfMaxOverTime | Rate | Increase | Delta | IRate | IDelta
-                | Deriv | Resets | Changes => {}
+                SumOverTime
+                | CountOverTime
+                | LastOverTime
+                | AvgOverTime
+                | MinOverTime
+                | MaxOverTime
+                | StddevOverTime
+                | StdvarOverTime
+                | MadOverTime
+                | PresentOverTime
+                | FirstOverTime
+                | QuantileOverTime
+                | TsOfFirstOverTime
+                | TsOfLastOverTime
+                | TsOfMinOverTime
+                | TsOfMaxOverTime
+                | Rate
+                | Increase
+                | Delta
+                | IRate
+                | IDelta
+                | Deriv
+                | Resets
+                | Changes
+                | StateDurationOverTime
+                | StateCountOverTime
+                | RangeOverTime => {}
             }
         }
         all.to_vec()
@@ -236,6 +324,11 @@ impl RollupKind {
             RollupKind::Deriv => RollupImpl::WholeWindowOptional(rollup_deriv),
             RollupKind::Resets => RollupImpl::WholeWindowOptional(rollup_resets),
             RollupKind::Changes => RollupImpl::WholeWindowOptional(rollup_changes),
+            RollupKind::StateDurationOverTime => {
+                RollupImpl::WholeWindowWithUnit(state_duration_window)
+            }
+            RollupKind::StateCountOverTime => RollupImpl::Windowed(rollup_state_count),
+            RollupKind::RangeOverTime => RollupImpl::Windowed(rollup_range),
         }
     }
 
@@ -243,26 +336,21 @@ impl RollupKind {
     ///
     /// The result is sparse: a window holding no samples contributes nothing, so
     /// the output is shorter than `window_ends` whenever the series has gaps.
-    /// `samples` must be sorted ascending by timestamp.
+    /// `samples` must be sorted ascending by timestamp. `unit_ms` is read only
+    /// by the kinds that take a unit; see [`Self::check_params`].
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::promql) fn eval_windows(
         self,
         samples: &[Sample],
         window_ms: i64,
-        lookback_ms: i64,
-        step_ms: i64,
         window_ends: impl IntoIterator<Item = Timestamp>,
         param: Option<f64>,
+        unit_ms: Option<i64>,
     ) -> Vec<Sample> {
         match self.implementation() {
-            RollupImpl::Windowed(f) => rollup_series_over_grid(
-                samples,
-                window_ms,
-                lookback_ms,
-                step_ms,
-                window_ends,
-                param,
-                f,
-            ),
+            RollupImpl::Windowed(f) => {
+                rollup_series_over_grid(samples, window_ms, window_ends, param, f)
+            }
             RollupImpl::WholeWindow(f) => {
                 Self::over_windows(samples, window_ms, window_ends, |window, _| Some(f(window)))
             }
@@ -272,6 +360,11 @@ impl RollupKind {
             RollupImpl::WindowAware(f) => {
                 Self::over_windows(samples, window_ms, window_ends, |window, end| {
                     f(window, window_ms, end)
+                })
+            }
+            RollupImpl::WholeWindowWithUnit(f) => {
+                Self::over_windows(samples, window_ms, window_ends, |window, _| {
+                    f(window, param, unit_ms)
                 })
             }
         }
@@ -337,7 +430,9 @@ pub(super) fn exec_basic_rollup_fn(
     expect_exact_arg_count(name, 1, args.len())?;
     let range = args.swap_remove(0).into_range_vector()?;
     Ok(ExprResult::InstantVector(eval_rollups_basic(
-        ctx, range, f,
+        ctx,
+        range,
+        |window| Some(f(window)),
     )?))
 }
 
@@ -347,13 +442,6 @@ macro_rules! make_rollup_function {
         pub(in crate::promql) struct $type_name;
 
         impl PromQLFunction for $type_name {
-            fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-                Err(EvaluationError::ArgumentError(format!(
-                    "invalid invocation of rollup function '{}'",
-                    $name
-                )))
-            }
-
             fn apply_call(
                 &self,
                 args: Vec<PromQLArg>,
@@ -371,13 +459,6 @@ macro_rules! basic_rollup_function {
         pub(in crate::promql) struct $type_name;
 
         impl PromQLFunction for $type_name {
-            fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-                Err(EvaluationError::ArgumentError(format!(
-                    "invalid invocation of rollup function '{}'",
-                    $name
-                )))
-            }
-
             fn apply_call(
                 &self,
                 args: Vec<PromQLArg>,
@@ -393,6 +474,7 @@ make_rollup_function!(AvgOverTimeFunction, "avg_over_time", rollup_avg);
 make_rollup_function!(MinOverTimeFunction, "min_over_time", rollup_min);
 make_rollup_function!(MadOverTimeFunction, "mad_over_time", rollup_mad);
 make_rollup_function!(MaxOverTimeFunction, "max_over_time", rollup_max);
+make_rollup_function!(RangeOverTimeFunction, "range_over_time", rollup_range);
 make_rollup_function!(SumOverTimeFunction, "sum_over_time", rollup_sum);
 make_rollup_function!(
     TsOfMinOverTimeFunction,
@@ -489,6 +571,27 @@ fn rollup_max(rfa: &RollupWindow, _param: Option<f64>) -> f64 {
     max
 }
 
+/// `range_over_time`: `max_over_time - min_over_time`, in one pass.
+///
+/// Both ends follow [`rollup_min`] and [`rollup_max`] exactly — a NaN is
+/// replaced by any later real value — so the answer is the difference of the
+/// two functions' answers, including NaN for an all-NaN window. Infinities
+/// subtract as IEEE says: `+Inf` and `-Inf` give `+Inf`, an all-`+Inf` window
+/// gives NaN.
+fn rollup_range(rfa: &RollupWindow, _param: Option<f64>) -> f64 {
+    let mut min = rfa.values[0];
+    let mut max = min;
+    for &cur in rfa.values.iter().skip(1) {
+        if cur < min || min.is_nan() {
+            min = cur;
+        }
+        if cur > max || max.is_nan() {
+            max = cur;
+        }
+    }
+    max - min
+}
+
 fn rollup_ts_of_min(rfa: &RollupWindow, _param: Option<f64>) -> f64 {
     let values = rfa.values;
     let mut min_value = values[0];
@@ -499,8 +602,9 @@ fn rollup_ts_of_min(rfa: &RollupWindow, _param: Option<f64>) -> f64 {
         .copied()
         .zip(rfa.timestamps.iter().copied())
     {
-        // Get the last timestamp for the minimum value as most users expect.
-        if v <= min_value {
+        // Get the last timestamp for the minimum value as most users expect. A
+        // NaN seed is replaced by the first real value, as in `rollup_min`.
+        if v <= min_value || min_value.is_nan() {
             min_value = v;
             min_timestamp = ts;
         }
@@ -518,8 +622,9 @@ fn rollup_ts_of_max(rfa: &RollupWindow, _param: Option<f64>) -> f64 {
         .copied()
         .zip(rfa.timestamps.iter().copied())
     {
-        // Get the last timestamp for the maximum value as most users expect.
-        if v >= max_value {
+        // Get the last timestamp for the maximum value as most users expect. A
+        // NaN seed is replaced by the first real value, as in `rollup_max`.
+        if v >= max_value || max_value.is_nan() {
             max_value = v;
             max_timestamp = ts;
         }
@@ -629,10 +734,6 @@ impl PromQLFunction for AbsentOverTimeFunction {
 pub(in crate::promql) struct QuantileOverTimeFunction;
 
 impl PromQLFunction for QuantileOverTimeFunction {
-    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(exact_arity_error("quantile_over_time", 2, 0))
-    }
-
     fn apply_call(
         &self,
         args: Vec<PromQLArg>,
@@ -645,8 +746,8 @@ impl PromQLFunction for QuantileOverTimeFunction {
         let phi_arg = iter.next().unwrap();
         let range_arg = iter.next().unwrap();
 
-        let phi = expect_scalar(phi_arg, "quantiles_over_time", "phi")?;
-        let range = expect_range_vector(range_arg, "quantiles_over_time")?;
+        let phi = expect_scalar(phi_arg, "quantile_over_time", "phi")?;
+        let range = expect_range_vector(range_arg, "quantile_over_time")?;
 
         Ok(ExprResult::InstantVector(eval_rollups(
             ctx,
@@ -657,10 +758,48 @@ impl PromQLFunction for QuantileOverTimeFunction {
     }
 }
 
+/// Parser-side declarations for the rollups that are not PromQL built-ins.
+/// Each is experimental, so a request must enable experimental functions to
+/// call it.
+pub(in crate::promql) fn get_extended_rollup_functions() -> Vec<Function> {
+    vec![Function::new(
+        "range_over_time",
+        vec![ValueType::Matrix],
+        0,
+        ValueType::Vector,
+        true,
+    )]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::promql::functions::rollups::window_samples;
+
+    /// A NaN first sample must not pin the timestamp: `ts_of_min_over_time` and
+    /// `ts_of_max_over_time` replace a NaN seed with the first real value, as
+    /// `min_over_time`/`max_over_time` (and Prometheus) do. Ties still report
+    /// the last timestamp, the documented `<=`/`>=` rule.
+    #[test]
+    fn ts_of_extrema_replace_a_nan_seed() {
+        let values = [f64::NAN, 3.0, 1.0, 1.0];
+        let timestamps = [10_i64, 20, 30, 40];
+        let window = RollupWindow {
+            values: &values,
+            timestamps: &timestamps,
+        };
+        assert_eq!(rollup_ts_of_min(&window, None), 0.04);
+        assert_eq!(rollup_ts_of_max(&window, None), 0.02);
+
+        // All NaN: the seed is replaced at every sample, so the last one wins.
+        let nans = [f64::NAN, f64::NAN];
+        let window = RollupWindow {
+            values: &nans,
+            timestamps: &[10, 20],
+        };
+        assert_eq!(rollup_ts_of_min(&window, None), 0.02);
+        assert_eq!(rollup_ts_of_max(&window, None), 0.02);
+    }
 
     /// A kind's name must round-trip: with two dozen hand-written entries in
     /// `from_function_name`, a typo would silently make one function
@@ -696,9 +835,8 @@ mod tests {
     /// that is all the matrix selector loaded. The pushed-down path hands it the
     /// union of the grid's windows and lets it slice, because loading each
     /// window separately is the transfer the push-down exists to avoid. A rollup
-    /// that read the surrounding samples — [`RollupWindow`] offers them as
-    /// `prev_value`, `real_prev_value` and `real_next_value` — would answer
-    /// differently on the two paths for the same query.
+    /// that read the surrounding samples would answer differently on the two
+    /// paths for the same query.
     ///
     /// So every [`RollupKind`] must reduce a window identically with and without
     /// its neighbours in view. A function that cannot is not eligible for
@@ -715,18 +853,18 @@ mod tests {
         let ends: Vec<Timestamp> = (0..=300_000).step_by(30_000).collect();
 
         for kind in RollupKind::all() {
-            let param = (kind == RollupKind::QuantileOverTime).then_some(0.9);
+            let (param, unit_ms) = kind.test_params();
 
             // The whole series in view, sliced per window — the grid path.
             let with_context =
-                kind.eval_windows(&series, window_ms, 0, 30_000, ends.iter().copied(), param);
+                kind.eval_windows(&series, window_ms, ends.iter().copied(), param, unit_ms);
 
             // One window at a time, nothing else in view — the local path.
             let isolated: Vec<Sample> = ends
                 .iter()
                 .filter_map(|&end| {
                     let window = window_samples(&series, end, window_ms)?;
-                    kind.eval_windows(window, window_ms, 0, 30_000, [end], param)
+                    kind.eval_windows(window, window_ms, [end], param, unit_ms)
                         .pop()
                 })
                 .collect();
@@ -736,5 +874,161 @@ mod tests {
                 "{kind:?} must not depend on samples outside its window"
             );
         }
+    }
+
+    /// The generic check above uses a strictly increasing series, where every
+    /// run of one value is a single sample. A run that crosses a window's start
+    /// is the case that matters here: with the neighbours in view it must still
+    /// be measured from the window's first sample.
+    #[test]
+    fn state_duration_ignores_runs_before_the_window() {
+        // Runs of four samples in and four out of state, 10 s apart.
+        let series: Vec<Sample> = (0..=40)
+            .map(|i| Sample {
+                timestamp: i * 10_000,
+                value: ((i / 4) % 2) as f64,
+            })
+            .collect();
+        let window_ms = 25_000;
+        let ends: Vec<Timestamp> = (0..=400_000).step_by(5_000).collect();
+        let kind = RollupKind::StateDurationOverTime;
+        for unit_ms in [None, Some(60_000)] {
+            let with_context =
+                kind.eval_windows(&series, window_ms, ends.iter().copied(), Some(1.0), unit_ms);
+            let isolated: Vec<Sample> = ends
+                .iter()
+                .filter_map(|&end| {
+                    let window = window_samples(&series, end, window_ms)?;
+                    kind.eval_windows(window, window_ms, [end], Some(1.0), unit_ms)
+                        .pop()
+                })
+                .collect();
+            // A 25 s window holds at most three samples 10 s apart, so no answer
+            // can exceed 20 s, though the runs themselves last 30 s.
+            let longest = 20_000.0 / unit_ms.unwrap_or(1_000) as f64;
+            assert!(!with_context.is_empty());
+            assert!(with_context.iter().all(|s| s.value <= longest));
+            assert_eq!(with_context, isolated, "unit {unit_ms:?}");
+        }
+    }
+
+    /// The count's version of the check above: a run that started before the
+    /// window is counted from the window's first sample, and windows out of
+    /// state answer `0` rather than dropping out.
+    #[test]
+    fn state_count_ignores_runs_before_the_window() {
+        // Runs of four samples in and four out of state, 10 s apart.
+        let series: Vec<Sample> = (0..=40)
+            .map(|i| Sample {
+                timestamp: i * 10_000,
+                value: ((i / 4) % 2) as f64,
+            })
+            .collect();
+        let window_ms = 25_000;
+        let ends: Vec<Timestamp> = (0..=400_000).step_by(5_000).collect();
+        let kind = RollupKind::StateCountOverTime;
+        let with_context =
+            kind.eval_windows(&series, window_ms, ends.iter().copied(), Some(1.0), None);
+        let isolated: Vec<Sample> = ends
+            .iter()
+            .filter_map(|&end| {
+                let window = window_samples(&series, end, window_ms)?;
+                kind.eval_windows(window, window_ms, [end], Some(1.0), None)
+                    .pop()
+            })
+            .collect();
+        // A 25 s window holds at most three samples, though the runs hold four.
+        assert!(with_context.iter().all(|s| s.value <= 3.0));
+        assert!(with_context.iter().any(|s| s.value == 3.0));
+        assert!(with_context.iter().any(|s| s.value == 0.0));
+        assert_eq!(with_context, isolated);
+    }
+
+    /// `range_over_time` folds `max_over_time - min_over_time` into one pass;
+    /// the two must agree bit for bit, including where NaN and the infinities
+    /// make a naive fold go wrong.
+    #[test]
+    fn rollup_range_is_max_minus_min() {
+        let nan = f64::NAN;
+        let inf = f64::INFINITY;
+        let cases: &[&[f64]] = &[
+            &[1.0],
+            &[3.0, 1.0, 2.0],
+            &[nan, 2.0, 5.0],
+            &[2.0, nan, 5.0],
+            &[5.0, 2.0, nan],
+            &[nan],
+            &[nan, nan, nan],
+            &[-inf, 3.0, inf],
+            &[inf, inf],
+            &[-inf, -inf],
+            &[nan, -inf, nan],
+            &[-0.0, 0.0],
+        ];
+        for values in cases {
+            let timestamps: Vec<Timestamp> = (0..values.len() as i64).collect();
+            let window = RollupWindow {
+                values,
+                timestamps: &timestamps,
+            };
+            let want = rollup_max(&window, None) - rollup_min(&window, None);
+            let got = rollup_range(&window, None);
+            assert!(
+                got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                "{values:?}: want {want}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn range_over_time_takes_no_params() {
+        assert!(RollupKind::RangeOverTime.check_params(None, None).is_ok());
+        assert!(
+            RollupKind::RangeOverTime
+                .check_params(None, Some(1_000))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn check_params_keeps_units_and_states_to_state_duration() {
+        use RollupKind::*;
+        assert!(StateDurationOverTime.check_params(Some(1.0), None).is_ok());
+        assert!(
+            StateDurationOverTime
+                .check_params(Some(1.0), Some(60_000))
+                .is_ok()
+        );
+        assert!(StateDurationOverTime.check_params(None, None).is_err());
+        assert!(
+            StateDurationOverTime
+                .check_params(Some(f64::NAN), None)
+                .is_err()
+        );
+        assert!(
+            StateDurationOverTime
+                .check_params(Some(1.0), Some(0))
+                .is_err()
+        );
+        assert!(
+            StateDurationOverTime
+                .check_params(Some(1.0), Some(-1))
+                .is_err()
+        );
+        assert!(StateCountOverTime.check_params(Some(1.0), None).is_ok());
+        assert!(StateCountOverTime.check_params(None, None).is_err());
+        assert!(
+            StateCountOverTime
+                .check_params(Some(f64::NAN), None)
+                .is_err()
+        );
+        assert!(
+            StateCountOverTime
+                .check_params(Some(1.0), Some(1_000))
+                .is_err()
+        );
+        assert!(SumOverTime.check_params(None, Some(1_000)).is_err());
+        assert!(QuantileOverTime.check_params(Some(0.9), None).is_ok());
+        assert!(Rate.check_params(None, None).is_ok());
     }
 }

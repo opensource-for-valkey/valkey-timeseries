@@ -24,7 +24,7 @@ use crate::common::math::kahan_inc;
 use crate::common::{Sample, Timestamp};
 use crate::labels::{HasFingerprint, SeriesFingerprint};
 use crate::promql::deadline::{Deadline, SERIES_WORK};
-use crate::promql::engine::query_reader::{AggregationParam, GridAggregation};
+use crate::promql::engine::query_reader::{AggregationParam, GridAggregation, GridSeries};
 use crate::promql::exec::aggregations::{
     AggregationKind, PushdownStrategy, apply_aggregation, max_ignore_nan, min_ignore_nan,
 };
@@ -252,8 +252,11 @@ impl PartialGroups {
         let kind = self.kind;
         for sample in samples {
             deadline.checkpoint(SERIES_WORK)?;
-            let labels = sample.labels.compute_grouping_labels(modifier);
-            self.entry(labels).update(kind, sample.value);
+            // Key every sample without allocating; build the group's labels
+            // only when the group is new (see `compute_grouping_key`).
+            let key = sample.labels.compute_grouping_key(modifier);
+            self.entry_with(key, || sample.labels.compute_grouping_labels(modifier))
+                .update(kind, sample.value);
         }
         Ok(())
     }
@@ -267,6 +270,16 @@ impl PartialGroups {
     /// The accumulated states, for transport to the coordinator.
     pub fn into_partials(self) -> impl Iterator<Item = (EvalLabels, AggregationPartial)> {
         self.groups.into_iter().map(|(_, entry)| entry)
+    }
+
+    /// [`Self::into_partials`] with each group's fingerprint, for a caller that
+    /// regroups them and would otherwise hash every label set again.
+    fn into_keyed(
+        self,
+    ) -> impl Iterator<Item = (SeriesFingerprint, EvalLabels, AggregationPartial)> {
+        self.groups
+            .into_iter()
+            .map(|(key, (labels, state))| (key, labels, state))
     }
 
     /// Finalize every group into a result sample stamped at `eval_time`, as
@@ -294,18 +307,18 @@ impl PartialGroups {
             .1
     }
 
-    /// [`Self::entry`] for a caller that already holds `labels`' fingerprint,
-    /// so the labels are only cloned when the group is first seen.
-    fn entry_keyed(
+    /// [`Self::entry`] for a caller that already holds the group's fingerprint,
+    /// so its labels are only built when the group is first seen.
+    fn entry_with(
         &mut self,
         key: SeriesFingerprint,
-        labels: &EvalLabels,
+        labels: impl FnOnce() -> EvalLabels,
     ) -> &mut AggregationPartial {
         let kind = self.kind;
         &mut self
             .groups
             .entry(key)
-            .or_insert_with(|| (labels.clone(), AggregationPartial::empty(kind)))
+            .or_insert_with(|| (labels(), AggregationPartial::empty(kind)))
             .1
     }
 }
@@ -349,25 +362,75 @@ impl SteppedPartialGroups {
         series: Vec<RangeSample<EvalLabels>>,
         deadline: &Deadline,
     ) -> EvalResult<usize> {
-        let kind = self.kind;
         let mut added = 0;
         for s in series {
             deadline.checkpoint(SERIES_WORK + s.samples.len())?;
-            // One group per series, however many steps it spans: resolve the
-            // group and hash it once, not once per point.
-            let labels = s.labels.compute_grouping_labels(modifier);
-            let key = labels.fingerprint();
-            for point in s.samples {
-                let groups = self
-                    .steps
-                    .entry(point.timestamp)
-                    .or_insert_with(|| PartialGroups::new(kind));
-                let before = groups.groups.len();
-                groups.entry_keyed(key, &labels).update(kind, point.value);
-                added += groups.groups.len() - before;
-            }
+            added += self.accumulate_points(
+                modifier,
+                &s.labels,
+                s.samples.iter().map(|p| (p.timestamp, p.value)),
+            );
         }
         Ok(added)
+    }
+
+    /// [`Self::accumulate`] over a per-series stage's output as it stands:
+    /// stepped points are folded where they lie rather than first copied into
+    /// `(step, value)` samples.
+    pub fn accumulate_grid(
+        &mut self,
+        modifier: Option<&LabelModifier>,
+        output: GridSeries,
+        deadline: &Deadline,
+    ) -> EvalResult<usize> {
+        match output {
+            GridSeries::Rolled(series) => self.accumulate(modifier, series, deadline),
+            GridSeries::Stepped(series) => {
+                let mut added = 0;
+                for s in series {
+                    deadline.checkpoint(SERIES_WORK + s.points.len())?;
+                    added += self.accumulate_points(
+                        modifier,
+                        &s.labels,
+                        s.points.iter().map(|p| (p.step_ts, p.sample.value)),
+                    );
+                }
+                Ok(added)
+            }
+        }
+    }
+
+    /// Fold one series' `(step, value)` points into its group's states,
+    /// returning how many states that added.
+    fn accumulate_points(
+        &mut self,
+        modifier: Option<&LabelModifier>,
+        series_labels: &EvalLabels,
+        points: impl Iterator<Item = (Timestamp, f64)>,
+    ) -> usize {
+        let kind = self.kind;
+        let mut added = 0;
+        // One group per series, however many steps it spans: hash it once,
+        // not once per point, and build its labels only if some step has not
+        // seen the group yet.
+        let key = series_labels.compute_grouping_key(modifier);
+        let mut labels: Option<EvalLabels> = None;
+        for (step_ts, value) in points {
+            let groups = self
+                .steps
+                .entry(step_ts)
+                .or_insert_with(|| PartialGroups::new(kind));
+            let before = groups.groups.len();
+            groups
+                .entry_with(key, || {
+                    labels
+                        .get_or_insert_with(|| series_labels.compute_grouping_labels(modifier))
+                        .clone()
+                })
+                .update(kind, value);
+            added += groups.groups.len() - before;
+        }
+        added
     }
 
     /// Merge one shard's state for a `(group, step)` pair, returning how many
@@ -409,8 +472,7 @@ impl SteppedPartialGroups {
 
         for (step_ts, groups) in self.steps {
             deadline.checkpoint(SERIES_WORK + groups.groups.len())?;
-            for (labels, state) in groups.into_partials() {
-                let key = labels.fingerprint();
+            for (key, labels, state) in groups.into_keyed() {
                 by_group
                     .entry(key)
                     .or_insert_with(|| (labels, Vec::new()))
@@ -460,6 +522,9 @@ impl SteppedSelection {
         self.aggregation.strategy()
     }
 
+    /// The collected form, kept as the reference the grid form is tested
+    /// against.
+    #[cfg(test)]
     /// Run the operator over per-series step values — a shard's own series,
     /// or the ones the coordinator was handed raw — and keep its output as
     /// candidates, returning how many it kept. `deadline` is checked between
@@ -473,6 +538,24 @@ impl SteppedSelection {
     ) -> EvalResult<usize> {
         let mut by_step: BTreeMap<Timestamp, Vec<EvalSample>> = BTreeMap::new();
         Self::transpose(series, &mut by_step, deadline)?;
+        self.run_steps(by_step, deadline)
+    }
+
+    /// [`Self::apply`] over a per-series stage's output as it stands, its
+    /// stepped points transposed where they lie.
+    pub fn apply_grid(&mut self, output: GridSeries, deadline: &Deadline) -> EvalResult<usize> {
+        let mut by_step: BTreeMap<Timestamp, Vec<EvalSample>> = BTreeMap::new();
+        Self::transpose_grid(output, &mut by_step, deadline)?;
+        self.run_steps(by_step, deadline)
+    }
+
+    /// Run the operator at every step of `by_step` and keep its output as
+    /// candidates, returning how many it kept.
+    fn run_steps(
+        &mut self,
+        by_step: BTreeMap<Timestamp, Vec<EvalSample>>,
+        deadline: &Deadline,
+    ) -> EvalResult<usize> {
         let mut added = 0;
         // Sequential on purpose: a step's selection is a few microseconds,
         // and fanning 240 of them out to the pool measured five times slower
@@ -485,6 +568,9 @@ impl SteppedSelection {
         Ok(added)
     }
 
+    /// The collected form, kept as the reference the grid form is tested
+    /// against.
+    #[cfg(test)]
     /// Fold in another party's output — a shard's per-step selection or
     /// counts — as candidates, returning how many. `deadline` is checked
     /// between series.
@@ -494,6 +580,11 @@ impl SteppedSelection {
         deadline: &Deadline,
     ) -> EvalResult<usize> {
         Self::transpose(series, &mut self.steps, deadline)
+    }
+
+    /// [`Self::merge`] over a per-series stage's output as it stands.
+    pub fn merge_grid(&mut self, output: GridSeries, deadline: &Deadline) -> EvalResult<usize> {
+        Self::transpose_grid(output, &mut self.steps, deadline)
     }
 
     /// One entry per output label set, each holding its sparse `(step,
@@ -566,17 +657,54 @@ impl SteppedSelection {
         let mut added = 0;
         for s in series {
             deadline.checkpoint(SERIES_WORK + s.samples.len())?;
-            added += s.samples.len();
-            for point in s.samples {
-                into.entry(point.timestamp).or_default().push(EvalSample {
-                    labels: s.labels.clone(),
-                    value: point.value,
-                    timestamp_ms: point.timestamp,
-                    drop_name: false,
-                });
-            }
+            added += Self::transpose_points(
+                &s.labels,
+                s.samples.iter().map(|p| (p.timestamp, p.value)),
+                into,
+            );
         }
         Ok(added)
+    }
+
+    /// [`Self::transpose`] over a per-series stage's output as it stands.
+    fn transpose_grid(
+        output: GridSeries,
+        into: &mut BTreeMap<Timestamp, Vec<EvalSample>>,
+        deadline: &Deadline,
+    ) -> EvalResult<usize> {
+        match output {
+            GridSeries::Rolled(series) => Self::transpose(series, into, deadline),
+            GridSeries::Stepped(series) => {
+                let mut added = 0;
+                for s in series {
+                    deadline.checkpoint(SERIES_WORK + s.points.len())?;
+                    added += Self::transpose_points(
+                        &s.labels,
+                        s.points.iter().map(|p| (p.step_ts, p.sample.value)),
+                        into,
+                    );
+                }
+                Ok(added)
+            }
+        }
+    }
+
+    fn transpose_points(
+        labels: &EvalLabels,
+        points: impl Iterator<Item = (Timestamp, f64)>,
+        into: &mut BTreeMap<Timestamp, Vec<EvalSample>>,
+    ) -> usize {
+        let mut added = 0;
+        for (step_ts, value) in points {
+            into.entry(step_ts).or_default().push(EvalSample {
+                labels: labels.clone(),
+                value,
+                timestamp_ms: step_ts,
+                drop_name: false,
+            });
+            added += 1;
+        }
+        added
     }
 }
 
@@ -824,6 +952,37 @@ mod tests {
                 (EvalLabels::from_pairs(&[("job", "b"), ("v", "1")]), 4.0),
             ]
         );
+    }
+
+    /// Series of one group fold into one entry per group, its points one per
+    /// step in order, whichever series reached a step first.
+    #[test]
+    fn stepped_finalize_groups_by_label_set() {
+        let series = |i: &str, points: &[(Timestamp, f64)]| RangeSample {
+            labels: EvalLabels::from_pairs(&[("i", i), ("job", "a")]),
+            samples: points.iter().map(|&(t, v)| Sample::new(t, v)).collect(),
+        };
+        let mut groups = SteppedPartialGroups::new(AggregationKind::Sum);
+        let added = groups
+            .accumulate(
+                Some(&by(&["job"])),
+                vec![
+                    series("1", &[(10, 1.0), (20, 2.0)]),
+                    series("2", &[(20, 5.0), (30, 7.0)]),
+                ],
+                &Deadline::default(),
+            )
+            .unwrap();
+        assert_eq!(added, 3, "one state per (group, step)");
+        let out = groups.finalize(&Deadline::default()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].labels, EvalLabels::from_pairs(&[("job", "a")]));
+        let points: Vec<(Timestamp, f64)> = out[0]
+            .samples
+            .iter()
+            .map(|s| (s.timestamp, s.value))
+            .collect();
+        assert_eq!(points, vec![(10, 1.0), (20, 7.0), (30, 7.0)]);
     }
 
     /// Only quantile lacks a decomposable form.

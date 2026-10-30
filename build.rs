@@ -109,7 +109,7 @@ fn main() -> io::Result<()> {
 
         entries.sort_by_key(|e| e.file_name());
 
-        code.push_str("use crate::promql::promqltest::runner::run_test;\n\n");
+        code.push_str("use crate::promql::promqltest::runner::{run_test, run_test_optimized};\n\n");
         let mut seen = std::collections::HashMap::new();
         for entry in entries {
             let path = entry.path();
@@ -136,7 +136,19 @@ fn main() -> io::Result<()> {
                 r#"
 #[test]
 fn should_pass_{fn_name}() {{
+    // Module load registers the engine's extra functions with the parser; a test never
+    // loads the module, so it has to register them itself.
+    crate::promql::register_parser_functions().expect("register PromQL parser functions");
     run_test({stem:?}, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), {include_path:?})))
+        .unwrap();
+}}
+
+/// The same file with the static optimizer on: its rewrites must not change
+/// any result.
+#[test]
+fn should_pass_optimized_{fn_name}() {{
+    crate::promql::register_parser_functions().expect("register PromQL parser functions");
+    run_test_optimized({stem:?}, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), {include_path:?})))
         .unwrap();
 }}
 "#,

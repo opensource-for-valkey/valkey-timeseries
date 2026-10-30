@@ -3,7 +3,7 @@ use crate::promql::engine::label_profile::{MAX_DERIVED_BYTES_PER_SELECTOR, deriv
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::exec::utils::strip_parens;
 use crate::promql::hashers::FingerprintHashSet;
-use crate::promql::optimizer::pushdown;
+use crate::promql::optimizer::filter_pushdown;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use ahash::AHashSet;
 use promql_parser::label::{METRIC_NAME, Matcher};
@@ -24,6 +24,22 @@ pub(in crate::promql) fn changes_metric_schema(op: TokenType) -> bool {
         op.id(),
         T_ADD | T_SUB | T_MUL | T_DIV | T_POW | T_MOD | T_ATAN2
     )
+}
+
+/// Whether `name` is part of a binary operation's match key under `matching`,
+/// as Prometheus' `Labels.MatchLabels` selects them: with `on(...)` just the
+/// listed labels, otherwise everything but the ignored labels and `__name__`.
+///
+/// Not the rule for the *result* labels (`result_metric`), which keeps
+/// `__name__` under `ignoring(...)` unless the operator drops it.
+pub(super) fn match_key_keeps(matching: Option<&LabelModifier>, name: &str) -> bool {
+    match matching {
+        Some(LabelModifier::Include(on)) => on.labels.iter().any(|n| n == name),
+        Some(LabelModifier::Exclude(ignoring)) => {
+            name != METRIC_NAME && !ignoring.labels.iter().any(|n| n == name)
+        }
+        None => name != METRIC_NAME,
+    }
 }
 
 /// Fingerprint of a sample's *effective* label set: the labels as they will
@@ -62,10 +78,13 @@ pub(in crate::promql) fn push_down_filters<'a>(
     let mut common_filters = get_common_label_filters(samples);
     if !common_filters.is_empty() {
         if let Some(modifier) = &expr.modifier {
-            pushdown::trim_filters_by_match_modifier(&mut common_filters, &modifier.matching);
+            filter_pushdown::trim_filters_by_match_modifier(
+                &mut common_filters,
+                &modifier.matching,
+            );
         }
         let mut copy = dest.clone();
-        pushdown::push_down_binary_op_filters_in_place(&mut copy, &common_filters);
+        filter_pushdown::push_down_binary_op_filters_in_place(&mut copy, &common_filters);
         return Ok(Cow::Owned(copy));
     }
     Ok(Cow::Borrowed(dest))

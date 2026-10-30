@@ -4,7 +4,9 @@ use crate::promql::functions::date_functions::{
 };
 use crate::promql::functions::deriv::DerivFunction;
 use crate::promql::functions::histogram::{HistogramFractionFunctions, HistogramQuantileFunction};
-use crate::promql::functions::holt_winters::DoubleExponentialSmoothingFunction;
+use crate::promql::functions::holt_winters::{
+    DoubleExponentialSmoothingFunction, HoltWintersFunction,
+};
 use crate::promql::functions::idelta::IDeltaFunction;
 use crate::promql::functions::irate::IRateFunction;
 use crate::promql::functions::labels::{LabelJoinFunction, LabelReplaceFunction};
@@ -21,8 +23,8 @@ use crate::promql::functions::rate::{DeltaFunction, IncreaseFunction, RateFuncti
 use crate::promql::functions::rollup_functions::{
     AbsentOverTimeFunction, AvgOverTimeFunction, CountOverTimeFunction, FirstOverTimeFunction,
     LastOverTimeFunction, MadOverTimeFunction, MaxOverTimeFunction, MinOverTimeFunction,
-    PresentOverTimeFunction, QuantileOverTimeFunction, StddevOverTimeFunction,
-    StdvarOverTimeFunction, SumOverTimeFunction, TsOfFirstOverTimeFunction,
+    PresentOverTimeFunction, QuantileOverTimeFunction, RangeOverTimeFunction,
+    StddevOverTimeFunction, StdvarOverTimeFunction, SumOverTimeFunction, TsOfFirstOverTimeFunction,
     TsOfLastOverTimeFunction, TsOfMaxOverTimeFunction, TsOfMinOverTimeFunction,
 };
 use crate::promql::functions::sort::{
@@ -32,6 +34,7 @@ use crate::promql::functions::special_functions::{
     AbsentFunction, EndFunction, RangeFunction, ScalarFunction, StartFunction, StepFunction,
     VectorFunction,
 };
+use crate::promql::functions::state::{StateCountOverTimeFunction, StateDurationOverTimeFunction};
 use std::fmt::Display;
 use strum_macros::EnumIter;
 use valkey_module::ValkeyError;
@@ -93,7 +96,6 @@ macro_rules! impl_promql_function_impl {
         use $crate::promql::functions::types::{FunctionCallContext, PromQLFunction};
         use $crate::promql::model::EvalContext;
 
-        #[allow(clippy::large_enum_variant)]
         #[derive(Copy, Clone)]
         pub(in crate::promql) enum PromQLFunctionImpl {
             $( $Variant($Ty), )*
@@ -265,11 +267,7 @@ macro_rules! promql_function_list {
                 DoubleExponentialSmoothingFunction
             ),
             (FirstOverTime, "first_over_time", FirstOverTimeFunction),
-            (
-                HoltWinters,
-                "holt_winters",
-                DoubleExponentialSmoothingFunction
-            ),
+            (HoltWinters, "holt_winters", HoltWintersFunction),
             (IRate, "irate", IRateFunction),
             (IDelta, "idelta", IDeltaFunction),
             (LastOverTime, "last_over_time", LastOverTimeFunction),
@@ -287,9 +285,20 @@ macro_rules! promql_function_list {
                 "quantile_over_time",
                 QuantileOverTimeFunction
             ),
+            (RangeOverTime, "range_over_time", RangeOverTimeFunction),
             (Rate, "rate", RateFunction),
             (Increase, "increase", IncreaseFunction),
             (Resets, "resets", ResetsFunction),
+            (
+                StateCountOverTime,
+                "state_count_over_time",
+                StateCountOverTimeFunction
+            ),
+            (
+                StateDurationOverTime,
+                "state_duration_over_time",
+                StateDurationOverTimeFunction
+            ),
             (StddevOverTime, "stddev_over_time", StddevOverTimeFunction),
             (StdvarOverTime, "stdvar_over_time", StdvarOverTimeFunction),
             (SumOverTime, "sum_over_time", SumOverTimeFunction),

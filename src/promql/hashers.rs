@@ -1,12 +1,10 @@
 use crate::common::time::system_time_to_millis;
 use crate::labels::{
-    HasFingerprint, LABEL_SEP, LabelHasher, SeriesFingerprint, create_hasher,
-    create_unseeded_hasher, hash_key_value,
+    HasFingerprint, LABEL_SEP, LabelHasher, SeriesFingerprint, create_hasher, hash_key_value,
 };
-use crate::promql::engine::query_reader::{AggregationParam, GridAggregation};
+use crate::promql::engine::query_reader::{AggregationParam, GridAggregation, GridRollup};
 use crate::promql::exec::aggregations::AggregationKind;
 use crate::promql::functions::RollupKind;
-use crate::promql::generated::Label as ProtoLabel;
 use crate::promql::time::duration_ms;
 use promql_parser::label::{MatchOp, Matcher};
 use promql_parser::parser::{AtModifier, LabelModifier, Offset, VectorSelector};
@@ -17,7 +15,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 /// Hashable representation of Offset
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub(in crate::promql) enum OffsetKey {
+enum OffsetKey {
     Pos(i64),
     Neg(i64),
 }
@@ -33,7 +31,7 @@ impl From<&Offset> for OffsetKey {
 
 /// Hashable representation of AtModifier
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub(in crate::promql) enum AtKey {
+enum AtKey {
     At(i64),
     Start,
     End,
@@ -46,16 +44,6 @@ impl From<&AtModifier> for AtKey {
             AtModifier::Start => AtKey::Start,
             AtModifier::End => AtKey::End,
         }
-    }
-}
-
-impl HasFingerprint for [ProtoLabel] {
-    fn fingerprint(&self) -> SeriesFingerprint {
-        let mut hasher = create_hasher();
-        for label in self {
-            hash_key_value(&mut hasher, &label.name, &label.value);
-        }
-        hasher.finish_128()
     }
 }
 
@@ -75,10 +63,7 @@ impl HasFingerprint for Matcher {
     }
 }
 
-pub(in crate::promql) fn update_hasher_for_vector_selector(
-    vs: &VectorSelector,
-    hasher: &mut LabelHasher,
-) {
+fn update_hasher_for_vector_selector(vs: &VectorSelector, hasher: &mut LabelHasher) {
     fn update_list(list: &Vec<Matcher>, hasher: &mut LabelHasher) {
         let mut keys: SmallVec<[&Matcher; 6]> = smallvec![];
         for m in list {
@@ -265,6 +250,8 @@ pub(in crate::promql) struct RollupKey {
     /// `f64` has no `Hash`/`Eq`; the bit pattern does, and two parameters that
     /// differ in bits are different requests.
     param_bits: Option<u64>,
+    /// `state_duration_over_time(m[1h], 1, "1m")` and its `"1s"` form differ.
+    unit_ms: Option<i64>,
 }
 
 /// The identity of a fused aggregation: operator, grouping and parameter.
@@ -307,20 +294,19 @@ impl AggregationKey {
 }
 
 impl GridPreloadKey {
-    /// A rollup over `vs`, optionally fused with an outer aggregation.
+    /// `rollup` over `vs`, optionally fused with an outer aggregation.
     pub(crate) fn rollup(
         vs: &VectorSelector,
-        kind: RollupKind,
-        range_ms: i64,
-        param: Option<f64>,
+        rollup: &GridRollup,
         aggregation: Option<AggregationKey>,
     ) -> Self {
         Self {
             selector: PreloadKey::from_selector(vs),
             rollup: Some(RollupKey {
-                kind,
-                range_ms,
-                param_bits: param.map(f64::to_bits),
+                kind: rollup.kind,
+                range_ms: rollup.range_ms,
+                param_bits: rollup.param.map(f64::to_bits),
+                unit_ms: rollup.unit_ms,
             }),
             aggregation,
         }
@@ -333,26 +319,5 @@ impl GridPreloadKey {
             rollup: None,
             aggregation: Some(aggregation),
         }
-    }
-}
-
-impl HasFingerprint for PreloadKey {
-    fn fingerprint(&self) -> SeriesFingerprint {
-        let mut hasher = create_unseeded_hasher();
-        hasher.write(self.selector.0.to_le_bytes().as_ref());
-        if let Some(offset) = &self.offset {
-            match offset {
-                OffsetKey::Pos(p) => hasher.write(&p.to_le_bytes()),
-                OffsetKey::Neg(p) => hasher.write(&p.to_le_bytes()),
-            }
-        }
-        if let Some(at) = &self.at {
-            match at {
-                AtKey::Start => hasher.write(b"-"),
-                AtKey::End => hasher.write(b"+"),
-                AtKey::At(v) => hasher.write(&v.to_le_bytes()),
-            }
-        }
-        hasher.finish_128()
     }
 }

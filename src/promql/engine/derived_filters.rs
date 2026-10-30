@@ -27,8 +27,9 @@
 //! matrix range, and each enclosing subquery's grid applied — so a series
 //! that stopped reporting before it (a rolled-out pod) is left out, but one
 //! with a sample anywhere in it is in, at whichever step. A selector that
-//! occurs more than once is profiled once, over the hull of its windows.
-//! Unauthorized series are counted too. Where a profile is unavailable, the
+//! occurs more than once is profiled once, over the hull of its windows, and
+//! one that is the only selector (`cpu - cpu offset 5m`) is not profiled at
+//! all. Unauthorized series are counted too. Where a profile is unavailable, the
 //! leaf behaves exactly as in the static pass.
 
 use crate::common::logging::log_debug;
@@ -38,10 +39,10 @@ use crate::promql::engine::label_profile::{LabelProfile, LabelValueProfile, Prof
 use crate::promql::engine::{QueryOptions, QueryReader};
 use crate::promql::exec::planner::PreloadGrid;
 use crate::promql::hashers::SelectorKey;
-use crate::promql::optimizer::pushdown::{LeafFilters, pushdown_filters_in_place_with};
+use crate::promql::optimizer::filter_pushdown::{LeafFilters, pushdown_filters_in_place_with};
 use crate::promql::time::{duration_ms, selector_bounds};
 use crate::promql::utils::subquery_step_ms;
-use crate::promql::{PromqlResult, QueryError};
+use crate::promql::{QueryError, QueryResult};
 use ahash::AHashMap;
 use orx_parallel::{Par, ParResult};
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
@@ -62,7 +63,7 @@ pub(crate) fn derive_filters_in_place<R: QueryReader + ?Sized>(
     reader: &R,
     grid: &PreloadGrid,
     options: QueryOptions,
-) -> PromqlResult<()> {
+) -> QueryResult<()> {
     let mut leaves = ProfiledLeaves::collect(expr, reader, grid, options)?;
     if leaves.is_empty() {
         return Ok(());
@@ -232,7 +233,7 @@ impl ProfiledLeaves {
         reader: &R,
         grid: &PreloadGrid,
         options: QueryOptions,
-    ) -> PromqlResult<Self> {
+    ) -> QueryResult<Self> {
         let mut leaves = Vec::new();
         collect_operand_leaves(expr, Some(grid), &mut leaves);
 
@@ -257,6 +258,12 @@ impl ProfiledLeaves {
                     *hull = (*hull).zip(window).map(|(a, b)| a.hull(b));
                 }
             }
+        }
+        // One profile shared by every leaf can neither narrow (its filters
+        // hold for every series it is pushed into) nor short-circuit (the
+        // operands are empty together or not at all), so skip the read.
+        if unique.len() == 1 {
+            return Ok(Self::empty());
         }
         let windows = unique
             .iter()
@@ -296,7 +303,17 @@ impl ProfiledLeaves {
         })
     }
 
-    /// No selector sits under an operation the push-down applies to.
+    fn empty() -> Self {
+        Self {
+            by_node: AHashMap::new(),
+            profiles: AHashMap::new(),
+            windows: AHashMap::new(),
+            derived: RefCell::default(),
+        }
+    }
+
+    /// No selector sits under an operation the push-down applies to, or
+    /// none whose profile could change the tree.
     fn is_empty(&self) -> bool {
         self.by_node.is_empty()
     }
@@ -576,7 +593,7 @@ mod tests {
             _: &VectorSelector,
             _: i64,
             _: QueryOptions,
-        ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
+        ) -> QueryResult<Vec<InstantSample<EvalLabels>>> {
             unreachable!("the pass reads no samples")
         }
 
@@ -586,7 +603,7 @@ mod tests {
             _: i64,
             _: i64,
             _: QueryOptions,
-        ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
+        ) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
             unreachable!("the pass reads no samples")
         }
 
@@ -596,7 +613,7 @@ mod tests {
             _: i64,
             _: &AggregationRequest,
             _: QueryOptions,
-        ) -> PromqlResult<AggregationOutcome> {
+        ) -> QueryResult<AggregationOutcome> {
             unreachable!()
         }
 
@@ -605,7 +622,7 @@ mod tests {
             selector: &VectorSelector,
             window: Option<ProfileWindow>,
             _: QueryOptions,
-        ) -> PromqlResult<Option<LabelProfile>> {
+        ) -> QueryResult<Option<LabelProfile>> {
             let mut stripped = selector.clone();
             stripped.offset = None;
             stripped.at = None;
@@ -749,8 +766,9 @@ mod tests {
             rewrite("cpu - cpu offset 5m", &reader),
             "cpu - cpu offset 5m"
         );
-        // One profile for the two occurrences.
-        assert_eq!(reader.asked.lock().unwrap().len(), 1);
+        // One profile would serve both occurrences, and could change
+        // nothing, so none is asked for.
+        assert!(reader.asked.lock().unwrap().is_empty());
     }
 
     /// With the static optimizer on, a range query gets its rewrites but not
@@ -767,7 +785,7 @@ mod tests {
         ]);
         let rewrite_simplified = |query: &str| {
             let expr = promql_parser::parser::parse(query).unwrap();
-            let mut expr = crate::promql::optimizer::simplify_expr(expr).unwrap();
+            let mut expr = crate::promql::optimizer::simplify_expr(expr);
             derive_filters_in_place(&mut expr, &reader, &grid(), options()).unwrap();
             expr.to_string()
         };
@@ -1339,12 +1357,17 @@ mod tests {
 
     #[test]
     fn a_selector_occurring_twice_is_profiled_once_over_the_hull() {
+        // `y` keeps the pass from skipping a tree of one profile.
+        let query = "(x - x offset 1h) * y";
         let reader = TableReader::new(vec![]);
-        rewrite("x - x offset 1h", &reader);
-        assert_eq!(reader.asked.lock().unwrap().len(), 1);
+        rewrite(query, &reader);
+        assert_eq!(reader.asked.lock().unwrap().len(), 2);
         assert_eq!(
-            windows("x - x offset 1h"),
-            vec![window("x", -LOOKBACK, 2 * HOUR)]
+            windows(query),
+            vec![
+                window("x", -LOOKBACK, 2 * HOUR),
+                window("y", HOUR - LOOKBACK, 2 * HOUR)
+            ]
         );
     }
 

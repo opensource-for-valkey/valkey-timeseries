@@ -18,9 +18,8 @@
 // https://github.com/apache/arrow-datafusion/tree/main/datafusion/optimizer/src
 // https://github.com/apache/arrow-datafusion/blob/e222bd627b6e7974133364fed4600d74b4da6811/datafusion/optimizer/src/utils.rs
 
-use crate::parser::ParseResult;
 use crate::promql::optimizer::const_folding::fold_constants;
-use crate::promql::optimizer::pushdown::pushdown_filters_in_place;
+use crate::promql::optimizer::filter_pushdown::pushdown_filters_in_place;
 use crate::promql::optimizer::utils::{expr_contains, is_null, is_number, is_op_with};
 use promql_parser::label::{Matcher, Matchers};
 use promql_parser::parser::token::{T_ADD, T_DIV, T_LAND, T_LOR, T_MUL, TokenType};
@@ -42,12 +41,12 @@ use promql_parser::parser::{BinaryExpr, Expr, ParenExpr};
 ///
 /// `b > 2`
 ///
-pub fn optimize_expr(expr: Expr) -> ParseResult<Expr> {
-    let mut expr = simplify_expr(expr)?;
+pub fn optimize_expr(expr: Expr) -> Expr {
+    let mut expr = simplify_expr(expr);
 
     // push down filters
     pushdown_filters_in_place(&mut expr);
-    Ok(expr)
+    expr
 }
 
 /// [`optimize_expr`] without the filter push-down: constant folding and the
@@ -56,7 +55,7 @@ pub fn optimize_expr(expr: Expr) -> ParseResult<Expr> {
 /// For a range query the data-derived pass (`engine::derived_filters`)
 /// pushes written filters too, but only where the index shows they prune;
 /// pushing them blindly first would leave matchers that pass cannot remove.
-pub fn simplify_expr(expr: Expr) -> ParseResult<Expr> {
+pub fn simplify_expr(expr: Expr) -> Expr {
     const MAX_OPTIMIZATION_PASSES: usize = 4;
 
     let mut expr = expr;
@@ -67,7 +66,7 @@ pub fn simplify_expr(expr: Expr) -> ParseResult<Expr> {
             break;
         }
     }
-    Ok(expr)
+    expr
 }
 
 /// Apply algebraic optimization rules to a binary expression.
@@ -198,14 +197,11 @@ fn optimize_binary(binary: BinaryExpr) -> Expr {
     }
 }
 
-/// Simplifies [`Expr`]s by applying algebraic transformation rules
-///
-/// Example transformations that are applied:
-/// * `expr == bool 1` and `expr != false` to `expr` when `expr` is of boolean type
-/// * `expr != true` to `!expr` when `expr` is of boolean type
-/// * `1 == bool 1` to `1`
-/// * `0 == bool 1` to `0`
-/// * `expr == NaN` and `expr != NaN` to `NaN`
+/// One post-order pass of the algebraic rules over `expr`: binary operators
+/// through `optimize_binary_expr`, selectors through `dedupe_matchers`, and
+/// parentheses stripped where a simplified operand no longer needs them.
+/// Constant folding is `const_folding`'s job and runs before this in
+/// `simplify_expr`.
 fn optimize_internal(expr: Expr) -> Expr {
     match expr {
         Expr::Paren(p) => {
@@ -586,12 +582,30 @@ mod tests {
     // ----- Simplifier tests -------
     // ------------------------------
 
-    fn try_simplify(expr: Expr) -> ParseResult<Expr> {
+    fn simplify(expr: Expr) -> Expr {
         optimize_expr(expr)
     }
 
-    fn simplify(expr: Expr) -> Expr {
-        try_simplify(expr).unwrap()
+    /// `vector(e)` is an instant vector wherever it is not inside `scalar(...)`:
+    /// the optimizer must not turn it into its scalar argument there, or an
+    /// aggregation over it is refused and a negation changes the result type.
+    #[test]
+    fn vector_calls_stay_vectors_outside_scalar() {
+        for query in [
+            "sum(vector(1))",
+            "max(vector(time()))",
+            "count_values(\"v\", vector(1))",
+            "-vector(1)",
+            "sum(x) or vector(0)",
+            "vector(1) + vector(2)",
+            "abs(vector(-1))",
+            "year(vector(1136239445))",
+        ] {
+            assert_string_simplify(query, query);
+        }
+        // Inside `scalar(...)` the two are interchangeable, so it still folds.
+        assert_string_simplify("scalar(vector(1) + vector(2))", "3");
+        assert_string_simplify("scalar(abs(vector(-1)))", "1");
     }
 
     #[test]

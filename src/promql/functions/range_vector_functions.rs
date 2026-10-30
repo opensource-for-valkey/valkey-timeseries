@@ -1,51 +1,23 @@
 use crate::common::Sample;
-use crate::common::threads::IntoParRayon;
-use crate::promql::deadline::SERIES_WORK;
+use crate::promql::functions::rollups::eval_series;
 use crate::promql::functions::types::{PromQLArg, PromQLFunction};
-use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult};
-use orx_parallel::{Par, ParResult};
+use crate::promql::{EvalContext, EvalResult, EvalSamples, ExprResult};
 
 /// Generic aggregator for range vector functions. As opposed to `aggr_over_time`, this operates
-/// over the entire range rather than bucketed windows.
-///
-/// Invariant:
-/// - Each input series is reduced to a single output sample at eval_timestamp_ms.
-/// - Empty series are skipped (matching Prometheus behavior).
-/// - Aggregation function `f` must implement PromQL float semantics exactly.
-///
-/// The deadline is checked per series, weighted by its samples, before `f` runs over them:
-/// never inside `f`, whose loop over one series' samples is the one the compiler vectorizes.
+/// over the entire range rather than bucketed windows: each input series is reduced to a
+/// single output sample at the evaluation timestamp, empty series are skipped, and `f` must
+/// implement PromQL float semantics exactly. See [`eval_series`].
 pub(super) fn eval_range<F>(
     ctx: &EvalContext,
     series: Vec<EvalSamples>,
     f: F,
 ) -> EvalResult<ExprResult>
 where
-    F: Fn(&[Sample]) -> Option<f64> + Send + Sync,
+    F: Fn(&[Sample]) -> Option<f64> + Sync,
 {
-    let (deadline, eval_timestamp_ms) = (ctx.deadline, ctx.evaluation_ts);
-    let res = series
-        .into_par_rayon()
-        .map(|series| -> EvalResult<Option<EvalSample>> {
-            deadline.checkpoint(series.values.len() + SERIES_WORK)?;
-            if series.values.is_empty() {
-                return Ok(None);
-            }
-            let Some(value) = f(&series.values) else {
-                return Ok(None);
-            };
-            Ok(Some(EvalSample {
-                timestamp_ms: eval_timestamp_ms,
-                value,
-                labels: series.labels,
-                drop_name: series.drop_name,
-            }))
-        })
-        .into_fallible()
-        .filter_map(|sample| sample)
-        .collect::<Vec<_>>()?;
-
-    Ok(ExprResult::InstantVector(res))
+    Ok(ExprResult::InstantVector(eval_series(ctx, series, |s| {
+        f(&s.values)
+    })?))
 }
 
 /// Returns the number of counter-resets within the provided time range as an instant vector. Any decrease in the value
@@ -121,4 +93,69 @@ pub(in crate::promql) fn rollup_changes(values: &[Sample]) -> Option<f64> {
     }
 
     Some(n as f64)
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use crate::common::Sample;
+    use crate::promql::deadline::{CHECK_EVERY, Deadline};
+    use crate::promql::exec::types::EvalLabels;
+    use crate::promql::functions::deriv::DerivFunction;
+    use crate::promql::functions::holt_winters::DoubleExponentialSmoothingFunction;
+    use crate::promql::functions::rate::RateFunction;
+    use crate::promql::functions::{PromQLArg, PromQLFunction};
+    use crate::promql::{EvalContext, EvalSamples, QueryError};
+
+    /// Series long enough that each one alone crosses a checkpoint.
+    fn long_series() -> Vec<EvalSamples> {
+        let len = CHECK_EVERY as i64 + 10;
+        (0..4)
+            .map(|i| EvalSamples {
+                values: (0..len)
+                    .map(|t| Sample::new(t * 10, t as f64))
+                    .collect::<Vec<_>>()
+                    .into(),
+                labels: EvalLabels::from_pairs(&[("i", &i.to_string())]),
+                drop_name: false,
+                range_ms: len * 10,
+                range_end_ms: len * 10,
+            })
+            .collect()
+    }
+
+    fn passed_ctx() -> EvalContext {
+        EvalContext {
+            query_start: 0,
+            query_end: 0,
+            evaluation_ts: 0,
+            lookback_delta_ms: 300_000,
+            step_ms: 0,
+            deadline: Deadline::until(Some(std::time::Instant::now())),
+        }
+    }
+
+    fn is_timeout(result: crate::promql::EvalResult<crate::promql::ExprResult>) -> bool {
+        matches!(result.map_err(QueryError::from), Err(QueryError::Timeout))
+    }
+
+    /// Every per-series range driver stops once the deadline has passed: a
+    /// long range over many series must not run every kernel to the end.
+    #[test]
+    fn rate_family_stops_at_a_passed_deadline() {
+        let ctx = passed_ctx();
+        assert!(is_timeout(
+            RateFunction.apply(PromQLArg::RangeVector(long_series()), &ctx)
+        ));
+        assert!(is_timeout(
+            DerivFunction.apply(PromQLArg::RangeVector(long_series()), &ctx)
+        ));
+        assert!(is_timeout(DoubleExponentialSmoothingFunction.apply_args(
+            vec![
+                PromQLArg::RangeVector(long_series()),
+                PromQLArg::Scalar(0.5),
+                PromQLArg::Scalar(0.5),
+            ],
+            &ctx,
+        )));
+    }
 }

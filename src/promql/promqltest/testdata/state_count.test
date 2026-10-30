@@ -1,0 +1,106 @@
+# state_count_over_time(v range-vector, state scalar)
+# Flux stateCount() as a rollup; see docs/plans/state-count-over-time-requirements.md.
+# Experimental: the promqltest harness enables experimental functions.
+
+# The Flux docs' door example (closed = 1, open = 0): samples at 0, 60s, 120s,
+# 180s (open), 240s and 311s. Where Flux writes -1 (last sample not in state),
+# the count is 0 and the series stays in the result.
+load 1s
+	door{door="front"} 1 _x59 1 _x59 1 _x59 0 _x59 1 _x70 1
+	door{door="back"} 1 _x59 1 _x59 1 _x59 1 _x59 1 _x70 1
+
+eval instant at 0 state_count_over_time(door{door="front"}[10m], 1)
+	{door="front"} 1
+
+eval instant at 1m state_count_over_time(door{door="front"}[10m], 1)
+	{door="front"} 2
+
+eval instant at 2m state_count_over_time(door{door="front"}[10m], 1)
+	{door="front"} 3
+
+eval instant at 3m state_count_over_time(door[10m], 1)
+	{door="front"} 0
+	{door="back"} 4
+
+eval instant at 4m state_count_over_time(door{door="front"}[10m], 1)
+	{door="front"} 1
+
+# Counts samples, so the uneven 71s gap before the last one does not matter.
+eval instant at 311s state_count_over_time(door[10m], 1)
+	{door="front"} 2
+	{door="back"} 6
+
+# Tracking the other state.
+eval instant at 3m state_count_over_time(door[10m], 0)
+	{door="front"} 1
+	{door="back"} 0
+
+# Every series with data answers, so count() counts them all; `> 0` keeps the
+# ones in state.
+eval instant at 3m count(state_count_over_time(door[10m], 1))
+	{} 2
+
+eval instant at 3m count(state_count_over_time(door[10m], 1) > 0)
+	{} 1
+
+eval instant at 3m sum(state_count_over_time(door[10m], 1))
+	{} 4
+
+# An empty window yields no sample at all — "no data" stays distinct from 0.
+eval instant at 50m state_count_over_time(door[1m], 1)
+
+eval instant at 50m state_count_over_time(nonexistent_metric[10m], 1)
+
+# Samples present, none in state: 0.
+clear
+load 1m
+	never 0 0 0
+	nan_run 1 NaN 1 1
+	nan_end 1 1 NaN
+
+eval instant at 2m state_count_over_time(never[5m], 1)
+	{} 0
+
+# A NaN sample never matches, so it ends the run.
+eval instant at 3m state_count_over_time(nan_run[5m], 1)
+	{} 2
+
+eval instant at 2m state_count_over_time(nan_end[5m], 1)
+	{} 0
+
+# A range query has no gaps: 0 at the steps where the series is out of state.
+clear
+load 1m
+	late_run 0 1 1 1 1 1 1
+	always_on 1x10
+
+eval range from 0 to 3m step 1m state_count_over_time(late_run[1m], 1)
+	{} 0 1 1 1
+
+# Each window stands alone: a run that started before the window is counted
+# from the window's first sample.
+eval instant at 6m state_count_over_time(late_run[2m], 1)
+	{} 2
+
+eval instant at 6m state_count_over_time(late_run[10m], 1)
+	{} 6
+
+eval range from 5m to 10m step 1m state_count_over_time(always_on[3m], 1)
+	{} 3 3 3 3 3 3
+
+# The range caps the answer: a 5m window of 1m samples holds at most 5.
+eval instant at 10m state_count_over_time(always_on[5m], 1)
+	{} 5
+
+# Argument errors.
+eval instant at 1m state_count_over_time(always_on[5m])
+	expect fail
+
+eval instant at 1m state_count_over_time(always_on[5m], 1, "1s")
+	expect fail
+
+eval instant at 1m state_count_over_time(always_on[5m], "1")
+	expect fail
+
+eval instant at 1m state_count_over_time(always_on[5m], NaN)
+	expect fail

@@ -1,4 +1,4 @@
-use super::labels::effective_fingerprint;
+use super::labels::{effective_fingerprint, match_key_keeps};
 use crate::common::threads::IterIntoParRayon;
 use crate::labels::{SeriesFingerprint, create_unseeded_hasher, hash_key_value};
 use crate::promql::binops::binary_op_fn;
@@ -256,15 +256,7 @@ fn make_fill_many_sample(
 /// otherwise everything but the ignored labels and `__name__`.
 fn match_labels(labels: &EvalLabels, matching: Option<&LabelModifier>) -> EvalLabels {
     let mut labels = labels.clone();
-    match matching {
-        Some(LabelModifier::Include(on)) => {
-            labels.retain(|l| on.labels.iter().any(|name| name == l.name));
-        }
-        Some(LabelModifier::Exclude(ignoring)) => labels.retain(|l| {
-            l.name != METRIC_NAME && !ignoring.labels.iter().any(|name| name == l.name)
-        }),
-        None => labels.retain(|l| l.name != METRIC_NAME),
-    }
+    labels.retain(|l| match_key_keeps(matching, l.name));
     labels
 }
 
@@ -609,23 +601,10 @@ fn compute_binary_match_key(
     matching: Option<&LabelModifier>,
 ) -> SeriesFingerprint {
     let mut hasher = create_unseeded_hasher();
-    let listed = |name: &str, list: &LabelModifier| match list {
-        LabelModifier::Include(l) | LabelModifier::Exclude(l) => l.labels.iter().any(|n| n == name),
-    };
-    match matching {
-        None => labels
-            .iter()
-            .filter(|k| k.name != METRIC_NAME)
-            .for_each(|label| hash_key_value(&mut hasher, label.name, label.value)),
-        Some(m @ LabelModifier::Include(_)) => labels
-            .iter()
-            .filter(|l| listed(l.name, m))
-            .for_each(|label| hash_key_value(&mut hasher, label.name, label.value)),
-        Some(m @ LabelModifier::Exclude(_)) => labels
-            .iter()
-            .filter(|l| l.name != METRIC_NAME && !listed(l.name, m))
-            .for_each(|label| hash_key_value(&mut hasher, label.name, label.value)),
-    };
+    labels
+        .iter()
+        .filter(|l| match_key_keeps(matching, l.name))
+        .for_each(|label| hash_key_value(&mut hasher, label.name, label.value));
     hasher.finish_128()
 }
 

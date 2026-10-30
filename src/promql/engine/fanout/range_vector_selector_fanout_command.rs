@@ -76,11 +76,7 @@ impl FanoutCommand for RangeVectorSelectorFanoutCommand {
         ctx: &FanoutContext,
         req: RangeQuery,
     ) -> ValkeyResult<RangeQueryResponse> {
-        let Some(selector) = req.selector else {
-            // todo: return error
-            ctx.log_warning("Received range query with no selector, returning empty response");
-            return Ok(RangeQueryResponse::default());
-        };
+        let selector = super::required(req.selector, "selector")?;
         let series_selector: SeriesSelector = (&selector).try_into()?;
         let read = shard_read(ctx)?;
         // Locks per batch of matched series; decodes with the lock released.

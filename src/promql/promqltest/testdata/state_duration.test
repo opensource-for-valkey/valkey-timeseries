@@ -1,0 +1,143 @@
+# state_duration_over_time(v range-vector, state scalar [, unit string])
+# Flux stateDuration() as a rollup;
+# Experimental: the promqltest harness enables experimental functions.
+
+# The Flux docs' door example (closed = 1, open = 0): samples at 0, 60s, 120s,
+# 180s (open), 240s and 311s. The docs print 60 for the last row, but by their
+# own rule 240s -> 311s is 71s. Where Flux writes -1 (last sample not in state),
+# the series is left out of the result.
+load 1s
+	door{door="front"} 1 _x59 1 _x59 1 _x59 0 _x59 1 _x70 1
+	door{door="back"} 1 _x59 1 _x59 1 _x59 1 _x59 1 _x70 1
+
+eval instant at 0 state_duration_over_time(door{door="front"}[10m], 1)
+	{door="front"} 0
+
+eval instant at 1m state_duration_over_time(door{door="front"}[10m], 1)
+	{door="front"} 60
+
+eval instant at 2m state_duration_over_time(door{door="front"}[10m], 1)
+	{door="front"} 120
+
+eval instant at 3m state_duration_over_time(door[10m], 1)
+	{door="back"} 180
+
+# Aggregations see only series in state: no sentinel skews sum/avg or inflates count.
+eval instant at 3m count(state_duration_over_time(door[10m], 1))
+	{} 1
+
+eval instant at 3m sum(state_duration_over_time(door[10m], 1))
+	{} 180
+
+# "Has samples but is not in state": the series the function leaves out.
+eval instant at 3m present_over_time(door[10m]) unless state_duration_over_time(door[10m], 1)
+	{door="front"} 1
+
+eval instant at 4m state_duration_over_time(door{door="front"}[10m], 1)
+	{door="front"} 0
+
+eval instant at 311s state_duration_over_time(door[10m], 1)
+	{door="front"} 71
+	{door="back"} 311
+
+# The run is measured to the last sample, not to the evaluation time.
+eval instant at 330s state_duration_over_time(door{door="front"}[10m], 1)
+	{door="front"} 71
+
+# unit: divides the duration and is not truncated.
+eval instant at 311s state_duration_over_time(door{door="front"}[10m], 1, "1s")
+	{door="front"} 71
+
+eval instant at 311s state_duration_over_time(door{door="front"}[10m], 1, "1m")
+	{door="front"} 1.1833333333333333
+
+eval instant at 311s state_duration_over_time(door{door="front"}[10m], 1, "500ms")
+	{door="front"} 142
+
+eval instant at 311s state_duration_over_time(door{door="front"}[10m], 1, "1m11s")
+	{door="front"} 1
+
+eval instant at 3m state_duration_over_time(door{door="front"}[10m], 1, "1h")
+
+# Tracking the other state.
+eval instant at 3m state_duration_over_time(door[10m], 0)
+	{door="front"} 0
+
+# An empty window yields no sample at all.
+eval instant at 50m state_duration_over_time(door[1m], 1)
+
+eval instant at 50m state_duration_over_time(nonexistent_metric[10m], 1)
+
+# The interval is accumulated, not the count: samples at 0, 10s and 40s.
+clear
+load 1s
+	uneven 1 _x9 1 _x29 1
+
+eval instant at 40s state_duration_over_time(uneven[1m], 1)
+	{} 40
+
+# Samples present, none in state: no result.
+clear
+load 1m
+	never 0 0 0
+	nan_run 1 NaN 1 1
+
+eval instant at 2m state_duration_over_time(never[5m], 1)
+
+# A NaN sample never matches, so it breaks the run.
+eval instant at 1m state_duration_over_time(nan_run[5m], 1)
+
+eval instant at 3m state_duration_over_time(nan_run[5m], 1)
+	{} 60
+
+# Each window stands alone: a run that started before the window is measured
+# from the window's first sample, not from where the run began.
+clear
+load 1m
+	always_on 1x10
+	late_run 0 1 1 1 1 1 1
+
+eval range from 5m to 10m step 1m state_duration_over_time(always_on[3m], 1)
+	{} 120 120 120 120 120 120
+
+# A range query has a gap at every step where the series is not in state.
+eval range from 0 to 3m step 1m state_duration_over_time(late_run[1m], 1)
+	{} _ 0 0 0
+
+eval instant at 6m state_duration_over_time(late_run[2m], 1)
+	{} 60
+
+eval instant at 6m state_duration_over_time(late_run[10m], 1)
+	{} 300
+
+# The range caps the answer: a 5m window can never report more than 5m.
+eval instant at 10m state_duration_over_time(always_on[5m], 1, "1m")
+	{} 4
+
+# Argument errors.
+eval instant at 1m state_duration_over_time(always_on[5m])
+	expect fail
+
+eval instant at 1m state_duration_over_time(always_on[5m], 1, "1s", "1s")
+	expect fail
+
+eval instant at 1m state_duration_over_time(always_on[5m], 1, 60)
+	expect fail
+
+eval instant at 1m state_duration_over_time(always_on[5m], NaN)
+	expect fail
+
+eval instant at 1m state_duration_over_time(always_on[5m], 1, "0s")
+	expect fail
+
+eval instant at 1m state_duration_over_time(always_on[5m], 1, "-1m")
+	expect fail
+
+eval instant at 1m state_duration_over_time(always_on[5m], 1, "60")
+	expect fail
+
+eval instant at 1m state_duration_over_time(always_on[5m], 1, "abc")
+	expect fail
+
+eval instant at 1m state_duration_over_time(always_on[5m], 1, "")
+	expect fail

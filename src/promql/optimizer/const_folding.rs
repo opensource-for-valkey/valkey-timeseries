@@ -1,9 +1,7 @@
-use crate::parser::number::parse_number;
 use crate::promql::binops::apply_binary_op;
 use crate::promql::functions::{DateTimePart, PromqlFunctionKind, datetime_from_seconds};
-use crate::promql::{EvalResult, EvaluationError};
 use num_traits::FloatConst;
-use promql_parser::parser::token::{T_ADD, T_EQLC, T_GTE, T_GTR, T_LSS, T_LTE, T_NEQ, TokenType};
+use promql_parser::parser::token::TokenType;
 use promql_parser::parser::{
     AggregateExpr, BinaryExpr, Call, Expr, ParenExpr, SubqueryExpr, UnaryExpr,
 };
@@ -30,24 +28,15 @@ pub(super) fn fold_constants(expr: Expr) -> Expr {
 }
 
 fn handle_unary_expr(ue: UnaryExpr) -> Expr {
-    let mut ue = ue;
-    match *ue.expr {
-        Expr::NumberLiteral(n) => {
-            return Expr::from(-n.val);
-        }
-        Expr::Unary(u2) => {
-            // Fully evaluate the inner UnaryExpr before applying the outer negation.
-            let inner_result = handle_unary_expr(u2);
-            if let Expr::NumberLiteral(n) = inner_result {
-                // inner produced a numeric constant; apply the outer negation
-                return Expr::from(-n.val);
-            }
-            // inner could not be reduced to a literal; preserve the nested structure
-            ue.expr = Box::new(inner_result);
-        }
-        _ => {}
+    // Fold the operand first, whatever it is — a literal, a nested negation,
+    // a parenthesized constant expression — and negate it if it became a
+    // number.
+    match fold_constants(*ue.expr) {
+        Expr::NumberLiteral(n) => Expr::from(-n.val),
+        operand => Expr::Unary(UnaryExpr {
+            expr: Box::new(operand),
+        }),
     }
-    Expr::Unary(ue)
 }
 
 fn handle_binop_internal(be: Expr) -> Expr {
@@ -86,9 +75,6 @@ fn handle_binary_expr(be: BinaryExpr) -> Expr {
         (Expr::NumberLiteral(ln), Expr::NumberLiteral(rn), op) => {
             handle_number_number(ln.val, rn.val, op, is_bool)
         }
-        (Expr::StringLiteral(left), Expr::StringLiteral(right), op) => {
-            handle_string_string(&left.val, &right.val, op, is_bool)
-        }
         _ => Expr::Binary(be),
     }
 }
@@ -102,63 +88,13 @@ fn handle_number_number(ln: f64, rn: f64, op: TokenType, is_bool: bool) -> Expr 
     Expr::from(n)
 }
 
-fn handle_string_string(left: &str, right: &str, op: TokenType, is_bool: bool) -> Expr {
-    if op.id() == T_ADD {
-        if left.is_empty() {
-            return Expr::from(right);
-        } else if right.is_empty() {
-            return Expr::from(left);
-        }
-        let mut res = String::with_capacity(left.len() + right.len());
-        res += left;
-        res += right;
-        Expr::from(res)
-    } else if op.is_comparison_operator() {
-        let n = string_compare(left, right, op, is_bool).expect("string compare failed");
-        Expr::from(n)
-    } else {
-        Expr::Binary(BinaryExpr {
-            lhs: Box::new(Expr::from(left)),
-            rhs: Box::new(Expr::from(right)),
-            op,
-            modifier: None,
-        })
-    }
-}
-
-pub fn string_compare(a: &str, b: &str, op: TokenType, is_bool: bool) -> EvalResult<f64> {
-    let res = match op.id() {
-        T_EQLC => a == b,
-        T_NEQ => a != b,
-        T_LTE => a <= b,
-        T_GTE => a >= b,
-        T_LSS => a < b,
-        T_GTR => a > b,
-        _ => {
-            return Err(EvaluationError::InternalError(format!(
-                "unexpected operator {op} in string comparison"
-            )));
-        }
-    };
-    Ok(if res {
-        1_f64
-    } else if is_bool {
-        0_f64
-    } else {
-        f64::NAN
-    })
-}
-
 fn get_single_scalar_arg(fe: &Call) -> Option<f64> {
     if fe.args.len() == 1 {
         match &*fe.args.args[0] {
             Expr::NumberLiteral(n) => return Some(n.val),
-            Expr::StringLiteral(s) => return parse_number(&s.val).ok(),
             Expr::Call(fe) if fe.func.name == "vector" && fe.args.len() == 1 => {
-                match &*fe.args.args[0] {
-                    Expr::NumberLiteral(n) => return Some(n.val),
-                    Expr::StringLiteral(s) => return parse_number(&s.val).ok(),
-                    _ => {}
+                if let Expr::NumberLiteral(n) = &*fe.args.args[0] {
+                    return Some(n.val);
                 }
             }
             _ => {}
@@ -169,10 +105,6 @@ fn get_single_scalar_arg(fe: &Call) -> Option<f64> {
 
 fn simplify_math_fn(fe: &Call, func: PromqlFunctionKind) -> Option<f64> {
     use PromqlFunctionKind::*;
-    let arg_count = fe.args.len();
-    if func == Pi && arg_count == 0 {
-        return Some(f64::PI());
-    }
     let arg = get_single_scalar_arg(fe)?;
     match func {
         Abs => Some(arg.abs()),
@@ -210,6 +142,53 @@ fn simplify_math_fn(fe: &Call, func: PromqlFunctionKind) -> Option<f64> {
     }
 }
 
+/// `expr` with every `vector(e)` replaced by `e`, through the arithmetic that
+/// keeps a one-sample, label-less vector one: for the argument of `scalar(...)`
+/// only, where the two read the same. A filtering comparison (no `bool`) or a
+/// matching modifier stops the rewrite, since there the vector and the scalar
+/// behave differently.
+fn unwrap_vectors(expr: Expr) -> Expr {
+    match expr {
+        Expr::Call(mut fe) if fe.func.name == "vector" && fe.args.len() == 1 => {
+            unwrap_vectors(*fe.args.args.remove(0))
+        }
+        // `abs(vector(-1))` reads as `abs(-1)` here: a math or date function
+        // over a number folds to its value.
+        Expr::Call(mut fe) => {
+            fe.args.args = fe
+                .args
+                .args
+                .into_iter()
+                .map(|arg| Box::new(fold_constants(unwrap_vectors(*arg))))
+                .collect();
+            match PromqlFunctionKind::try_from(fe.func.name)
+                .ok()
+                .and_then(|kind| simplify_math_fn(&fe, kind))
+            {
+                Some(value) => Expr::from(value),
+                None => Expr::Call(fe),
+            }
+        }
+        Expr::Binary(mut be)
+            if (!be.op.is_comparison_operator() || be.return_bool())
+                && be.modifier.as_ref().is_none_or(|m| m.matching.is_none()) =>
+        {
+            be.lhs = Box::new(unwrap_vectors(*be.lhs));
+            be.rhs = Box::new(unwrap_vectors(*be.rhs));
+            Expr::Binary(be)
+        }
+        Expr::Paren(mut p) => {
+            p.expr = Box::new(unwrap_vectors(*p.expr));
+            Expr::Paren(p)
+        }
+        Expr::Unary(mut u) => {
+            u.expr = Box::new(unwrap_vectors(*u.expr));
+            Expr::Unary(u)
+        }
+        other => other,
+    }
+}
+
 fn handle_function_expr(fe: Call) -> Expr {
     use PromqlFunctionKind::*;
     // const-simplify function arguments first so we can simplify calls like
@@ -226,27 +205,24 @@ fn handle_function_expr(fe: Call) -> Expr {
         return Expr::Call(fe);
     };
     match kind {
-        Vector if arg_count == 1 => {
-            let mut fe = fe;
-            // unwrap vector(...) -> inner literal when possible
-            *fe.args.args.remove(0)
-        }
         Scalar if arg_count == 1 => {
-            // try to extract a single scalar argument (e.g., scalar(vector(123)) -> 123)
-            if let Some(v) = get_single_scalar_arg(&fe) {
-                Expr::from(v)
+            // Inside `scalar(...)` a one-sample, label-less `vector(e)` and `e`
+            // are interchangeable, so the argument folds with its `vector`
+            // calls unwrapped: `scalar(9 + vector(4))` -> `13`. Only here:
+            // anywhere else `vector(e)` is an instant vector, and unwrapping it
+            // would retype `sum(vector(1))` or `-vector(1)`.
+            let candidate = fold_constants(unwrap_vectors((*fe.args.args[0]).clone()));
+            if let Expr::NumberLiteral(_) = candidate {
+                candidate
             } else {
                 Expr::Call(fe)
             }
         }
         Pi if arg_count == 0 => Expr::from(f64::PI()),
-        _ => {
-            if let Some(value) = simplify_math_fn(&fe, kind) {
-                Expr::from(value)
-            } else {
-                Expr::Call(fe)
-            }
-        }
+        // A math or date function takes an instant vector and returns one, so
+        // folding it to a number is sound only inside `scalar(...)`, where
+        // `unwrap_vectors` does it.
+        _ => Expr::Call(fe),
     }
 }
 
@@ -255,15 +231,11 @@ pub(crate) fn extract_datetime_part(epoch_secs: f64, part: DateTimePart) -> Opti
 }
 
 fn handle_aggregation_expr(ae: AggregateExpr) -> Expr {
-    if let Some(param) = ae.param {
-        let arg = fold_constants(*param);
-        let ae = AggregateExpr {
-            param: Some(Box::new(arg)),
-            ..ae
-        };
-        return Expr::Aggregate(ae);
-    };
-    Expr::Aggregate(ae)
+    Expr::Aggregate(AggregateExpr {
+        expr: Box::new(fold_constants(*ae.expr)),
+        param: ae.param.map(|param| Box::new(fold_constants(*param))),
+        ..ae
+    })
 }
 
 fn handle_rollup_expr(re: SubqueryExpr) -> Expr {
@@ -278,6 +250,7 @@ fn handle_rollup_expr(re: SubqueryExpr) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::number::parse_number;
     use promql_parser::parser::parse;
 
     // ------------------------------
@@ -296,6 +269,28 @@ mod tests {
         );
     }
 
+    /// Constants fold wherever they sit: inside an aggregation's operand and
+    /// under a unary minus, not only at the top of a binary expression. A
+    /// vector-typed operand is never folded away (`x * NaN` stays).
+    #[test]
+    fn folds_inside_aggregations_and_under_unary_minus() {
+        test_simplify("sum(x * (1 + 2))", "sum(x * 3)");
+        test_simplify(
+            "sum by (job) (rate(m[5m]) / (2 * 30))",
+            "sum by (job) (rate(m[5m]) / 60)",
+        );
+        test_simplify("sum(x * NaN)", "sum(x * NaN)");
+
+        let Expr::NumberLiteral(n) = fold_constants(parse("-(1 + 2)").unwrap()) else {
+            panic!("-(1 + 2) did not fold to a number");
+        };
+        assert_eq!(n.val, -3.0);
+        let Expr::NumberLiteral(n) = fold_constants(parse("-(-(2 * 2))").unwrap()) else {
+            panic!("-(-(2 * 2)) did not fold to a number");
+        };
+        assert_eq!(n.val, 4.0);
+    }
+
     #[test]
     fn test_const_evaluator() {
         // true --> true
@@ -307,7 +302,7 @@ mod tests {
     }
 
     fn test_math_fn(name: &str, arg: f64, expected: f64) {
-        let expr = format!("{}(vector({}))", name, arg);
+        let expr = format!("scalar({}(vector({})))", name, arg);
         let simplified = fold_constants(parse(&expr).expect("parse failed")).prettify();
         let simplified_value = parse_number(&simplified).unwrap();
         if expected.is_nan() {
@@ -398,7 +393,7 @@ mod tests {
     }
 
     fn test_date_part_fn(name: &str, epoch_secs: f64, part: DateTimePart) {
-        let expr = format!("{name}(vector({epoch_secs}))");
+        let expr = format!("scalar({name}(vector({epoch_secs})))");
         let simplified = fold_constants(parse(&expr).expect("parse failed")).prettify();
         let expected = extract_datetime_part(epoch_secs, part).unwrap();
         let actual = parse_number(&simplified).unwrap();
@@ -430,10 +425,10 @@ mod tests {
         // NaN and ±Inf are not a point in time: the call must stay unfolded so
         // evaluation returns NaN, not a calendar value for some fallback instant.
         for arg in ["NaN", "Inf", "-Inf"] {
-            let expr = format!("year(vector({arg}))");
+            let expr = format!("scalar(year(vector({arg})))");
             let simplified = fold_constants(parse(&expr).expect("parse failed")).prettify();
             assert!(
-                simplified.starts_with("year("),
+                simplified.starts_with("scalar(year("),
                 "{expr} folded to {simplified}"
             );
         }

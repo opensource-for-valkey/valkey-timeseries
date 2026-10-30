@@ -196,7 +196,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let mut seen = AHashSet::new();
         let mut requests = Vec::new();
         for candidate in collect_rollup_candidates(expr) {
-            let Some((kind, matrix, param)) = self.pushable_rollup(candidate.call()) else {
+            let Some((matrix, rollup)) = self.pushable_rollup(candidate.call()) else {
                 continue;
             };
             // An aggregation that cannot be fused leaves the rollup to be pushed
@@ -207,15 +207,13 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             };
             let key = GridPreloadKey::rollup(
                 &matrix.vs,
-                kind,
-                matrix_range_ms(matrix),
-                param,
+                &rollup,
                 aggregation.as_ref().map(AggregationKey::of),
             );
             if !seen.insert(key.clone()) {
                 continue;
             }
-            requests.push((key, kind, matrix, param, aggregation));
+            requests.push((key, rollup, matrix, aggregation));
         }
 
         // One request per distinct rollup, in parallel but capped: each is a
@@ -226,9 +224,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let _: Vec<()> = requests
             .into_par_rayon()
             .num_threads(MAX_CONCURRENT_PRELOAD_REQUESTS)
-            .map(|(key, kind, matrix, param, aggregation)| {
+            .map(|(key, rollup, matrix, aggregation)| {
                 self.check_deadline()?;
-                self.preload_rollup(key, kind, matrix, param, aggregation, grid)
+                self.preload_rollup(key, rollup, matrix, aggregation, grid)
             })
             .into_fallible()
             .collect()?;
@@ -273,16 +271,14 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             // Mirror the key the step loop will look up: covered calls short-
             // circuit in evaluate_call / evaluate_fused_rollup before their
             // arguments are evaluated.
-            if let Some((kind, matrix, param)) = self.pushable_rollup(call) {
+            if let Some((matrix, rollup)) = self.pushable_rollup(call) {
                 let aggregation = match candidate {
                     RollupCandidate::Fused(aggregate, _) => fusable_aggregation(aggregate),
                     RollupCandidate::Rollup(_) => None,
                 };
                 let key = GridPreloadKey::rollup(
                     &matrix.vs,
-                    kind,
-                    matrix_range_ms(matrix),
-                    param,
+                    &rollup,
                     aggregation.as_ref().map(AggregationKey::of),
                 );
                 if grids.contains_key(&key) {
@@ -385,41 +381,25 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         grid: &PreloadGrid,
     ) -> Vec<Timestamp> {
         grid.steps()
-            .map(|step_ts| {
-                apply_time_modifiers_ms(
-                    vs.at.as_ref(),
-                    vs.offset.as_ref(),
-                    grid.at_start_ms,
-                    grid.at_end_ms,
-                    step_ts,
-                )
-            })
+            .map(|step_ts| grid.modified_ts(vs.at.as_ref(), vs.offset.as_ref(), step_ts))
             .collect()
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn preload_rollup(
         &self,
         key: GridPreloadKey,
-        kind: RollupKind,
+        rollup: GridRollup,
         matrix: &MatrixSelector,
-        param: Option<f64>,
         aggregation: Option<GridAggregation>,
         grid: &PreloadGrid,
     ) -> EvalResult<()> {
-        let rollup = GridRollup {
-            kind,
-            range_ms: matrix_range_ms(matrix),
-            param,
-        };
         let Some((request, window_ends)) =
             self.grid_request(&matrix.vs, grid, Some(rollup), aggregation)
         else {
             return Ok(());
         };
 
-        let mut options = self.options;
-        options.lookback_delta = Duration::from_millis(grid.lookback_delta_ms as u64);
+        let options = self.options.with_lookback_ms(grid.lookback_delta_ms);
 
         // A peer without grid push-down: leave the rollup unpreloaded, and
         // `preload_matrices` reads its span raw instead.
@@ -666,8 +646,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             return Ok(());
         };
 
-        let mut options = self.options;
-        options.lookback_delta = Duration::from_millis(grid.lookback_delta_ms as u64);
+        let options = self.options.with_lookback_ms(grid.lookback_delta_ms);
 
         let (groups, charged) = match self.reader.query_grid(vs, &request, options)? {
             // Nothing was pushed down: the span is here. Grouping it once per
@@ -707,8 +686,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // the source answers that one; the scatter below replicates it.
         let raw_series = match self.grid_request(vs, grid, None, None) {
             Some((request, window_ends)) => {
-                let mut options = self.options;
-                options.lookback_delta = Duration::from_millis(lookback_delta_ms as u64);
+                let options = self.options.with_lookback_ms(lookback_delta_ms);
                 match self.reader.query_grid(vs, &request, options)? {
                     GridOutcome::Stepped(series) => {
                         // Charged as the grids they become, holes included: a
@@ -792,8 +770,6 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let num_steps = grid.expected_steps();
         let at_modifier = vs.at.clone();
         let offset_mod = vs.offset.clone();
-        let at_start_ms = grid.at_start_ms;
-        let at_end_ms = grid.at_end_ms;
 
         // ── Per-series step-bucketing ─────────────────
         let preloaded_series: Vec<PreloadedInstantSeries> = raw_series
@@ -811,13 +787,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 // per-step fallback path resolves them from the EvalContext.
                 let steps = (0..num_steps).map(|step_idx| {
                     let eval_ts_i = eval_start_ms + (step_idx as i64) * step_ms;
-                    apply_time_modifiers_ms(
-                        at_modifier.as_ref(),
-                        offset_mod.as_ref(),
-                        at_start_ms,
-                        at_end_ms,
-                        eval_ts_i,
-                    )
+                    grid.modified_ts(at_modifier.as_ref(), offset_mod.as_ref(), eval_ts_i)
                 });
 
                 let mut values = StepGridBuilder::with_capacity(num_steps);

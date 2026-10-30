@@ -24,13 +24,21 @@ pub(crate) use crate::commands::fanout_codec::generated;
 pub use engine::QueryOptions;
 
 use crate::promql::engine::register_fanout_commands;
-pub use error::*;
+pub(crate) use error::EvalResult;
+pub use error::{EvaluationError, QueryError, QueryResult};
 pub use exec::*;
 pub use model::*;
 pub(crate) use time::{MAX_GRID_STEPS, duration_ms};
 pub(crate) use utils::check_query_depth;
 use valkey_module::ValkeyResult;
 
-pub(crate) fn register_promql() -> ValkeyResult<()> {
+pub(crate) use functions::register_parser_functions;
+
+/// Parse a PromQL query. Every query parse outside of tests should come through here.
+pub(crate) fn parse_query(query: &str) -> Result<promql_parser::parser::Expr, String> {
+    promql_parser::parser::parse(query)
+}
+
+pub(crate) fn register_promql_fanout() -> ValkeyResult<()> {
     register_fanout_commands()
 }

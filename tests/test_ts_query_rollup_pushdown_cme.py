@@ -116,7 +116,8 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
     def get_config_file_lines(self, test_dir, port) -> List[str]:
         # Every rollup kind is covered, the experimental ones included
         # (`first_over_time`, `mad_over_time`, `ts_of_*_over_time`,
-        # `double_exponential_smoothing`), and those are off by default.
+        # `range_over_time`, `double_exponential_smoothing`, the state
+        # functions), and those are off by default.
         lines = super().get_config_file_lines(test_dir, port)
         return [f'{line} ts-promql-enable-experimental-functions yes'
                 if line.startswith('loadmodule ') else line
@@ -380,6 +381,9 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
             ('max_over_time',
              {'api-1': 5, 'api-2': 50, 'api-3': 500,
               'web-1': 10, 'web-2': 15, 'web-3': 8}),
+            ('range_over_time',
+             {'api-1': 3, 'api-2': 30, 'api-3': 300,
+              'web-1': 6, 'web-2': 9, 'web-3': 1}),
             ('first_over_time',
              {'api-1': 2, 'api-2': 20, 'api-3': 200,
               'web-1': 4, 'web-2': 6, 'web-3': 7}),
@@ -441,6 +445,117 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
             {'api-1': 2.75, 'api-2': 27.5, 'api-3': 275,
              'web-1': 5.5, 'web-2': 8.25, 'web-3': 7},
             context='quantile_over_time(0.25)')
+
+    def test_state_duration_over_time_across_shards(self):
+        """`web-3` reads 7, 7, 7, 8, 8 (every other series is strictly
+        increasing), so it is the only series with a run longer than a sample.
+        A series whose last sample is not in the state is absent, not -1."""
+        self.setup_fleet()
+
+        # Window (T0, T0+120]: web-3 is 7, 8, 8 — in state 8 since T0+90.
+        result = self.instant_query(f'state_duration_over_time(mem_usage[{RANGE}], 8)')
+        self.assert_values_exact(self.values_by_instance(result), {'web-3': 30},
+                                 context='state 8, seconds')
+
+        # The unit travels with the request; the shard divides.
+        result = self.instant_query(
+            f'state_duration_over_time(mem_usage[{RANGE}], 8, "500ms")')
+        self.assert_values_exact(self.values_by_instance(result), {'web-3': 60},
+                                 context='state 8, 500ms')
+
+        # Window (T0-60, T0+60]: web-3 is 7 at T0, T0+30 and T0+60.
+        for unit, want in (('', 60), (', "1m"', 1)):
+            result = self.instant_query(
+                f'state_duration_over_time(mem_usage[{RANGE}], 7{unit})', time=T0 + 60)
+            self.assert_values_exact(self.values_by_instance(result), {'web-3': want},
+                                     context=f'state 7{unit}')
+
+        # Fused: only series in state reach the reduction.
+        result = self.instant_query(
+            f'sum by (job) (state_duration_over_time(mem_usage[{RANGE}], 8))')
+        self.assert_values_exact(self.values_by_label(result, 'job'), {'web': 30},
+                                 context='sum by (job)')
+        result = self.instant_query(
+            f'count(state_duration_over_time(mem_usage[{RANGE}], 5))')
+        self.assert_single_value(result, 1)  # api-1 ends on 5
+
+        # A stepped grid: in state at T0 and T0+60, out of it at T0+120.
+        result = self.range_query(f'state_duration_over_time(mem_usage[{RANGE}], 7)')
+        self.assert_steps_exact(self.steps_by_instance(result), {'web-3': [0, 60]},
+                                context='range, state 7')
+
+    def test_state_duration_over_time_rejects_bad_arguments(self):
+        """Arguments the function rejects never reach a shard: the coordinator
+        keeps the call local, and the local error is the reply."""
+        self.setup_fleet()
+        for query in (f'state_duration_over_time(mem_usage[{RANGE}], 8, "60")',
+                      f'state_duration_over_time(mem_usage[{RANGE}], 8, "0s")',
+                      f'state_duration_over_time(mem_usage[{RANGE}], NaN)'):
+            with pytest.raises(ResponseError):
+                self.instant_query(query)
+            with pytest.raises(ResponseError):
+                self.range_query(query)
+
+    def test_state_count_over_time_across_shards(self):
+        """Unlike `state_duration_over_time`, a series not in the state is
+        present with `0`: every gauge series answers, on every shard."""
+        self.setup_fleet()
+        zeros = {instance: 0 for instance in GAUGE_SERIES}
+
+        # Window (T0, T0+120]: web-3 is 7, 8, 8 — two samples in state 8.
+        result = self.instant_query(f'state_count_over_time(mem_usage[{RANGE}], 8)')
+        self.assert_values_exact(self.values_by_instance(result), {**zeros, 'web-3': 2},
+                                 context='state 8')
+
+        result = self.instant_query(
+            f'sum by (job) (state_count_over_time(mem_usage[{RANGE}], 8))')
+        self.assert_values_exact(self.values_by_label(result, 'job'),
+                                 {'api': 0, 'web': 2}, context='sum by (job)')
+        result = self.instant_query(
+            f'count(state_count_over_time(mem_usage[{RANGE}], 8))')
+        self.assert_single_value(result, len(GAUGE_SERIES))
+        result = self.instant_query(
+            f'count(state_count_over_time(mem_usage[{RANGE}], 8) > 0)')
+        self.assert_single_value(result, 1)
+
+        # A stepped grid with no gaps: web-3 is in state 7 for one sample at T0,
+        # three by T0+60, none at T0+120.
+        result = self.range_query(f'state_count_over_time(mem_usage[{RANGE}], 7)')
+        self.assert_steps_exact(
+            self.steps_by_instance(result),
+            {**{instance: [0, 0, 0] for instance in GAUGE_SERIES}, 'web-3': [1, 3, 0]},
+            context='range, state 7')
+
+        with pytest.raises(ResponseError):
+            self.instant_query(f'state_count_over_time(mem_usage[{RANGE}], NaN)')
+
+    def test_range_over_time_across_shards(self):
+        """`range_over_time` is `max_over_time - min_over_time`, per window and
+        per series, whichever shard holds the series."""
+        self.setup_fleet()
+
+        # A stepped grid: the T0 window holds one sample (no spread), the
+        # T0+60 window three, the T0+120 window four.
+        result = self.range_query(f'range_over_time(mem_usage[{RANGE}])')
+        self.assert_steps_exact(
+            self.steps_by_instance(result),
+            {'api-1': [0, 2, 3], 'api-2': [0, 20, 30], 'api-3': [0, 200, 300],
+             'web-1': [0, 4, 6], 'web-2': [0, 6, 9], 'web-3': [0, 0, 1]},
+            context='range')
+
+        reference = self.range_query(
+            f'max_over_time(mem_usage[{RANGE}]) - min_over_time(mem_usage[{RANGE}])')
+        self.assert_steps_exact(
+            self.matrix_by_labelset(result), self.matrix_by_labelset(reference),
+            context='range_over_time == max - min')
+
+        result = self.instant_query(
+            f'sum by (job) (range_over_time(mem_usage[{RANGE}]))')
+        self.assert_values_exact(self.values_by_label(result, 'job'),
+                                 {'api': 333, 'web': 16}, context='sum by (job)')
+
+        with pytest.raises(ResponseError):
+            self.instant_query(f'range_over_time(mem_usage[{RANGE}], 1)')
 
     def test_ts_of_functions_across_shards(self):
         """The `ts_of_*` family returns a timestamp in seconds.
@@ -1022,6 +1137,13 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
         'topk(2, sum_over_time(mem_usage[2m]))',
         'sort(sum_over_time(mem_usage[2m]))',
         'sum_over_time(mem_usage[2m]) * 2',
+        'state_duration_over_time(mem_usage[2m], 8, "1m")',
+        'state_duration_over_time(mem_usage[3m], 7)',
+        'state_count_over_time(mem_usage[2m], 8)',
+        'state_count_over_time(mem_usage[3m], 7)',
+        'range_over_time(mem_usage[2m])',
+        'range_over_time(mem_usage[30s])',
+        'range_over_time(sparse_metric[1m])',
     ]
 
     EQUIVALENCE_RANGE = [
@@ -1044,6 +1166,11 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
         'absent_over_time(mem_usage{instance="nope"}[2m])',
         'predict_linear(http_requests_total[2m], 30)',
         'topk(2, sum_over_time(mem_usage[2m]))',
+        'state_duration_over_time(mem_usage[2m], 7)',
+        'state_duration_over_time(mem_usage[2m], 8, "500ms")',
+        'state_count_over_time(mem_usage[2m], 7)',
+        'range_over_time(mem_usage[2m])',
+        'range_over_time(mem_usage[2m] offset 60s)',
     ]
 
     # Fused: the coordinator merges per-shard partials, whose summation order
@@ -1060,6 +1187,12 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
         'sum(rate(http_requests_total[2m]))',
         'sum without (instance) (sum_over_time(mem_usage[2m]))',
         'sum by (job) (sum_over_time(mem_usage[2m] offset 60s))',
+        'sum by (job) (state_duration_over_time(mem_usage[2m], 7, "1m"))',
+        'count(state_duration_over_time(mem_usage[1m], 8))',
+        'sum by (job) (state_count_over_time(mem_usage[2m], 7))',
+        'avg(state_count_over_time(mem_usage[1m], 8))',
+        'max by (job) (range_over_time(mem_usage[2m]))',
+        'sum(range_over_time(mem_usage[1m]))',
         'quantile by (job) (0.5, sum_over_time(mem_usage[2m]))',
         'sum by (job) (sum_over_time(no_such_metric[2m]))',
     ]

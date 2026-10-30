@@ -58,6 +58,18 @@ pub(crate) fn apply_limits() {
     }
 }
 
+/// Empties the cache, first sightings included, for `TS._DEBUG CLEAR_QUERY_CACHE`. Returns how
+/// many entries it removed, which are freed off the calling thread and not counted as
+/// evictions.
+pub(crate) fn clear() -> usize {
+    let cleared = QUERY_CACHE.clear();
+    let count = cleared.len();
+    if count > 0 {
+        crate::common::threads::spawn_background("ts-promql-cache-clear", move || drop(cleared));
+    }
+    count
+}
+
 /// The cache's counters and gauges, for `INFO ts_promql`. Read without the cache lock.
 pub(crate) fn stats() -> QueryCacheStats {
     QUERY_CACHE.stats()
@@ -290,6 +302,17 @@ impl QueryCache {
         let evicted = evict_least_recent(&mut inner, max_entries, max_bytes);
         self.publish(&inner, evicted.len());
         evicted
+    }
+
+    /// Removes every entry and every first sighting, leaving the counters alone. Returns the
+    /// removed expressions, for the caller to drop.
+    fn clear(&self) -> Vec<Arc<Expr>> {
+        let mut inner = self.lock();
+        inner.seen.clear();
+        inner.bytes = 0;
+        let cleared = inner.entries.drain().map(|(_, entry)| entry.expr).collect();
+        self.publish(&inner, 0);
+        cleared
     }
 
     fn publish(&self, inner: &Inner, evicted: usize) {
@@ -815,6 +838,32 @@ mod tests {
             0,
             "disabling forgets first sightings too"
         );
+    }
+
+    #[test]
+    fn clearing_empties_the_cache_and_forgets_first_sightings() {
+        let cache = QueryCache::default();
+        for i in 0..3 {
+            warm(&cache, &format!("m{i}"), ROOMY);
+        }
+        cache.get_or_prepare("once", || ROOMY, parse).unwrap();
+        let before = cache.stats();
+
+        assert_eq!(cache.clear().len(), 3);
+        let stats = cache.stats();
+        assert_eq!((stats.entries, stats.bytes), (0, 0));
+        assert_eq!(
+            (stats.hits, stats.misses, stats.evictions),
+            (before.hits, before.misses, before.evictions),
+            "counters are left alone"
+        );
+        assert_eq!(cache.lock().seen.len(), 0);
+
+        // "once" was forgotten, so its next sighting is a first one again.
+        cache.get_or_prepare("once", || ROOMY, parse).unwrap();
+        assert_eq!(cache.stats().entries, 0);
+        warm(&cache, "m0", ROOMY);
+        assert_eq!(cache.stats().entries, 1);
     }
 
     #[test]

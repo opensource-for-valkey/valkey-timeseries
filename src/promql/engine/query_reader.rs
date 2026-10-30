@@ -3,12 +3,13 @@ use crate::common::{Sample, Timestamp};
 use crate::promql::EvalLabels;
 use crate::promql::deadline::{Deadline, SERIES_WORK};
 use crate::promql::engine::label_profile::{LabelProfile, ProfileWindow};
+use crate::promql::engine::sample_budget::SampleBudget;
 use crate::promql::exec::aggregations::{AggregationKind, PushdownStrategy};
 use crate::promql::exec::partial_aggregation::{SteppedPartialGroups, SteppedSelection};
 use crate::promql::exec::pipeline::for_each_step_sample;
 use crate::promql::functions::RollupKind;
 use crate::promql::{
-    EvalResult, ExprResult, PromqlResult, QueryError, QueryOptions,
+    EvalResult, ExprResult, QueryError, QueryOptions, QueryResult,
     model::{InstantSample, RangeSample},
 };
 use orx_parallel::Par;
@@ -73,8 +74,13 @@ pub struct GridRollup {
     pub kind: RollupKind,
     /// Window width: the `[5m]`. Each window is `(end - range_ms, end]`.
     pub range_ms: i64,
-    /// Numeric function parameter, e.g. `quantile_over_time`'s phi.
+    /// Numeric function parameter, e.g. `quantile_over_time`'s phi or
+    /// `state_duration_over_time`'s state.
     pub param: Option<f64>,
+    /// Output unit in milliseconds, for the kinds that take one
+    /// (`state_duration_over_time`); `None` is the kind's default. Carried
+    /// resolved, so the source never parses the user's duration string.
+    pub unit_ms: Option<i64>,
 }
 
 /// An outer aggregation fused onto a grid request: the `sum by (job)` of
@@ -165,6 +171,7 @@ pub struct SteppedSeries {
 impl SteppedSeries {
     /// The points as `(step, value)` samples — the form the per-`(group, step)`
     /// fold takes, where the sample's own timestamp no longer matters.
+    #[cfg(test)]
     pub(in crate::promql) fn into_step_values(self) -> RangeSample<EvalLabels> {
         RangeSample {
             labels: self.labels,
@@ -203,6 +210,7 @@ impl GridSeries {
     }
 
     /// Every entry as sparse `(step, value)` samples, whichever stage made it.
+    #[cfg(test)]
     pub(in crate::promql) fn into_step_values(self) -> Vec<RangeSample<EvalLabels>> {
         match self {
             GridSeries::Stepped(series) => series
@@ -324,10 +332,9 @@ impl GridRequest {
                 let points = rollup.kind.eval_windows(
                     &s.samples,
                     rollup.range_ms,
-                    self.lookback_delta_ms,
-                    self.step_ms,
                     window_ends.iter().copied(),
                     rollup.param,
+                    rollup.unit_ms,
                 );
                 (!points.is_empty()).then_some(RangeSample {
                     labels: s.labels,
@@ -360,8 +367,8 @@ impl GridRequest {
         &self,
         series: Vec<RangeSample<EvalLabels>>,
         deadline: &Deadline,
-        charge: &mut dyn FnMut(usize) -> PromqlResult<()>,
-    ) -> PromqlResult<GridOutcome> {
+        charge: &mut dyn FnMut(usize) -> QueryResult<()>,
+    ) -> QueryResult<GridOutcome> {
         let window_ends = self.window_ends();
         let mut sink = GridSink::for_request(self);
         self.per_series_chunked(&window_ends, series, deadline, |output, read| {
@@ -387,8 +394,8 @@ impl GridRequest {
         window_ends: &[Timestamp],
         series: Vec<RangeSample<EvalLabels>>,
         deadline: &Deadline,
-        mut sink: impl FnMut(GridSeries, usize) -> PromqlResult<()>,
-    ) -> PromqlResult<()> {
+        mut sink: impl FnMut(GridSeries, usize) -> QueryResult<()>,
+    ) -> QueryResult<()> {
         let backward_ms = self.backward_ms();
         let mut pending = series.into_iter();
         loop {
@@ -476,7 +483,7 @@ impl GridSink {
         deadline: &Deadline,
     ) -> EvalResult<usize> {
         match self {
-            GridSink::Selection(selection) => selection.apply(output.into_step_values(), deadline),
+            GridSink::Selection(selection) => selection.apply_grid(output, deadline),
             GridSink::Series(_) | GridSink::Partials(_) => self.merge(request, output, deadline),
         }
     }
@@ -498,9 +505,7 @@ impl GridSink {
                 added
             }
             GridSink::Partials(partials) => Self::fold(partials, request, output, deadline)?,
-            GridSink::Selection(selection) => {
-                selection.merge(output.into_step_values(), deadline)?
-            }
+            GridSink::Selection(selection) => selection.merge_grid(output, deadline)?,
         })
     }
 
@@ -514,12 +519,28 @@ impl GridSink {
             .aggregation
             .as_ref()
             .and_then(|aggregation| aggregation.modifier.as_ref());
-        partials.accumulate(modifier, output.into_step_values(), deadline)
+        partials.accumulate_grid(modifier, output, deadline)
     }
 
     /// Everything taken, as the request's outcome. A fused sink walks every
     /// state or candidate it accumulated to finalize them, `deadline` checked
     /// as it goes.
+    /// [`Self::take`], charging `budget` for what the sink now holds beyond
+    /// the `read` raw samples the output was built from, which the read
+    /// already charged. The one place a staged chunk is accounted, on the
+    /// shard and on the coordinator alike.
+    pub(in crate::promql) fn take_charged(
+        &mut self,
+        request: &GridRequest,
+        output: GridSeries,
+        read: usize,
+        deadline: &Deadline,
+        budget: &SampleBudget,
+    ) -> QueryResult<()> {
+        let added = self.take(request, output, deadline)?;
+        budget.charge(added.saturating_sub(read))
+    }
+
     pub(in crate::promql) fn finish(self, deadline: &Deadline) -> EvalResult<GridOutcome> {
         Ok(match self {
             GridSink::Series(series) => series.into(),
@@ -636,6 +657,25 @@ impl GridOutcome {
     }
 }
 
+/// A grid request answered from an ordinary range read: the span its windows
+/// cover, read raw, for the caller to run the kernels over
+/// ([`GridOutcome::Raw`]). What a source with nothing to push down to does —
+/// the trait default below, and the Valkey querier when shard push-down is
+/// switched off. A request with no windows reads nothing.
+pub(in crate::promql) fn raw_grid_read<R: QueryReader + ?Sized>(
+    reader: &R,
+    selector: &VectorSelector,
+    request: &GridRequest,
+    options: QueryOptions,
+) -> QueryResult<GridOutcome> {
+    let Some((start_ms, end_ms)) = request.fetch_bounds() else {
+        return Ok(GridOutcome::Raw(Vec::new()));
+    };
+    reader
+        .query_range(selector, start_ms, end_ms, options)
+        .map(GridOutcome::Raw)
+}
+
 pub trait QueryReader: Send + Sync {
     /// Query instant samples at `timestamp`.
     /// `deadline` is an optional absolute Instant by which the operation should complete.
@@ -644,7 +684,7 @@ pub trait QueryReader: Send + Sync {
         selector: &VectorSelector,
         timestamp: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample<EvalLabels>>>;
+    ) -> QueryResult<Vec<InstantSample<EvalLabels>>>;
 
     /// Query range samples between `start_ms` and `end_ms` with an optional `deadline`.
     fn query_range(
@@ -653,7 +693,7 @@ pub trait QueryReader: Send + Sync {
         start_ms: i64,
         end_ms: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>>;
+    ) -> QueryResult<Vec<RangeSample<EvalLabels>>>;
 
     /// Evaluate `aggregation` over the instant vector `selector` selects at
     /// `timestamp`, at the source.
@@ -669,7 +709,7 @@ pub trait QueryReader: Send + Sync {
         _timestamp: i64,
         _aggregation: &AggregationRequest,
         _options: QueryOptions,
-    ) -> PromqlResult<AggregationOutcome> {
+    ) -> QueryResult<AggregationOutcome> {
         Ok(AggregationOutcome::Unsupported)
     }
 
@@ -687,12 +727,8 @@ pub trait QueryReader: Send + Sync {
         selector: &VectorSelector,
         request: &GridRequest,
         options: QueryOptions,
-    ) -> PromqlResult<GridOutcome> {
-        let Some((start_ms, end_ms)) = request.fetch_bounds() else {
-            return Ok(GridOutcome::Raw(Vec::new()));
-        };
-        self.query_range(selector, start_ms, end_ms, options)
-            .map(GridOutcome::Raw)
+    ) -> QueryResult<GridOutcome> {
+        raw_grid_read(self, selector, request, options)
     }
 
     /// The labels of the series `selector` matches, from the index rather
@@ -706,7 +742,7 @@ pub trait QueryReader: Send + Sync {
         _selector: &VectorSelector,
         _window: Option<ProfileWindow>,
         _options: QueryOptions,
-    ) -> PromqlResult<Option<LabelProfile>> {
+    ) -> QueryResult<Option<LabelProfile>> {
         Ok(None)
     }
 }
@@ -717,7 +753,7 @@ impl QueryReader for Arc<dyn QueryReader> {
         selector: &VectorSelector,
         timestamp: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
+    ) -> QueryResult<Vec<InstantSample<EvalLabels>>> {
         self.as_ref().query(selector, timestamp, options)
     }
 
@@ -727,7 +763,7 @@ impl QueryReader for Arc<dyn QueryReader> {
         start_ms: i64,
         end_ms: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
+    ) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
         self.as_ref()
             .query_range(selector, start_ms, end_ms, options)
     }
@@ -738,7 +774,7 @@ impl QueryReader for Arc<dyn QueryReader> {
         timestamp: i64,
         aggregation: &AggregationRequest,
         options: QueryOptions,
-    ) -> PromqlResult<AggregationOutcome> {
+    ) -> QueryResult<AggregationOutcome> {
         self.as_ref()
             .query_aggregation(selector, timestamp, aggregation, options)
     }
@@ -748,7 +784,7 @@ impl QueryReader for Arc<dyn QueryReader> {
         selector: &VectorSelector,
         request: &GridRequest,
         options: QueryOptions,
-    ) -> PromqlResult<GridOutcome> {
+    ) -> QueryResult<GridOutcome> {
         self.as_ref().query_grid(selector, request, options)
     }
 
@@ -757,7 +793,7 @@ impl QueryReader for Arc<dyn QueryReader> {
         selector: &VectorSelector,
         window: Option<ProfileWindow>,
         options: QueryOptions,
-    ) -> PromqlResult<Option<LabelProfile>> {
+    ) -> QueryResult<Option<LabelProfile>> {
         self.as_ref().label_profile(selector, window, options)
     }
 }
@@ -952,6 +988,7 @@ mod evaluate_chunk_tests {
                 kind: RollupKind::SumOverTime,
                 range_ms: STEPS as i64 * 1_000,
                 param: None,
+                unit_ms: None,
             }),
             aggregation,
             sample_timestamps: false,
@@ -987,6 +1024,7 @@ mod evaluate_chunk_tests {
                 kind: RollupKind::CountOverTime,
                 range_ms: 3_000,
                 param: None,
+                unit_ms: None,
             }),
             ..stepped_request()
         };

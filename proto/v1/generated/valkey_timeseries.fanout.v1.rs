@@ -502,8 +502,6 @@ pub struct InstantQuery {
     pub lookback_delta: u64,
     #[prost(uint64, tag = "4")]
     pub max_series: u64,
-    #[prost(uint64, tag = "5")]
-    pub max_points_per_series: u64,
     /// / How long the requester waits for this answer, in milliseconds from when
     /// / it sent the request. The receiver drops the request, or stops reading,
     /// / once that long has passed since it received it: by then the requester has
@@ -652,18 +650,26 @@ pub struct GridRollup {
     /// / Window width: the `\[5m\]`. Each window is `(end - range_ms, end]`.
     #[prost(int64, tag = "2")]
     pub range_ms: i64,
-    /// / Numeric function parameter — `quantile_over_time`'s phi. Absent for the
+    /// / Numeric function parameter — `quantile_over_time`'s phi, the state of
+    /// / `state_duration_over_time` and `state_count_over_time`. Absent for the
     /// / parameterless rollups.
     #[prost(double, optional, tag = "3")]
     pub scalar_param: ::core::option::Option<f64>,
+    /// / Output unit in milliseconds, for the kinds that take one
+    /// / (`state_duration_over_time`); absent means the kind's default (seconds).
+    /// / Positive when present. A shard refuses a unit on any other kind.
+    #[prost(int64, optional, tag = "4")]
+    pub unit_ms: ::core::option::Option<i64>,
 }
 /// / An outer aggregation fused onto a grid query: the `sum by (job)` of
 /// / `sum by (job) (rate(m\[5m\]))` or of `sum by (job) (m)`. The shard groups
 /// / its per-series values as well as computing them, so what crosses the wire is
 /// / one partial per group per step rather than one value per *series* per step.
 /// /
-/// / Only the reducing operators appear here; the selecting ones (topk and
-/// / friends) need the individual samples and are not fused.
+/// / The reducing operators ship one partial per group per step. The selecting
+/// / and counting ones (topk and friends, count_values) are fused too, shipping
+/// / their per-step picks or counts as candidates the coordinator re-selects or
+/// / sums (`SteppedSelection`).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GridAggregation {
     #[prost(enumeration = "AggregationKind", tag = "1")]
@@ -1005,6 +1011,9 @@ pub enum RollupKind {
     Deriv = 22,
     Resets = 23,
     Changes = 24,
+    StateDurationOverTime = 25,
+    StateCountOverTime = 26,
+    RangeOverTime = 27,
 }
 impl RollupKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1038,6 +1047,9 @@ impl RollupKind {
             Self::Deriv => "ROLLUP_KIND_DERIV",
             Self::Resets => "ROLLUP_KIND_RESETS",
             Self::Changes => "ROLLUP_KIND_CHANGES",
+            Self::StateDurationOverTime => "ROLLUP_KIND_STATE_DURATION_OVER_TIME",
+            Self::StateCountOverTime => "ROLLUP_KIND_STATE_COUNT_OVER_TIME",
+            Self::RangeOverTime => "ROLLUP_KIND_RANGE_OVER_TIME",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1068,6 +1080,9 @@ impl RollupKind {
             "ROLLUP_KIND_DERIV" => Some(Self::Deriv),
             "ROLLUP_KIND_RESETS" => Some(Self::Resets),
             "ROLLUP_KIND_CHANGES" => Some(Self::Changes),
+            "ROLLUP_KIND_STATE_DURATION_OVER_TIME" => Some(Self::StateDurationOverTime),
+            "ROLLUP_KIND_STATE_COUNT_OVER_TIME" => Some(Self::StateCountOverTime),
+            "ROLLUP_KIND_RANGE_OVER_TIME" => Some(Self::RangeOverTime),
             _ => None,
         }
     }
@@ -1214,6 +1229,11 @@ pub struct DebugMetricsRequest {
     #[prost(bool, tag = "2")]
     pub reset: bool,
 }
+/// TS._DEBUG CLEAR_QUERY_CACHE: each node empties its own parsed PromQL query
+/// cache. The cache is per process and holds no keys, so every node is asked
+/// (replicas included) and there is nothing to filter.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClearQueryCacheRequest {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum QueryLabelsSubtype {
@@ -1602,4 +1622,10 @@ pub mod debug_metric {
 pub struct DebugMetricsResponse {
     #[prost(message, repeated, tag = "1")]
     pub metrics: ::prost::alloc::vec::Vec<DebugMetric>,
+}
+/// How many entries a node's parsed-query cache held when it was cleared.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClearQueryCacheResponse {
+    #[prost(uint64, tag = "1")]
+    pub cleared: u64,
 }

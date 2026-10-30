@@ -3,16 +3,15 @@
 //! This module defines the fundamental data structures used in the public API,
 //! including labels for series identification, samples for data points, and
 //! series for batched ingestion.
-use crate::common::constants::MILLIS_PER_MIN;
-use crate::common::time::{current_time_millis, system_time_to_millis, valkey_cached_time_millis};
+use crate::common::time::valkey_cached_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::labels::Labels;
-use crate::promql::time::duration_ms;
+use crate::promql::time::apply_time_modifiers_ms;
 use crate::promql::{EvalLabels, EvalSample, EvalSamples, ExprResult};
 #[cfg(test)]
 use crate::promql::{QueryError, QueryResult};
-use promql_parser::parser::EvalStmt;
 use promql_parser::parser::value::ValueType;
+use promql_parser::parser::{AtModifier, Offset};
 
 /// StaleNaN is a signaling NaN used as a staleness marker in Prometheus.
 ///
@@ -145,6 +144,23 @@ pub(crate) struct EvalContext {
 }
 
 impl EvalContext {
+    /// The evaluation timestamp with a selector's or subquery's `@` and
+    /// `offset` applied; `@ start()`/`@ end()` resolve against this context's
+    /// query bounds.
+    pub(crate) fn modified_eval_ts(
+        &self,
+        at: Option<&AtModifier>,
+        offset: Option<&Offset>,
+    ) -> Timestamp {
+        apply_time_modifiers_ms(
+            at,
+            offset,
+            self.query_start,
+            self.query_end,
+            self.evaluation_ts,
+        )
+    }
+
     #[cfg(test)]
     pub fn for_vector_selector(query_time: Timestamp, lookback_delta_ms: i64) -> Self {
         EvalContext {
@@ -158,10 +174,13 @@ impl EvalContext {
     }
 }
 
-const DEFAULT_LOOKBACK_DELTA: i64 = (5 * MILLIS_PER_MIN) as i64;
+/// A context ending now with the Prometheus default lookback: a convenience
+/// for tests only, since production contexts come from the query's statement.
+#[cfg(test)]
 impl Default for EvalContext {
     fn default() -> Self {
-        let now = current_time_millis();
+        const DEFAULT_LOOKBACK_DELTA: i64 = (5 * crate::common::constants::MILLIS_PER_MIN) as i64;
+        let now = crate::common::time::current_time_millis();
         let lookback = DEFAULT_LOOKBACK_DELTA;
         let query_end = now;
         let query_start = now - lookback;
@@ -173,24 +192,6 @@ impl Default for EvalContext {
             lookback_delta_ms: lookback,
             step_ms: 0,
             evaluation_ts,
-            deadline: Default::default(),
-        }
-    }
-}
-impl From<&EvalStmt> for EvalContext {
-    fn from(value: &EvalStmt) -> Self {
-        // Convert SystemTime to Timestamp at the entry point
-        let query_start = system_time_to_millis(value.start);
-        let query_end = system_time_to_millis(value.end);
-        let evaluation_ts = query_end; // using end follows the "as-of" convention
-        let interval_ms = duration_ms(value.interval);
-        let lookback_delta_ms = duration_ms(value.lookback_delta);
-        Self {
-            query_start,
-            query_end,
-            evaluation_ts,
-            lookback_delta_ms,
-            step_ms: interval_ms,
             deadline: Default::default(),
         }
     }

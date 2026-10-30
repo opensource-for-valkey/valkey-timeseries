@@ -4,10 +4,10 @@ use crate::promql::engine::label_profile::{LabelProfile, ProfileWindow};
 #[cfg(test)]
 use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
 use crate::promql::engine::query_reader::{
-    AggregationOutcome, AggregationRequest, GridOutcome, GridRequest,
+    AggregationOutcome, AggregationRequest, GridOutcome, GridRequest, raw_grid_read,
 };
 use crate::promql::engine::selector_batch_executor::SelectorBatchExecutor;
-use crate::promql::{InstantSample, PromqlResult, QueryOptions, QueryResult, RangeSample};
+use crate::promql::{InstantSample, QueryOptions, QueryResult, RangeSample};
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher, Matchers};
 use promql_parser::parser::VectorSelector;
 use std::sync::{Arc, LazyLock};
@@ -101,7 +101,6 @@ impl QueryReader for ValkeySeriesQuerier {
         request: &GridRequest,
         options: QueryOptions,
     ) -> QueryResult<GridOutcome> {
-        let matchers: Matchers = normalize_selector(selector);
         // The toggle governs shipping the grid to *shards*: off, the raw span
         // comes back through the ordinary range fanout and the caller evaluates
         // it with the kernels a shard would have used — the same answer, at the
@@ -109,20 +108,9 @@ impl QueryReader for ValkeySeriesQuerier {
         // answered locally (`GridOutcome::Raw`) either way, which is also the
         // path the in-memory querier gives the PromQL conformance suite.
         if self.clustered && !crate::config::is_fanout_rollup_pushdown_enabled() {
-            let Some((start_ms, end_ms)) = request.fetch_bounds() else {
-                return Ok(GridOutcome::Raw(Vec::new()));
-            };
-            return SERIES_SELECTOR
-                .query_range(
-                    matchers,
-                    start_ms,
-                    end_ms,
-                    options,
-                    self.caller_user.clone(),
-                    self.hash_tags.clone(),
-                )
-                .map(GridOutcome::Raw);
+            return raw_grid_read(self, selector, request, options);
         }
+        let matchers: Matchers = normalize_selector(selector);
         SERIES_SELECTOR.query_grid(
             matchers,
             request.clone(),
@@ -244,7 +232,7 @@ impl QueryReader for ConcreteSeriesQuerier {
         selector: &VectorSelector,
         timestamp: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
+    ) -> QueryResult<Vec<InstantSample<EvalLabels>>> {
         match self {
             ConcreteSeriesQuerier::Actual(local) => local.query(selector, timestamp, options),
             #[cfg(test)]
@@ -258,7 +246,7 @@ impl QueryReader for ConcreteSeriesQuerier {
         start_ms: i64,
         end_ms: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
+    ) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
         match self {
             ConcreteSeriesQuerier::Actual(local) => {
                 local.query_range(selector, start_ms, end_ms, options)
@@ -276,7 +264,7 @@ impl QueryReader for ConcreteSeriesQuerier {
         timestamp: i64,
         aggregation: &AggregationRequest,
         options: QueryOptions,
-    ) -> PromqlResult<AggregationOutcome> {
+    ) -> QueryResult<AggregationOutcome> {
         match self {
             ConcreteSeriesQuerier::Actual(local) => {
                 local.query_aggregation(selector, timestamp, aggregation, options)
@@ -295,7 +283,7 @@ impl QueryReader for ConcreteSeriesQuerier {
         selector: &VectorSelector,
         request: &GridRequest,
         options: QueryOptions,
-    ) -> PromqlResult<GridOutcome> {
+    ) -> QueryResult<GridOutcome> {
         match self {
             ConcreteSeriesQuerier::Actual(local) => local.query_grid(selector, request, options),
             #[cfg(test)]
@@ -308,7 +296,7 @@ impl QueryReader for ConcreteSeriesQuerier {
         selector: &VectorSelector,
         window: Option<ProfileWindow>,
         options: QueryOptions,
-    ) -> PromqlResult<Option<LabelProfile>> {
+    ) -> QueryResult<Option<LabelProfile>> {
         match self {
             ConcreteSeriesQuerier::Actual(local) => local.label_profile(selector, window, options),
             #[cfg(test)]

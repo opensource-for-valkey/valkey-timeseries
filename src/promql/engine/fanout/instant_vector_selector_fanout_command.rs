@@ -19,7 +19,6 @@ pub struct InstantVectorSelectorFanoutCommand {
     timestamp: i64,
     lookback_delta: u64,
     max_series: u64,
-    max_points_per_series: u64,
     /// Samples already in evaluator form: each response is resolved against
     /// its symbol table as it arrives (see `on_response`).
     results: Vec<InstantSample<EvalLabels>>,
@@ -39,7 +38,6 @@ impl Default for InstantVectorSelectorFanoutCommand {
             timestamp: 0,
             lookback_delta,
             max_series: 0,
-            max_points_per_series: 0,
             results: vec![],
             timeout: crate::fanout::get_cluster_command_timeout(),
             seen: FingerprintHashSet::default(),
@@ -52,7 +50,6 @@ impl InstantVectorSelectorFanoutCommand {
         timestamp: Timestamp,
         lookback_delta: u64,
         max_series: u64,
-        max_points_per_series: u64,
         timeout: Duration,
     ) -> Self {
         Self {
@@ -60,7 +57,6 @@ impl InstantVectorSelectorFanoutCommand {
             timestamp,
             lookback_delta,
             max_series,
-            max_points_per_series,
             results: vec![],
             timeout,
             seen: FingerprintHashSet::default(),
@@ -85,13 +81,7 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
         ctx: &FanoutContext,
         req: InstantQuery,
     ) -> ValkeyResult<InstantQueryResponse> {
-        let Some(selector) = req.selector else {
-            ctx.log_warning("Received instant query with no selector, returning empty response");
-            return Ok(InstantQueryResponse {
-                samples: vec![],
-                labels: Some(Default::default()),
-            });
-        };
+        let selector = super::required(req.selector, "selector")?;
         let series_selector: SeriesSelector = (&selector).try_into()?;
         // The response is the samples read, so the budget is held until it is returned.
         let read = shard_read(ctx)?;
@@ -102,7 +92,6 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
             req.timestamp,
             req.lookback_delta,
             req.max_series,
-            req.max_points_per_series,
             &read,
         )
     }
@@ -118,7 +107,6 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
             timestamp: self.timestamp,
             lookback_delta: self.lookback_delta,
             max_series: self.max_series,
-            max_points_per_series: self.max_points_per_series,
             time_budget_ms: super::time_budget_to_wire(self.timeout),
         }
     }
@@ -127,12 +115,14 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
         super::time_budget_from_wire(req.time_budget_ms)
     }
 
-    fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
+    fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult {
         let symbol_table = resp.labels.unwrap_or_default();
         let mut resolver = symbol_table::EvalLabelResolver::new(&symbol_table);
         self.results.reserve(resp.samples.len());
         for mut s in resp.samples {
-            let labels = resolver.resolve(&mut s)?;
+            let labels = resolver
+                .resolve(&mut s)
+                .map_err(|why| super::peer_error(target, "returned malformed labels", why))?;
             let fingerprint = labels.fingerprint();
             if !self.seen.insert(fingerprint) {
                 // error. we have a duplicate
