@@ -1,9 +1,8 @@
 use crate::parser::number::parse_number;
 use crate::promql::binops::apply_binary_op;
 use crate::promql::functions::{DateTimePart, PromqlFunctionKind, datetime_from_seconds};
-use crate::promql::{EvalResult, EvaluationError};
 use num_traits::FloatConst;
-use promql_parser::parser::token::{T_ADD, T_EQLC, T_GTE, T_GTR, T_LSS, T_LTE, T_NEQ, TokenType};
+use promql_parser::parser::token::TokenType;
 use promql_parser::parser::{
     AggregateExpr, BinaryExpr, Call, Expr, ParenExpr, SubqueryExpr, UnaryExpr,
 };
@@ -86,9 +85,6 @@ fn handle_binary_expr(be: BinaryExpr) -> Expr {
         (Expr::NumberLiteral(ln), Expr::NumberLiteral(rn), op) => {
             handle_number_number(ln.val, rn.val, op, is_bool)
         }
-        (Expr::StringLiteral(left), Expr::StringLiteral(right), op) => {
-            handle_string_string(&left.val, &right.val, op, is_bool)
-        }
         _ => Expr::Binary(be),
     }
 }
@@ -100,53 +96,6 @@ fn handle_number_number(ln: f64, rn: f64, op: TokenType, is_bool: bool) -> Expr 
         return Expr::from(if n.is_nan() || n == 0.0 { 0.0 } else { 1.0 });
     }
     Expr::from(n)
-}
-
-fn handle_string_string(left: &str, right: &str, op: TokenType, is_bool: bool) -> Expr {
-    if op.id() == T_ADD {
-        if left.is_empty() {
-            return Expr::from(right);
-        } else if right.is_empty() {
-            return Expr::from(left);
-        }
-        let mut res = String::with_capacity(left.len() + right.len());
-        res += left;
-        res += right;
-        Expr::from(res)
-    } else if op.is_comparison_operator() {
-        let n = string_compare(left, right, op, is_bool).expect("string compare failed");
-        Expr::from(n)
-    } else {
-        Expr::Binary(BinaryExpr {
-            lhs: Box::new(Expr::from(left)),
-            rhs: Box::new(Expr::from(right)),
-            op,
-            modifier: None,
-        })
-    }
-}
-
-pub fn string_compare(a: &str, b: &str, op: TokenType, is_bool: bool) -> EvalResult<f64> {
-    let res = match op.id() {
-        T_EQLC => a == b,
-        T_NEQ => a != b,
-        T_LTE => a <= b,
-        T_GTE => a >= b,
-        T_LSS => a < b,
-        T_GTR => a > b,
-        _ => {
-            return Err(EvaluationError::InternalError(format!(
-                "unexpected operator {op} in string comparison"
-            )));
-        }
-    };
-    Ok(if res {
-        1_f64
-    } else if is_bool {
-        0_f64
-    } else {
-        f64::NAN
-    })
 }
 
 fn get_single_scalar_arg(fe: &Call) -> Option<f64> {
