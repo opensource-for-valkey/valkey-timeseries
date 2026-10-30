@@ -13,18 +13,27 @@ pub(super) fn test_query_options() -> QueryOptions {
     }
 }
 
+/// [`test_query_options`] with the static optimizer on: every conformance file
+/// also runs this way, so a rewrite that changes a result fails the suite.
+pub(super) fn optimized_query_options() -> QueryOptions {
+    QueryOptions {
+        optimize_queries: true,
+        ..test_query_options()
+    }
+}
+
 /// Execute instant query and return structured results
 pub(super) fn eval_instant(
     tsdb: &PromqlQuerier,
     time: SystemTime,
     query: &str,
+    options: &QueryOptions,
 ) -> Result<QueryValue, String> {
-    let options = test_query_options();
     // Quick debug: attempt to parse the query directly to get a more detailed parser error
     match crate::promql::parse_query(query) {
         Ok(_) => {
             // parsed OK, proceed
-            tsdb.eval_query(query, Some(time), &options)
+            tsdb.eval_query(query, Some(time), options)
                 .map_err(|e| e.to_string())
         }
         Err(e) => {
@@ -43,11 +52,11 @@ pub(super) fn eval_instant(
                     normalized
                 );
                 return tsdb
-                    .eval_query(&normalized, Some(time), &options)
+                    .eval_query(&normalized, Some(time), options)
                     .map_err(|e| e.to_string());
             }
             // fall through to attempt evaluation which will return error
-            tsdb.eval_query(query, Some(time), &options)
+            tsdb.eval_query(query, Some(time), options)
                 .map_err(|err| err.to_string())
         }
     }
@@ -59,9 +68,9 @@ pub(super) fn eval_range(
     end: SystemTime,
     step: std::time::Duration,
     query: &str,
+    options: &QueryOptions,
 ) -> Result<Vec<RangeSample>, String> {
-    let options = test_query_options();
     let range = start..=end;
-    tsdb.eval_query_range(query, range, step, &options)
+    tsdb.eval_query_range(query, range, step, options)
         .map_err(|e| e.to_string())
 }
