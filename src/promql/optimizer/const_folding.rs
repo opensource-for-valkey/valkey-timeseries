@@ -142,6 +142,36 @@ fn simplify_math_fn(fe: &Call, func: PromqlFunctionKind) -> Option<f64> {
     }
 }
 
+/// `expr` with every `vector(e)` replaced by `e`, through the arithmetic that
+/// keeps a one-sample, label-less vector one: for the argument of `scalar(...)`
+/// only, where the two read the same. A filtering comparison (no `bool`) or a
+/// matching modifier stops the rewrite, since there the vector and the scalar
+/// behave differently.
+fn unwrap_vectors(expr: Expr) -> Expr {
+    match expr {
+        Expr::Call(mut fe) if fe.func.name == "vector" && fe.args.len() == 1 => {
+            unwrap_vectors(*fe.args.args.remove(0))
+        }
+        Expr::Binary(mut be)
+            if (!be.op.is_comparison_operator() || be.return_bool())
+                && be.modifier.as_ref().is_none_or(|m| m.matching.is_none()) =>
+        {
+            be.lhs = Box::new(unwrap_vectors(*be.lhs));
+            be.rhs = Box::new(unwrap_vectors(*be.rhs));
+            Expr::Binary(be)
+        }
+        Expr::Paren(mut p) => {
+            p.expr = Box::new(unwrap_vectors(*p.expr));
+            Expr::Paren(p)
+        }
+        Expr::Unary(mut u) => {
+            u.expr = Box::new(unwrap_vectors(*u.expr));
+            Expr::Unary(u)
+        }
+        other => other,
+    }
+}
+
 fn handle_function_expr(fe: Call) -> Expr {
     use PromqlFunctionKind::*;
     // const-simplify function arguments first so we can simplify calls like
@@ -158,15 +188,15 @@ fn handle_function_expr(fe: Call) -> Expr {
         return Expr::Call(fe);
     };
     match kind {
-        Vector if arg_count == 1 => {
-            let mut fe = fe;
-            // unwrap vector(...) -> inner literal when possible
-            *fe.args.args.remove(0)
-        }
         Scalar if arg_count == 1 => {
-            // try to extract a single scalar argument (e.g., scalar(vector(123)) -> 123)
-            if let Some(v) = get_single_scalar_arg(&fe) {
-                Expr::from(v)
+            // Inside `scalar(...)` a one-sample, label-less `vector(e)` and `e`
+            // are interchangeable, so the argument folds with its `vector`
+            // calls unwrapped: `scalar(9 + vector(4))` -> `13`. Only here:
+            // anywhere else `vector(e)` is an instant vector, and unwrapping it
+            // would retype `sum(vector(1))` or `-vector(1)`.
+            let candidate = fold_constants(unwrap_vectors((*fe.args.args[0]).clone()));
+            if let Expr::NumberLiteral(_) = candidate {
+                candidate
             } else {
                 Expr::Call(fe)
             }

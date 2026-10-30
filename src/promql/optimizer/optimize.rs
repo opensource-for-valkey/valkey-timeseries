@@ -586,6 +586,25 @@ mod tests {
         optimize_expr(expr)
     }
 
+    /// `vector(e)` is an instant vector wherever it is not inside `scalar(...)`:
+    /// the optimizer must not turn it into its scalar argument there, or an
+    /// aggregation over it is refused and a negation changes the result type.
+    #[test]
+    fn vector_calls_stay_vectors_outside_scalar() {
+        for query in [
+            "sum(vector(1))",
+            "max(vector(time()))",
+            "count_values(\"v\", vector(1))",
+            "-vector(1)",
+            "sum(x) or vector(0)",
+            "vector(1) + vector(2)",
+        ] {
+            assert_string_simplify(query, query);
+        }
+        // Inside `scalar(...)` the two are interchangeable, so it still folds.
+        assert_string_simplify("scalar(vector(1) + vector(2))", "3");
+    }
+
     #[test]
     fn simplify_expr_nan_comparison() {
         // scalar == bool NAN is always false
