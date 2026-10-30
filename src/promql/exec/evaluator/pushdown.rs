@@ -178,15 +178,8 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
 
         // Selection timestamp and lookback, resolved exactly as
         // `evaluate_vector_selector` resolves them for the same selector.
-        let adjusted_eval_ts = apply_time_modifiers_ms(
-            selector.at.as_ref(),
-            selector.offset.as_ref(),
-            ctx.query_start,
-            ctx.query_end,
-            ctx.evaluation_ts,
-        );
-        let mut options = self.options;
-        options.lookback_delta = Duration::from_millis(ctx.lookback_delta_ms as u64);
+        let adjusted_eval_ts = ctx.modified_eval_ts(selector.at.as_ref(), selector.offset.as_ref());
+        let options = self.options.with_lookback_ms(ctx.lookback_delta_ms);
 
         let outcome =
             self.reader
@@ -302,13 +295,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
 
         // A single evaluation — an instant query, or a subquery step the
         // preload did not cover: one request for this evaluation.
-        let range_end_ms = apply_time_modifiers_ms(
-            matrix.vs.at.as_ref(),
-            matrix.vs.offset.as_ref(),
-            ctx.query_start,
-            ctx.query_end,
-            ctx.evaluation_ts,
-        );
+        let range_end_ms = ctx.modified_eval_ts(matrix.vs.at.as_ref(), matrix.vs.offset.as_ref());
         let request = GridRequest {
             step_ms: ctx.step_ms,
             query_start: ctx.query_start,
@@ -321,8 +308,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             sample_timestamps: false,
         };
 
-        let mut options = self.options;
-        options.lookback_delta = Duration::from_millis(ctx.lookback_delta_ms as u64);
+        let options = self.options.with_lookback_ms(ctx.lookback_delta_ms);
 
         // A peer without grid push-down: decline, and the aggregation is
         // evaluated here from an ordinary read.
@@ -397,13 +383,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
 
         // Resolve `@`/`offset` here: the source is told the window, never the
         // modifier, so it cannot resolve one differently than the local path.
-        let range_end_ms = apply_time_modifiers_ms(
-            matrix.vs.at.as_ref(),
-            matrix.vs.offset.as_ref(),
-            ctx.query_start,
-            ctx.query_end,
-            ctx.evaluation_ts,
-        );
+        let range_end_ms = ctx.modified_eval_ts(matrix.vs.at.as_ref(), matrix.vs.offset.as_ref());
 
         let request = GridRequest {
             step_ms: ctx.step_ms,
@@ -422,8 +402,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             sample_timestamps: false,
         };
 
-        let mut options = self.options;
-        options.lookback_delta = Duration::from_millis(ctx.lookback_delta_ms as u64);
+        let options = self.options.with_lookback_ms(ctx.lookback_delta_ms);
 
         // A peer without grid push-down: decline, and the rollup is evaluated
         // here from an ordinary read.

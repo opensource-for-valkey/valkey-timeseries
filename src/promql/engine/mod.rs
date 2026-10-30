@@ -87,6 +87,16 @@ pub struct QueryOptions {
     pub max_reply_bytes: usize,
 }
 
+impl QueryOptions {
+    /// These options with the lookback a plan or grid resolved, in
+    /// milliseconds: what a read is handed so the source applies the same
+    /// staleness window the evaluator does.
+    pub(crate) fn with_lookback_ms(mut self, lookback_ms: i64) -> Self {
+        self.lookback_delta = Duration::from_millis(lookback_ms as u64);
+        self
+    }
+}
+
 impl Default for QueryOptions {
     fn default() -> Self {
         let config = promql_config();

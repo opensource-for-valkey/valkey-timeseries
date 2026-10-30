@@ -15,11 +15,10 @@ use crate::common::{Sample, Timestamp};
 use crate::promql::engine::QueryReader;
 #[cfg(test)]
 use crate::promql::exec::types::EvalLabels;
-use crate::promql::time::grid_step_count;
+use crate::promql::time::{grid_step_count, step_times};
 use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult, QueryOptions};
 use orx_parallel::Par;
 use promql_parser::parser::VectorSelector;
-use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Phase artifact types
@@ -216,7 +215,7 @@ fn shape_subquery_results(series_data: Vec<EvalSamples>, plan: &QueryPlan) -> Ve
             }
 
             let mut step_samples = Vec::with_capacity(expected_steps);
-            let steps = (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize);
+            let steps = step_times(aligned_start_ms, subquery_end_ms, step_ms);
             for_each_step_sample(
                 &sample.values,
                 steps,
@@ -268,7 +267,7 @@ pub(crate) fn execute_selector_pipeline<R: QueryReader + ?Sized>(
     // to filter for the last item on the worker nodes instead of shipping the data only to filter
     // out on the requester. The `query` method on the reader should handle this
     if let QueryPathKind::InstantVector { lookback_delta_ms } = plan.path_kind {
-        options.lookback_delta = Duration::from_millis(lookback_delta_ms as u64);
+        options = options.with_lookback_ms(lookback_delta_ms);
         let series_data = reader
             .query(selector, plan.sample_end_ms, options)?
             .into_iter()

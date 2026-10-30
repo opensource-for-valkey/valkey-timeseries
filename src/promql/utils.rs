@@ -32,21 +32,6 @@ pub(in crate::promql) fn range_bounds_to_system_time(
     (start, end)
 }
 
-#[inline]
-fn calc_points(start: Timestamp, end: Timestamp, step: &Duration) -> i64 {
-    if end < start {
-        return 0;
-    }
-
-    // A range grid includes both bounds: 0..=1000 at a 1ms step has 1,001
-    // points. Saturate the conversion and arithmetic because an unbounded end
-    // is represented by i64::MAX.
-    let step_ms = i64::try_from(step.as_millis()).unwrap_or(i64::MAX).max(1);
-    end.saturating_sub(start)
-        .saturating_div(step_ms)
-        .saturating_add(1)
-}
-
 /// Checks the maximum number of points that may be returned per each time series.
 ///
 /// The number mustn't exceed `max_points_per_timeseries`, or [`MAX_GRID_STEPS`]
@@ -57,12 +42,15 @@ pub(crate) fn validate_max_points_per_timeseries(
     step: Duration,
     max_points_per_timeseries: usize,
 ) -> EvalResult<()> {
-    let points = calc_points(start, end, &step);
+    // A range grid includes both bounds: 0..=1000 at a 1 ms step has 1,001
+    // points. A sub-millisecond step counts as 1 ms, and an unbounded end
+    // (`i64::MAX`) cannot overflow the count.
+    let points = grid_step_count(start, end, duration_ms(step).max(1));
     let limit = match max_points_per_timeseries as u64 {
         0 => MAX_GRID_STEPS,
         configured => configured.min(MAX_GRID_STEPS),
     };
-    if points as u64 > limit {
+    if points > limit {
         let msg = format!(
             "too many points for the given step={:?}, start={start} and end={end}: {points}; cannot exceed {limit}",
             step
@@ -366,7 +354,7 @@ mod max_points_tests {
 
     #[test]
     fn extreme_span_does_not_overflow() {
-        // start below zero with the max end must not panic/overflow in calc_points; it just
+        // start below zero with the max end must not panic/overflow in grid_step_count; it just
         // yields a huge point count that the limit rejects.
         let err = validate_max_points_per_timeseries(
             i64::MIN,

@@ -39,9 +39,7 @@ use crate::promql::hashers::{AggregationKey, GridPreloadKey, MatrixPreloadKey, P
 use crate::promql::model::EvalContext;
 use crate::promql::model::RangeSample;
 use crate::promql::time::duration_ms;
-use crate::promql::time::{
-    MAX_GRID_STEPS, apply_time_modifiers_ms, grid_step_count, selector_bounds, step_times,
-};
+use crate::promql::time::{MAX_GRID_STEPS, grid_step_count, selector_bounds, step_times};
 use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
 use crate::promql::utils::{check_subquery_steps, subquery_step_ms};
 use crate::promql::{
@@ -59,7 +57,6 @@ use promql_parser::parser::{
 use promql_parser::util::{ExprVisitor, walk_expr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Duration;
 
 #[cfg(test)]
 mod evaluator_tests;
@@ -505,13 +502,8 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let range_ms = matrix_range_ms(matrix_selector);
 
         // Apply time modifiers to evaluation_ts
-        let adjusted_eval_ts = apply_time_modifiers_ms(
-            vector_selector.at.as_ref(),
-            vector_selector.offset.as_ref(),
-            ctx.query_start,
-            ctx.query_end,
-            ctx.evaluation_ts,
-        );
+        let adjusted_eval_ts =
+            ctx.modified_eval_ts(vector_selector.at.as_ref(), vector_selector.offset.as_ref());
 
         // Slice this step's window out of the preloaded span, if the
         // selector's whole grid was fetched up front (`preload_matrices`).
@@ -590,13 +582,8 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         }
 
         // Apply time modifiers (offset and @)
-        let adjusted_eval_ts = apply_time_modifiers_ms(
-            vector_selector.at.as_ref(),
-            vector_selector.offset.as_ref(),
-            ctx.query_start,
-            ctx.query_end,
-            ctx.evaluation_ts,
-        );
+        let adjusted_eval_ts =
+            ctx.modified_eval_ts(vector_selector.at.as_ref(), vector_selector.offset.as_ref());
 
         // The pipeline's instant-vector path stamps `lookback_delta` from the plan
         // onto the options before calling QueryReader::query.

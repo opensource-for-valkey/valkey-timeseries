@@ -381,15 +381,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         grid: &PreloadGrid,
     ) -> Vec<Timestamp> {
         grid.steps()
-            .map(|step_ts| {
-                apply_time_modifiers_ms(
-                    vs.at.as_ref(),
-                    vs.offset.as_ref(),
-                    grid.at_start_ms,
-                    grid.at_end_ms,
-                    step_ts,
-                )
-            })
+            .map(|step_ts| grid.modified_ts(vs.at.as_ref(), vs.offset.as_ref(), step_ts))
             .collect()
     }
 
@@ -407,8 +399,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             return Ok(());
         };
 
-        let mut options = self.options;
-        options.lookback_delta = Duration::from_millis(grid.lookback_delta_ms as u64);
+        let options = self.options.with_lookback_ms(grid.lookback_delta_ms);
 
         // A peer without grid push-down: leave the rollup unpreloaded, and
         // `preload_matrices` reads its span raw instead.
@@ -655,8 +646,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             return Ok(());
         };
 
-        let mut options = self.options;
-        options.lookback_delta = Duration::from_millis(grid.lookback_delta_ms as u64);
+        let options = self.options.with_lookback_ms(grid.lookback_delta_ms);
 
         let (groups, charged) = match self.reader.query_grid(vs, &request, options)? {
             // Nothing was pushed down: the span is here. Grouping it once per
@@ -696,8 +686,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // the source answers that one; the scatter below replicates it.
         let raw_series = match self.grid_request(vs, grid, None, None) {
             Some((request, window_ends)) => {
-                let mut options = self.options;
-                options.lookback_delta = Duration::from_millis(lookback_delta_ms as u64);
+                let options = self.options.with_lookback_ms(lookback_delta_ms);
                 match self.reader.query_grid(vs, &request, options)? {
                     GridOutcome::Stepped(series) => {
                         // Charged as the grids they become, holes included: a
@@ -781,8 +770,6 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let num_steps = grid.expected_steps();
         let at_modifier = vs.at.clone();
         let offset_mod = vs.offset.clone();
-        let at_start_ms = grid.at_start_ms;
-        let at_end_ms = grid.at_end_ms;
 
         // ── Per-series step-bucketing ─────────────────
         let preloaded_series: Vec<PreloadedInstantSeries> = raw_series
@@ -800,13 +787,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 // per-step fallback path resolves them from the EvalContext.
                 let steps = (0..num_steps).map(|step_idx| {
                     let eval_ts_i = eval_start_ms + (step_idx as i64) * step_ms;
-                    apply_time_modifiers_ms(
-                        at_modifier.as_ref(),
-                        offset_mod.as_ref(),
-                        at_start_ms,
-                        at_end_ms,
-                        eval_ts_i,
-                    )
+                    grid.modified_ts(at_modifier.as_ref(), offset_mod.as_ref(), eval_ts_i)
                 });
 
                 let mut values = StepGridBuilder::with_capacity(num_steps);

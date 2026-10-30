@@ -6,10 +6,12 @@
 use crate::common::time::valkey_cached_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::labels::Labels;
+use crate::promql::time::apply_time_modifiers_ms;
 use crate::promql::{EvalLabels, EvalSample, EvalSamples, ExprResult};
 #[cfg(test)]
 use crate::promql::{QueryError, QueryResult};
 use promql_parser::parser::value::ValueType;
+use promql_parser::parser::{AtModifier, Offset};
 
 /// StaleNaN is a signaling NaN used as a staleness marker in Prometheus.
 ///
@@ -142,6 +144,23 @@ pub(crate) struct EvalContext {
 }
 
 impl EvalContext {
+    /// The evaluation timestamp with a selector's or subquery's `@` and
+    /// `offset` applied; `@ start()`/`@ end()` resolve against this context's
+    /// query bounds.
+    pub(crate) fn modified_eval_ts(
+        &self,
+        at: Option<&AtModifier>,
+        offset: Option<&Offset>,
+    ) -> Timestamp {
+        apply_time_modifiers_ms(
+            at,
+            offset,
+            self.query_start,
+            self.query_end,
+            self.evaluation_ts,
+        )
+    }
+
     #[cfg(test)]
     pub fn for_vector_selector(query_time: Timestamp, lookback_delta_ms: i64) -> Self {
         EvalContext {
