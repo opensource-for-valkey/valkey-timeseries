@@ -167,7 +167,6 @@ pub(super) fn handle_instant_query<S: GilSource + ?Sized>(
     timestamp: Timestamp,
     lookback_delta: u64,
     max_series: u64,
-    _max_points_per_series: u64,
     read: &ShardRead,
 ) -> ValkeyResult<InstantQueryResponse> {
     let mut symbol_table = symbol_table::SymbolTableBuilder::default();

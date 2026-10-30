@@ -51,7 +51,9 @@ message InstantQuery {
   int64 timestamp = 2;
   uint64 lookback_delta = 3;
   uint64 max_series = 4;
-  uint64 max_points_per_series = 5;
+  /// Field 5 carried `max_points_per_series`, which no shard ever read: an
+  /// instant read yields one sample per series.
+  reserved 5;
   /// How long the requester waits for this answer, in milliseconds from when
   /// it sent the request. The receiver drops the request, or stops reading,
   /// once that long has passed since it received it: by then the requester has
@@ -244,8 +246,10 @@ message GridRollup {
 /// its per-series values as well as computing them, so what crosses the wire is
 /// one partial per group per step rather than one value per *series* per step.
 ///
-/// Only the reducing operators appear here; the selecting ones (topk and
-/// friends) need the individual samples and are not fused.
+/// The reducing operators ship one partial per group per step. The selecting
+/// and counting ones (topk and friends, count_values) are fused too, shipping
+/// their per-step picks or counts as candidates the coordinator re-selects or
+/// sums (`SteppedSelection`).
 message GridAggregation {
   AggregationKind kind = 1;
   optional AggregationGrouping grouping = 2;

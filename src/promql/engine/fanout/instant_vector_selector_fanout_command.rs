@@ -19,7 +19,6 @@ pub struct InstantVectorSelectorFanoutCommand {
     timestamp: i64,
     lookback_delta: u64,
     max_series: u64,
-    max_points_per_series: u64,
     /// Samples already in evaluator form: each response is resolved against
     /// its symbol table as it arrives (see `on_response`).
     results: Vec<InstantSample<EvalLabels>>,
@@ -39,7 +38,6 @@ impl Default for InstantVectorSelectorFanoutCommand {
             timestamp: 0,
             lookback_delta,
             max_series: 0,
-            max_points_per_series: 0,
             results: vec![],
             timeout: crate::fanout::get_cluster_command_timeout(),
             seen: FingerprintHashSet::default(),
@@ -52,7 +50,6 @@ impl InstantVectorSelectorFanoutCommand {
         timestamp: Timestamp,
         lookback_delta: u64,
         max_series: u64,
-        max_points_per_series: u64,
         timeout: Duration,
     ) -> Self {
         Self {
@@ -60,7 +57,6 @@ impl InstantVectorSelectorFanoutCommand {
             timestamp,
             lookback_delta,
             max_series,
-            max_points_per_series,
             results: vec![],
             timeout,
             seen: FingerprintHashSet::default(),
@@ -102,7 +98,6 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
             req.timestamp,
             req.lookback_delta,
             req.max_series,
-            req.max_points_per_series,
             &read,
         )
     }
@@ -118,7 +113,6 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
             timestamp: self.timestamp,
             lookback_delta: self.lookback_delta,
             max_series: self.max_series,
-            max_points_per_series: self.max_points_per_series,
             time_budget_ms: super::time_budget_to_wire(self.timeout),
         }
     }

@@ -636,7 +636,6 @@ fn execute_cluster_vector_selector(
         timestamp,
         lookback_delta,
         iqc.options.max_series as u64,
-        iqc.options.max_points_per_series.unwrap_or(0) as u64,
         timeout,
     );
 
@@ -747,7 +746,6 @@ fn execute_cluster_aggregation(
         timestamp: ac.timestamp,
         lookback_delta: ac.options.lookback_delta.as_millis() as u64,
         max_series: ac.options.max_series as u64,
-        max_points_per_series: ac.options.max_points_per_series.unwrap_or(0) as u64,
     };
     let deadline = Deadline::from_options(&ac.options);
     let cmd = AggregationFanoutCommand::new(vector, ac.aggregation, timeout, deadline);

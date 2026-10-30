@@ -502,8 +502,6 @@ pub struct InstantQuery {
     pub lookback_delta: u64,
     #[prost(uint64, tag = "4")]
     pub max_series: u64,
-    #[prost(uint64, tag = "5")]
-    pub max_points_per_series: u64,
     /// / How long the requester waits for this answer, in milliseconds from when
     /// / it sent the request. The receiver drops the request, or stops reading,
     /// / once that long has passed since it received it: by then the requester has
@@ -668,8 +666,10 @@ pub struct GridRollup {
 /// / its per-series values as well as computing them, so what crosses the wire is
 /// / one partial per group per step rather than one value per *series* per step.
 /// /
-/// / Only the reducing operators appear here; the selecting ones (topk and
-/// / friends) need the individual samples and are not fused.
+/// / The reducing operators ship one partial per group per step. The selecting
+/// / and counting ones (topk and friends, count_values) are fused too, shipping
+/// / their per-step picks or counts as candidates the coordinator re-selects or
+/// / sums (`SteppedSelection`).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GridAggregation {
     #[prost(enumeration = "AggregationKind", tag = "1")]
