@@ -1,7 +1,9 @@
 use super::go_compat::{cosh, sinh};
 use crate::promql::common::math::{max_with_nan, min_with_nan};
 use crate::promql::functions::types::{PromQLArg, PromQLFunction};
-use crate::promql::functions::utils::{exact_arity_error, map_scalar_or_vector};
+use crate::promql::functions::utils::{
+    exact_arity_error, map_scalar_or_vector, three_args, two_args,
+};
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvaluationError, ExprResult};
 
 #[inline]
@@ -144,16 +146,9 @@ impl PromQLFunction for ClampMaxFunction {
     }
 
     fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        if args.len() != 2 {
-            return Err(exact_arity_error("clamp_max", 2, args.len()));
-        }
-
-        let mut args_iter = args.into_iter();
-        let first_arg = args_iter.next().expect("validated args.len() == 2");
-        let second_arg = args_iter.next().expect("validated args.len() == 2");
-
-        let mut samples = first_arg.into_instant_vector()?;
-        let max = second_arg.into_scalar()?;
+        let (vector, max) = two_args("clamp_max", args)?;
+        let mut samples = vector.into_instant_vector()?;
+        let max = max.into_scalar()?;
         for sample in &mut samples {
             sample.value = min_with_nan(sample.value, max);
             sample.drop_name = true;
@@ -171,16 +166,9 @@ impl PromQLFunction for ClampMinFunction {
     }
 
     fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        if args.len() != 2 {
-            return Err(exact_arity_error("clamp_min", 2, args.len()));
-        }
-
-        let mut args_iter = args.into_iter();
-        let first_arg = args_iter.next().expect("validated args.len() == 2");
-        let second_arg = args_iter.next().expect("validated args.len() == 2");
-
-        let mut samples = first_arg.into_instant_vector()?;
-        let min = second_arg.into_scalar()?;
+        let (vector, min) = two_args("clamp_min", args)?;
+        let mut samples = vector.into_instant_vector()?;
+        let min = min.into_scalar()?;
         for sample in &mut samples {
             sample.value = max_with_nan(sample.value, min);
             sample.drop_name = true;
@@ -198,18 +186,10 @@ impl PromQLFunction for ClampFunction {
     }
 
     fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        if args.len() != 3 {
-            return Err(exact_arity_error("clamp", 3, args.len()));
-        }
-
-        let mut args_iter = args.into_iter();
-        let first_arg = args_iter.next().expect("validated args.len() == 3");
-        let second_arg = args_iter.next().expect("validated args.len() == 3");
-        let third_arg = args_iter.next().expect("validated args.len() == 3");
-
-        let mut samples = first_arg.into_instant_vector()?;
-        let min = second_arg.into_scalar()?;
-        let max = third_arg.into_scalar()?;
+        let (vector, min, max) = three_args("clamp", args)?;
+        let mut samples = vector.into_instant_vector()?;
+        let min = min.into_scalar()?;
+        let max = max.into_scalar()?;
         if min > max {
             return Ok(ExprResult::InstantVector(vec![]));
         }
@@ -232,20 +212,11 @@ impl PromQLFunction for MaxOfFunction {
     }
 
     fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        if args.len() != 2 {
-            return Err(exact_arity_error("max_of", 2, args.len()));
-        }
-
-        let mut args_iter = args.into_iter();
-        let a = args_iter
-            .next()
-            .expect("validated args.len() == 2")
-            .into_scalar()?;
-        let b = args_iter
-            .next()
-            .expect("validated args.len() == 2")
-            .into_scalar()?;
-        Ok(ExprResult::Scalar(max_with_nan(a, b)))
+        let (a, b) = two_args("max_of", args)?;
+        Ok(ExprResult::Scalar(max_with_nan(
+            a.into_scalar()?,
+            b.into_scalar()?,
+        )))
     }
 }
 
@@ -259,20 +230,11 @@ impl PromQLFunction for MinOfFunction {
     }
 
     fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        if args.len() != 2 {
-            return Err(exact_arity_error("min_of", 2, args.len()));
-        }
-
-        let mut args_iter = args.into_iter();
-        let a = args_iter
-            .next()
-            .expect("validated args.len() == 2")
-            .into_scalar()?;
-        let b = args_iter
-            .next()
-            .expect("validated args.len() == 2")
-            .into_scalar()?;
-        Ok(ExprResult::Scalar(min_with_nan(a, b)))
+        let (a, b) = two_args("min_of", args)?;
+        Ok(ExprResult::Scalar(min_with_nan(
+            a.into_scalar()?,
+            b.into_scalar()?,
+        )))
     }
 }
 

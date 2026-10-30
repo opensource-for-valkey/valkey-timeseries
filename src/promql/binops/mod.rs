@@ -8,7 +8,6 @@ use promql_parser::parser::token::{
 #[cfg(feature = "bench")]
 mod bench;
 mod binop_range_scalar;
-mod binop_scalar_vector;
 mod binop_vector_scalar;
 mod binop_vector_vector;
 mod labels;
@@ -35,7 +34,7 @@ pub(crate) fn eval_binary_expr(
         }
         // Scalar-Vector operations: apply scalar to each vector element
         (ExprResult::Scalar(scalar), ExprResult::InstantVector(vector)) => {
-            binop_scalar_vector::eval_binop_scalar_vector(expr, scalar, vector)
+            binop_vector_scalar::eval_binop_scalar_vector(expr, scalar, vector)
         }
         (ExprResult::InstantVector(left_vector), ExprResult::InstantVector(right_vector)) => {
             binop_vector_vector::eval_binop_vector_vector(expr, left_vector, right_vector)

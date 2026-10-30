@@ -47,6 +47,33 @@ pub(super) fn expect_exact_arg_count(
     Ok(())
 }
 
+/// The two arguments of a two-argument function, or its arity error.
+pub(super) fn two_args(
+    function_name: &str,
+    args: Vec<PromQLArg>,
+) -> EvalResult<(PromQLArg, PromQLArg)> {
+    expect_exact_arg_count(function_name, 2, args.len())?;
+    let mut args = args.into_iter();
+    Ok((
+        args.next().expect("checked arg count"),
+        args.next().expect("checked arg count"),
+    ))
+}
+
+/// The three arguments of a three-argument function, or its arity error.
+pub(super) fn three_args(
+    function_name: &str,
+    args: Vec<PromQLArg>,
+) -> EvalResult<(PromQLArg, PromQLArg, PromQLArg)> {
+    expect_exact_arg_count(function_name, 3, args.len())?;
+    let mut args = args.into_iter();
+    Ok((
+        args.next().expect("checked arg count"),
+        args.next().expect("checked arg count"),
+        args.next().expect("checked arg count"),
+    ))
+}
+
 pub(super) fn expect_min_arg_count(
     function_name: &str,
     expected: usize,

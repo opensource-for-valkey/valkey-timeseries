@@ -26,6 +26,22 @@ pub(in crate::promql) fn changes_metric_schema(op: TokenType) -> bool {
     )
 }
 
+/// Whether `name` is part of a binary operation's match key under `matching`,
+/// as Prometheus' `Labels.MatchLabels` selects them: with `on(...)` just the
+/// listed labels, otherwise everything but the ignored labels and `__name__`.
+///
+/// Not the rule for the *result* labels (`result_metric`), which keeps
+/// `__name__` under `ignoring(...)` unless the operator drops it.
+pub(super) fn match_key_keeps(matching: Option<&LabelModifier>, name: &str) -> bool {
+    match matching {
+        Some(LabelModifier::Include(on)) => on.labels.iter().any(|n| n == name),
+        Some(LabelModifier::Exclude(ignoring)) => {
+            name != METRIC_NAME && !ignoring.labels.iter().any(|n| n == name)
+        }
+        None => name != METRIC_NAME,
+    }
+}
+
 /// Fingerprint of a sample's *effective* label set: the labels as they will
 /// stand once a pending `__name__` drop is applied.
 pub(crate) fn effective_fingerprint(labels: &EvalLabels, drop_name: bool) -> SeriesFingerprint {
