@@ -7,7 +7,7 @@ use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationRequest, GridOutcome, GridRequest,
 };
 use crate::promql::engine::selector_batch_executor::SelectorBatchExecutor;
-use crate::promql::{InstantSample, PromqlResult, QueryOptions, QueryResult, RangeSample};
+use crate::promql::{InstantSample, QueryOptions, QueryResult, RangeSample};
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher, Matchers};
 use promql_parser::parser::VectorSelector;
 use std::sync::{Arc, LazyLock};
@@ -244,7 +244,7 @@ impl QueryReader for ConcreteSeriesQuerier {
         selector: &VectorSelector,
         timestamp: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
+    ) -> QueryResult<Vec<InstantSample<EvalLabels>>> {
         match self {
             ConcreteSeriesQuerier::Actual(local) => local.query(selector, timestamp, options),
             #[cfg(test)]
@@ -258,7 +258,7 @@ impl QueryReader for ConcreteSeriesQuerier {
         start_ms: i64,
         end_ms: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
+    ) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
         match self {
             ConcreteSeriesQuerier::Actual(local) => {
                 local.query_range(selector, start_ms, end_ms, options)
@@ -276,7 +276,7 @@ impl QueryReader for ConcreteSeriesQuerier {
         timestamp: i64,
         aggregation: &AggregationRequest,
         options: QueryOptions,
-    ) -> PromqlResult<AggregationOutcome> {
+    ) -> QueryResult<AggregationOutcome> {
         match self {
             ConcreteSeriesQuerier::Actual(local) => {
                 local.query_aggregation(selector, timestamp, aggregation, options)
@@ -295,7 +295,7 @@ impl QueryReader for ConcreteSeriesQuerier {
         selector: &VectorSelector,
         request: &GridRequest,
         options: QueryOptions,
-    ) -> PromqlResult<GridOutcome> {
+    ) -> QueryResult<GridOutcome> {
         match self {
             ConcreteSeriesQuerier::Actual(local) => local.query_grid(selector, request, options),
             #[cfg(test)]
@@ -308,7 +308,7 @@ impl QueryReader for ConcreteSeriesQuerier {
         selector: &VectorSelector,
         window: Option<ProfileWindow>,
         options: QueryOptions,
-    ) -> PromqlResult<Option<LabelProfile>> {
+    ) -> QueryResult<Option<LabelProfile>> {
         match self {
             ConcreteSeriesQuerier::Actual(local) => local.label_profile(selector, window, options),
             #[cfg(test)]

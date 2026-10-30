@@ -63,10 +63,7 @@ impl HasFingerprint for Matcher {
     }
 }
 
-fn update_hasher_for_vector_selector(
-    vs: &VectorSelector,
-    hasher: &mut LabelHasher,
-) {
+fn update_hasher_for_vector_selector(vs: &VectorSelector, hasher: &mut LabelHasher) {
     fn update_list(list: &Vec<Matcher>, hasher: &mut LabelHasher) {
         let mut keys: SmallVec<[&Matcher; 6]> = smallvec![];
         for m in list {
@@ -324,4 +321,3 @@ impl GridPreloadKey {
         }
     }
 }
-

@@ -4028,7 +4028,7 @@ mod tests {
             selector: &VectorSelector,
             timestamp: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::InstantSample<EvalLabels>>> {
+        ) -> crate::promql::QueryResult<Vec<crate::promql::InstantSample<EvalLabels>>> {
             self.record(selector);
             self.inner.query(selector, timestamp, options)
         }
@@ -4039,7 +4039,7 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::RangeSample<EvalLabels>>> {
+        ) -> crate::promql::QueryResult<Vec<crate::promql::RangeSample<EvalLabels>>> {
             self.record(selector);
             self.inner.query_range(selector, start_ms, end_ms, options)
         }
@@ -4176,7 +4176,7 @@ mod tests {
             selector: &VectorSelector,
             timestamp: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::InstantSample<EvalLabels>>> {
+        ) -> crate::promql::QueryResult<Vec<crate::promql::InstantSample<EvalLabels>>> {
             self.inner.query(selector, timestamp, options)
         }
 
@@ -4186,7 +4186,7 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::RangeSample<EvalLabels>>> {
+        ) -> crate::promql::QueryResult<Vec<crate::promql::RangeSample<EvalLabels>>> {
             self.inner.query_range(selector, start_ms, end_ms, options)
         }
 
@@ -4196,7 +4196,7 @@ mod tests {
             timestamp: i64,
             aggregation: &AggregationRequest,
             _options: QueryOptions,
-        ) -> crate::promql::PromqlResult<AggregationOutcome> {
+        ) -> crate::promql::QueryResult<AggregationOutcome> {
             self.offered.lock().unwrap().push((
                 aggregation.kind,
                 aggregation.param.clone(),
@@ -4670,7 +4670,7 @@ mod tests {
             selector: &VectorSelector,
             timestamp: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::InstantSample<EvalLabels>>> {
+        ) -> crate::promql::QueryResult<Vec<crate::promql::InstantSample<EvalLabels>>> {
             self.inner.query(selector, timestamp, options)
         }
 
@@ -4680,7 +4680,7 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::RangeSample<EvalLabels>>> {
+        ) -> crate::promql::QueryResult<Vec<crate::promql::RangeSample<EvalLabels>>> {
             self.inner.query_range(selector, start_ms, end_ms, options)
         }
 
@@ -4689,7 +4689,7 @@ mod tests {
             selector: &VectorSelector,
             request: &GridRequest,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<GridOutcome> {
+        ) -> crate::promql::QueryResult<GridOutcome> {
             self.offered.lock().unwrap().push(OfferedGrid {
                 rollup: request.rollup.clone(),
                 aggregation: request.aggregation.as_ref().map(|agg| agg.kind),

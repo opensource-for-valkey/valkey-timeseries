@@ -8,7 +8,7 @@ use crate::promql::exec::partial_aggregation::{SteppedPartialGroups, SteppedSele
 use crate::promql::exec::pipeline::for_each_step_sample;
 use crate::promql::functions::RollupKind;
 use crate::promql::{
-    EvalResult, ExprResult, PromqlResult, QueryError, QueryOptions,
+    EvalResult, ExprResult, QueryError, QueryOptions, QueryResult,
     model::{InstantSample, RangeSample},
 };
 use orx_parallel::Par;
@@ -366,8 +366,8 @@ impl GridRequest {
         &self,
         series: Vec<RangeSample<EvalLabels>>,
         deadline: &Deadline,
-        charge: &mut dyn FnMut(usize) -> PromqlResult<()>,
-    ) -> PromqlResult<GridOutcome> {
+        charge: &mut dyn FnMut(usize) -> QueryResult<()>,
+    ) -> QueryResult<GridOutcome> {
         let window_ends = self.window_ends();
         let mut sink = GridSink::for_request(self);
         self.per_series_chunked(&window_ends, series, deadline, |output, read| {
@@ -393,8 +393,8 @@ impl GridRequest {
         window_ends: &[Timestamp],
         series: Vec<RangeSample<EvalLabels>>,
         deadline: &Deadline,
-        mut sink: impl FnMut(GridSeries, usize) -> PromqlResult<()>,
-    ) -> PromqlResult<()> {
+        mut sink: impl FnMut(GridSeries, usize) -> QueryResult<()>,
+    ) -> QueryResult<()> {
         let backward_ms = self.backward_ms();
         let mut pending = series.into_iter();
         loop {
@@ -650,7 +650,7 @@ pub trait QueryReader: Send + Sync {
         selector: &VectorSelector,
         timestamp: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample<EvalLabels>>>;
+    ) -> QueryResult<Vec<InstantSample<EvalLabels>>>;
 
     /// Query range samples between `start_ms` and `end_ms` with an optional `deadline`.
     fn query_range(
@@ -659,7 +659,7 @@ pub trait QueryReader: Send + Sync {
         start_ms: i64,
         end_ms: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>>;
+    ) -> QueryResult<Vec<RangeSample<EvalLabels>>>;
 
     /// Evaluate `aggregation` over the instant vector `selector` selects at
     /// `timestamp`, at the source.
@@ -675,7 +675,7 @@ pub trait QueryReader: Send + Sync {
         _timestamp: i64,
         _aggregation: &AggregationRequest,
         _options: QueryOptions,
-    ) -> PromqlResult<AggregationOutcome> {
+    ) -> QueryResult<AggregationOutcome> {
         Ok(AggregationOutcome::Unsupported)
     }
 
@@ -693,7 +693,7 @@ pub trait QueryReader: Send + Sync {
         selector: &VectorSelector,
         request: &GridRequest,
         options: QueryOptions,
-    ) -> PromqlResult<GridOutcome> {
+    ) -> QueryResult<GridOutcome> {
         let Some((start_ms, end_ms)) = request.fetch_bounds() else {
             return Ok(GridOutcome::Raw(Vec::new()));
         };
@@ -712,7 +712,7 @@ pub trait QueryReader: Send + Sync {
         _selector: &VectorSelector,
         _window: Option<ProfileWindow>,
         _options: QueryOptions,
-    ) -> PromqlResult<Option<LabelProfile>> {
+    ) -> QueryResult<Option<LabelProfile>> {
         Ok(None)
     }
 }
@@ -723,7 +723,7 @@ impl QueryReader for Arc<dyn QueryReader> {
         selector: &VectorSelector,
         timestamp: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
+    ) -> QueryResult<Vec<InstantSample<EvalLabels>>> {
         self.as_ref().query(selector, timestamp, options)
     }
 
@@ -733,7 +733,7 @@ impl QueryReader for Arc<dyn QueryReader> {
         start_ms: i64,
         end_ms: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
+    ) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
         self.as_ref()
             .query_range(selector, start_ms, end_ms, options)
     }
@@ -744,7 +744,7 @@ impl QueryReader for Arc<dyn QueryReader> {
         timestamp: i64,
         aggregation: &AggregationRequest,
         options: QueryOptions,
-    ) -> PromqlResult<AggregationOutcome> {
+    ) -> QueryResult<AggregationOutcome> {
         self.as_ref()
             .query_aggregation(selector, timestamp, aggregation, options)
     }
@@ -754,7 +754,7 @@ impl QueryReader for Arc<dyn QueryReader> {
         selector: &VectorSelector,
         request: &GridRequest,
         options: QueryOptions,
-    ) -> PromqlResult<GridOutcome> {
+    ) -> QueryResult<GridOutcome> {
         self.as_ref().query_grid(selector, request, options)
     }
 
@@ -763,7 +763,7 @@ impl QueryReader for Arc<dyn QueryReader> {
         selector: &VectorSelector,
         window: Option<ProfileWindow>,
         options: QueryOptions,
-    ) -> PromqlResult<Option<LabelProfile>> {
+    ) -> QueryResult<Option<LabelProfile>> {
         self.as_ref().label_profile(selector, window, options)
     }
 }

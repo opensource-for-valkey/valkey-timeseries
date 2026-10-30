@@ -42,7 +42,7 @@ use crate::promql::hashers::SelectorKey;
 use crate::promql::optimizer::pushdown::{LeafFilters, pushdown_filters_in_place_with};
 use crate::promql::time::{duration_ms, selector_bounds};
 use crate::promql::utils::subquery_step_ms;
-use crate::promql::{PromqlResult, QueryError};
+use crate::promql::{QueryError, QueryResult};
 use ahash::AHashMap;
 use orx_parallel::{Par, ParResult};
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
@@ -63,7 +63,7 @@ pub(crate) fn derive_filters_in_place<R: QueryReader + ?Sized>(
     reader: &R,
     grid: &PreloadGrid,
     options: QueryOptions,
-) -> PromqlResult<()> {
+) -> QueryResult<()> {
     let mut leaves = ProfiledLeaves::collect(expr, reader, grid, options)?;
     if leaves.is_empty() {
         return Ok(());
@@ -233,7 +233,7 @@ impl ProfiledLeaves {
         reader: &R,
         grid: &PreloadGrid,
         options: QueryOptions,
-    ) -> PromqlResult<Self> {
+    ) -> QueryResult<Self> {
         let mut leaves = Vec::new();
         collect_operand_leaves(expr, Some(grid), &mut leaves);
 
@@ -593,7 +593,7 @@ mod tests {
             _: &VectorSelector,
             _: i64,
             _: QueryOptions,
-        ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
+        ) -> QueryResult<Vec<InstantSample<EvalLabels>>> {
             unreachable!("the pass reads no samples")
         }
 
@@ -603,7 +603,7 @@ mod tests {
             _: i64,
             _: i64,
             _: QueryOptions,
-        ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
+        ) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
             unreachable!("the pass reads no samples")
         }
 
@@ -613,7 +613,7 @@ mod tests {
             _: i64,
             _: &AggregationRequest,
             _: QueryOptions,
-        ) -> PromqlResult<AggregationOutcome> {
+        ) -> QueryResult<AggregationOutcome> {
             unreachable!()
         }
 
@@ -622,7 +622,7 @@ mod tests {
             selector: &VectorSelector,
             window: Option<ProfileWindow>,
             _: QueryOptions,
-        ) -> PromqlResult<Option<LabelProfile>> {
+        ) -> QueryResult<Option<LabelProfile>> {
             let mut stripped = selector.clone();
             stripped.offset = None;
             stripped.at = None;

@@ -1,7 +1,7 @@
-//! Error types for OpenData TimeSeries operations.
+//! Error types for PromQL query and discovery operations.
 //!
-//! This module defines [`Error`], the primary error type for all time series
-//! operations, along with a convenient [`Result`] type alias.
+//! This module defines [`QueryError`], the error type every PromQL read and
+//! query path returns, and its [`QueryResult`] alias.
 
 use crate::promql::EvaluationError;
 
@@ -79,5 +79,4 @@ impl From<EvaluationError> for QueryError {
     }
 }
 
-pub type PromqlResult<T> = Result<T, QueryError>;
 pub type QueryResult<T> = Result<T, QueryError>;
