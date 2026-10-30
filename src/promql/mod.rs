@@ -24,7 +24,8 @@ pub(crate) use crate::commands::fanout_codec::generated;
 pub use engine::QueryOptions;
 
 use crate::promql::engine::register_fanout_commands;
-pub use error::*;
+pub(crate) use error::EvalResult;
+pub use error::{EvaluationError, QueryError, QueryResult};
 pub use exec::*;
 pub use model::*;
 pub(crate) use time::{MAX_GRID_STEPS, duration_ms};

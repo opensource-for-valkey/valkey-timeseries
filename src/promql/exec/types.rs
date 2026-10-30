@@ -6,7 +6,6 @@ use crate::labels::{
     HasFingerprint, InternedLabel, Labels, MetricName, SeriesFingerprint, fingerprint_labels,
     hash_label,
 };
-use crate::promql::error::QueryError;
 use crate::promql::exec::bitset::BitSet;
 use crate::promql::hashers::{GridPreloadKey, MatrixPreloadKey, PreloadKey};
 use ahash::RandomState;
@@ -16,40 +15,6 @@ use promql_parser::parser::value::ValueType;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-
-#[derive(Debug, Clone)]
-pub enum EvaluationError {
-    InternalError(String),
-    ArgumentError(String),
-    DuplicateLabelSet,
-    /// A `QueryError` surfaced by a `QueryReader` (or nested query evaluation),
-    /// wrapped without loss so that converting back to `QueryError` preserves
-    /// the original kind (e.g. `Timeout` stays `Timeout`).
-    Query(QueryError),
-}
-
-impl From<QueryError> for EvaluationError {
-    fn from(err: QueryError) -> Self {
-        EvaluationError::Query(err)
-    }
-}
-
-impl Display for EvaluationError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EvaluationError::InternalError(err) => write!(f, "PromQL internal error: {err}"),
-            EvaluationError::ArgumentError(err) => write!(f, "PromQL argument error: {err}"),
-            EvaluationError::DuplicateLabelSet => {
-                write!(f, "vector cannot contain metrics with the same labelset")
-            }
-            EvaluationError::Query(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl std::error::Error for EvaluationError {}
-
-pub(crate) type EvalResult<T> = Result<T, EvaluationError>;
 
 /// No series: the end of a successor chain, or no step seen yet.
 const NO_SERIES: usize = usize::MAX;

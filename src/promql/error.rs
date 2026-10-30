@@ -1,9 +1,46 @@
 //! Error types for PromQL query and discovery operations.
 //!
-//! This module defines [`QueryError`], the error type every PromQL read and
-//! query path returns, and its [`QueryResult`] alias.
+//! Two layers: [`EvaluationError`] is what expression evaluation produces —
+//! a bad argument, a duplicate label set, an internal invariant — and
+//! [`QueryError`] is what a query returns to its caller. A `QueryError` a
+//! reader raises travels through evaluation wrapped
+//! ([`EvaluationError::Query`]) so that converting back preserves its kind.
 
-use crate::promql::EvaluationError;
+use std::fmt::{Display, Formatter};
+
+#[derive(Debug, Clone)]
+pub enum EvaluationError {
+    InternalError(String),
+    ArgumentError(String),
+    DuplicateLabelSet,
+    /// A `QueryError` surfaced by a `QueryReader` (or nested query evaluation),
+    /// wrapped without loss so that converting back to `QueryError` preserves
+    /// the original kind (e.g. `Timeout` stays `Timeout`).
+    Query(QueryError),
+}
+
+impl From<QueryError> for EvaluationError {
+    fn from(err: QueryError) -> Self {
+        EvaluationError::Query(err)
+    }
+}
+
+impl Display for EvaluationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EvaluationError::InternalError(err) => write!(f, "PromQL internal error: {err}"),
+            EvaluationError::ArgumentError(err) => write!(f, "PromQL argument error: {err}"),
+            EvaluationError::DuplicateLabelSet => {
+                write!(f, "vector cannot contain metrics with the same labelset")
+            }
+            EvaluationError::Query(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for EvaluationError {}
+
+pub(crate) type EvalResult<T> = Result<T, EvaluationError>;
 
 /// Error type for PromQL query and discovery operations.
 ///
