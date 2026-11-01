@@ -1,4 +1,4 @@
-# Comparative benchmark deployment — see docs/plans/rts-comparative-benchmarks-plan.md.
+# Comparative benchmark deployment — see docs/topics/comparative-benchmarks.md.
 #
 # Both engines run here as containers with *equal* resource limits so the results
 # compare the two server/module stacks and nothing else. The reference service
