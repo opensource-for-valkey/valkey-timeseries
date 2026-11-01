@@ -33,7 +33,7 @@ pub(super) fn fetch_series_batch(
         // series rejected by `pred`) do not shrink the batch that is returned.
         let mut resolved = Vec::with_capacity(batch_size);
 
-        for _ in 0..SCAN_ROUNDS {
+        'scan: for _ in 0..SCAN_ROUNDS {
             let mut buf = [0_u64; BUF_SIZE];
             let n = cursor.read_many(&mut buf);
             if n == 0 {
@@ -44,7 +44,7 @@ pub(super) fn fetch_series_batch(
                 if let Some(k) = postings.get_key_by_id(id) {
                     resolved.push((id, create_key_string(ctx, k.as_ref())));
                     if resolved.len() >= batch_size {
-                        break;
+                        break 'scan;
                     }
                 } else {
                     stale_ids.push(id);
