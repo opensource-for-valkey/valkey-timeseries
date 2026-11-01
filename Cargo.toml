@@ -12,12 +12,12 @@ description = "A Timeseries data type for Valkey"
 ahash = { version = "0.8", features = ["std"] }
 arc-swap = "1.9"
 blart = "0.6"
-bon = { version = "3.10.2", optional = true }
+bon = { version = "3.10.3", optional = true }
 byte-pool = "0.2.4"
 croaring = "2.8.0"
 enquote = "1.1.0"
 enum_dispatch = "0.3.13"
-get-size2 = { version = "0.11.0", features = ["derive"] }
+get-size2 = { version = "0.11.1", features = ["derive"] }
 hashify = { version = "0.3" }
 itertools = "0.15.0"
 # `mmap` for the RDB save counters, which the BGSAVE fork child must share with the server
@@ -52,7 +52,7 @@ range-set-blaze = "0.8"
 redis = { version = "1.7", optional = true, default-features = false, features = ["cluster"] }
 rayon-core = "1.13"
 regex = "1"
-simd-json = "0.18.1"
+simd-json = "0.19.0"
 # Only `StudentsT` is used; the default features pull in nalgebra and rand for nothing.
 statrs = { version = "0.19.1", default-features = false, features = ["std"] }
 welch-sde = "0.1.0"
