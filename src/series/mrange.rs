@@ -204,12 +204,37 @@ pub(crate) fn process_mrange_group_partials(
     deadline.finish(results)
 }
 
+/// Who a node's TS.MRANGE results are for, which decides how they are shaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MRangeScope {
+    /// The client itself: grouped and sorted here, uncompressed.
+    Client,
+    /// A coordinator on another node: per-series results, compressed for the wire.
+    RemoteShard,
+    /// This node's own coordinator. Shaped like [`Self::RemoteShard`], but the results
+    /// never leave the process, so compressing them would only cost an encode here
+    /// and a decode in the coordinator.
+    LocalShard,
+}
+
+impl MRangeScope {
+    fn is_shard(self) -> bool {
+        self != MRangeScope::Client
+    }
+
+    /// Whether per-series samples go through the wire encoding
+    /// ([`samples_to_chunk_lossless`]).
+    fn compress(self) -> bool {
+        self == MRangeScope::RemoteShard
+    }
+}
+
 /// `expired` says whether a shard's requester has stopped waiting: the decode, which runs under
 /// the lock, stops between series once it has.
 pub(crate) fn process_mrange_query(
     ctx: &Context,
     options: MRangeOptions,
-    clustered: bool,
+    scope: MRangeScope,
     limit: Option<SampleLimit>,
     expired: &(dyn Fn() -> bool + Sync),
 ) -> ValkeyResult<Vec<MRangeSeriesResult>> {
@@ -237,16 +262,17 @@ pub(crate) fn process_mrange_query(
         })
         .collect();
 
-    process_mrange(series_metas, options, clustered, limit, expired)
+    process_mrange(series_metas, options, scope, limit, expired)
 }
 
 fn process_mrange(
     metas: Vec<MRangeSeriesMeta>,
     options: MRangeOptions,
-    is_clustered: bool,
+    scope: MRangeScope,
     limit: Option<SampleLimit>,
     expired: &(dyn Fn() -> bool + Sync),
 ) -> ValkeyResult<Vec<MRangeSeriesResult>> {
+    let is_clustered = scope.is_shard();
     let mut options = options;
     let mut metas = metas;
 
@@ -272,7 +298,7 @@ fn process_mrange(
         // coordinator re-applies EXCLUDEEMPTY regardless, so a peer that ignores
         // the request flag still yields the same reply.
         let deadline = ReadDeadline::new(expired);
-        let items = handle_non_grouped(metas, options, true, limit, &deadline);
+        let items = handle_non_grouped(metas, options, scope.compress(), limit, &deadline);
         let mut items = deadline.finish(items)?;
         if exclude_empty {
             items.retain(|item| !item.data.is_empty());
@@ -407,7 +433,7 @@ pub(crate) fn sort_mrange_results(results: &mut [MRangeSeriesResult], is_grouped
 fn handle_non_grouped(
     metas: Vec<MRangeSeriesMeta>,
     options: MRangeOptions,
-    clustered: bool,
+    compress: bool,
     limit: Option<SampleLimit>,
     deadline: &ReadDeadline<'_>,
 ) -> Vec<MRangeSeriesResult> {
@@ -472,10 +498,10 @@ fn handle_non_grouped(
                     }
                 };
                 let samples = iter.collect::<Vec<_>>();
-                // Only the clustered response crosses the network, so only it is
-                // worth compressing — and only once it holds enough samples to
-                // pay for the chunk header (see `samples_to_chunk`).
-                if clustered {
+                // Only a response that crosses the network is worth compressing —
+                // and only once it holds enough samples to pay for the chunk
+                // header (see `samples_to_chunk`).
+                if compress {
                     SeriesResultData::Chunk(samples_to_chunk_lossless(samples))
                 } else {
                     let chunk = UncompressedChunk::from_vec(samples);
@@ -1190,7 +1216,7 @@ pub(crate) fn local_mrange_query<R>(
                 latest: get_latest(&options.range, ctx, guard),
             })
             .collect();
-        return process_mrange(metas, options.clone(), false, None, &|| false)
+        return process_mrange(metas, options.clone(), MRangeScope::Client, None, &|| false)
             .map(LocalMRange::Answered);
     };
     let (start, end) = options.range.get_timestamp_range();
@@ -1330,9 +1356,13 @@ mod tests {
             ..Default::default()
         };
 
-        let result = process_mrange(vec![meta(&series, "s", None)], options, true, None, &|| {
-            true
-        });
+        let result = process_mrange(
+            vec![meta(&series, "s", None)],
+            options,
+            MRangeScope::RemoteShard,
+            None,
+            &|| true,
+        );
 
         match result {
             Err(ValkeyError::Str(msg)) => assert_eq!(msg, error_consts::FANOUT_REQUESTER_GAVE_UP),
@@ -1349,9 +1379,13 @@ mod tests {
             ..Default::default()
         };
 
-        let results = process_mrange(vec![meta(&series, "s", None)], options, true, None, &|| {
-            false
-        })
+        let results = process_mrange(
+            vec![meta(&series, "s", None)],
+            options,
+            MRangeScope::RemoteShard,
+            None,
+            &|| false,
+        )
         .unwrap();
 
         assert_eq!(keys_of(&results), vec!["s"]);
@@ -1390,11 +1424,17 @@ mod tests {
         };
 
         // Default: every matched series is reported, empty payload included.
-        let results = process_mrange(metas(), options.clone(), false, None, &|| false).unwrap();
+        let results = process_mrange(metas(), options.clone(), MRangeScope::Client, None, &|| {
+            false
+        })
+        .unwrap();
         assert_eq!(keys_of(&results), vec!["n", "s", "u"]);
 
         options.exclude_empty = true;
-        let results = process_mrange(metas(), options.clone(), false, None, &|| false).unwrap();
+        let results = process_mrange(metas(), options.clone(), MRangeScope::Client, None, &|| {
+            false
+        })
+        .unwrap();
         assert_eq!(
             keys_of(&results),
             vec!["n", "s"],
@@ -1402,12 +1442,20 @@ mod tests {
         );
 
         // Shard side (clustered): same decision, made before the payload ships.
-        let results = process_mrange(metas(), options.clone(), true, None, &|| false).unwrap();
+        let results = process_mrange(
+            metas(),
+            options.clone(),
+            MRangeScope::RemoteShard,
+            None,
+            &|| false,
+        )
+        .unwrap();
         assert_eq!(keys_of(&results), vec!["n", "s"]);
 
         // A value filter that removes every sample makes a series empty too.
         options.range.value_filter = Some(crate::series::ValueFilter::new(0.0, 200.0).unwrap());
-        let results = process_mrange(metas(), options, false, None, &|| false).unwrap();
+        let results =
+            process_mrange(metas(), options, MRangeScope::Client, None, &|| false).unwrap();
         assert_eq!(
             keys_of(&results),
             vec!["s"],
@@ -1430,7 +1478,9 @@ mod tests {
         for is_reverse in [false, true] {
             options.is_reverse = is_reverse;
             let metas = vec![meta(&in_range, "s", None), meta(&out_of_range, "u", None)];
-            let results = process_mrange(metas, options.clone(), false, None, &|| false).unwrap();
+            let results =
+                process_mrange(metas, options.clone(), MRangeScope::Client, None, &|| false)
+                    .unwrap();
             assert_eq!(keys_of(&results), vec!["s"], "reverse={is_reverse}");
             assert_eq!(rows_of(&results[0]).len(), 2);
         }
@@ -1724,6 +1774,40 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The coordinator's own share skips the wire encoding: the same per-series
+    /// samples as a remote shard sends, never compressed.
+    #[test]
+    fn test_local_shard_scope_skips_wire_compression() {
+        let (s1, s2) = (multi_chunk_series(0.0), multi_chunk_series(100.0));
+        let options = MRangeOptions {
+            range: RangeOptions {
+                date_range: crate::series::TimestampRange::from_timestamps(95, 2405).unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let run = |scope| {
+            let metas = vec![meta(&s1, "a", None), meta(&s2, "b", None)];
+            let mut results =
+                process_mrange(metas, options.clone(), scope, None, &|| false).unwrap();
+            sort_mrange_results(&mut results, false);
+            results
+        };
+        let (remote, local) = (run(MRangeScope::RemoteShard), run(MRangeScope::LocalShard));
+        assert!(remote.iter().all(|r| matches!(
+            r.data,
+            SeriesResultData::Chunk(ref c) if !matches!(c, TimeSeriesChunk::Uncompressed(_))
+        )));
+        assert!(local.iter().all(|r| matches!(
+            r.data,
+            SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(_))
+        )));
+        assert_eq!(keys_of(&local), keys_of(&remote));
+        for (l, r) in local.iter().zip(&remote) {
+            assert_eq!(samples_of(l), samples_of(r));
         }
     }
 }

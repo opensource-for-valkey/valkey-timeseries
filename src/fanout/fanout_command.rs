@@ -546,7 +546,7 @@ where
         // deadline passed and the blocked client has had the timeout error.
         // A write runs regardless (`FanoutCommand::cancellable`); a late answer
         // is ignored once the fanout has completed.
-        let fanout_ctx = FanoutContext::new(user, db);
+        let fanout_ctx = FanoutContext::new(user, db).local_share();
         if OP::cancellable() {
             if state.is_completed() {
                 return;

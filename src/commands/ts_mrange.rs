@@ -7,7 +7,7 @@ use crate::common::threads::{BoundedExecutor, Capacity, lane_workers};
 use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, is_clustered};
 use crate::series::mrange::{
-    LocalMRange, decode_snapshot_series, is_snapshot_answerable, local_mrange_query,
+    LocalMRange, MRangeScope, decode_snapshot_series, is_snapshot_answerable, local_mrange_query,
     process_mrange_query,
 };
 use std::sync::LazyLock;
@@ -122,7 +122,7 @@ fn mrange_internal(ctx: &Context, args: Vec<ValkeyString>, reverse: bool) -> Val
     }
 
     let shape = MRangeReplyShape::from_options(&options);
-    let result_rows = process_mrange_query(ctx, options, false, None, &|| false)?;
+    let result_rows = process_mrange_query(ctx, options, MRangeScope::Client, None, &|| false)?;
     reply_with_mrange_series_results(ctx, &result_rows, &shape)
 }
 

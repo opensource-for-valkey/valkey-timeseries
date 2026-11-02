@@ -18,7 +18,7 @@ use crate::fanout::{FanoutCommandResult, FanoutContext};
 use crate::iterators::{KWayMerge, RowReducer, SampleReducer, create_sample_iterator_adapter};
 use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
 use crate::series::mrange::{
-    SampleLimit, build_mrange_grouped_labels, collect_rows, collect_samples,
+    MRangeScope, SampleLimit, build_mrange_grouped_labels, collect_rows, collect_samples,
     process_mrange_group_partials, process_mrange_query, sort_mrange_results,
 };
 use crate::series::request_types::{
@@ -162,12 +162,19 @@ impl FanoutClientCommand for MRangeFanoutCommand {
             options.range.aggregation = None;
         }
 
+        // The coordinator's own share is handed over in memory, so it skips the
+        // wire compression a remote coordinator gets.
+        let scope = if ctx.is_local_share() {
+            MRangeScope::LocalShard
+        } else {
+            MRangeScope::RemoteShard
+        };
         // Process the MRange query locally. The results are owned, so the
         // encoding below (including label interning) runs with the GIL released.
         let series = {
             let expired = || ctx.expired();
             let ctx = ctx.lock_unexpired()?;
-            process_mrange_query(&ctx, options, true, limit, &expired)?
+            process_mrange_query(&ctx, options, scope, limit, &expired)?
         };
 
         // Convert MRangeSeriesResult to SeriesResponse
