@@ -253,7 +253,7 @@ fn process_mrange(
 
     if let Some(grouping) = &options.grouping {
         collect_group_label_values(&mut metas, grouping);
-        // Is_clustered here means that we are being called from a remote node. Since grouping
+        // `is_clustered` here means that we are being called from a remote node. Since grouping
         // is cross-series, it can only be done when all results are available in the caller node.
         // However, we need to tag each series with the grouping label value (done above), so we can
         // group them by the grouping label when they are returned to the client.
@@ -535,17 +535,8 @@ fn handle_grouping(
     // then fold each group's rows into its bucket table in series order — the same order
     // the k-way merge yields, so the reduce is bit-identical to it. Groups the grid
     // cannot serve fall through to the merge below.
-    let mut dense: Vec<(String, GroupedSeriesData, BucketGrid)> = Vec::new();
-    let mut merged: Vec<(String, GroupedSeriesData)> = Vec::new();
-    for (label_value, group_data) in grouped_series_map {
-        match (!is_multi)
-            .then(|| BucketGrid::for_query(&options.range, &group_data.series))
-            .flatten()
-        {
-            Some(grid) => dense.push((label_value, group_data, grid)),
-            None => merged.push((label_value, group_data)),
-        }
-    }
+    let (dense, mut merged) =
+        plan_dense_groups(grouped_series_map, &options, count, DENSE_STAGING_MAX_ROWS);
 
     let mut items: Vec<MRangeSeriesResult> = Vec::with_capacity(dense.len() + merged.len());
     if !dense.is_empty() {
@@ -647,6 +638,89 @@ struct BucketGrid {
 /// More buckets than this and the table is not worth its memory against the merge
 /// (a `-`/`+` window over a sparse series with a one-millisecond bucket is legal).
 const DENSE_GROUP_MAX_SLOTS: usize = 1 << 20;
+
+/// Bucket rows the dense path may stage at once across every group (64 MiB of
+/// samples). The slot cap bounds one group's table, not series × buckets; groups
+/// past this budget take the streaming merge instead.
+const DENSE_STAGING_MAX_ROWS: usize = 4 << 20;
+
+type DenseGroup<'a> = (String, GroupedSeriesData<'a>, BucketGrid);
+type MergedGroup<'a> = (String, GroupedSeriesData<'a>);
+
+/// Splits groups between the bucket table and the merge. A group takes the merge when
+/// the grid cannot serve it, when an ascending `COUNT` asks for fewer buckets than the
+/// grid spans (the merge stops after `count` buckets; the table decodes all of them),
+/// or when staging its rows would exceed `budget` rows across the dense groups.
+fn plan_dense_groups<'a>(
+    groups: impl IntoIterator<Item = MergedGroup<'a>>,
+    options: &MRangeOptions,
+    count: Option<usize>,
+    budget: usize,
+) -> (Vec<DenseGroup<'a>>, Vec<MergedGroup<'a>>) {
+    let is_multi = options
+        .range
+        .aggregation
+        .as_ref()
+        .is_some_and(|a| a.is_multi());
+    let mut dense = Vec::new();
+    let mut merged = Vec::new();
+    let mut staged = 0usize;
+    for (label_value, group_data) in groups {
+        let grid = (!is_multi)
+            .then(|| BucketGrid::for_query(&options.range, &group_data.series))
+            .flatten()
+            .filter(|grid| options.is_reverse || count.is_none_or(|c| c >= grid.slots))
+            .filter(|grid| {
+                let rows: usize = group_data
+                    .series
+                    .iter()
+                    .map(|meta| estimated_bucket_rows(meta, &options.range, grid))
+                    .sum();
+                let fits = rows <= budget.saturating_sub(staged);
+                if fits {
+                    staged += rows;
+                }
+                fits
+            });
+        match grid {
+            Some(grid) => dense.push((label_value, group_data, grid)),
+            None => merged.push((label_value, group_data)),
+        }
+    }
+    (dense, merged)
+}
+
+/// Upper bound on the rows [`series_bucket_rows`] yields for `meta`: the buckets its own
+/// extent spans inside the window, and without `EMPTY` no more than one per sample.
+fn estimated_bucket_rows(
+    meta: &MRangeSeriesMeta,
+    range: &RangeOptions,
+    grid: &BucketGrid,
+) -> usize {
+    let series = meta.series;
+    let (mut first, mut last) = if series.is_empty() {
+        (Timestamp::MAX, Timestamp::MIN)
+    } else {
+        (series.first_timestamp, series.last_timestamp())
+    };
+    if let Some(latest) = meta.latest {
+        first = first.min(latest.timestamp);
+        last = last.max(latest.timestamp);
+    }
+    let (start, end) = range.get_timestamp_range();
+    let (start, end) = (start.max(first), end.min(last));
+    if start > end {
+        return 0;
+    }
+    let buckets = ((end - start) as u64 / grid.duration) as usize + 2;
+    let report_empty = range.aggregation.as_ref().is_some_and(|a| a.report_empty);
+    let rows = if report_empty {
+        buckets
+    } else {
+        buckets.min(series.total_samples + usize::from(meta.latest.is_some()))
+    };
+    rows.min(grid.slots)
+}
 
 impl BucketGrid {
     /// `None` when the query does not aggregate, when a bucket could start before 0 (the
@@ -805,23 +879,8 @@ fn fold_group_rows(
     Some(table.into_samples())
 }
 
-/// Aggregated GROUPBY without the merge: per-series bucket rows folded straight into a
-/// bucket table. `None` when the query is not one the table can serve (see
-/// [`BucketGrid::for_query`]) — the caller then runs the merge.
-fn get_grouped_samples_dense(
-    series_metas: &[MRangeSeriesMeta],
-    options: &MRangeOptions,
-    grouping_options: &RangeGroupingOptions,
-) -> Option<Vec<Sample>> {
-    let grid = BucketGrid::for_query(&options.range, series_metas)?;
-    let template = grouping_options.aggregation.create_aggregator();
-    let rows: Vec<Vec<Sample>> = series_metas
-        .iter()
-        .map(|meta| series_bucket_rows(meta, &options.range))
-        .collect();
-    fold_group_rows(&grid, &template, &rows)
-}
-
+/// The k-way merge reduce. `handle_grouping` has already tried the bucket table for
+/// every group it could serve, so this never retries it.
 fn get_grouped_samples(
     series_metas: &[MRangeSeriesMeta],
     options: &MRangeOptions,
@@ -832,10 +891,6 @@ fn get_grouped_samples(
     // reducer across the samples.
     // todo: choose approach based on data size and available memory?
     let is_reverse = options.is_reverse;
-
-    if let Some(samples) = get_grouped_samples_dense(series_metas, options, grouping_options) {
-        return collect_samples(samples.into_iter(), is_reverse, count);
-    }
 
     // todo(perf): with sufficient memory, we could parallel load all samples into memory first,
     // and construct the KWayMerge from those. In low memory, we could use the code
@@ -1398,5 +1453,130 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].timestamp, 200);
         assert_eq!(rows[1].timestamp, 100);
+    }
+
+    fn grouped_sum_options(bucket_duration: u64) -> MRangeOptions {
+        MRangeOptions {
+            range: RangeOptions {
+                date_range: crate::series::TimestampRange::from_timestamps(0, 1000).unwrap(),
+                aggregation: Some(AggregationOptions {
+                    aggregations: smallvec::smallvec![AggregationType::Sum.into()],
+                    bucket_duration,
+                    timestamp_output: Default::default(),
+                    alignment: Default::default(),
+                    report_empty: false,
+                }),
+                ..Default::default()
+            },
+            grouping: Some(RangeGroupingOptions {
+                aggregation: AggregatorConfig::new(AggregationType::Sum, None).unwrap(),
+                group_label: "region".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn group<'a>(name: &str, members: Vec<MRangeSeriesMeta<'a>>) -> MergedGroup<'a> {
+        let group = GroupedSeriesData {
+            series: members,
+            labels: Vec::new(),
+            source_keys: Vec::new(),
+        };
+        (name.to_string(), group)
+    }
+
+    fn planned_names(planned: &[MergedGroup]) -> Vec<String> {
+        planned.iter().map(|(name, _)| name.clone()).collect()
+    }
+
+    #[test]
+    fn test_dense_plan_leaves_small_ascending_count_to_merge() {
+        // 10 buckets of 100 ms over [0, 900]
+        let s = make_series(&(0..10).map(|i| (i * 100, 1.0)).collect::<Vec<_>>());
+        let options = grouped_sum_options(100);
+        let plan = |options: &MRangeOptions, count| {
+            let (dense, merged) = plan_dense_groups(
+                [group("us", vec![meta(&s, "a", None)])],
+                options,
+                count,
+                usize::MAX,
+            );
+            (dense.len(), merged.len())
+        };
+
+        assert_eq!(plan(&options, None), (1, 0));
+        // Ascending COUNT 1 only needs the first bucket: stream it.
+        assert_eq!(plan(&options, Some(1)), (0, 1));
+        // A COUNT covering the whole grid gains nothing from streaming.
+        assert_eq!(plan(&options, Some(1000)), (1, 0));
+        // Reverse COUNT drains the merge anyway, so the table stays.
+        let mut reverse = options.clone();
+        reverse.is_reverse = true;
+        assert_eq!(plan(&reverse, Some(1)), (1, 0));
+    }
+
+    #[test]
+    fn test_dense_plan_respects_staging_budget() {
+        // 10 samples, one per bucket: 10 staged rows per series.
+        let samples: Vec<(i64, f64)> = (0..10).map(|i| (i * 100, 1.0)).collect();
+        let (s1, s2, s3) = (
+            make_series(&samples),
+            make_series(&samples),
+            make_series(&samples),
+        );
+        let options = grouped_sum_options(100);
+        let groups = || {
+            vec![
+                group("a", vec![meta(&s1, "k1", None), meta(&s2, "k2", None)]),
+                group("b", vec![meta(&s3, "k3", None)]),
+            ]
+        };
+
+        let (dense, merged) = plan_dense_groups(groups(), &options, None, usize::MAX);
+        assert_eq!((dense.len(), merged.len()), (2, 0));
+
+        // Room for group "a" (20 rows) but not "a" + "b" (30).
+        let (dense, merged) = plan_dense_groups(groups(), &options, None, 25);
+        assert_eq!(
+            dense.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>(),
+            ["a"]
+        );
+        assert_eq!(planned_names(&merged), ["b"]);
+
+        // A later, smaller group still fits after a larger one is turned away.
+        let (dense, merged) = plan_dense_groups(groups(), &options, None, 15);
+        assert_eq!(
+            dense.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>(),
+            ["b"]
+        );
+        assert_eq!(planned_names(&merged), ["a"]);
+    }
+
+    #[test]
+    fn test_grouped_ascending_count_matches_full_prefix() {
+        let s1 = make_series(&[(0, 1.0), (10, 3.0), (110, 5.0), (220, 2.0)]);
+        let s2 = make_series(&[(0, 8.0), (120, 12.0), (250, 7.0)]);
+        let metas = || vec![meta(&s1, "a", Some("us")), meta(&s2, "b", Some("us"))];
+        let samples = |options: MRangeOptions| {
+            let results = handle_grouping(metas(), options).unwrap();
+            assert_eq!(results.len(), 1);
+            match &results[0].data {
+                SeriesResultData::Chunk(chunk) => {
+                    crate::series::chunks::ChunkOps::iter(chunk).collect::<Vec<Sample>>()
+                }
+                SeriesResultData::Rows(_) => panic!("expected single-aggregation samples"),
+            }
+        };
+
+        let full = samples(grouped_sum_options(100));
+        assert_eq!(
+            full.iter()
+                .map(|s| (s.timestamp, s.value))
+                .collect::<Vec<_>>(),
+            [(0, 12.0), (100, 17.0), (200, 9.0)]
+        );
+        let mut counted = grouped_sum_options(100);
+        counted.range.count = Some(2);
+        assert_eq!(samples(counted), full[..2]);
     }
 }
