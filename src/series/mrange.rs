@@ -224,7 +224,7 @@ impl MRangeScope {
 
     /// Whether per-series samples go through the wire encoding
     /// ([`samples_to_chunk_lossless`]).
-    fn compress(self) -> bool {
+    pub(crate) fn compress(self) -> bool {
         self == MRangeScope::RemoteShard
     }
 }
@@ -1141,19 +1141,27 @@ pub struct SnapshotSeries {
     pub snapshot: RangeSnapshot,
     pub latest: Option<Sample>,
     pub empty_fill: EmptyFillBounds,
+    /// The GROUPBY label's value, collected for the coordinator on a shard.
+    pub group_label_value: Option<String>,
 }
 
-/// Whether the non-clustered path can answer `options` from snapshots:
-/// grouping needs the reducer pass, multi-aggregation yields rows, and
-/// `FILTER_BY_TS` needs the series-backed base reader.
+/// Whether a snapshot can stand in for the series: multi-aggregation yields
+/// rows, and `FILTER_BY_TS` needs the series-backed base reader.
+fn snapshot_supports(range: &RangeOptions) -> bool {
+    range.timestamp_filter.is_none() && !range.aggregation.as_ref().is_some_and(|a| a.is_multi())
+}
+
+/// Whether the non-clustered path can answer `options` from snapshots; grouping
+/// needs the reducer pass as well.
 pub(crate) fn is_snapshot_answerable(options: &MRangeOptions) -> bool {
-    options.grouping.is_none()
-        && options.range.timestamp_filter.is_none()
-        && !options
-            .range
-            .aggregation
-            .as_ref()
-            .is_some_and(|a| a.is_multi())
+    options.grouping.is_none() && snapshot_supports(&options.range)
+}
+
+/// Whether a shard can answer its share of a clustered TS.MRANGE from
+/// snapshots. Grouping is fine here: a shard only tags each series with its
+/// group, and the coordinator reduces.
+pub(crate) fn is_shard_snapshot_answerable(options: &MRangeOptions) -> bool {
+    snapshot_supports(&options.range)
 }
 
 /// Least estimated work (units of [`estimated_work`]) a TS.MRANGE needs before
@@ -1219,21 +1227,132 @@ pub(crate) fn local_mrange_query<R>(
         return process_mrange(metas, options.clone(), MRangeScope::Client, None, &|| false)
             .map(LocalMRange::Answered);
     };
+    Ok(LocalMRange::Deferred(
+        slot,
+        snapshot_series(ctx, &series_guards, options),
+    ))
+}
+
+/// Copies out of each guarded series what the decode needs; the caller holds
+/// the guards, so this runs under the lock.
+fn snapshot_series(
+    ctx: &Context,
+    guards: &[(SeriesGuard, ValkeyString)],
+    options: &MRangeOptions,
+) -> Vec<SnapshotSeries> {
     let (start, end) = options.range.get_timestamp_range();
-    let series = series_guards
+    guards
         .iter()
-        .map(|(guard, key)| {
-            let snapshot = guard.snapshot_range(start, end);
-            SnapshotSeries {
-                key: key.as_slice().to_vec(),
-                labels: convert_labels(guard, options.with_labels, &options.selected_labels),
-                snapshot,
-                latest: get_latest(&options.range, ctx, guard),
-                empty_fill: range_empty_fill_bounds(guard, &options.range, options.is_reverse),
+        .map(|(guard, key)| SnapshotSeries {
+            key: key.as_slice().to_vec(),
+            labels: convert_labels(guard, options.with_labels, &options.selected_labels),
+            snapshot: guard.snapshot_range(start, end),
+            latest: get_latest(&options.range, ctx, guard),
+            empty_fill: range_empty_fill_bounds(
+                guard,
+                &options.range,
+                options.is_reverse,
+                options.is_reverse || options.reply_reverse,
+            ),
+            group_label_value: options
+                .grouping
+                .as_ref()
+                .and_then(|g| guard.label_value(&g.group_label))
+                .map(|v| v.to_string()),
+        })
+        .collect()
+}
+
+/// A shard's share of a clustered TS.MRANGE, under the lock: resolve and
+/// ACL-check the series, then snapshot them. [`decode_shard_snapshots`] does
+/// the rest once the lock is released, so the shard's main thread waits only
+/// for the copy, not the decode. `options` must satisfy
+/// [`is_shard_snapshot_answerable`].
+pub(crate) fn snapshot_shard_mrange(
+    ctx: &Context,
+    options: &MRangeOptions,
+) -> ValkeyResult<Vec<SnapshotSeries>> {
+    if options.filters.is_empty() {
+        return Err(ValkeyError::Str(error_consts::MISSING_FILTER));
+    }
+    let series_guards = series_by_selectors(ctx, &options.filters, None)?;
+    Ok(snapshot_series(ctx, &series_guards, options))
+}
+
+/// Decodes a shard's snapshots as `process_mrange` does for a clustered
+/// request: per-series results with their group tags, wire-encoded when
+/// `compress`, the COUNT push-down `limit` applied, EXCLUDEEMPTY applied, unsorted.
+pub(crate) fn decode_shard_snapshots(
+    series: Vec<SnapshotSeries>,
+    options: &MRangeOptions,
+    limit: Option<SampleLimit>,
+    compress: bool,
+    expired: &(dyn Fn() -> bool + Sync),
+) -> ValkeyResult<Vec<MRangeSeriesResult>> {
+    let work = series
+        .iter()
+        .map(|s| PER_SERIES_WORK + s.snapshot.estimated_samples())
+        .sum();
+    let threads = request_par_threads(series.len(), work);
+    // The decode runs after the lock is released, so it is where a requester that
+    // has given up stops this share, as `handle_non_grouped` does under the lock.
+    let deadline = ReadDeadline::new(expired);
+    let items: Vec<MRangeSeriesResult> = series
+        .into_par_rayon()
+        .num_threads(threads)
+        .map(|s| {
+            if deadline.passed() {
+                return MRangeSeriesResult::default();
             }
+            decode_snapshot(s, options, limit, compress)
         })
         .collect();
-    Ok(LocalMRange::Deferred(slot, series))
+    let mut items = deadline.finish(items)?;
+    if options.exclude_empty {
+        items.retain(|item| !item.data.is_empty());
+    }
+    Ok(items)
+}
+
+/// One snapshot through the pipeline `handle_non_grouped` runs over a live
+/// series. Grouping never applies here: a standalone deferred request has none,
+/// and a shard leaves the reduce to the coordinator.
+fn decode_snapshot(
+    s: SnapshotSeries,
+    options: &MRangeOptions,
+    limit: Option<SampleLimit>,
+    compress: bool,
+) -> MRangeSeriesResult {
+    let has_aggregation = options.range.aggregation.is_some();
+    let should_reverse_iter = !has_aggregation && options.is_reverse;
+    // The live path's base reader over the copied chunks: decoded lazily, so
+    // COUNT stops the decode, descending for a non-aggregated reverse query, and
+    // unboxed, so the aggregation inlines the decode as it does on the live path.
+    let iter = create_range_iterator_from_base(
+        s.snapshot.sample_iter(should_reverse_iter),
+        &options.range,
+        s.latest,
+        options.is_reverse,
+        s.empty_fill,
+    );
+    let samples: Vec<Sample> = match limit {
+        Some(limit) => limit.apply(iter).collect(),
+        None => iter.collect(),
+    };
+    let data = if compress {
+        SeriesResultData::Chunk(samples_to_chunk_lossless(samples))
+    } else {
+        SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(
+            samples,
+        )))
+    };
+    MRangeSeriesResult {
+        group_label_value: s.group_label_value,
+        key: s.key,
+        labels: s.labels,
+        sources: Vec::new(),
+        data,
+    }
 }
 
 /// The off-thread half: decode every snapshot through the same pipeline
@@ -1242,37 +1361,9 @@ pub(crate) fn decode_snapshot_series(
     series: Vec<SnapshotSeries>,
     options: &MRangeOptions,
 ) -> Vec<MRangeSeriesResult> {
-    let has_aggregation = options.range.aggregation.is_some();
-    let should_reverse_iter = !has_aggregation && options.is_reverse;
     let mut items: Vec<MRangeSeriesResult> = series
         .into_iter()
-        .map(|s| {
-            // Decode lazily, so COUNT stops the decode as it would stop
-            // `SeriesSampleIterator`. A non-aggregated reverse query wants the
-            // base descending, as `SeriesSampleIterator` would give it.
-            let base: Box<dyn Iterator<Item = Sample> + '_> = if should_reverse_iter {
-                Box::new(s.snapshot.rev_range_iter())
-            } else {
-                Box::new(s.snapshot.range_iter())
-            };
-            let samples: Vec<Sample> = create_range_iterator_from_base(
-                base,
-                &options.range,
-                s.latest,
-                options.is_reverse,
-                s.empty_fill,
-            )
-            .collect();
-            MRangeSeriesResult {
-                group_label_value: None,
-                key: s.key,
-                labels: s.labels,
-                sources: Vec::new(),
-                data: SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(
-                    UncompressedChunk::from_vec(samples),
-                )),
-            }
-        })
+        .map(|s| decode_snapshot(s, options, None, false))
         .collect();
     if options.exclude_empty {
         items.retain(|item| !item.data.is_empty());
@@ -1700,18 +1791,46 @@ mod tests {
         series
     }
 
+    /// Readings separated by NaN-only buckets and gaps (250 ms buckets). A NaN-only bucket
+    /// right before a reading is where EMPTY's `last` answers differently for a forward
+    /// reply (the value held so far) and a reverse one (the next bucket's value).
+    fn nan_gap_series() -> TimeSeries {
+        let mut series = TimeSeries::new();
+        for (ts, value) in [
+            (100, 1.0),
+            (300, f64::NAN),
+            (600, 5.0),
+            (1300, f64::NAN),
+            (1350, f64::NAN),
+            (1600, 9.0),
+            (2200, 3.0),
+        ] {
+            let _ = series.add(ts, value, None);
+        }
+        series
+    }
+
     #[test]
-    fn test_snapshot_rev_range_iter_matches_reversed_forward() {
+    fn test_snapshot_sample_iter_matches_live_series() {
+        use crate::series::SeriesSampleIterator;
         let series = multi_chunk_series(0.0);
-        for (start, end) in [(0, 2990), (155, 2405), (1000, 1000), (3000, 4000)] {
+        for (start, end) in [
+            (0, 2990),
+            (155, 2405),
+            (1000, 1000),
+            (3000, 4000),
+            (500, 100),
+        ] {
             let snapshot = series.snapshot_range(start, end);
-            let mut forward: Vec<Sample> = snapshot.range_iter().collect();
-            forward.reverse();
-            assert_eq!(
-                snapshot.rev_range_iter().collect::<Vec<_>>(),
-                forward,
-                "{start}..{end}"
-            );
+            for is_reverse in [false, true] {
+                let live: Vec<Sample> =
+                    SeriesSampleIterator::new(&series, start, end, is_reverse).collect();
+                assert_eq!(
+                    snapshot.sample_iter(is_reverse).collect::<Vec<_>>(),
+                    live,
+                    "{start}..{end} reverse={is_reverse}"
+                );
+            }
         }
     }
 
@@ -1752,7 +1871,9 @@ mod tests {
                                     series,
                                     &options.range,
                                     options.is_reverse,
+                                    options.is_reverse,
                                 ),
+                                group_label_value: None,
                             }
                         })
                         .collect();
@@ -1775,6 +1896,142 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A shard's snapshot decode gives the coordinator what the live clustered
+    /// path gives it: same series, group tags, samples and EXCLUDEEMPTY, under
+    /// each COUNT push-down limit.
+    #[test]
+    fn test_shard_snapshot_decode_matches_live_path() {
+        let (s1, s2) = (multi_chunk_series(0.0), multi_chunk_series(100.0));
+        let empty = TimeSeries::default();
+        let gappy = nan_gap_series();
+        // `last` under EMPTY carries values across gaps, and which way depends on the
+        // reply's order, which a shard learns from `reply_reverse`.
+        let aggregation = |aggregation: AggregationType| AggregationOptions {
+            aggregations: smallvec::smallvec![aggregation.into()],
+            bucket_duration: 250,
+            timestamp_output: Default::default(),
+            alignment: Default::default(),
+            report_empty: true,
+        };
+        let aggs = [
+            None,
+            Some(aggregation(AggregationType::Max)),
+            Some(aggregation(AggregationType::Last)),
+        ];
+        for limit in [None, Some(SampleLimit::Head(5)), Some(SampleLimit::Tail(5))] {
+            for agg in &aggs {
+                for exclude_empty in [false, true] {
+                    for reply_reverse in [false, true] {
+                        let options = MRangeOptions {
+                            range: RangeOptions {
+                                date_range: crate::series::TimestampRange::from_timestamps(
+                                    95, 2405,
+                                )
+                                .unwrap(),
+                                aggregation: agg.clone(),
+                                ..Default::default()
+                            },
+                            exclude_empty,
+                            reply_reverse,
+                            ..Default::default()
+                        };
+                        let fixtures = [
+                            (&s1, "a", "g1"),
+                            (&s2, "b", "g2"),
+                            (&empty, "c", "g1"),
+                            (&gappy, "d", "g2"),
+                        ];
+                        let (start, end) = options.range.get_timestamp_range();
+                        let snapshots = || {
+                            fixtures
+                                .iter()
+                                .map(|(series, key, group)| SnapshotSeries {
+                                    key: (*key).into(),
+                                    labels: Vec::new(),
+                                    snapshot: series.snapshot_range(start, end),
+                                    latest: None,
+                                    empty_fill: range_empty_fill_bounds(
+                                        series,
+                                        &options.range,
+                                        options.is_reverse,
+                                        options.is_reverse || options.reply_reverse,
+                                    ),
+                                    group_label_value: Some((*group).into()),
+                                })
+                                .collect()
+                        };
+                        let mut shard =
+                            decode_shard_snapshots(snapshots(), &options, limit, true, &|| false)
+                                .unwrap();
+                        // The local share skips the wire encoding: same samples, never compressed.
+                        let mut local =
+                            decode_shard_snapshots(snapshots(), &options, limit, false, &|| false)
+                                .unwrap();
+                        assert!(local.iter().all(|r| matches!(
+                            r.data,
+                            SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(_))
+                        )));
+                        let metas = fixtures
+                            .iter()
+                            .map(|(series, key, group)| meta(series, key, Some(group)))
+                            .collect();
+                        let mut live = handle_non_grouped(
+                            metas,
+                            options.clone(),
+                            true,
+                            limit,
+                            &ReadDeadline::new(&|| false),
+                        );
+                        if exclude_empty {
+                            live.retain(|item| !item.data.is_empty());
+                        }
+                        sort_mrange_results(&mut shard, false);
+                        sort_mrange_results(&mut local, false);
+                        sort_mrange_results(&mut live, false);
+
+                        let case = format!(
+                            "limit={limit:?} agg={agg:?} exclude_empty={exclude_empty} \
+                             reply_reverse={reply_reverse}"
+                        );
+                        assert_eq!(keys_of(&shard), keys_of(&live), "{case}");
+                        assert_eq!(keys_of(&local), keys_of(&live), "{case}");
+                        for ((d, u), l) in shard.iter().zip(&local).zip(&live) {
+                            assert_eq!(d.group_label_value, l.group_label_value, "{case}");
+                            assert_eq!(u.group_label_value, l.group_label_value, "{case}");
+                            assert_eq!(samples_of(d), samples_of(l), "{case}");
+                            assert_eq!(samples_of(u), samples_of(l), "{case}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A shard whose requester gave up stops its snapshot decode and answers with the
+    /// error, as the live path does under the lock.
+    #[test]
+    fn test_shard_snapshot_decode_stops_once_expired() {
+        let s1 = multi_chunk_series(0.0);
+        let options = MRangeOptions {
+            range: RangeOptions {
+                date_range: crate::series::TimestampRange::from_timestamps(95, 2405).unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (start, end) = options.range.get_timestamp_range();
+        let snapshots = vec![SnapshotSeries {
+            key: b"a".to_vec(),
+            labels: Vec::new(),
+            snapshot: s1.snapshot_range(start, end),
+            latest: None,
+            empty_fill: Default::default(),
+            group_label_value: None,
+        }];
+        let result = decode_shard_snapshots(snapshots, &options, None, true, &|| true);
+        assert!(result.is_err());
     }
 
     /// The coordinator's own share skips the wire encoding: the same per-series

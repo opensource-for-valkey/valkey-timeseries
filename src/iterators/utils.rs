@@ -530,16 +530,19 @@ where
     output.chain_latest(base, latest_sample, should_reverse_iter)
 }
 
-/// The [`EmptyFillBounds`] [`create_range_iterator`] derives for `series` when the
-/// reply runs in the query's own order, for a caller that builds the pipeline from a
-/// base it read separately ([`create_range_iterator_from_base`]).
+/// The [`EmptyFillBounds`] [`create_range_iterator_for_reply`] derives for `series`, for a
+/// caller that builds the pipeline from a base it read separately
+/// ([`create_range_iterator_from_base`]). `reply_reverse` is the reply's real order, which
+/// differs from `is_reverse` on a shard that streams ascending for a coordinator that
+/// reverses it.
 pub(crate) fn range_empty_fill_bounds(
     series: &TimeSeries,
     options: &RangeOptions,
     is_reverse: bool,
+    reply_reverse: bool,
 ) -> EmptyFillBounds {
     let tail_limit = options.count.filter(|_| is_reverse);
-    empty_fill_bounds(series, options, is_reverse, tail_limit)
+    empty_fill_bounds(series, options, reply_reverse, tail_limit)
 }
 
 /// Pre-aggregation composition for one series: base reader (ts-filter variant

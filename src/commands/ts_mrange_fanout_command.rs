@@ -20,7 +20,8 @@ use crate::iterators::{KWayMerge, RowReducer, SampleReducer, create_sample_itera
 use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
 use crate::series::mrange::{
     MRangeScope, SampleLimit, build_mrange_grouped_labels, collect_rows, collect_samples,
-    process_mrange_group_partials, process_mrange_query, sort_mrange_results,
+    decode_shard_snapshots, is_shard_snapshot_answerable, process_mrange_group_partials,
+    process_mrange_query, snapshot_shard_mrange, sort_mrange_results,
 };
 use crate::series::request_types::{
     MRangeOptions, MRangeSeriesResult, RangeGroupingOptions, SeriesResultData,
@@ -163,6 +164,10 @@ impl FanoutClientCommand for MRangeFanoutCommand {
             options.range.aggregation = None;
         }
 
+        // Process the MRange query locally. When snapshots can stand in for the
+        // series, the GIL is held only to resolve and copy them, and the decode
+        // runs after it is released; either way the results are owned, so the
+        // encoding below (including label interning) runs with the GIL released.
         // The coordinator's own share is handed over in memory, so it skips the
         // wire compression a remote coordinator gets.
         let scope = if ctx.is_local_share() {
@@ -170,10 +175,14 @@ impl FanoutClientCommand for MRangeFanoutCommand {
         } else {
             MRangeScope::RemoteShard
         };
-        // Process the MRange query locally. The results are owned, so the
-        // encoding below (including label interning) runs with the GIL released.
-        let series = {
-            let expired = || ctx.expired();
+        let expired = || ctx.expired();
+        let series = if is_shard_snapshot_answerable(&options) {
+            let snapshots = {
+                let ctx = ctx.lock_unexpired()?;
+                snapshot_shard_mrange(&ctx, &options)?
+            };
+            decode_shard_snapshots(snapshots, &options, limit, scope.compress(), &expired)?
+        } else {
             let ctx = ctx.lock_unexpired()?;
             process_mrange_query(&ctx, options, scope, limit, &expired)?
         };

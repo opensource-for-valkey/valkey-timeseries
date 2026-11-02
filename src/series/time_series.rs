@@ -1443,30 +1443,24 @@ fn get_range_parallel(
 /// main-thread time proportional to the decode into time proportional to the
 /// memcpy. Only the chunks overlapping the range are copied.
 pub struct RangeSnapshot {
-    /// Already clamped to the series' retention floor, as `range_iter` would.
+    /// Already clamped to the series' retention floor, as a live range read would.
     start: Timestamp,
     end: Timestamp,
     chunks: Vec<TimeSeriesChunk>,
 }
 
 impl RangeSnapshot {
-    /// The samples in `[start, end]`, ascending, decoded on demand. Equivalent
-    /// to [`TimeSeries::range_iter`] over the same range at snapshot time.
-    pub fn range_iter(&self) -> impl Iterator<Item = Sample> + '_ {
-        self.chunks
-            .iter()
-            .flat_map(|chunk| chunk.range_iter(self.start, self.end))
+    /// Samples in the copied chunks — an upper bound on the range's samples,
+    /// since the edge chunks may reach past it.
+    pub fn estimated_samples(&self) -> usize {
+        self.chunks.iter().map(|c| c.len()).sum()
     }
 
-    /// The samples in `[start, end]`, descending. Chunks decode newest first and
-    /// one at a time, so at most one chunk's samples are buffered — the reverse
-    /// [`SeriesSampleIterator`] keeps the same bound.
-    pub fn rev_range_iter(&self) -> impl Iterator<Item = Sample> + '_ {
-        self.chunks.iter().rev().flat_map(|chunk| {
-            let mut samples: Vec<Sample> = chunk.range_iter(self.start, self.end).collect();
-            samples.reverse();
-            samples
-        })
+    /// The samples in `[start, end]`, decoded on demand, descending when
+    /// `is_reverse`. The same iterator type a live range read uses, so the
+    /// aggregation pipeline built over it compiles to the same loop.
+    pub fn sample_iter(&self, is_reverse: bool) -> SeriesSampleIterator<'_> {
+        SeriesSampleIterator::over_chunks(&self.chunks, self.start, self.end, is_reverse)
     }
 }
 
