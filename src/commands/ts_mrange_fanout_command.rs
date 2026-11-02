@@ -1,6 +1,7 @@
 use super::fanout_codec;
 use super::fanout_codec::generated::{
-    GroupPartialSeries, MultiRangeRequest, MultiRangeResponse, SeriesRangeResponse,
+    CompressionType, GroupPartialSeries, MultiRangeRequest, MultiRangeResponse, SampleData,
+    SeriesRangeResponse,
 };
 use crate::aggregators::EmptyFillBounds;
 use crate::aggregators::MultiAggregateIterator;
@@ -459,21 +460,31 @@ fn handle_basic(
         .collect()
 }
 
-/// Work estimate for decoding shard responses, in sample-sized units: a sample is
-/// at most 16 bytes uncompressed and compresses to a few, so payload bytes / 4 is
-/// a conservative sample count. Only feeds the dispatch decision.
+/// Work estimate for decoding shard responses, in sample-sized units. Only feeds
+/// the dispatch decision.
 fn shard_payload_work(series: &[(SeriesRangeResponse, bool)]) -> usize {
-    series
-        .iter()
-        .map(|(r, _)| r.columns.iter().map(|c| c.data.len()).sum::<usize>() / 4)
-        .sum()
+    series.iter().map(|(r, _)| response_work(r)).sum()
 }
 
 fn shard_payload_work_plain(series: &[SeriesRangeResponse]) -> usize {
-    series
-        .iter()
-        .map(|r| r.columns.iter().map(|c| c.data.len()).sum::<usize>() / 4)
-        .sum()
+    series.iter().map(response_work).sum()
+}
+
+fn response_work(response: &SeriesRangeResponse) -> usize {
+    response.columns.iter().map(column_samples).sum()
+}
+
+/// Samples in one column: exact for an uncompressed column (the local share's,
+/// or a small remote one), read from its header; an upper bound for a compressed
+/// one, since a sample is at most 16 bytes uncompressed and compresses to a few.
+/// Counting uncompressed bytes the compressed way overstated them ~3×, which
+/// sent small replies to the shared pool from the main thread.
+fn column_samples(column: &SampleData) -> usize {
+    if column.compression == CompressionType::Uncompressed as i32 {
+        UncompressedChunk::serialized_sample_count(&column.data).unwrap_or(column.data.len() / 9)
+    } else {
+        column.data.len() / 4
+    }
 }
 
 fn serialize_request(request: &MRangeOptions) -> MultiRangeRequest {
@@ -927,6 +938,33 @@ mod tests {
 
     fn to_response(result: MRangeSeriesResult) -> SeriesRangeResponse {
         result.try_into().expect("serialize series result")
+    }
+
+    /// An uncompressed column is counted at its exact sample count, not at the
+    /// compressed rate of four bytes a sample, which would overstate it.
+    #[test]
+    fn test_payload_work_counts_samples_by_encoding() {
+        let data: Vec<Sample> = (0..100)
+            .map(|i| Sample {
+                timestamp: i * 1000,
+                value: i as f64,
+            })
+            .collect();
+        let plain = to_response(series_result("a", None, data.clone()));
+        assert_eq!(response_work(&plain), 100);
+
+        let mut compressed = series_result("b", None, Vec::new());
+        compressed.data =
+            SeriesResultData::Chunk(crate::series::chunks::samples_to_chunk_lossless(data));
+        let compressed = to_response(compressed);
+        assert_ne!(
+            compressed.columns[0].compression,
+            CompressionType::Uncompressed as i32
+        );
+        assert_eq!(
+            response_work(&compressed),
+            compressed.columns[0].data.len() / 4
+        );
     }
 
     fn series_result_with_labels(
