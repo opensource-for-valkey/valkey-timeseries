@@ -1450,22 +1450,23 @@ pub struct RangeSnapshot {
 }
 
 impl RangeSnapshot {
-    /// Upper bound on the samples the snapshot can yield.
-    pub fn capacity_hint(&self) -> usize {
-        self.chunks.iter().map(|c| c.len()).sum()
-    }
-
-    /// Bytes copied out of the series.
-    pub fn compressed_bytes(&self) -> usize {
-        self.chunks.iter().map(|c| c.size()).sum()
-    }
-
     /// The samples in `[start, end]`, ascending, decoded on demand. Equivalent
     /// to [`TimeSeries::range_iter`] over the same range at snapshot time.
     pub fn range_iter(&self) -> impl Iterator<Item = Sample> + '_ {
         self.chunks
             .iter()
             .flat_map(|chunk| chunk.range_iter(self.start, self.end))
+    }
+
+    /// The samples in `[start, end]`, descending. Chunks decode newest first and
+    /// one at a time, so at most one chunk's samples are buffered — the reverse
+    /// [`SeriesSampleIterator`] keeps the same bound.
+    pub fn rev_range_iter(&self) -> impl Iterator<Item = Sample> + '_ {
+        self.chunks.iter().rev().flat_map(|chunk| {
+            let mut samples: Vec<Sample> = chunk.range_iter(self.start, self.end).collect();
+            samples.reverse();
+            samples
+        })
     }
 }
 

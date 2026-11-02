@@ -7,9 +7,12 @@ use crate::common::threads::{BoundedExecutor, Capacity, lane_workers};
 use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, is_clustered};
 use crate::series::mrange::{
-    decode_snapshot_series, is_snapshot_answerable, process_mrange_query, snapshot_mrange_query,
+    LocalMRange, decode_snapshot_series, is_snapshot_answerable, local_mrange_query,
+    process_mrange_query,
 };
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 /// EXPERIMENT (not for merge as-is): `TS_MRANGE_DEFER=1` answers non-clustered,
@@ -32,6 +35,31 @@ static MRANGE_EXECUTOR: BoundedExecutor = BoundedExecutor::new(
     lane_workers,
     Capacity::Fixed(MRANGE_QUEUE_CAPACITY),
 );
+
+/// Window within which another client's TS.MRANGE marks the main thread as
+/// contended. Under contention the block/unblock round trip is hidden by other
+/// clients' work, and deferring even a one-series request measured 1.2–1.3×
+/// throughput at 16 connections; with no other client it costs a lone small
+/// request ~11 %.
+const CONTENTION_WINDOW_MICROS: u64 = 1_000;
+
+/// The client and arrival time (µs since [`CONTENTION_EPOCH`]) of the last TS.MRANGE.
+/// Only the main thread touches these; atomics just make the statics `Sync`.
+static LAST_MRANGE_CLIENT: AtomicU64 = AtomicU64::new(0);
+static LAST_MRANGE_MICROS: AtomicU64 = AtomicU64::new(0);
+static CONTENTION_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Records this request and reports whether a different client's TS.MRANGE
+/// arrived within [`CONTENTION_WINDOW_MICROS`]. Comparing clients matters: one
+/// client issuing back-to-back requests arrives just as often, and gains nothing.
+fn mrange_contended(ctx: &Context) -> bool {
+    let client = ctx.get_client_id();
+    // `+ 1` keeps 0 free as "no previous request".
+    let now = CONTENTION_EPOCH.elapsed().as_micros() as u64 + 1;
+    let last_client = LAST_MRANGE_CLIENT.swap(client, Ordering::Relaxed);
+    let last = LAST_MRANGE_MICROS.swap(now, Ordering::Relaxed);
+    last != 0 && last_client != client && now - last <= CONTENTION_WINDOW_MICROS
+}
 
 acl_categories!(TS_MRANGE, "ts.mrange", "read timeseries");
 /// TS.MRANGE fromTimestamp toTimestamp
@@ -98,7 +126,11 @@ fn mrange_internal(ctx: &Context, args: Vec<ValkeyString>, reverse: bool) -> Val
     reply_with_mrange_series_results(ctx, &result_rows, &shape)
 }
 
-/// Snapshot on the main thread, decode and reply on the [`MRANGE_EXECUTOR`] lane.
+/// Answers inline unless other clients keep the main thread busy
+/// ([`mrange_contended`]) or the request carries enough work to pay for the
+/// block/unblock round trip ([`DEFER_MIN_WORK`](crate::series::mrange::DEFER_MIN_WORK));
+/// then snapshots on the main thread and decodes and replies on the
+/// [`MRANGE_EXECUTOR`] lane.
 ///
 /// The lane slot is reserved before the client is blocked; when the lane is full the
 /// request is answered inline instead, since deferring is only an optimization.
@@ -106,13 +138,16 @@ fn mrange_deferred(
     ctx: &Context,
     options: crate::series::request_types::MRangeOptions,
 ) -> ValkeyResult {
-    let Ok(slot) = MRANGE_EXECUTOR.try_reserve() else {
-        let shape = MRangeReplyShape::from_options(&options);
-        let result_rows = process_mrange_query(ctx, options, false, None, &|| false)?;
-        return reply_with_mrange_series_results(ctx, &result_rows, &shape);
-    };
-    let (series, _copied) = snapshot_mrange_query(ctx, &options)?;
     let shape = MRangeReplyShape::from_options(&options);
+    let contended = mrange_contended(ctx);
+    let (slot, series) = match local_mrange_query(ctx, &options, contended, || {
+        MRANGE_EXECUTOR.try_reserve().ok()
+    })? {
+        LocalMRange::Answered(rows) => {
+            return reply_with_mrange_series_results(ctx, &rows, &shape);
+        }
+        LocalMRange::Deferred(slot, series) => (slot, series),
+    };
     let blocked_client = block_client(ctx);
     slot.spawn(move || {
         let thread_ctx = ThreadSafeReplyContext::with_blocked_client(blocked_client);

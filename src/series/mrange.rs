@@ -17,17 +17,16 @@ use crate::iterators::{
     get_range_latest_sample, range_empty_fill_bounds,
 };
 use crate::labels::Label;
-use crate::series::RangeSnapshot;
-use crate::series::TimeSeries;
 use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk, samples_to_chunk_lossless};
 use crate::series::index::series_by_selectors;
 use crate::series::request_types::{
     MRangeOptions, MRangeSeriesResult, RangeGroupingOptions, RangeOptions, SeriesResultData,
 };
+use crate::series::{RangeSnapshot, SeriesGuard, TimeSeries};
 use ahash::AHashMap;
 use orx_parallel::Par;
 use std::sync::atomic::{AtomicBool, Ordering};
-use valkey_module::{Context, ValkeyError, ValkeyResult};
+use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString};
 
 struct MRangeSeriesMeta<'a> {
     series: &'a TimeSeries,
@@ -1121,7 +1120,7 @@ pub struct SnapshotSeries {
 /// Whether the non-clustered path can answer `options` from snapshots:
 /// grouping needs the reducer pass, multi-aggregation yields rows, and
 /// `FILTER_BY_TS` needs the series-backed base reader.
-pub fn is_snapshot_answerable(options: &MRangeOptions) -> bool {
+pub(crate) fn is_snapshot_answerable(options: &MRangeOptions) -> bool {
     options.grouping.is_none()
         && options.range.timestamp_filter.is_none()
         && !options
@@ -1131,24 +1130,74 @@ pub fn is_snapshot_answerable(options: &MRangeOptions) -> bool {
             .is_some_and(|a| a.is_multi())
 }
 
-/// The main-thread half of a deferred TS.MRANGE: resolve and ACL-check the
-/// series, then copy out what the decode needs. Returns the snapshots and the
-/// total compressed bytes copied.
-pub fn snapshot_mrange_query(
+/// Least estimated work (units of [`estimated_work`]) a TS.MRANGE needs before
+/// it is deferred. Deferring adds a block/unblock round trip through the event
+/// loop — ~100 µs measured when the server is otherwise idle, and lost in the
+/// noise under load. Main-thread time runs at ~11 ns per unit (ten series × 100
+/// samples ≈ 11k units ≈ 121 µs inline), so this is where deferring frees
+/// about as much main-thread time as the round trip costs an idle client.
+pub const DEFER_MIN_WORK: usize = 8192;
+
+/// Like [`estimated_work`], but a non-aggregated COUNT caps each series'
+/// samples: the decode stops there, deferred or not.
+fn estimated_defer_work(guards: &[(SeriesGuard, ValkeyString)], options: &MRangeOptions) -> usize {
+    let (start, end) = options.range.get_timestamp_range();
+    let cap = match (&options.range.aggregation, options.range.count) {
+        (None, Some(count)) => count,
+        _ => usize::MAX,
+    };
+    guards
+        .iter()
+        .map(|(guard, _)| PER_SERIES_WORK + estimated_samples_in_range(guard, start, end).min(cap))
+        .sum()
+}
+
+/// A non-clustered, non-grouped TS.MRANGE after its single key lookup: either
+/// answered on the main thread, or snapshotted for decode off it.
+pub(crate) enum LocalMRange<R> {
+    Answered(Vec<MRangeSeriesResult>),
+    Deferred(R, Vec<SnapshotSeries>),
+}
+
+/// Resolves and ACL-checks the series once, then defers when the request is
+/// `contended` or carries at least [`DEFER_MIN_WORK`], and `reserve` yields a
+/// worker slot —
+/// copying out what the decode needs while the guards are held. Otherwise it
+/// answers inline, exactly as [`process_mrange_query`] would. `options` must
+/// satisfy [`is_snapshot_answerable`].
+pub(crate) fn local_mrange_query<R>(
     ctx: &Context,
     options: &MRangeOptions,
-) -> ValkeyResult<(Vec<SnapshotSeries>, usize)> {
+    contended: bool,
+    reserve: impl FnOnce() -> Option<R>,
+) -> ValkeyResult<LocalMRange<R>> {
     if options.filters.is_empty() {
         return Err(ValkeyError::Str(error_consts::MISSING_FILTER));
     }
     let series_guards = series_by_selectors(ctx, &options.filters, None)?;
+    let slot = if contended || estimated_defer_work(&series_guards, options) >= DEFER_MIN_WORK {
+        reserve()
+    } else {
+        None
+    };
+    let Some(slot) = slot else {
+        let metas = series_guards
+            .iter()
+            .map(|(guard, key)| MRangeSeriesMeta {
+                series: guard,
+                source_key: key.as_slice().to_vec(),
+                group_label_value: None,
+                latest: get_latest(&options.range, ctx, guard),
+            })
+            .collect();
+        return process_mrange(metas, options.clone(), false, None, &|| false)
+            .map(LocalMRange::Answered);
+    };
     let (start, end) = options.range.get_timestamp_range();
-    let mut copied = 0usize;
     let series = series_guards
         .iter()
         .map(|(guard, key)| {
             let snapshot = guard.snapshot_range(start, end);
-            copied += snapshot.compressed_bytes();
             SnapshotSeries {
                 key: key.as_slice().to_vec(),
                 labels: convert_labels(guard, options.with_labels, &options.selected_labels),
@@ -1158,7 +1207,7 @@ pub fn snapshot_mrange_query(
             }
         })
         .collect();
-    Ok((series, copied))
+    Ok(LocalMRange::Deferred(slot, series))
 }
 
 /// The off-thread half: decode every snapshot through the same pipeline
@@ -1172,15 +1221,16 @@ pub(crate) fn decode_snapshot_series(
     let mut items: Vec<MRangeSeriesResult> = series
         .into_iter()
         .map(|s| {
-            // The snapshot decodes ascending; a non-aggregated reverse query
-            // wants the base descending, as `SeriesSampleIterator` would give it.
-            let mut base: Vec<Sample> = Vec::with_capacity(s.snapshot.capacity_hint());
-            base.extend(s.snapshot.range_iter());
-            if should_reverse_iter {
-                base.reverse();
-            }
+            // Decode lazily, so COUNT stops the decode as it would stop
+            // `SeriesSampleIterator`. A non-aggregated reverse query wants the
+            // base descending, as `SeriesSampleIterator` would give it.
+            let base: Box<dyn Iterator<Item = Sample> + '_> = if should_reverse_iter {
+                Box::new(s.snapshot.rev_range_iter())
+            } else {
+                Box::new(s.snapshot.range_iter())
+            };
             let samples: Vec<Sample> = create_range_iterator_from_base(
-                base.into_iter(),
+                base,
                 &options.range,
                 s.latest,
                 options.is_reverse,
@@ -1578,5 +1628,102 @@ mod tests {
         let mut counted = grouped_sum_options(100);
         counted.range.count = Some(2);
         assert_eq!(samples(counted), full[..2]);
+    }
+
+    fn samples_of(result: &MRangeSeriesResult) -> Vec<Sample> {
+        match &result.data {
+            SeriesResultData::Chunk(chunk) => {
+                crate::series::chunks::ChunkOps::iter(chunk).collect()
+            }
+            SeriesResultData::Rows(_) => panic!("expected samples"),
+        }
+    }
+
+    /// A series spread over many small chunks, so reverse decoding crosses chunk edges.
+    fn multi_chunk_series(offset: f64) -> TimeSeries {
+        let mut series = TimeSeries::new();
+        series.chunk_size_bytes = 64;
+        for i in 0..300i64 {
+            let _ = series.add(i * 10, offset + (i % 17) as f64, None);
+        }
+        assert!(series.chunks.len() > 4, "fixture must span several chunks");
+        series
+    }
+
+    #[test]
+    fn test_snapshot_rev_range_iter_matches_reversed_forward() {
+        let series = multi_chunk_series(0.0);
+        for (start, end) in [(0, 2990), (155, 2405), (1000, 1000), (3000, 4000)] {
+            let snapshot = series.snapshot_range(start, end);
+            let mut forward: Vec<Sample> = snapshot.range_iter().collect();
+            forward.reverse();
+            assert_eq!(
+                snapshot.rev_range_iter().collect::<Vec<_>>(),
+                forward,
+                "{start}..{end}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_snapshot_decode_matches_live_path() {
+        let (s1, s2) = (multi_chunk_series(0.0), multi_chunk_series(100.0));
+        let aggregation = |report_empty| AggregationOptions {
+            aggregations: smallvec::smallvec![AggregationType::Sum.into()],
+            bucket_duration: 250,
+            timestamp_output: Default::default(),
+            alignment: Default::default(),
+            report_empty,
+        };
+        for is_reverse in [false, true] {
+            for count in [None, Some(1), Some(7), Some(1000)] {
+                for agg in [None, Some(aggregation(false)), Some(aggregation(true))] {
+                    let options = MRangeOptions {
+                        range: RangeOptions {
+                            date_range: crate::series::TimestampRange::from_timestamps(95, 2405)
+                                .unwrap(),
+                            count,
+                            aggregation: agg.clone(),
+                            ..Default::default()
+                        },
+                        is_reverse,
+                        ..Default::default()
+                    };
+                    let snapshots = [(&s1, "a"), (&s2, "b")]
+                        .into_iter()
+                        .map(|(series, key)| {
+                            let (start, end) = options.range.get_timestamp_range();
+                            SnapshotSeries {
+                                key: key.into(),
+                                labels: Vec::new(),
+                                snapshot: series.snapshot_range(start, end),
+                                latest: None,
+                                empty_fill: range_empty_fill_bounds(
+                                    series,
+                                    &options.range,
+                                    options.is_reverse,
+                                ),
+                            }
+                        })
+                        .collect();
+                    let deferred = decode_snapshot_series(snapshots, &options);
+                    let metas = vec![meta(&s1, "a", None), meta(&s2, "b", None)];
+                    let mut live = handle_non_grouped(
+                        metas,
+                        options.clone(),
+                        false,
+                        None,
+                        &ReadDeadline::new(&|| false),
+                    );
+                    sort_mrange_results(&mut live, false);
+
+                    let case = format!("reverse={is_reverse} count={count:?} agg={agg:?}");
+                    assert_eq!(keys_of(&deferred), keys_of(&live), "{case}");
+                    for (d, l) in deferred.iter().zip(&live) {
+                        assert_eq!(samples_of(d), samples_of(l), "{case}");
+                    }
+                }
+            }
+        }
     }
 }
