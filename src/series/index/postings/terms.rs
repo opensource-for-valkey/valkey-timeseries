@@ -14,6 +14,7 @@ use super::{EMPTY_BITMAP, Postings, PostingsBitmap, PostingsIndex, StaleSet};
 use crate::labels::SeriesLabel;
 use crate::series::SeriesRef;
 use crate::series::index::key_buffer::KeyBuffer;
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 
@@ -86,6 +87,17 @@ impl<'a> Terms<'a> {
         self.stale.mask_cow(postings)
     }
 
+    /// Union of `bitmaps`, stale ids removed. Borrows when at most one of them is non-empty.
+    fn union_of(
+        self,
+        bitmaps: impl Iterator<Item = &'a PostingsBitmap>,
+    ) -> Cow<'a, PostingsBitmap> {
+        let acc = bitmaps.fold(Cow::Borrowed(&*EMPTY_BITMAP), |acc, bmp| {
+            union_cow(acc, Cow::Borrowed(bmp))
+        });
+        self.mask_cow(acc)
+    }
+
     /// Return postings for a key (borrowed if possible), applying stale removal.
     /// If stale_ids is non-empty, this returns Owned.
     fn postings_for_key(self, key: &[u8]) -> Cow<'a, PostingsBitmap> {
@@ -93,13 +105,6 @@ impl<'a> Terms<'a> {
             Some(bmp) => self.mask_cow(Cow::Borrowed(bmp)),
             None => Cow::Borrowed(&*EMPTY_BITMAP),
         }
-    }
-
-    /// Clone postings for a key (or empty), then remove stale IDs in-place.
-    fn postings_for_key_owned(self, key: &[u8]) -> PostingsBitmap {
-        let mut out = self.index.get(key).cloned().unwrap_or_default();
-        self.mask(&mut out);
-        out
     }
 
     pub(super) fn postings_for_label_value(
@@ -140,35 +145,28 @@ impl<'a> Terms<'a> {
         values
     }
 
-    pub(super) fn postings_for_all_label_values(self, label_name: &str) -> PostingsBitmap {
+    /// Postings of every series that has the label `label_name`, whatever its value.
+    pub(super) fn postings_for_all_label_values(self, label_name: &str) -> Cow<'a, PostingsBitmap> {
         let prefix = KeyBuffer::for_prefix(label_name);
-        let mut result = PostingsBitmap::new();
-        for (_, map) in self.index.prefix(prefix.as_bytes()) {
-            result |= map;
-        }
-        self.mask(&mut result);
-        result
+        self.union_of(self.index.prefix(prefix.as_bytes()).map(|(_, map)| map))
     }
 
     /// `postings_for_label_values` returns a `PostingsBitmap` for the label pairs.
     /// The postings here contain the ids to the series inside the index.
-    pub(super) fn postings_for_label_values(self, name: &str, values: &[String]) -> PostingsBitmap {
+    pub(super) fn postings_for_label_values(
+        self,
+        name: &str,
+        values: &[String],
+    ) -> Cow<'a, PostingsBitmap> {
         if let [value] = values {
             let key = KeyBuffer::for_label_value(name, value);
-            return self.postings_for_key_owned(key.as_bytes());
+            return self.postings_for_key(key.as_bytes());
         }
 
-        let mut result = PostingsBitmap::new();
-
-        for value in values {
+        self.union_of(values.iter().filter_map(|value| {
             let key = KeyBuffer::for_label_value(name, value);
-            if let Some(bmp) = self.index.get(key.as_bytes()) {
-                result |= bmp;
-            }
-        }
-
-        self.mask(&mut result);
-        result
+            self.index.get(key.as_bytes())
+        }))
     }
 
     /// `postings_for_label_matching` returns postings having a label with the given name and a value
@@ -179,23 +177,18 @@ impl<'a> Terms<'a> {
         name: &str,
         state: &mut STATE,
         match_fn: F,
-    ) -> PostingsBitmap
+    ) -> Cow<'a, PostingsBitmap>
     where
         F: Fn(&str, &mut STATE) -> bool,
     {
         let prefix = KeyBuffer::for_prefix(name);
         let start_pos = prefix.len();
-        let mut result = PostingsBitmap::new();
-
-        for (key, map) in self.index.prefix(prefix.as_bytes()) {
-            let value = key.sub_string(start_pos);
-            if match_fn(value, state) {
-                result |= map;
-            }
-        }
-
-        self.mask(&mut result);
-        result
+        self.union_of(
+            self.index
+                .prefix(prefix.as_bytes())
+                .filter(|(key, _)| match_fn(key.sub_string(start_pos), state))
+                .map(|(_, map)| map),
+        )
     }
 
     /// Return all series ids corresponding to the given labels
@@ -242,15 +235,9 @@ impl<'a> Terms<'a> {
     ///
     /// # Returns
     /// A `PostingsBitmap` that contains the union of all postings that match the given label and prefix.
-    pub(super) fn postings_by_prefix(self, label: &str, prefix: &str) -> PostingsBitmap {
+    pub(super) fn postings_by_prefix(self, label: &str, prefix: &str) -> Cow<'a, PostingsBitmap> {
         let search_prefix = KeyBuffer::for_label_value_prefix(label, prefix);
-
-        let mut result = PostingsBitmap::new();
-        for (_key, map) in self.index.prefix(&search_prefix) {
-            result |= map;
-        }
-        self.mask(&mut result);
-        result
+        self.union_of(self.index.prefix(&search_prefix).map(|(_, map)| map))
     }
 
     pub(super) fn postings_by_prefix_and_predicate<F>(
@@ -258,45 +245,63 @@ impl<'a> Terms<'a> {
         label: &str,
         prefix: &str,
         predicate: F,
-    ) -> PostingsBitmap
+    ) -> Cow<'a, PostingsBitmap>
     where
         F: Fn(&str) -> bool,
     {
         let search_prefix = KeyBuffer::for_label_value_prefix(label, prefix);
-
-        let mut result = PostingsBitmap::new();
         let start_pos = label.len() + 1;
-        for (key, map) in self.index.prefix(&search_prefix) {
-            let value = key.sub_string(start_pos);
-            if predicate(value) {
-                result |= map;
-            }
-        }
-        self.mask(&mut result);
-
-        result
+        self.union_of(
+            self.index
+                .prefix(&search_prefix)
+                .filter(|(key, _)| predicate(key.sub_string(start_pos)))
+                .map(|(_, map)| map),
+        )
     }
 
     /// Get the unique series id for the given set of labels if it exists.
     ///
     /// This exists primarily to ensure that we disallow duplicate metric names
     pub(super) fn posting_id_by_labels<T: SeriesLabel>(self, labels: &[T]) -> Option<SeriesRef> {
-        let mut it = labels.iter();
-
-        let first = it.next()?;
-        let first_key = KeyBuffer::for_label_value(first.name(), first.value());
-        let mut acc = self.index.get(first_key.as_bytes())?.clone();
-
-        for label in it {
+        // Look every bitmap up before intersecting any: a new series nearly always carries one
+        // unseen value, which this answers with key lookups alone.
+        let mut bitmaps: SmallVec<[&'a PostingsBitmap; 8]> = SmallVec::with_capacity(labels.len());
+        for label in labels {
             let key = KeyBuffer::for_label_value(label.name(), label.value());
             let bmp = self.index.get(key.as_bytes())?;
-            acc.and_inplace(bmp);
+            if bmp.is_empty() {
+                return None;
+            }
+            bitmaps.push(bmp);
+        }
+
+        // Smallest first, so the cost no longer depends on how the label names sort.
+        bitmaps.sort_unstable_by_key(|bmp| bmp.cardinality());
+        let (&smallest, rest) = bitmaps.split_first()?;
+
+        // Usually a per-series label (`host`, `instance`) pins one candidate: probe the rest for it
+        // instead of intersecting.
+        if smallest.cardinality() == 1 {
+            let id = smallest.minimum()?;
+            let unique = !self.stale.contains(id) && rest.iter().all(|bmp| bmp.contains(id));
+            return unique.then_some(id);
+        }
+
+        let mut acc = Cow::Borrowed(smallest);
+        for &bmp in rest {
+            acc = match acc {
+                Cow::Borrowed(first) => Cow::Owned(first.and(bmp)),
+                Cow::Owned(mut acc) => {
+                    acc.and_inplace(bmp);
+                    Cow::Owned(acc)
+                }
+            };
             if acc.is_empty() {
                 return None;
             }
         }
 
-        self.mask(&mut acc);
+        let acc = self.mask_cow(acc);
 
         (acc.cardinality() == 1)
             .then(|| acc.iter().next())
@@ -312,10 +317,179 @@ impl<'a> Terms<'a> {
         }
     }
 }
+
+/// `a | b`, borrowing whichever side is the whole answer and reusing an owned side's buffer
+/// otherwise.
+pub(super) fn union_cow<'a>(
+    a: Cow<'a, PostingsBitmap>,
+    b: Cow<'a, PostingsBitmap>,
+) -> Cow<'a, PostingsBitmap> {
+    if b.is_empty() {
+        return a;
+    }
+    if a.is_empty() {
+        return b;
+    }
+    match (a, b) {
+        (Cow::Owned(mut a), b) | (b, Cow::Owned(mut a)) => {
+            a |= b.as_ref();
+            Cow::Owned(a)
+        }
+        (Cow::Borrowed(a), Cow::Borrowed(b)) => Cow::Owned(a.or(b)),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::labels::Label;
+
+    fn single_value_fixture() -> Postings {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "job", "api");
+        postings.add_posting_for_label_value(2, "job", "api");
+        postings.add_posting_for_label_value(3, "env", "prod");
+        postings.add_posting_for_label_value(3, "env", "dev");
+        postings
+    }
+
+    #[test]
+    fn unions_over_one_key_stay_borrowed() {
+        let postings = single_value_fixture();
+        let terms = postings.terms();
+
+        let all_values = terms.postings_for_all_label_values("job");
+        assert!(matches!(all_values, Cow::Borrowed(_)));
+        assert_eq!(all_values.iter().collect::<Vec<_>>(), vec![1, 2]);
+
+        let values = vec!["api".to_string(), "web".to_string()];
+        assert!(matches!(
+            terms.postings_for_label_values("job", &values),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            terms.postings_for_label_matching("env", &mut (), |v, _| v == "dev"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            terms.postings_by_prefix("job", "a"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            terms.postings_by_prefix_and_predicate("env", "d", |_| true),
+            Cow::Borrowed(_)
+        ));
+        assert!(terms.postings_by_prefix("job", "zzz").is_empty());
+    }
+
+    #[test]
+    fn unions_over_several_keys_are_owned_and_correct() {
+        let mut postings = single_value_fixture();
+        postings.add_posting_for_label_value(4, "env", "prod");
+        let terms = postings.terms();
+
+        let env = terms.postings_for_all_label_values("env");
+        assert!(matches!(env, Cow::Owned(_)));
+        assert_eq!(env.iter().collect::<Vec<_>>(), vec![3, 4]);
+    }
+
+    #[test]
+    fn unions_mask_stale_ids_even_when_borrowable() {
+        let mut postings = single_value_fixture();
+        postings.mark_ids_as_stale(&[2]);
+        let terms = postings.terms();
+
+        let job = terms.postings_for_all_label_values("job");
+        assert_eq!(job.iter().collect::<Vec<_>>(), vec![1]);
+        let by_prefix = terms.postings_by_prefix("job", "a");
+        assert_eq!(by_prefix.iter().collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn posting_id_by_labels_finds_unique_id() {
+        let mut postings = Postings::default();
+        for id in 1..=100 {
+            postings.add_posting_for_label_value(id, "__name__", "cpu");
+            postings.add_posting_for_label_value(id, "host", &format!("h{id}"));
+        }
+        let labels = [Label::new("__name__", "cpu"), Label::new("host", "h42")];
+        assert_eq!(postings.posting_id_by_labels(&labels), Some(42));
+
+        // a single label matching many series is not a unique id
+        assert_eq!(
+            postings.posting_id_by_labels(&[Label::new("__name__", "cpu")]),
+            None
+        );
+        assert_eq!(
+            postings.posting_id_by_labels(&[Label::new("host", "h7")]),
+            Some(7)
+        );
+
+        postings.mark_ids_as_stale(&[42]);
+        assert_eq!(postings.posting_id_by_labels(&labels), None);
+    }
+
+    #[test]
+    fn posting_id_by_labels_ignores_label_order() {
+        let mut postings = Postings::default();
+        for id in 1..=100 {
+            postings.add_posting_for_label_value(id, "__name__", "cpu");
+            postings.add_posting_for_label_value(id, "host", &format!("h{id}"));
+        }
+        let forward = [Label::new("__name__", "cpu"), Label::new("host", "h42")];
+        let reversed = [Label::new("host", "h42"), Label::new("__name__", "cpu")];
+        assert_eq!(postings.posting_id_by_labels(&forward), Some(42));
+        assert_eq!(postings.posting_id_by_labels(&reversed), Some(42));
+
+        // the single candidate must carry every other label too
+        let mismatch = [Label::new("__name__", "mem"), Label::new("host", "h42")];
+        assert_eq!(postings.posting_id_by_labels(&mismatch), None);
+        postings.add_posting_for_label_value(42, "__name__", "mem");
+        postings.add_posting_for_label_value(43, "__name__", "mem");
+        assert_eq!(postings.posting_id_by_labels(&mismatch), Some(42));
+        let missing = [Label::new("__name__", "cpu"), Label::new("host", "h-new")];
+        assert_eq!(postings.posting_id_by_labels(&missing), None);
+    }
+
+    #[test]
+    fn posting_id_by_labels_without_a_unique_label() {
+        let mut postings = Postings::default();
+        for id in [1, 2, 3] {
+            postings.add_posting_for_label_value(id, "a", "x");
+        }
+        for id in [2, 3, 4] {
+            postings.add_posting_for_label_value(id, "b", "y");
+        }
+        for id in [3, 5] {
+            postings.add_posting_for_label_value(id, "c", "z");
+        }
+        let labels = [
+            Label::new("a", "x"),
+            Label::new("b", "y"),
+            Label::new("c", "z"),
+        ];
+        assert_eq!(postings.posting_id_by_labels(&labels), Some(3));
+
+        // two candidates left after masking one of three
+        let ab = [Label::new("a", "x"), Label::new("b", "y")];
+        assert_eq!(postings.posting_id_by_labels(&ab), None);
+        postings.mark_ids_as_stale(&[2]);
+        assert_eq!(postings.posting_id_by_labels(&ab), Some(3));
+    }
+
+    #[test]
+    fn union_cow_borrows_the_non_empty_side() {
+        let a = PostingsBitmap::of(&[1, 2]);
+        let b = PostingsBitmap::of(&[3]);
+        let empty = PostingsBitmap::new();
+
+        let only_a = union_cow(Cow::Borrowed(&a), Cow::Borrowed(&empty));
+        assert!(matches!(only_a, Cow::Borrowed(x) if std::ptr::eq(x, &a)));
+        let only_b = union_cow(Cow::Borrowed(&empty), Cow::Borrowed(&b));
+        assert!(matches!(only_b, Cow::Borrowed(x) if std::ptr::eq(x, &b)));
+
+        let both = union_cow(Cow::Borrowed(&a), Cow::Owned(b.clone()));
+        assert_eq!(both.iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
 
     #[test]
     fn test_postings_multiple_values_same_label() {

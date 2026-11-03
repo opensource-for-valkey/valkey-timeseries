@@ -5,7 +5,7 @@
 //! [`Terms::inverse_postings_for_filter`] serves the planner's negation path, where Prometheus
 //! semantics require "matches the inverse" rather than "does not match".
 
-use super::terms::Terms;
+use super::terms::{Terms, union_cow};
 use super::{EMPTY_BITMAP, PostingsBitmap};
 use crate::error_consts::INTERNAL_ERROR;
 use crate::labels::filters::{LabelFilter, PredicateMatch, PredicateValue};
@@ -46,46 +46,37 @@ impl<'a> Terms<'a> {
             PredicateMatch::NotEqual(pv) => handle_equal_match(self, &filter.label, pv),
             // If the matcher being inverted is ="", we just want all the values.
             PredicateMatch::Equal(PredicateValue::String(s)) if s.is_empty() => {
-                Cow::Owned(self.postings_for_all_label_values(&filter.label))
+                self.postings_for_all_label_values(&filter.label)
             }
             PredicateMatch::MatchAll => Cow::Borrowed(&*EMPTY_BITMAP),
             PredicateMatch::MatchNone => Cow::Borrowed(self.all()),
             // If the matcher being inverted is =~"", we just want all the values.
             PredicateMatch::RegexEqual(re) if matches!(re.regex.as_str(), "" | ".*") => {
-                Cow::Owned(self.postings_for_all_label_values(&filter.label))
+                self.postings_for_all_label_values(&filter.label)
             }
             // A series has at most one value per label, so "has the label, minus has a matching
             // value" is the series whose value doesn't match: one scan, no difference.
             PredicateMatch::StartsWith(prefix) => {
                 let mut state = prefix;
-                Cow::Owned(self.postings_for_label_matching(
-                    &filter.label,
-                    &mut state,
-                    |value, prefix| !starts_with_any(prefix, value),
-                ))
+                self.postings_for_label_matching(&filter.label, &mut state, |value, prefix| {
+                    !starts_with_any(prefix, value)
+                })
             }
             PredicateMatch::NotStartsWith(prefix) => {
-                Cow::Owned(postings_by_prefix_value(self, &filter.label, prefix))
+                postings_by_prefix_value(self, &filter.label, prefix)
             }
             PredicateMatch::Contains(needle) => {
                 let mut state = needle;
-                Cow::Owned(self.postings_for_label_matching(
-                    &filter.label,
-                    &mut state,
-                    |value, needle| !needle.matches_contains_any(value),
-                ))
+                self.postings_for_label_matching(&filter.label, &mut state, |value, needle| {
+                    !needle.matches_contains_any(value)
+                })
             }
-            PredicateMatch::NotContains(needle) => {
-                Cow::Owned(handle_contains(self, &filter.label, needle).into_owned())
-            }
+            PredicateMatch::NotContains(needle) => handle_contains(self, &filter.label, needle),
             _ => {
                 let mut state = filter;
-                let postings =
-                    self.postings_for_label_matching(&filter.label, &mut state, |s, state| {
-                        let valid = state.matches(s);
-                        !valid
-                    });
-                Cow::Owned(postings)
+                self.postings_for_label_matching(&filter.label, &mut state, |s, state| {
+                    !state.matches(s)
+                })
             }
         }
     }
@@ -113,10 +104,10 @@ fn handle_equal_match<'a>(
                 }
             }
             _ => {
-                // If the list contains an explicit empty alternative, include series
-                // without the label as well.
-                let contains_empty = val.iter().any(|s| s.is_empty());
-
+                // An explicit empty alternative also selects the series without the label.
+                if !val.iter().any(String::is_empty) {
+                    return ix.postings_for_label_values(label, val);
+                }
                 let non_empty_values: Vec<String> =
                     val.iter().filter(|s| !s.is_empty()).cloned().collect();
 
@@ -124,26 +115,24 @@ fn handle_equal_match<'a>(
                     // only empty alternative -> postings without label
                     return ix.postings_without_label(label);
                 }
-
-                let mut result = ix.postings_for_label_values(label, &non_empty_values);
-                // include series that don't have the label only if the original
-                // alternatives contained an empty branch.
-                if contains_empty {
-                    let without = ix.postings_without_label(label).into_owned();
-                    result |= without;
-                }
-                Cow::Owned(result)
+                union_cow(
+                    ix.postings_for_label_values(label, &non_empty_values),
+                    ix.postings_without_label(label),
+                )
             }
         },
         PredicateValue::Empty => ix.postings_without_label(label),
     }
 }
 
-// return postings for series which has the label `label
-fn with_label<'a>(ix: Terms<'a>, label: &str) -> Cow<'a, PostingsBitmap> {
-    let mut state = ();
-    let postings = ix.postings_for_label_matching(label, &mut state, |_value, _| true);
-    Cow::Owned(postings)
+/// Every series except those in `remove`; borrows the full set when there is nothing to remove.
+fn all_except<'a>(ix: Terms<'a>, remove: &PostingsBitmap) -> Cow<'a, PostingsBitmap> {
+    let all = ix.all();
+    if remove.is_empty() {
+        Cow::Borrowed(all)
+    } else {
+        Cow::Owned(all.andnot(remove))
+    }
 }
 
 fn handle_not_equal_match<'a>(
@@ -155,34 +144,17 @@ fn handle_not_equal_match<'a>(
     match value {
         PredicateValue::String(s) => {
             if s.is_empty() {
-                return with_label(ix, label);
+                return ix.postings_for_all_label_values(label);
             }
-            let all = ix.all();
-            let postings = ix.postings_for_label_value(label, s);
-            if postings.is_empty() {
-                Cow::Borrowed(all)
-            } else {
-                let result = all.andnot(&postings);
-                Cow::Owned(result)
-            }
+            all_except(ix, &ix.postings_for_label_value(label, s))
+        }
+        PredicateValue::List(values) if values.is_empty() => {
+            ix.postings_for_all_label_values(label)
         }
         PredicateValue::List(values) => {
-            match values.len() {
-                0 => with_label(ix, label),
-                _ => {
-                    // get postings for label m.label without values in values
-                    let to_remove = ix.postings_for_label_values(label, values);
-                    let all_postings = ix.all();
-                    if to_remove.is_empty() {
-                        Cow::Borrowed(all_postings)
-                    } else {
-                        let result = all_postings.andnot(&to_remove);
-                        Cow::Owned(result)
-                    }
-                }
-            }
+            all_except(ix, &ix.postings_for_label_values(label, values))
         }
-        PredicateValue::Empty => with_label(ix, label),
+        PredicateValue::Empty => ix.postings_for_all_label_values(label),
     }
 }
 
@@ -206,7 +178,7 @@ fn handle_regex_equal_match<'a>(
         postings
             .postings_for_label_matching(&filter.label, &mut state, |value, _| re.is_match(value))
     };
-    Ok(Cow::Owned(res))
+    Ok(res)
 }
 
 fn handle_regex_not_equal_match<'a>(
@@ -214,7 +186,7 @@ fn handle_regex_not_equal_match<'a>(
     filter: &LabelFilter,
 ) -> ValkeyResult<Cow<'a, PostingsBitmap>> {
     if filter.matches_empty() {
-        return Ok(with_label(postings, &filter.label));
+        return Ok(postings.postings_for_all_label_values(&filter.label));
     }
     // The caller dispatches on this same enum (`postings_for_filter`), so this arm is only
     // reached for `RegexNotEqual` filters; a mismatch means that invariant broke.
@@ -226,9 +198,8 @@ fn handle_regex_not_equal_match<'a>(
         return Err(ValkeyError::Str(INTERNAL_ERROR));
     };
     let mut state = ();
-    let res = postings
-        .postings_for_label_matching(&filter.label, &mut state, |value, _| !re.is_match(value));
-    Ok(Cow::Owned(res))
+    Ok(postings
+        .postings_for_label_matching(&filter.label, &mut state, |value, _| !re.is_match(value)))
 }
 
 fn handle_starts_with<'a>(
@@ -236,7 +207,7 @@ fn handle_starts_with<'a>(
     label: &str,
     prefix: &PredicateValue,
 ) -> Cow<'a, PostingsBitmap> {
-    Cow::Owned(postings_by_prefix_value(postings, label, prefix))
+    postings_by_prefix_value(postings, label, prefix)
 }
 
 fn handle_not_starts_with<'a>(
@@ -244,25 +215,22 @@ fn handle_not_starts_with<'a>(
     label: &str,
     prefix: &PredicateValue,
 ) -> Cow<'a, PostingsBitmap> {
-    let matching_prefix = postings_by_prefix_value(postings, label, prefix);
-    Cow::Owned(postings.all().andnot(&matching_prefix))
+    all_except(postings, &postings_by_prefix_value(postings, label, prefix))
 }
 
-fn postings_by_prefix_value(
-    postings: Terms<'_>,
+fn postings_by_prefix_value<'a>(
+    postings: Terms<'a>,
     label: &str,
     value: &PredicateValue,
-) -> PostingsBitmap {
+) -> Cow<'a, PostingsBitmap> {
     match value {
-        PredicateValue::Empty => PostingsBitmap::new(),
+        PredicateValue::Empty => Cow::Borrowed(&*EMPTY_BITMAP),
         PredicateValue::String(prefix) => postings.postings_by_prefix(label, prefix),
-        PredicateValue::List(prefixes) => {
-            let mut result = PostingsBitmap::new();
-            for prefix in prefixes {
-                result.or_inplace(&postings.postings_by_prefix(label, prefix));
-            }
-            result
-        }
+        PredicateValue::List(prefixes) => prefixes
+            .iter()
+            .fold(Cow::Borrowed(&*EMPTY_BITMAP), |acc, prefix| {
+                union_cow(acc, postings.postings_by_prefix(label, prefix))
+            }),
     }
 }
 
@@ -281,10 +249,9 @@ fn handle_contains<'a>(
     value: &PredicateValue,
 ) -> Cow<'a, PostingsBitmap> {
     let mut state = value;
-    let res = postings.postings_for_label_matching(label, &mut state, |candidate, value| {
+    postings.postings_for_label_matching(label, &mut state, |candidate, value| {
         value.matches_contains_any(candidate)
-    });
-    Cow::Owned(res)
+    })
 }
 
 fn handle_not_contains<'a>(
@@ -302,9 +269,7 @@ fn handle_not_contains<'a>(
         postings.postings_for_label_matching(&filter.label, &mut state, |candidate, value| {
             value.matches_contains_any(candidate)
         });
-    let res = postings.all();
-    let value = res.andnot(&contains_matches);
-    Ok(Cow::Owned(value))
+    Ok(all_except(postings, &contains_matches))
 }
 
 #[cfg(test)]

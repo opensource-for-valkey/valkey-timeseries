@@ -5,7 +5,7 @@
 //! small and stable), and cheap matchers run before expensive ones. Degenerate regexes (`.*`,
 //! `.+`) are short-circuited before touching the index at all.
 
-use super::terms::Terms;
+use super::terms::{Terms, union_cow};
 use super::{EMPTY_BITMAP, Postings, PostingsBitmap};
 use crate::error_consts::MISSING_FILTER;
 use crate::labels::filters::{FilterList, LabelFilter, MatchOp, PredicateMatch, SeriesSelector};
@@ -50,7 +50,10 @@ impl<'a> Terms<'a> {
         for m in filters {
             let matches_empty = m.matches("");
 
-            let is_subtracting = matches_empty || m.is_negative_matcher();
+            // A matcher that rejects "" needs the label present, so it intersects even when
+            // negative (`l!=""`, `l!~"a*"`): the loop below puts every such matcher in `its`.
+            // Counting it as subtracting would seed `its` with all postings for nothing.
+            let is_subtracting = matches_empty;
 
             if is_subtracting {
                 has_subtracting_matchers = true;
@@ -116,14 +119,12 @@ impl<'a> Terms<'a> {
                 // .+ regexp matches any non-empty string
                 (MatchOp::RegexEqual, ".+") => {
                     // .+ regexp matches any non-empty string: get postings for all label values.
-                    let it = self.postings_for_all_label_values(&filter.label);
-                    its.push(Cow::Owned(it));
+                    its.push(self.postings_for_all_label_values(&filter.label));
                 }
 
                 // .+ regexp does not match any non-empty string
                 (MatchOp::RegexNotEqual, ".+") => {
-                    let it = self.postings_for_all_label_values(&filter.label);
-                    not_its.push(Cow::Owned(it));
+                    not_its.push(self.postings_for_all_label_values(&filter.label));
                 }
                 // l!="" (the RTS `l!=` form parses to PredicateValue::Empty): any non-empty value.
                 // Go straight to all label values rather than inverting to l="" first.
@@ -132,7 +133,7 @@ impl<'a> Terms<'a> {
                     if it.is_empty() {
                         return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
                     }
-                    its.push(Cow::Owned(it));
+                    its.push(it);
                 }
                 // See which label must be non-empty.
                 // Optimization for a case like {l=~".", l!="1"}.
@@ -164,23 +165,34 @@ impl<'a> Terms<'a> {
             }
         }
 
-        // optimization: if we have a single iterator and no not_its, return it directly, saving a clone.
-        if its.len() == 1 && not_its.is_empty() {
-            let single = its
+        let base = match its.len() {
+            0 => Cow::Borrowed(self.all()),
+            // a single intersecting set stays borrowed if nothing is subtracted from it
+            1 => its
                 .pop()
-                .expect("unexpected out of bounds error running matchers");
-
-            return Ok(single);
-        }
-
-        let mut result = if its.is_empty() {
-            self.all().clone()
-        } else {
-            // sort by cardinality first to reduce the amount of work
-            its.sort_by_key(|a| a.cardinality());
-            intersection(its)
+                .expect("index planner: intersecting set must have at least one element"),
+            _ => {
+                // sort by cardinality first to reduce the amount of work
+                its.sort_by_key(|a| a.cardinality());
+                Cow::Owned(intersection(its))
+            }
         };
 
+        let mut not_its = not_its.into_iter().filter(|not| !not.is_empty());
+        let Some(first_not) = not_its.next() else {
+            return Ok(base);
+        };
+        if base.is_empty() {
+            return Ok(base);
+        }
+        // `andnot` on a borrowed base allocates only the difference, not a full clone.
+        let mut result = match base {
+            Cow::Borrowed(base) => base.andnot(&first_not),
+            Cow::Owned(mut base) => {
+                base.andnot_inplace(&first_not);
+                base
+            }
+        };
         for not in not_its {
             result.andnot_inplace(&not)
         }
@@ -228,15 +240,11 @@ impl<'a> Terms<'a> {
         match filters {
             [] => Ok(Cow::Borrowed(self.all())),
             [filters] => self.postings_for_label_filters(filters),
-            _ => {
-                let mut result = PostingsBitmap::new();
-                // maybe chili here to run in parallel
-                for matchers in filters {
-                    let postings = self.postings_for_label_filters(matchers)?;
-                    result.or_inplace(&postings);
-                }
-                Ok(Cow::Owned(result))
-            }
+            _ => filters
+                .iter()
+                .try_fold(Cow::Borrowed(&*EMPTY_BITMAP), |acc, matchers| {
+                    Ok(union_cow(acc, self.postings_for_label_filters(matchers)?))
+                }),
         }
     }
 }
@@ -273,28 +281,95 @@ where
     I: IntoIterator<Item = Cow<'a, PostingsBitmap>>,
 {
     let mut its = its.into_iter();
-    if let Some(it) = its.next() {
-        let mut result = it.into_owned();
-
-        for it in its {
-            if it.is_empty() {
-                result.clear();
-                return result;
-            }
-
-            result.and_inplace(&it);
+    let Some(first) = its.next() else {
+        return PostingsBitmap::new();
+    };
+    let Some(second) = its.next() else {
+        return first.into_owned();
+    };
+    // A borrowed `first` gets a fresh bitmap sized to the intersection rather than a full clone;
+    // an owned one is narrowed in place.
+    let mut result = match first {
+        Cow::Borrowed(first) => first.and(&second),
+        Cow::Owned(mut first) => {
+            first.and_inplace(&second);
+            first
         }
-
-        result
-    } else {
-        PostingsBitmap::new()
+    };
+    for it in its {
+        if result.is_empty() {
+            break;
+        }
+        result.and_inplace(&it);
     }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::labels::filters::PredicateValue;
+
+    fn filter(label: &str, matcher: PredicateMatch) -> LabelFilter {
+        LabelFilter {
+            label: label.to_string(),
+            matcher,
+        }
+    }
+
+    #[test]
+    fn subtracting_an_absent_value_keeps_the_base_borrowed() {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "job", "api");
+        postings.add_posting_for_label_value(2, "job", "api");
+        postings.add_posting_for_label_value(2, "env", "prod");
+
+        let filters = [
+            filter("job", PredicateMatch::Equal(PredicateValue::from("api"))),
+            filter("env", PredicateMatch::NotEqual(PredicateValue::from("dev"))),
+        ];
+        let result = postings
+            .terms()
+            .postings_for_label_filters(&filters)
+            .unwrap();
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result.iter().collect::<Vec<_>>(), vec![1, 2]);
+
+        let filters = [
+            filter("job", PredicateMatch::Equal(PredicateValue::from("api"))),
+            filter(
+                "env",
+                PredicateMatch::NotEqual(PredicateValue::from("prod")),
+            ),
+        ];
+        let result = postings
+            .terms()
+            .postings_for_label_filters(&filters)
+            .unwrap();
+        assert_eq!(result.iter().collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn or_selector_with_one_non_empty_branch_stays_borrowed() {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "job", "api");
+        postings.add_posting_for_label_value(2, "job", "web");
+
+        let branch = |value: &str| {
+            FilterList::from(vec![filter(
+                "job",
+                PredicateMatch::Equal(PredicateValue::from(value)),
+            )])
+        };
+        let selector = SeriesSelector::Or(smallvec::smallvec![branch("api"), branch("missing")]);
+        let result = postings.postings_for_selector(&selector).unwrap();
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result.iter().collect::<Vec<_>>(), vec![1]);
+
+        let selector = SeriesSelector::Or(smallvec::smallvec![branch("api"), branch("web")]);
+        let result = postings.postings_for_selector(&selector).unwrap();
+        assert_eq!(result.iter().collect::<Vec<_>>(), vec![1, 2]);
+    }
 
     #[test]
     fn test_equal_list_includes_empty_alternative() {
