@@ -51,7 +51,7 @@ fn build_index(size: u64) -> TimeSeriesIndex {
     index
 }
 
-/// (case id, selector, expected share of the fleet matched, as a numerator over 20)
+/// (case id, selector, exact share of the fleet matched, as a numerator over 20)
 const SELECTOR_CASES: &[(&str, &str, u64)] = &[
     // single-valued label: one key's bitmap
     ("label_present_one_value", r#"{job!=""}"#, 20),
@@ -92,10 +92,7 @@ fn bench_selectors(c: &mut Criterion) {
                 .unwrap()
                 .cardinality();
             let expected = size * twentieths / 20;
-            assert!(
-                matched.abs_diff(expected) <= size / 100,
-                "{case} at {size}: matched {matched}, expected about {expected}"
-            );
+            assert_eq!(matched, expected, "{case} at {size}");
             group.bench_with_input(BenchmarkId::new(case, size), &selector, |b, selector| {
                 b.iter(|| {
                     let result = postings.postings_for_selector(black_box(selector)).unwrap();
