@@ -13,8 +13,8 @@ use crate::error_consts;
 use crate::iterators::{
     KWayMerge, RowReducer, SampleReducer, TailIter, create_range_iterator,
     create_range_iterator_for_reply, create_range_iterator_from_base, create_range_tail_iterator,
-    create_row_iterator, create_row_iterator_for_reply, create_row_tail_iterator,
-    get_range_latest_sample, range_empty_fill_bounds,
+    create_row_iterator, create_row_iterator_for_reply, create_row_iterator_from_base,
+    create_row_tail_iterator, get_range_latest_sample, range_empty_fill_bounds,
 };
 use crate::labels::Label;
 use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk, samples_to_chunk_lossless};
@@ -72,6 +72,27 @@ pub(crate) struct GroupPartialsResult {
     pub column_count: usize,
 }
 
+/// The grouping and its partial reducer for an `apply_group_reduce` request. Needs no lock.
+pub(crate) fn group_partial_reducer(
+    options: &MRangeOptions,
+) -> ValkeyResult<(RangeGroupingOptions, PartialReducer)> {
+    let Some(grouping) = options.grouping.clone() else {
+        return Err(ValkeyError::Str(
+            "TSDB: internal error: group reduce requested without grouping",
+        ));
+    };
+
+    let Some(reducer) = PartialReducer::for_config(&grouping.aggregation) else {
+        // The coordinator only sets apply_group_reduce for decomposable
+        // reducers; reject rather than silently produce wrong results.
+        return Err(ValkeyError::String(format!(
+            "TSDB: internal error: REDUCE {} does not support partial reduce",
+            grouping.aggregation.aggregation_name()
+        )));
+    };
+    Ok((grouping, reducer))
+}
+
 /// Shard-side handler for `apply_group_reduce`: per-series bucket aggregation
 /// (when `AGGREGATION` is present), then a per-group k-way merge and partial
 /// reduce. The caller must have stripped `count` and `is_reverse`.
@@ -87,20 +108,7 @@ pub(crate) fn process_mrange_group_partials(
         return Err(ValkeyError::Str(error_consts::MISSING_FILTER));
     }
 
-    let Some(grouping) = options.grouping.clone() else {
-        return Err(ValkeyError::Str(
-            "TSDB: internal error: group reduce requested without grouping",
-        ));
-    };
-
-    let Some(reducer) = PartialReducer::for_config(&grouping.aggregation) else {
-        // The coordinator only sets apply_group_reduce for decomposable
-        // reducers; reject rather than silently produce wrong results.
-        return Err(ValkeyError::String(format!(
-            "TSDB: internal error: REDUCE {} does not support partial reduce",
-            grouping.aggregation.aggregation_name()
-        )));
-    };
+    let (grouping, reducer) = group_partial_reducer(&options)?;
 
     let series_guards = series_by_selectors(ctx, &options.filters, None)?;
 
@@ -1337,6 +1345,116 @@ pub(crate) fn decode_shard_snapshots(
     Ok(items)
 }
 
+/// A shard's share of a pushed-down GROUPBY, under the lock: check permissions, resolve
+/// and ACL-check the series, then snapshot them with their group labels.
+/// [`decode_group_partials`] does the rest once the lock is released. `options` must
+/// carry the grouping and no `FILTER_BY_TS`.
+pub(crate) fn snapshot_shard_group_partials(
+    ctx: &Context,
+    options: &MRangeOptions,
+) -> ValkeyResult<Vec<SnapshotSeries>> {
+    check_metadata_permissions(ctx)?;
+    snapshot_shard_mrange(ctx, options)
+}
+
+/// [`process_mrange_group_partials`] over snapshots: group by the captured label (series
+/// without it take no part), run each member's ascending pipeline, and reduce each group's
+/// buckets to partial states. Runs without the lock.
+pub(crate) fn decode_group_partials(
+    series: Vec<SnapshotSeries>,
+    options: &MRangeOptions,
+    reducer: &PartialReducer,
+    limit: Option<SampleLimit>,
+    expired: &(dyn Fn() -> bool + Sync),
+) -> ValkeyResult<Vec<GroupPartialsResult>> {
+    let mut grouped: AHashMap<String, Vec<SnapshotSeries>> = AHashMap::new();
+    for mut s in series {
+        if let Some(label_value) = s.group_label_value.take() {
+            grouped.entry(label_value).or_default().push(s);
+        }
+    }
+
+    // Multi-aggregation reduces column-wise: N states per bucket, one per
+    // aggregation column, all with the same REDUCE type.
+    let multi_columns = options
+        .range
+        .aggregation
+        .as_ref()
+        .filter(|a| a.is_multi())
+        .map(|a| a.aggregations.len());
+
+    let work = grouped
+        .values()
+        .flatten()
+        .map(|s| PER_SERIES_WORK + s.snapshot.estimated_samples())
+        .sum();
+    let threads = request_par_threads(grouped.len(), work);
+    // As in `process_mrange_group_partials`: a requester that has given up stops the
+    // reduce between groups, and the share answers with the error.
+    let deadline = ReadDeadline::new(expired);
+    let results = grouped
+        .into_iter()
+        .iter_into_par_rayon()
+        .num_threads(threads)
+        .map(|(label_value, members)| {
+            if deadline.passed() {
+                return GroupPartialsResult {
+                    group_label_value: label_value,
+                    source_keys: Vec::new(),
+                    timestamps: Vec::new(),
+                    states: Vec::new(),
+                    column_count: 1,
+                };
+            }
+            let mut source_keys: Vec<Vec<u8>> = members.iter().map(|s| s.key.clone()).collect();
+            source_keys.sort();
+
+            // The live path's base reader over the copied chunks, unboxed, so each
+            // member's aggregation inlines the decode as it does on the live path.
+            let (timestamps, states, column_count) = if let Some(columns) = multi_columns {
+                let iterators = members
+                    .iter()
+                    .map(|s| {
+                        create_row_iterator_from_base(
+                            s.snapshot.sample_iter(false),
+                            &options.range,
+                            s.latest,
+                            s.empty_fill,
+                            false,
+                        )
+                    })
+                    .collect();
+                let (timestamps, states) = reduce_group_rows(iterators, reducer, columns, limit);
+                (timestamps, states, columns)
+            } else {
+                let iterators = members
+                    .iter()
+                    .map(|s| {
+                        create_range_iterator_from_base(
+                            s.snapshot.sample_iter(false),
+                            &options.range,
+                            s.latest,
+                            false,
+                            s.empty_fill,
+                        )
+                    })
+                    .collect();
+                let (timestamps, states) = reduce_group_samples(iterators, reducer, limit);
+                (timestamps, states, 1)
+            };
+
+            GroupPartialsResult {
+                group_label_value: label_value,
+                source_keys,
+                timestamps,
+                states,
+                column_count,
+            }
+        })
+        .collect();
+    deadline.finish(results)
+}
+
 /// One snapshot through the pipeline `handle_non_grouped` runs over a live
 /// series. Grouping never applies here: a standalone deferred request has none,
 /// and a shard leaves the reduce to the coordinator.
@@ -2138,6 +2256,147 @@ mod tests {
                             assert_eq!(
                                 copied, live,
                                 "empty={report_empty} filter={value_filter:?} count={count:?} reverse={is_reverse}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// GROUPBY partials reduced from snapshots match the live per-member pipelines fed to the
+    /// same reducers: grouping (unlabelled series excluded), source keys, timestamps and
+    /// states, for single, multi and no aggregation, under each COUNT push-down limit.
+    #[test]
+    fn test_group_partials_from_snapshots_match_live_pipelines() {
+        let series = [
+            (multi_chunk_series(0.0), "a", Some("g1")),
+            (multi_chunk_series(100.0), "b", Some("g2")),
+            (multi_chunk_series(7.0), "c", Some("g1")),
+            (TimeSeries::default(), "d", Some("g1")),
+            (multi_chunk_series(50.0), "e", None),
+        ];
+        let aggregation = |aggregations: &[AggregationType], report_empty| AggregationOptions {
+            aggregations: aggregations.iter().map(|a| (*a).into()).collect(),
+            bucket_duration: 250,
+            timestamp_output: Default::default(),
+            alignment: Default::default(),
+            report_empty,
+        };
+        let aggregations = [
+            None,
+            Some(aggregation(&[AggregationType::Avg], false)),
+            Some(aggregation(&[AggregationType::Avg], true)),
+            Some(aggregation(
+                &[AggregationType::Min, AggregationType::Last],
+                true,
+            )),
+        ];
+        // The decomposable reducers: the coordinator never pushes down first/last.
+        let reducers = [
+            AggregationType::Sum,
+            AggregationType::Avg,
+            AggregationType::Min,
+            AggregationType::Max,
+            AggregationType::Count,
+            AggregationType::StdS,
+        ];
+        for reduce in reducers {
+            for agg in &aggregations {
+                for value_filter in [
+                    None,
+                    Some(crate::series::ValueFilter::new(3.0, 112.0).unwrap()),
+                ] {
+                    for limit in [None, Some(SampleLimit::Head(3)), Some(SampleLimit::Tail(3))] {
+                        let options = MRangeOptions {
+                            range: RangeOptions {
+                                date_range: crate::series::TimestampRange::from_timestamps(
+                                    95, 2405,
+                                )
+                                .unwrap(),
+                                aggregation: agg.clone(),
+                                value_filter,
+                                ..Default::default()
+                            },
+                            grouping: Some(RangeGroupingOptions {
+                                aggregation: AggregatorConfig::new(reduce, None).unwrap(),
+                                group_label: "grp".into(),
+                            }),
+                            ..Default::default()
+                        };
+                        let case = format!(
+                            "reduce={reduce:?} agg={agg:?} filter={value_filter:?} limit={limit:?}"
+                        );
+                        let (_, reducer) = group_partial_reducer(&options).unwrap();
+                        let (start, end) = options.range.get_timestamp_range();
+
+                        let snapshots = series
+                            .iter()
+                            .map(|(s, key, group)| SnapshotSeries {
+                                key: (*key).into(),
+                                labels: Vec::new(),
+                                snapshot: s.snapshot_range(start, end),
+                                latest: None,
+                                empty_fill: range_empty_fill_bounds(
+                                    s,
+                                    &options.range,
+                                    false,
+                                    false,
+                                ),
+                                group_label_value: group.map(String::from),
+                            })
+                            .collect();
+                        let mut copied =
+                            decode_group_partials(snapshots, &options, &reducer, limit, &|| false)
+                                .unwrap();
+                        copied.sort_by(|a, b| a.group_label_value.cmp(&b.group_label_value));
+
+                        let mut groups: Vec<(&str, Vec<(&TimeSeries, &str)>)> = Vec::new();
+                        for (s, key, group) in &series {
+                            let Some(group) = group else { continue };
+                            match groups.iter_mut().find(|(g, _)| g == group) {
+                                Some((_, members)) => members.push((s, key)),
+                                None => groups.push((group, vec![(s, key)])),
+                            }
+                        }
+                        groups.sort_by_key(|(g, _)| *g);
+                        assert_eq!(copied.len(), groups.len(), "{case}");
+
+                        for (got, (group, members)) in copied.iter().zip(&groups) {
+                            let (timestamps, states) = match agg.as_ref().filter(|a| a.is_multi()) {
+                                Some(a) => reduce_group_rows(
+                                    members
+                                        .iter()
+                                        .map(|(s, _)| {
+                                            create_row_iterator(s, &options.range, None, false)
+                                        })
+                                        .collect(),
+                                    &reducer,
+                                    a.aggregations.len(),
+                                    limit,
+                                ),
+                                None => reduce_group_samples(
+                                    members
+                                        .iter()
+                                        .map(|(s, _)| {
+                                            create_range_iterator(s, &options.range, None, false)
+                                        })
+                                        .collect(),
+                                    &reducer,
+                                    limit,
+                                ),
+                            };
+                            let mut keys: Vec<Vec<u8>> =
+                                members.iter().map(|(_, k)| k.as_bytes().to_vec()).collect();
+                            keys.sort();
+                            assert_eq!(got.group_label_value, *group, "{case}");
+                            assert_eq!(got.source_keys, keys, "{case}");
+                            assert_eq!(got.timestamps, timestamps, "{case}");
+                            // Debug renderings, so NaN states (empty buckets) compare equal.
+                            assert_eq!(
+                                format!("{:?}", got.states),
+                                format!("{states:?}"),
+                                "{case}"
                             );
                         }
                     }

@@ -20,8 +20,9 @@ use crate::iterators::{KWayMerge, RowReducer, SampleReducer, create_sample_itera
 use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
 use crate::series::mrange::{
     MRangeScope, SampleLimit, build_mrange_grouped_labels, collect_rows, collect_samples,
-    decode_shard_snapshots, is_shard_snapshot_answerable, process_mrange_group_partials,
-    process_mrange_query, snapshot_shard_mrange, sort_mrange_results,
+    decode_group_partials, decode_shard_snapshots, group_partial_reducer,
+    is_shard_snapshot_answerable, process_mrange_group_partials, process_mrange_query,
+    snapshot_shard_group_partials, snapshot_shard_mrange, sort_mrange_results,
 };
 use crate::series::request_types::{
     MRangeOptions, MRangeSeriesResult, RangeGroupingOptions, SeriesResultData,
@@ -140,8 +141,17 @@ impl FanoutClientCommand for MRangeFanoutCommand {
             // GROUPBY/REDUCE push-down: pre-reduce local group members per
             // bucket (per-series aggregation included when present) and ship
             // partial states instead of per-series samples.
-            let partials = {
-                let expired = || ctx.expired();
+            let expired = || ctx.expired();
+            // Off FILTER_BY_TS, the GIL is held only to resolve and copy the members'
+            // chunks; decoding and reducing them runs after it is released.
+            let partials = if options.range.timestamp_filter.is_none() {
+                let (_, reducer) = group_partial_reducer(&options)?;
+                let snapshots = {
+                    let ctx = ctx.lock_unexpired()?;
+                    snapshot_shard_group_partials(&ctx, &options)?
+                };
+                decode_group_partials(snapshots, &options, &reducer, limit, &expired)?
+            } else {
                 let ctx = ctx.lock_unexpired()?;
                 process_mrange_group_partials(&ctx, options, limit, &expired)?
             };
