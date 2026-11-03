@@ -561,6 +561,11 @@ fn handle_post_migration_cleanup(source_slots: RangeSetBlaze<u16>) {
                     break;
                 }
                 optimize_index_fully(db);
+                // `optimize_index_fully` stops early on shutdown without aborting this run; check
+                // again so a pass cut short on the last db isn't recorded as completed.
+                if run.check_shutdown() {
+                    break;
+                }
             }
         }
 
