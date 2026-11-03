@@ -156,7 +156,7 @@ pub(crate) fn process_mrange_group_partials(
             source_keys.sort();
 
             // Per-series pipeline (aggregation included when present),
-            // ascending; the group reducer runs once, across series, below.
+            // ascending; the group reducer runs once, across series.
             let (timestamps, states, column_count) = if let Some(columns) = multi_columns {
                 let iterators = group_data
                     .series
@@ -164,15 +164,8 @@ pub(crate) fn process_mrange_group_partials(
                     .map(|meta| {
                         create_row_iterator(meta.series, &options.range, meta.latest, false)
                     })
-                    .collect::<Vec<_>>();
-
-                let multi_iter = KWayMerge::new(iterators);
-                let rows = PartialRowReducer::new(multi_iter, reducer.clone(), columns);
-                let (timestamps, buckets): (Vec<Timestamp>, Vec<_>) = match limit {
-                    Some(limit) => limit.apply(rows).unzip(),
-                    None => rows.unzip(),
-                };
-                let states = buckets.into_iter().flatten().collect();
+                    .collect();
+                let (timestamps, states) = reduce_group_rows(iterators, &reducer, columns, limit);
                 (timestamps, states, columns)
             } else {
                 let iterators = group_data
@@ -181,14 +174,8 @@ pub(crate) fn process_mrange_group_partials(
                     .map(|meta| {
                         create_range_iterator(meta.series, &options.range, meta.latest, false)
                     })
-                    .collect::<Vec<_>>();
-
-                let multi_iter = KWayMerge::new(iterators);
-                let rows = PartialSampleReducer::new(multi_iter, reducer.clone());
-                let (timestamps, states) = match limit {
-                    Some(limit) => limit.apply(rows).unzip(),
-                    None => rows.unzip(),
-                };
+                    .collect();
+                let (timestamps, states) = reduce_group_samples(iterators, &reducer, limit);
                 (timestamps, states, 1)
             };
 
@@ -202,6 +189,42 @@ pub(crate) fn process_mrange_group_partials(
         })
         .collect();
     deadline.finish(results)
+}
+
+/// One group's partials from its members' ascending sample streams: merged by timestamp,
+/// then each bucket reduced to a mergeable state. `limit` is the COUNT push-down.
+fn reduce_group_samples<'a, I>(
+    iterators: Vec<I>,
+    reducer: &PartialReducer,
+    limit: Option<SampleLimit>,
+) -> (Vec<Timestamp>, Vec<PartialState>)
+where
+    I: Iterator<Item = Sample> + 'a,
+{
+    let rows = PartialSampleReducer::new(KWayMerge::new(iterators), reducer.clone());
+    match limit {
+        Some(limit) => limit.apply(rows).unzip(),
+        None => rows.unzip(),
+    }
+}
+
+/// [`reduce_group_samples`] for multi-aggregation rows: `columns` states per bucket, one per
+/// aggregation column, flattened row-major.
+fn reduce_group_rows<'a, I>(
+    iterators: Vec<I>,
+    reducer: &PartialReducer,
+    columns: usize,
+    limit: Option<SampleLimit>,
+) -> (Vec<Timestamp>, Vec<PartialState>)
+where
+    I: Iterator<Item = MultiSample> + 'a,
+{
+    let rows = PartialRowReducer::new(KWayMerge::new(iterators), reducer.clone(), columns);
+    let (timestamps, buckets): (Vec<Timestamp>, Vec<_>) = match limit {
+        Some(limit) => limit.apply(rows).unzip(),
+        None => rows.unzip(),
+    };
+    (timestamps, buckets.into_iter().flatten().collect())
 }
 
 /// Who a node's TS.MRANGE results are for, which decides how they are shaped.
@@ -2065,6 +2088,61 @@ mod tests {
         assert_eq!(keys_of(&local), keys_of(&remote));
         for (l, r) in local.iter().zip(&remote) {
             assert_eq!(samples_of(l), samples_of(r));
+        }
+    }
+
+    /// The row pipeline over a snapshot's chunks matches the one over the live series:
+    /// multi-aggregation, EMPTY, a value filter, COUNT, both directions.
+    #[test]
+    fn test_row_iterator_from_snapshot_matches_live_series() {
+        use crate::iterators::create_row_iterator_from_base;
+        for series in [multi_chunk_series(0.0), nan_gap_series()] {
+            for report_empty in [false, true] {
+                for value_filter in [
+                    None,
+                    Some(crate::series::ValueFilter::new(3.0, 12.0).unwrap()),
+                ] {
+                    for count in [None, Some(4)] {
+                        for is_reverse in [false, true] {
+                            let range = RangeOptions {
+                                date_range: crate::series::TimestampRange::from_timestamps(
+                                    95, 2405,
+                                )
+                                .unwrap(),
+                                count,
+                                value_filter,
+                                aggregation: Some(AggregationOptions {
+                                    aggregations: smallvec::smallvec![
+                                        AggregationType::Min.into(),
+                                        AggregationType::Last.into(),
+                                    ],
+                                    bucket_duration: 250,
+                                    timestamp_output: Default::default(),
+                                    alignment: Default::default(),
+                                    report_empty,
+                                }),
+                                ..Default::default()
+                            };
+                            let live: Vec<MultiSample> =
+                                create_row_iterator(&series, &range, None, is_reverse).collect();
+                            let (start, end) = range.get_timestamp_range();
+                            let snapshot = series.snapshot_range(start, end);
+                            let copied: Vec<MultiSample> = create_row_iterator_from_base(
+                                snapshot.sample_iter(false),
+                                &range,
+                                None,
+                                range_empty_fill_bounds(&series, &range, is_reverse, is_reverse),
+                                is_reverse,
+                            )
+                            .collect();
+                            assert_eq!(
+                                copied, live,
+                                "empty={report_empty} filter={value_filter:?} count={count:?} reverse={is_reverse}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }

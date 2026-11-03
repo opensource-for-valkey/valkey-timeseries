@@ -686,6 +686,49 @@ fn row_pipeline<'a>(
     finalize(aggr_iter, is_reverse, options.count)
 }
 
+/// The pipeline [`create_row_iterator`] builds after its base reader, for a base that is
+/// not a live series, such as a [`crate::series::RangeSnapshot`] read off the GIL. `base`
+/// must be ascending and already clipped to the query window (and to FILTER_BY_TS, if any);
+/// `latest` and `empty_fill` must have been derived from the series beforehand (see
+/// [`range_empty_fill_bounds`]). The base covers the whole window, so there is no read floor
+/// and no counter baseline. Generic over the base so a concrete reader keeps its decode
+/// inlinable into the aggregation.
+pub(crate) fn create_row_iterator_from_base<'a, I>(
+    base: I,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    empty_fill: EmptyFillBounds,
+    is_reverse: bool,
+) -> Box<dyn Iterator<Item = MultiSample> + 'a>
+where
+    I: Iterator<Item = Sample> + 'a,
+{
+    let aggregation = options
+        .aggregation
+        .as_ref()
+        .expect("create_row_iterator requires aggregation options");
+
+    // A partial compaction sample is beyond the last stored sample, so it is chained at the
+    // end of the ascending stream; the value filter applies to it too.
+    let value_filter = options.value_filter;
+    let filtered = base
+        .chain(latest_sample)
+        .filter(move |sample| value_filter.is_none_or(|vf| vf.is_match(sample.value)));
+
+    let (start_ts, end_ts) = options.get_timestamp_range();
+    let aligned_timestamp = aggregation
+        .alignment
+        .get_aligned_timestamp(start_ts, end_ts);
+    let aggr_iter = MultiAggregateIterator::with_empty_fill(
+        filtered,
+        aggregation,
+        aligned_timestamp,
+        empty_fill,
+    );
+
+    finalize(aggr_iter, is_reverse, options.count)
+}
+
 /// Apply reversal and COUNT, then box. Buckets and samples alike: COUNT limits output items, and
 /// the stream arrives in its final chronological form, `last`'s EMPTY carry included.
 fn finalize<'a, I>(
