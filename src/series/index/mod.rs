@@ -313,5 +313,8 @@ pub fn deserialize_bitmap(bitmap: &[u8]) -> PostingsBitmap {
         log_warning(&msg);
         return PostingsBitmap::default();
     }
-    PostingsBitmap::deserialize::<Portable>(&bitmap[1..])
+    PostingsBitmap::try_deserialize::<Portable>(&bitmap[1..]).unwrap_or_else(|| {
+        log_warning("Invalid serialized postings bitmap");
+        PostingsBitmap::default()
+    })
 }
