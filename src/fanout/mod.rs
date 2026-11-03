@@ -123,8 +123,8 @@ fn take_cluster_map_stale() -> bool {
     CLUSTER_MAP_STALE.swap(false, Ordering::AcqRel)
 }
 
-fn update_cluster_map(map: ClusterMap) {
-    CLUSTER_MAP.swap(Arc::new(map));
+fn update_cluster_map(map: Arc<ClusterMap>) {
+    CLUSTER_MAP.store(map);
 }
 
 /// Get the set of target nodes for a fanout, together with the cluster-map
@@ -147,21 +147,34 @@ pub fn get_fanout_targets(ctx: &Context, mode: FanoutTarget) -> (Arc<HashSet<Nod
     }
     // Possibly race condition, but only if called concurrently, which is possible but very unlikely.
     // In any case, the worst that can happen is that we refresh more than once.
-    refresh_cluster_map(ctx);
-    // Load the refreshed map once so targets and fingerprint come from the same snapshot.
-    let map = CLUSTER_MAP.load();
+    // Take targets and fingerprint from the snapshot the refresh produced, not a reload.
+    let map = refresh_cluster_map(ctx)
+        .into_map()
+        .unwrap_or_else(|| CLUSTER_MAP.load_full());
     (map.get_targets(mode), map.cluster_slots_fingerprint())
 }
 
-/// What [`refresh_cluster_map`] did with the map it built.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What [`refresh_cluster_map`] did with the map it built, carrying the exact snapshot the
+/// refresh published or kept, so callers never pair the outcome with a later, possibly
+/// concurrently swapped, map.
+#[derive(Debug, Clone)]
 pub enum ClusterMapRefresh {
-    /// The topology changed (or a map was inconsistent): a new map was published.
-    Changed,
-    /// The topology was unchanged: the published map was kept, its expiry extended.
-    Unchanged,
+    /// The topology changed (or a map was inconsistent): this new map was published.
+    Changed(Arc<ClusterMap>),
+    /// The topology was unchanged: this published map was kept, its expiry extended.
+    Unchanged(Arc<ClusterMap>),
     /// `CLUSTER NODES` gave no usable reply: the previous map stays in place.
     Failed,
+}
+
+impl ClusterMapRefresh {
+    /// The snapshot this refresh published or kept; `None` when it failed.
+    pub fn into_map(self) -> Option<Arc<ClusterMap>> {
+        match self {
+            Self::Changed(map) | Self::Unchanged(map) => Some(map),
+            Self::Failed => None,
+        }
+    }
 }
 
 // Refresh the cluster map by creating a new one from the current cluster state.
@@ -179,7 +192,7 @@ pub fn refresh_cluster_map(ctx: &impl ClusterNodesSource) -> ClusterMapRefresh {
     metrics::REFRESHES.incr();
     match ClusterMap::create(ctx) {
         Some(new_map) => {
-            let current_map = CLUSTER_MAP.load();
+            let current_map = CLUSTER_MAP.load_full();
             if new_map.is_consistent
                 && current_map.is_consistent
                 && new_map.same_topology(&current_map)
@@ -188,15 +201,16 @@ pub fn refresh_cluster_map(ctx: &impl ClusterNodesSource) -> ClusterMapRefresh {
                 metrics::REFRESH_UNCHANGED.incr();
                 log_notice("Cluster map unchanged; extended expiration");
                 mark_cluster_map_verified();
-                ClusterMapRefresh::Unchanged
+                ClusterMapRefresh::Unchanged(current_map)
             } else {
                 drop(current_map);
                 reset_refresh_interval();
-                update_cluster_map(new_map);
+                let new_map = Arc::new(new_map);
+                update_cluster_map(Arc::clone(&new_map));
                 metrics::REFRESH_CHANGED.incr();
                 log_notice("Cluster map refreshed");
                 mark_cluster_map_verified();
-                ClusterMapRefresh::Changed
+                ClusterMapRefresh::Changed(new_map)
             }
         }
         None => {
@@ -217,8 +231,9 @@ pub fn get_or_refresh_cluster_map(ctx: &impl ClusterNodesSource) -> Arc<ClusterM
 
     if needs_refresh {
         drop(current_map);
-        refresh_cluster_map(ctx);
-        return get_cluster_map().clone();
+        return refresh_cluster_map(ctx)
+            .into_map()
+            .unwrap_or_else(|| CLUSTER_MAP.load_full());
     }
 
     current_map.clone()

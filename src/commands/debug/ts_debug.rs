@@ -7,9 +7,7 @@ use crate::commands::CommandArgIterator;
 use crate::commands::analysis_runner::panic_next_analysis_job;
 use crate::commands::command_parser::parse_query_index_command_args;
 use crate::common::replies::*;
-use crate::fanout::{
-    ClusterMapRefresh, get_cluster_map, inflight_requests, is_clustered, refresh_cluster_map,
-};
+use crate::fanout::{ClusterMapRefresh, inflight_requests, is_clustered, refresh_cluster_map};
 use crate::series::index::series_keys_by_selectors;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
@@ -58,16 +56,17 @@ fn refresh_clustermap(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyRes
             "TSDB: REFRESH_CLUSTERMAP requires cluster mode",
         ));
     }
-    let outcome = match refresh_cluster_map(ctx) {
-        ClusterMapRefresh::Changed => "changed",
-        ClusterMapRefresh::Unchanged => "unchanged",
+    // Every reply field comes from the snapshot the refresh itself published or kept: reloading
+    // the global map here could pair this outcome with a map a concurrent refresh swapped in.
+    let (outcome, map) = match refresh_cluster_map(ctx) {
+        ClusterMapRefresh::Changed(map) => ("changed", map),
+        ClusterMapRefresh::Unchanged(map) => ("unchanged", map),
         ClusterMapRefresh::Failed => {
             return Err(ValkeyError::Str(
                 "TSDB: failed to rebuild the cluster map; the previous map is kept",
             ));
         }
     };
-    let map = get_cluster_map();
     reply_with_map(ctx, 4);
     reply_with_str(ctx, "outcome");
     reply_with_str(ctx, outcome);
