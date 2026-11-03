@@ -4,7 +4,7 @@ use crate::common::metrics::task::{self as metrics, TaskRun};
 use crate::common::sync::lock;
 use crate::common::threads::{LockGil, ParMutRayon, SingleFlight, spawn_task_single};
 use crate::is_shutting_down;
-use crate::series::tasks::utils::{fetch_series_batch, find_next_db};
+use crate::series::tasks::utils::{SeriesBatch, fetch_series_batch, find_next_db};
 use orx_parallel::Par;
 use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
@@ -89,21 +89,33 @@ fn trim_series(ctx: &Context, db: i32, cursor: u64) -> (usize, i32) {
         return (0, db);
     }
 
-    let mut batch = fetch_series_batch(ctx, cursor + 1, SERIES_TRIM_BATCH_SIZE, |series| {
+    let SeriesBatch {
+        series: mut batch,
+        last_scanned,
+        exhausted,
+    } = fetch_series_batch(ctx, cursor + 1, SERIES_TRIM_BATCH_SIZE, |series| {
         !series.retention.is_zero() && !series.is_empty()
     });
 
     set_current_db(ctx, save_db);
 
-    if batch.is_empty() {
+    // Only a scan that reached the end of the db moves on to the next one; a scan that settled
+    // ids without accepting any (all rejected or stale) just advances the cursor past them.
+    let next_db = {
         let mut context = lock(&SERIES_TRIM_CURSORS);
-        let db = find_next_db(context.db).unwrap_or(0);
-        context.db = db;
-        context.cursor = 0;
-        return (0, db);
+        if exhausted {
+            context.db = find_next_db(context.db).unwrap_or(0);
+            context.cursor = 0;
+        } else if let Some(last) = last_scanned {
+            context.cursor = last;
+        }
+        context.db
+    };
+
+    if batch.is_empty() {
+        return (0, next_db);
     }
 
-    let last_processed = batch.last().map(|s| s.id).unwrap_or(0);
     let processed = batch.len();
 
     let total_deletes: usize = batch
@@ -124,14 +136,11 @@ fn trim_series(ctx: &Context, db: i32, cursor: u64) -> (usize, i32) {
     metrics::RETENTION_TRIM_SERIES_PROCESSED.fetch_add(processed as u64, Ordering::Relaxed);
     metrics::RETENTION_TRIM_SAMPLES_DELETED.fetch_add(total_deletes as u64, Ordering::Relaxed);
 
-    let mut context = lock(&SERIES_TRIM_CURSORS);
-    context.cursor = last_processed;
-
     if processed > 0 {
         log_debug(format!(
             "Processed: {processed} Deleted Samples: {total_deletes} samples"
         ));
     }
 
-    (processed, db)
+    (processed, next_db)
 }
