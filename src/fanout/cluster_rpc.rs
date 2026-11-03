@@ -496,8 +496,11 @@ fn cluster_fingerprint_matches(ctx: &DetachedContext, expected: u64) -> bool {
 
     // Our map might just be stale; force one refresh and re-check.
     clustermap_metrics::FORCED_REFRESHES.incr();
-    refresh_cluster_map(ctx);
-    get_cluster_map().cluster_slots_fingerprint() == expected
+    refresh_cluster_map(ctx)
+        .into_map()
+        .unwrap_or_else(|| get_cluster_map().clone())
+        .cluster_slots_fingerprint()
+        == expected
 }
 
 /// Processes a valid request by executing the command and sending back the response.
