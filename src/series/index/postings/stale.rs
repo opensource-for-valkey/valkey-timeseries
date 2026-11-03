@@ -86,7 +86,7 @@ impl StaleSet {
         }
     }
 
-    #[cfg(test)]
+    #[inline]
     pub(in crate::series::index) fn contains(&self, id: SeriesRef) -> bool {
         self.ids.contains(id)
     }
