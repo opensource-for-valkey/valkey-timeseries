@@ -42,6 +42,16 @@ pub trait FanoutCommand: Default + Send + 'static {
     /// responsive while the shard-local reply is materialized.
     fn get_local_response(ctx: &FanoutContext, req: Self::Request) -> ValkeyResult<Self::Response>;
 
+    /// Whether a share whose requester has given up may be abandoned: dropped unrun when it
+    /// waited in the queue past the operation's timeout, or stopped between read batches.
+    ///
+    /// `false` for an operation that writes: abandoning it on some shards and not others
+    /// would leave a partial write behind a reply that already said the command timed out,
+    /// so it runs to the end on every shard that received it.
+    fn cancellable() -> bool {
+        true
+    }
+
     /// Return the timeout duration for the entire fanout operation.
     /// This timeout applies to the overall operation, not individual RPC calls.
     fn get_timeout(&self) -> Duration {
@@ -466,15 +476,20 @@ where
         // A share that waited in the queue may no longer be wanted: the fanout
         // already completed (an RPC timeout or a fail-fast error), or its
         // deadline passed and the blocked client has had the timeout error.
-        if state.is_completed() {
-            return;
-        }
-        if Instant::now() >= deadline {
-            metrics::FANOUT_LOCAL_SHARE_EXPIRED.incr();
-            state.on_error(FanoutError::timeout(), &target);
-            return;
-        }
+        // A write runs regardless (`FanoutCommand::cancellable`); a late answer
+        // is ignored once the fanout has completed.
         let fanout_ctx = FanoutContext::new(user, db);
+        if OP::cancellable() {
+            if state.is_completed() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                metrics::FANOUT_LOCAL_SHARE_EXPIRED.incr();
+                state.on_error(FanoutError::timeout(), &target);
+                return;
+            }
+            fanout_ctx.set_deadline(deadline);
+        }
         match OP::get_local_response(&fanout_ctx, req) {
             Ok(response) => state.on_response(response, &target),
             Err(err) => state.on_error(err.into(), &target),

@@ -280,6 +280,7 @@ As a peer serving a coordinator:
 | `fanout_rejected_unsupported_features_total` | counter | Requests demanding envelope features this node lacks |
 | `fanout_rejected_no_handler_total` | counter | Requests for an operation this node has no handler for |
 | `fanout_rejected_busy_total` | counter | Requests refused because the fan-out lane's queue was full |
+| `fanout_dropped_expired_total` | counter | Requests dropped unrun because they waited in the queue past their time budget (no reply is sent: the requester has already given up) |
 | `fanout_rejected_cluster_map_mismatch_total` | counter | Requests rejected because the sender's cluster map disagrees with this node's |
 
 On the wire (counted by the sender):

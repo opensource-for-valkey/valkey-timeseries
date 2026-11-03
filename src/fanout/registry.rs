@@ -14,10 +14,19 @@ use valkey_module::{ValkeyError, ValkeyResult};
 /// outside it, and the operation takes it only for its keyspace/index work.
 pub(super) type RequestHandlerCallback = fn(&FanoutContext, &[u8], &mut Vec<u8>) -> FanoutResult;
 
+/// A registered operation, as a receiving node runs it.
+#[derive(Clone, Copy)]
+pub(super) struct RegisteredOperation {
+    pub run: RequestHandlerCallback,
+    /// [`FanoutCommand::cancellable`]: whether a request past its time budget may be
+    /// dropped unrun, or stopped between read batches.
+    pub cancellable: bool,
+}
+
 /// A registry for fanout operations that allows type-erased storage and retrieval
 /// of [`FanoutCommand`] implementations.
 pub struct FanoutOperationRegistry {
-    operations: papaya::HashMap<&'static str, RequestHandlerCallback, RandomState>,
+    operations: papaya::HashMap<&'static str, RegisteredOperation, RandomState>,
 }
 
 impl FanoutOperationRegistry {
@@ -70,13 +79,19 @@ impl FanoutOperationRegistry {
             )));
         }
 
-        map.insert(name, request_handler::<OP>);
+        map.insert(
+            name,
+            RegisteredOperation {
+                run: request_handler::<OP>,
+                cancellable: OP::cancellable(),
+            },
+        );
 
         Ok(())
     }
 
     #[inline]
-    fn get_operation_by_name(&self, name: &str) -> Option<RequestHandlerCallback> {
+    fn get_operation_by_name(&self, name: &str) -> Option<RegisteredOperation> {
         self.operations.pin().get(name).copied()
     }
 }
@@ -97,6 +112,6 @@ where
     FANOUT_REGISTRY.register::<OP>()
 }
 
-pub(super) fn get_fanout_request_handler(name: &str) -> Option<RequestHandlerCallback> {
+pub(super) fn get_fanout_request_handler(name: &str) -> Option<RegisteredOperation> {
     FANOUT_REGISTRY.get_operation_by_name(name)
 }

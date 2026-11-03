@@ -49,9 +49,9 @@ impl FanoutContext {
     /// keyspace for it stop between batches from then on ([`Self::expired`]). Only the
     /// first call counts.
     ///
-    /// Nothing on this branch sets one yet: the PromQL fan-out does, from its
-    /// request's time budget. Until then [`Self::expired`] is always false.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Set from the request's time budget for a cancellable operation
+    /// (`FanoutCommand::cancellable`), counted from when the request arrived; without
+    /// one, [`Self::expired`] is always false.
     pub fn set_deadline(&self, deadline: Instant) {
         let _ = self.deadline.set(deadline);
     }
