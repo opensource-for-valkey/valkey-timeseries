@@ -1176,10 +1176,10 @@ pub struct SnapshotSeries {
     pub group_label_value: Option<String>,
 }
 
-/// Whether a snapshot can stand in for the series: multi-aggregation yields
-/// rows, and `FILTER_BY_TS` needs the series-backed base reader.
+/// Whether a snapshot can stand in for the series: `FILTER_BY_TS` needs the
+/// series-backed base reader.
 fn snapshot_supports(range: &RangeOptions) -> bool {
-    range.timestamp_filter.is_none() && !range.aggregation.as_ref().is_some_and(|a| a.is_multi())
+    range.timestamp_filter.is_none()
 }
 
 /// Whether the non-clustered path can answer `options` from snapshots; grouping
@@ -1464,6 +1464,34 @@ fn decode_snapshot(
     limit: Option<SampleLimit>,
     compress: bool,
 ) -> MRangeSeriesResult {
+    // Multi-aggregation yields rows, aggregated ascending and reversed at the end, as
+    // `create_row_iterator` does on the live series. Rows ship as per-column chunks, so
+    // `compress` does not apply.
+    if options
+        .range
+        .aggregation
+        .as_ref()
+        .is_some_and(|a| a.is_multi())
+    {
+        let iter = create_row_iterator_from_base(
+            s.snapshot.sample_iter(false),
+            &options.range,
+            s.latest,
+            s.empty_fill,
+            options.is_reverse,
+        );
+        let rows = match limit {
+            Some(limit) => limit.apply(iter).collect(),
+            None => iter.collect(),
+        };
+        return MRangeSeriesResult {
+            group_label_value: s.group_label_value,
+            key: s.key,
+            labels: s.labels,
+            sources: Vec::new(),
+            data: SeriesResultData::Rows(rows),
+        };
+    }
     let has_aggregation = options.range.aggregation.is_some();
     let should_reverse_iter = !has_aggregation && options.is_reverse;
     // The live path's base reader over the copied chunks: decoded lazily, so
@@ -1921,6 +1949,28 @@ mod tests {
         }
     }
 
+    /// A result's samples or rows, rendered for comparison (rows hold floats, NaN included).
+    fn data_of(result: &MRangeSeriesResult) -> String {
+        match &result.data {
+            SeriesResultData::Chunk(_) => format!("{:?}", samples_of(result)),
+            SeriesResultData::Rows(rows) => format!("{rows:?}"),
+        }
+    }
+
+    /// Multi-aggregation options for the snapshot equivalence tests: two columns, EMPTY on.
+    fn multi_aggregation() -> AggregationOptions {
+        AggregationOptions {
+            aggregations: smallvec::smallvec![
+                AggregationType::Min.into(),
+                AggregationType::Last.into()
+            ],
+            bucket_duration: 250,
+            timestamp_output: Default::default(),
+            alignment: Default::default(),
+            report_empty: true,
+        }
+    }
+
     /// A series spread over many small chunks, so reverse decoding crosses chunk edges.
     fn multi_chunk_series(offset: f64) -> TimeSeries {
         let mut series = TimeSeries::new();
@@ -1987,7 +2037,12 @@ mod tests {
         };
         for is_reverse in [false, true] {
             for count in [None, Some(1), Some(7), Some(1000)] {
-                for agg in [None, Some(aggregation(false)), Some(aggregation(true))] {
+                for agg in [
+                    None,
+                    Some(aggregation(false)),
+                    Some(aggregation(true)),
+                    Some(multi_aggregation()),
+                ] {
                     let options = MRangeOptions {
                         range: RangeOptions {
                             date_range: crate::series::TimestampRange::from_timestamps(95, 2405)
@@ -2032,7 +2087,7 @@ mod tests {
                     let case = format!("reverse={is_reverse} count={count:?} agg={agg:?}");
                     assert_eq!(keys_of(&deferred), keys_of(&live), "{case}");
                     for (d, l) in deferred.iter().zip(&live) {
-                        assert_eq!(samples_of(d), samples_of(l), "{case}");
+                        assert_eq!(data_of(d), data_of(l), "{case}");
                     }
                 }
             }
@@ -2060,6 +2115,7 @@ mod tests {
             None,
             Some(aggregation(AggregationType::Max)),
             Some(aggregation(AggregationType::Last)),
+            Some(multi_aggregation()),
         ];
         for limit in [None, Some(SampleLimit::Head(5)), Some(SampleLimit::Tail(5))] {
             for agg in &aggs {
@@ -2113,6 +2169,7 @@ mod tests {
                         assert!(local.iter().all(|r| matches!(
                             r.data,
                             SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(_))
+                                | SeriesResultData::Rows(_)
                         )));
                         let metas = fixtures
                             .iter()
@@ -2141,8 +2198,8 @@ mod tests {
                         for ((d, u), l) in shard.iter().zip(&local).zip(&live) {
                             assert_eq!(d.group_label_value, l.group_label_value, "{case}");
                             assert_eq!(u.group_label_value, l.group_label_value, "{case}");
-                            assert_eq!(samples_of(d), samples_of(l), "{case}");
-                            assert_eq!(samples_of(u), samples_of(l), "{case}");
+                            assert_eq!(data_of(d), data_of(l), "{case}");
+                            assert_eq!(data_of(u), data_of(l), "{case}");
                         }
                     }
                 }
