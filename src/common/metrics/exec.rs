@@ -2,7 +2,7 @@
 //! Everything here is read from the executors' own counts.
 
 use crate::commands::analysis_lane_stats;
-use crate::fanout::request_lane_stats;
+use crate::fanout::{reply_lane_stats, request_lane_stats};
 use metered::Registry;
 use metered::entry::{counter_value, gauge_value};
 
@@ -22,6 +22,21 @@ pub(super) fn register(registry: &mut Registry<'static>) {
             counter_value("fanout_rejected")
                 .read(|_: &()| request_lane_stats().rejected)
                 .help("Jobs refused because the ts-fanout-request queue was full (answered as busy)"),
+        )
+        .register(
+            gauge_value("fanout_reply_queued")
+                .read(|_: &()| reply_lane_stats().queued)
+                .help("Fanout replies waiting for a worker on the ts-fanout-reply lane"),
+        )
+        .register(
+            gauge_value("fanout_reply_running")
+                .read(|_: &()| reply_lane_stats().running)
+                .help("Fanout replies a worker is building on the ts-fanout-reply lane"),
+        )
+        .register(
+            counter_value("fanout_reply_rejected")
+                .read(|_: &()| reply_lane_stats().rejected)
+                .help("Fanout replies the full ts-fanout-reply queue refused, built on the main thread instead"),
         )
         .register(
             gauge_value("analysis_queued")

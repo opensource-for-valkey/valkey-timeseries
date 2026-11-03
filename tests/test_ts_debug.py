@@ -1063,7 +1063,8 @@ class TestDebugMetrics(ValkeyTimeSeriesTestCaseDebugMode):
     RDB_METRICS = ['rdb_load_failures_total', 'rdb_loads_total',
                    'rdb_save_failures_total', 'rdb_saves_total']
     EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
-                    'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_running']
+                    'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_reply_queued',
+                    'exec_fanout_reply_rejected_total', 'exec_fanout_reply_running', 'exec_fanout_running']
     TASKS = ['retention_trim', 'tombstone_sweep', 'optimize_index']
     ASM_TASKS = ['optimize']
     TASK_FIELDS = ('started_total', 'completed_total', 'skipped_inflight_total',
@@ -1152,9 +1153,10 @@ class TestDebugMetrics(ValkeyTimeSeriesTestCaseDebugMode):
             else:
                 assert isinstance(value, int), (name, value)
                 assert value >= 0, (name, value)
-        # Nothing has been sent to either lane, and a standalone server never fans out or
+        # Nothing has been sent to any lane, and a standalone server never fans out or
         # builds a cluster map.
         assert stats['exec_fanout_rejected_total'] == 0
+        assert stats['exec_fanout_reply_rejected_total'] == 0
         assert stats['exec_analysis_rejected_total'] == 0
         for name, value in stats.items():
             if name.startswith('fanout_') and name not in self.HISTOGRAMS:

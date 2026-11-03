@@ -228,6 +228,9 @@ counters stay at zero, `refresh_interval_seconds` at 0 and `age_seconds` at -1.
 | `exec_fanout_queued` | gauge | Jobs waiting for a worker on the `ts-fanout-request` lane (peer requests and local fan-out shares) |
 | `exec_fanout_running` | gauge | Jobs a worker is running on the `ts-fanout-request` lane |
 | `exec_fanout_rejected_total` | counter | Jobs refused because the `ts-fanout-request` queue was full (answered as busy) |
+| `exec_fanout_reply_queued` | gauge | Fan-out replies waiting for a worker on the `ts-fanout-reply` lane |
+| `exec_fanout_reply_running` | gauge | Fan-out replies a worker is building on the `ts-fanout-reply` lane |
+| `exec_fanout_reply_rejected_total` | counter | Fan-out replies the full `ts-fanout-reply` queue refused, built on the main thread instead |
 | `exec_analysis_queued` | gauge | Jobs waiting for a worker on the `ts-analysis` lane |
 | `exec_analysis_running` | gauge | Jobs a worker is running on the `ts-analysis` lane |
 | `exec_analysis_rejected_total` | counter | Jobs refused because the `ts-analysis` queue was full |
@@ -261,6 +264,7 @@ As coordinator:
 | `fanout_send_failures_total` | counter | Requests the cluster bus refused to send |
 | `fanout_local_share_busy_total` | counter | Local shares refused because the fan-out lane's queue was full |
 | `fanout_local_share_expired_total` | counter | Local shares that waited in the queue past the deadline |
+| `fanout_reply_expired_total` | counter | Replies the `ts-fanout-reply` lane did not build because the client's deadline had passed (left to the main thread, which skips a client already timed out) |
 | `fanout_error_decode_failures_total` | counter | Error responses from peers that could not be decoded |
 | `fanout_ignored_unknown_request_total` | counter | Peer answers dropped because their request is no longer in flight (it timed out, say) |
 | `fanout_ignored_unknown_sender_total` | counter | Peer answers dropped because their sender is not a remote target of the request |
@@ -466,8 +470,14 @@ TS._DEBUG METRICS exec
 8) (integer) 0
 9) "exec_fanout_rejected_total"
 10) (integer) 0
-11) "exec_fanout_running"
+11) "exec_fanout_reply_queued"
 12) (integer) 0
+13) "exec_fanout_reply_rejected_total"
+14) (integer) 0
+15) "exec_fanout_reply_running"
+16) (integer) 0
+17) "exec_fanout_running"
+18) (integer) 0
 ```
 
 Start a clean window, then read one section with descriptions:

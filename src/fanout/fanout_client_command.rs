@@ -7,6 +7,7 @@ use crate::fanout::blocked_client::FanoutBlockedClient;
 use crate::fanout::cluster_rpc::get_cluster_command_timeout;
 use crate::fanout::fanout_error::FANOUT_BLOCKING_DENIED;
 use crate::fanout::serialization::Serializable;
+use crate::fanout::workers::REPLY_EXECUTOR;
 use crate::fanout::{FanoutCommand, FanoutContext, FanoutResult, FanoutTarget, NodeInfo};
 use metered::Counter;
 use std::sync::{Arc, Mutex};
@@ -40,9 +41,16 @@ pub trait FanoutClientCommand: Default + Send + 'static {
 
     fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult;
 
-    /// NOTE: Use the provided `ReplyContext` reply helpers. This is already
-    /// running on the main thread and does not require locking.
+    /// NOTE: Use the provided `ReplyContext` reply helpers. This runs on the main thread,
+    /// unless [`Self::REPLY_OFF_MAIN_THREAD`] moves it, and does not require locking.
     fn reply(&mut self, ctx: &ReplyContext) -> Status;
+
+    /// Whether a successful fan-out's [`Self::reply`] may run on the fan-out reply lane
+    /// instead of the main thread, writing through a thread-safe context bound to the
+    /// blocked client. Only for a `reply` that merges what the shards sent and writes it:
+    /// no keyspace access, no ACL checks, nothing that needs the GIL or the real client.
+    /// Errors, and replies the lane has no room for, still go through the main thread.
+    const REPLY_OFF_MAIN_THREAD: bool = false;
 
     /// Execute the fanout operation across cluster nodes.
     /// The `where Self: FanoutCommand` bound is always satisfied via the blanket impl below.
@@ -70,6 +78,19 @@ pub trait FanoutClientCommand: Default + Send + 'static {
             // Runs once, on whichever thread completes the fanout: the main thread
             // for the last remote answer, a send failure or the RPC timer, a worker
             // for the last local answer.
+            if Self::REPLY_OFF_MAIN_THREAD
+                && result.is_ok()
+                && let Ok(slot) = REPLY_EXECUTOR.try_reserve()
+            {
+                slot.spawn(move || {
+                    let replied = lock(&bc_for_closure).reply_off_main_thread(op);
+                    // The merged results are freed here rather than on the main thread;
+                    // dropping the last handle then unblocks the client.
+                    drop(replied);
+                    drop(bc_for_closure);
+                });
+                return;
+            }
             lock(&bc_for_closure).set_private_data(op, result);
         };
 

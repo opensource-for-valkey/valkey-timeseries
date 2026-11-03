@@ -225,6 +225,9 @@ impl FanoutClientCommand for MRangeFanoutCommand {
         self.ingest_response(resp).map_err(Into::into)
     }
 
+    // `reply` only merges the shard responses and writes them.
+    const REPLY_OFF_MAIN_THREAD: bool = true;
+
     fn reply(&mut self, ctx: &ReplyContext) -> Status {
         self.options.range.latest = false;
         self.options.range.timestamp_filter = None;

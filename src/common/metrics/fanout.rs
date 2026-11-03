@@ -31,6 +31,8 @@ pub static FANOUT_SETUP_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub static FANOUT_LOCAL_SHARE_BUSY: AtomicU64 = AtomicU64::new(0);
 /// Local shares that waited in the queue past the deadline and were answered with a timeout.
 pub static FANOUT_LOCAL_SHARE_EXPIRED: AtomicU64 = AtomicU64::new(0);
+/// Replies the reply lane left to the main thread because the client's deadline had passed.
+pub static FANOUT_REPLY_EXPIRED: AtomicU64 = AtomicU64::new(0);
 /// Commands refused because the client could not be blocked (MULTI, a script, a module call).
 pub static FANOUT_BLOCKING_DENIED: AtomicU64 = AtomicU64::new(0);
 /// Requests the cluster bus refused to send.
@@ -191,6 +193,11 @@ static COUNTERS: &[(&str, &AtomicU64, &str)] = &[
         "local_share_expired",
         &FANOUT_LOCAL_SHARE_EXPIRED,
         "Local fanout shares that waited in the queue past the deadline",
+    ),
+    (
+        "reply_expired",
+        &FANOUT_REPLY_EXPIRED,
+        "Fanout replies not built on the reply lane because the client's deadline had passed",
     ),
     (
         "blocking_denied",

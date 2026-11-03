@@ -33,7 +33,7 @@ pub use fanout_command::*;
 pub use fanout_context::FanoutContext;
 pub use fanout_error::*;
 pub use utils::*;
-pub(crate) use workers::request_lane_stats;
+pub(crate) use workers::{reply_lane_stats, request_lane_stats};
 
 pub(crate) use cluster_map::NUM_SLOTS;
 pub use cluster_map::{ClusterMap, ClusterNodesSource, FanoutTarget, NodeInfo};

@@ -23,7 +23,22 @@ pub(super) static PEER_REQUEST_EXECUTOR: BoundedExecutor = BoundedExecutor::new(
     Capacity::Fixed(QUEUE_CAPACITY),
 );
 
+/// Builds and writes fan-out replies for commands that opt in
+/// (`FanoutClientCommand::REPLY_OFF_MAIN_THREAD`), so the merge and the per-item reply calls
+/// run off the main thread. Its jobs never take the GIL, so they never queue behind peer
+/// requests waiting for it.
+pub(super) static REPLY_EXECUTOR: BoundedExecutor = BoundedExecutor::new(
+    "ts-fanout-reply",
+    lane_workers,
+    Capacity::Fixed(QUEUE_CAPACITY),
+);
+
 /// The load on the fan-out lane, for `TS._DEBUG METRICS`. Never starts the workers.
 pub(crate) fn request_lane_stats() -> ExecutorStats {
     PEER_REQUEST_EXECUTOR.stats()
+}
+
+/// The load on the fan-out reply lane, for `TS._DEBUG METRICS`. Never starts the workers.
+pub(crate) fn reply_lane_stats() -> ExecutorStats {
+    REPLY_EXECUTOR.stats()
 }
