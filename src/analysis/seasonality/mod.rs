@@ -29,7 +29,8 @@ pub fn seasonally_adjust(
     let mut periods = match seasonality {
         Seasonality::Periods(periods) => periods.clone(),
         Seasonality::Auto => {
-            // use periodogram to detect periods
+            // use periodogram to detect periods; `detect` already caps the list at
+            // MAX_SEASONALITY_PERIODS, strongest first
             let detector = PeriodogramDetector::default();
             detector.detect(ts).iter().map(|&x| x as usize).collect()
         }

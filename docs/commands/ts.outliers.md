@@ -73,8 +73,8 @@ seasonal components based on the provided periods and perform detection on the r
 SEASONALITY [AUTO | period1 ...]
 ```
 
-* `AUTO` - Automatically detects the dominant seasonality period using periodograms. Suitable for data with unknown or
-  complex seasonal patterns.
+* `AUTO` - Automatically detects up to four seasonal periods, strongest first, using periodograms. Suitable for data
+  with unknown or complex seasonal patterns.
 * For a single period: Uses STL (Seasonal-Trend decomposition using LOESS)
 * For multiple periods: Uses MSTL (Multiple Seasonal-Trend decomposition using LOESS)
 * Periods must be unique integers ≥ 2 and ≤ half the number of finite samples in the range.
