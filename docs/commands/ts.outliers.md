@@ -271,15 +271,19 @@ METHOD RCF [NUM_TREES trees]
 
 * `NUM_TREES` - Number of trees in forest. Default: `100`. Must be an integer from `1` to `512`.
 * `SAMPLE_SIZE` - Sample size per tree. Default: `256`. Must be an integer from `2` to `4096`.
-* `THRESHOLD` - Anomaly score threshold in standard deviations. Default: `3.0`
-* `CONTAMINATION` - The amount of contamination in the data set, i.e., the proportion of outliers in the data set.
-* `SHINGLE_SIZE` - Sliding window size. Default: `1`. Must be an integer from `1` to `128` and no larger than the number of samples in the query range. Use values > 1 for contextual anomalies.
-* `OUTPUT_AFTER` - Warmup period (samples). Must be a positive integer. Default: `32`
-* `DECAY` - Time decay factor, from `0` to `1`. Default: `0.1`. Controls how quickly old data is forgotten.
+* `THRESHOLD` - Anomaly score threshold in standard deviations above the mean of the forest scores. Default: `3.0`
+* `CONTAMINATION` - The amount of contamination in the data set, i.e., the proportion of outliers in the data set. From above `0` up to `0.5`.
+* `SHINGLE_SIZE` - Sliding window size. Default: `1`. Must be an integer from `1` to `128` and no larger than the number of *finite* samples in the query range: `NaN` and infinite samples are left out of the analysis, so they do not count. Use values > 1 for contextual anomalies.
+* `OUTPUT_AFTER` - Warmup period (samples). Must be a positive integer. Default: `1 + SAMPLE_SIZE / 4` (`65` for the default sample size)
+* `DECAY` - Time decay factor, from `0` to `1`. Default: `0.1 / SAMPLE_SIZE`. Controls how quickly old data is forgotten.
 
-Either `THRESHOLD` or `CONTAMINATION` must be specified to determine the cutoff for anomaly scores. `THRESHOLD` sets a
-fixed score
-threshold, while `CONTAMINATION` determines the threshold based on the expected proportion of anomalies in the data.
+`THRESHOLD` and `CONTAMINATION` are alternative ways to set the cutoff for anomaly scores; if both are given, the later one applies. `THRESHOLD`
+places the cutoff a number of standard deviations above the mean of the forest scores, while `CONTAMINATION` places it
+at the quantile that leaves the expected proportion of anomalies above it. When neither is given, `THRESHOLD 3.0`
+applies.
+
+The first `OUTPUT_AFTER` samples are the warmup: the forest has not learned the data yet, so those samples are scored
+but never flagged, and their scores take no part in fitting the cutoff in either mode.
 
 The forest is built with a fixed random seed, so the same query over the same data always returns the same scores.
 

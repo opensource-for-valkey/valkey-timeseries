@@ -164,7 +164,8 @@ fn process_request(
         (series.get_range(start, end), lane_slot)
     };
 
-    validate_rcf_shingle_size(&options, samples.len())?;
+    // Detection leaves NaN and infinities out, so the shingle must fit the finite samples.
+    validate_rcf_shingle_size(&options, finite_sample_count(&samples))?;
 
     let Some(lane_slot) = lane_slot else {
         let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
@@ -667,16 +668,24 @@ fn parse_bounded_integer(
     Ok(value as usize)
 }
 
-fn validate_rcf_shingle_size(options: &AnomalyOptions, sample_count: usize) -> ValkeyResult<()> {
+/// The samples detection will actually see: NaN and infinities are left out of the analysis.
+fn finite_sample_count(samples: &[Sample]) -> usize {
+    samples.iter().filter(|s| s.value.is_finite()).count()
+}
+
+fn validate_rcf_shingle_size(
+    options: &AnomalyOptions,
+    finite_sample_count: usize,
+) -> ValkeyResult<()> {
     let AnomalyDetectionMethodOptions::Rcf(rcf_options) = &options.options else {
         return Ok(());
     };
 
     if let Some(shingle_size) = rcf_options.shingle_size
-        && shingle_size > sample_count
+        && shingle_size > finite_sample_count
     {
         return Err(ValkeyError::String(format!(
-            "TSDB: SHINGLE_SIZE ({shingle_size}) cannot exceed the number of samples ({sample_count})"
+            "TSDB: SHINGLE_SIZE ({shingle_size}) cannot exceed the number of finite samples ({finite_sample_count})"
         )));
     }
 
@@ -1154,6 +1163,52 @@ mod tests {
             err.to_string().contains("combined"),
             "unexpected error message: {err}"
         );
+    }
+
+    fn rcf_options_with_shingle(shingle_size: usize) -> AnomalyOptions {
+        AnomalyOptions {
+            options: AnomalyDetectionMethodOptions::Rcf(RCFOptions {
+                shingle_size: Some(shingle_size),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn finite_sample_count_skips_nan_and_infinities() {
+        let values = [1.0, f64::NAN, 2.0, f64::INFINITY, f64::NEG_INFINITY, 3.0];
+        let samples: Vec<Sample> = values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| Sample::new(i as i64, v))
+            .collect();
+        assert_eq!(finite_sample_count(&samples), 3);
+    }
+
+    #[test]
+    fn validate_rcf_shingle_size_is_bounded_by_the_finite_samples() {
+        let options = rcf_options_with_shingle(12);
+
+        let err = validate_rcf_shingle_size(&options, 10)
+            .expect_err("a shingle larger than the finite samples must be rejected");
+        assert!(
+            err.to_string()
+                .contains("SHINGLE_SIZE (12) cannot exceed the number of finite samples (10)"),
+            "unexpected error message: {err}"
+        );
+
+        validate_rcf_shingle_size(&options, 12).expect("a shingle equal to the count is valid");
+        validate_rcf_shingle_size(&options, 15).expect("a shingle below the count is valid");
+    }
+
+    #[test]
+    fn validate_rcf_shingle_size_ignores_other_methods() {
+        let options = AnomalyOptions {
+            options: AnomalyDetectionMethodOptions::Cusum,
+            ..Default::default()
+        };
+        validate_rcf_shingle_size(&options, 0).expect("only RCF has a shingle size");
     }
 
     #[test]

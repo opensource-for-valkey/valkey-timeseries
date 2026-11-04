@@ -124,7 +124,10 @@ class TestRCFOutlierDetector(ValkeyTimeSeriesTestCaseBase):
         data = [42.0] * 200
         _add(self.client, key, 1_000, data)
 
-        raw = _rcf_cmd(self.client, key)
+        # 65 = 1 + SAMPLE_SIZE / 4, the warmup the forest itself needs. A shorter one lets
+        # the first scores after it, still on the forest's learning curve, stand out from
+        # the steady ones now that the warmup zeros no longer widen the cutoff.
+        raw = _rcf_cmd(self.client, key, "OUTPUT_AFTER", 65)
         anomalies = _parse_anomalies(raw)
 
         assert len(anomalies) == 0, f"expected no anomalies, got {anomalies}"
@@ -135,7 +138,8 @@ class TestRCFOutlierDetector(ValkeyTimeSeriesTestCaseBase):
         data = [10.0 + 0.5 * math.sin(i * 0.1) for i in range(200)]
         _add(self.client, key, 1_000, data)
 
-        raw = _rcf_cmd(self.client, key)
+        # 65 = 1 + SAMPLE_SIZE / 4; see the flat-data test above.
+        raw = _rcf_cmd(self.client, key, "OUTPUT_AFTER", 65)
         anomalies = _parse_anomalies(raw)
 
         # A gentle sine with amplitude 0.5 around 10 should not trigger
@@ -586,7 +590,7 @@ class TestRCFOutlierDetector(ValkeyTimeSeriesTestCaseBase):
             ("SAMPLE_SIZE", 4097, "must be between"),
             ("SHINGLE_SIZE", 1.5, "invalid integer value"),
             ("SHINGLE_SIZE", 129, "must be between"),
-            ("SHINGLE_SIZE", 11, "cannot exceed the number of samples"),
+            ("SHINGLE_SIZE", 11, "cannot exceed the number of finite samples"),
         )
 
         for option, value, message in invalid_options:
@@ -596,6 +600,28 @@ class TestRCFOutlierDetector(ValkeyTimeSeriesTestCaseBase):
                     "METHOD", "rcf",
                     option, value,
                 )
+
+    def test_rcf_shingle_is_validated_against_finite_samples(self):
+        """SHINGLE_SIZE is bounded by the finite samples: NaN readings are left out of the analysis."""
+        key = "rcf:options:shingle_finite"
+        _add(self.client, key, 1_000, [10.0 + (i % 3) for i in range(10)])
+        for i in range(10, 15):
+            self.client.execute_command("TS.ADD", key, 1_000 + i * 1_000, "nan")
+
+        # 15 samples in the range, 10 of them finite
+        with pytest.raises(ResponseError, match="cannot exceed the number of finite samples"):
+            self.client.execute_command(
+                "TS.OUTLIERS", key, "-", "+",
+                "METHOD", "rcf",
+                "SHINGLE_SIZE", 12,
+            )
+
+        # The finite count itself is still a valid shingle size
+        self.client.execute_command(
+            "TS.OUTLIERS", key, "-", "+",
+            "METHOD", "rcf",
+            "SHINGLE_SIZE", 10,
+        )
 
     def test_rcf_option_decay(self):
         """DECAY option is accepted and the detector adapts to shifting data."""
