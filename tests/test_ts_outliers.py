@@ -475,6 +475,20 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
 
         assert len(result) == 0
 
+    def test_cleaned_output_after_a_step(self):
+        """A constant baseline must not blind CUSUM: the baseline stays, the shifted tail goes."""
+        key = 'test:outliers:cleaned:after_step'
+        for i in range(100):
+            self.client.execute_command('TS.ADD', key, 1000 + i, 5.0)
+        for i in range(100):
+            self.client.execute_command('TS.ADD', key, 1100 + i, 50.0)
+
+        res = self.client.execute_command(
+            'TS.OUTLIERS', key, '-', '+', 'METHOD', 'cusum', 'OUTPUT', 'cleaned'
+        )
+
+        assert TSOutliersCleanedResult.parse(res).sample_count() == 100
+
     def test_format_cleaned(self):
         """Test OUTPUT cleaned returns only samples with directed anomalies removed."""
         key = 'test:outliers:format:cleaned'

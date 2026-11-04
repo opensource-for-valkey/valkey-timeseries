@@ -1,4 +1,7 @@
-use super::utils::{deviation_and_fence_distance, normalize_evidence, normalize_value};
+use super::utils::{
+    deviation_and_fence_distance, normalize_evidence, normalize_value, snap_dust_if_collapsed,
+    usable_fence_distance,
+};
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::math::{calculate_median_sorted, robust_scale_from_sorted_abs_devs};
 use crate::analysis::outliers::{
@@ -46,23 +49,20 @@ impl ModifiedZScoreOutlierDetector {
     /// rounding step about a value sitting exactly on the fence.
     #[inline]
     fn deviation_and_boundary(&self, value: f64) -> (f64, f64) {
-        if self.mad_scaled <= 1e-10 {
-            // No usable scale: nothing to be past.
-            return (value - self.median, f64::NAN);
-        }
         let (lower_fence, upper_fence) = self.fences();
-        deviation_and_fence_distance(value, self.median, lower_fence, upper_fence)
+        let (deviation, boundary) =
+            deviation_and_fence_distance(value, self.median, lower_fence, upper_fence);
+        (
+            snap_dust_if_collapsed(deviation, boundary, self.median),
+            boundary,
+        )
     }
 
     /// The fences `model_info` reports, and the ones `deviation_and_boundary`
     /// measures against. One definition, so they cannot drift apart.
     #[inline]
     fn fences(&self) -> (f64, f64) {
-        let delta = if self.mad_scaled > 1e-10 {
-            self.threshold * self.mad_scaled
-        } else {
-            0.0
-        };
+        let delta = usable_fence_distance(self.median, self.threshold * self.mad_scaled);
         (self.median - delta, self.median + delta)
     }
 
