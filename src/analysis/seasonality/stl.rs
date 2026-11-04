@@ -138,7 +138,7 @@ impl Stl {
     /// Decompose the time series.
     pub fn decompose(&self, series: &[f64]) -> Option<STLResult> {
         let n = series.len();
-        if n < 2 * self.seasonal_period {
+        if n < self.seasonal_period.saturating_mul(2) {
             return None;
         }
 
@@ -624,5 +624,10 @@ mod tests {
             "Trend strength should be in [0, 1]: {}",
             strength
         );
+    }
+
+    #[test]
+    fn stl_oversized_period_returns_none_instead_of_overflowing() {
+        assert!(Stl::new(1usize << 63).decompose(&[1.0; 10]).is_none());
     }
 }

@@ -77,7 +77,7 @@ SEASONALITY [AUTO | period1 ...]
   complex seasonal patterns.
 * For a single period: Uses STL (Seasonal-Trend decomposition using LOESS)
 * For multiple periods: Uses MSTL (Multiple Seasonal-Trend decomposition using LOESS)
-* Periods must be unique positive integers
+* Periods must be unique integers ≥ 2 and ≤ half the number of finite samples in the range.
 * Requires at least `2 × max(period)` data points
 
 **Example:** `SEASONALITY 24 168` adjusts for daily (24 hours) and weekly (168 hours) patterns in hourly data.

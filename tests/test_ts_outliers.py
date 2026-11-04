@@ -574,6 +574,13 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
         assert 50.0 in sample_values_neg  # Positive anomaly should remain
         assert len(samples_neg) == len(data) - 1
 
+    def test_seasonality_rejects_degenerate_and_oversized_periods(self):
+        key = 'test:outliers:seasonality:bad_periods'
+        create_normal_series(self.client, key, count=50)
+        for period in (0, 1, 2**63, 26):
+            with pytest.raises(ResponseError):
+                self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore', 'SEASONALITY', period)
+
     def test_daily_seasonality_with_spike(self):
         """Test detection on a daily seasonal pattern with an anomalous spike."""
         key = "test:seasonality:daily:spike"

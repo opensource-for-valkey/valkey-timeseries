@@ -6,7 +6,7 @@ pub mod test_data;
 
 use crate::analysis::seasonality::mstl::Mstl;
 use crate::analysis::seasonality::stl::Stl;
-use crate::analysis::{TimeSeriesAnalysisError, TimeSeriesAnalysisResult};
+use crate::analysis::{INSUFFICIENT_DATA_ERROR, TimeSeriesAnalysisError, TimeSeriesAnalysisResult};
 pub use periodogram::Detector as PeriodogramDetector;
 
 #[derive(Clone, Debug)]
@@ -14,6 +14,12 @@ pub enum Seasonality {
     Auto,
     Periods(Vec<usize>),
 }
+
+/// Maximum number of seasonal periods accepted by `SEASONALITY`.
+pub const MAX_SEASONALITY_PERIODS: usize = 4;
+
+/// Smallest meaningful seasonal period: a period of 0 or 1 has no cycle to remove.
+pub const MIN_SEASONALITY_PERIOD: usize = 2;
 
 /// Seasonal adjustment using (M)Stl decomposition
 pub fn seasonally_adjust(
@@ -34,12 +40,9 @@ pub fn seasonally_adjust(
     }
 
     periods.sort_unstable();
+    validate_periods(&periods, ts.len())?;
 
-    let n = ts.len();
     if periods.len() == 1 {
-        let required = 2 * periods[0];
-        validate_insufficient_data::<Vec<f64>>(required, n)?;
-
         Stl::new(periods[0])
             .robust()
             .decompose(ts)
@@ -48,11 +51,7 @@ pub fn seasonally_adjust(
                 TimeSeriesAnalysisError::DecompositionError("STL decomposition failed".to_string())
             })
     } else {
-        let max_period = periods[periods.len() - 1];
-        let required = 2 * max_period;
-        validate_insufficient_data::<Vec<f64>>(required, n)?;
-
-        Mstl::new(periods.to_vec())
+        Mstl::new(periods)
             .robust()
             .decompose(ts)
             .map(|res| res.remainder)
@@ -62,18 +61,30 @@ pub fn seasonally_adjust(
     }
 }
 
-fn validate_insufficient_data<T: Default>(
-    required: usize,
-    actual: usize,
-) -> TimeSeriesAnalysisResult<T> {
-    if actual >= required {
-        return Ok(T::default());
+/// Checks every period against a series of `n` samples before any arithmetic or allocation
+/// depends on it. A period must be at least [`MIN_SEASONALITY_PERIOD`] and the series must
+/// hold at least two full cycles of it. `2 * period` saturates at `usize::MAX`, so an
+/// oversized period reports `required: usize::MAX` instead of wrapping.
+pub fn validate_periods(periods: &[usize], n: usize) -> TimeSeriesAnalysisResult<()> {
+    for &period in periods {
+        if period < MIN_SEASONALITY_PERIOD {
+            return Err(TimeSeriesAnalysisError::InvalidParameter {
+                name: "period".to_string(),
+                message: format!(
+                    "seasonal periods must be at least {MIN_SEASONALITY_PERIOD}, got {period}"
+                ),
+            });
+        }
+        let required = period.saturating_mul(2);
+        if n < required {
+            return Err(TimeSeriesAnalysisError::InsufficientData {
+                message: INSUFFICIENT_DATA_ERROR.to_string(),
+                required,
+                actual: n,
+            });
+        }
     }
-    Err(TimeSeriesAnalysisError::InsufficientData {
-        message: "TSDB: insufficient samples for anomaly detection".to_string(),
-        required,
-        actual,
-    })
+    Ok(())
 }
 
 #[cfg(test)]
@@ -226,5 +237,46 @@ mod tests {
         let result = seasonally_adjust(&data, &Seasonality::Auto).unwrap();
 
         assert_eq!(result, data);
+    }
+
+    // ── period validation ────────────────────────────────────────────────────
+
+    #[test]
+    fn oversized_period_is_rejected_not_hung() {
+        let err = seasonally_adjust(&[1.0, 2.0, 1.0], &Seasonality::Periods(vec![1usize << 63]))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TimeSeriesAnalysisError::InsufficientData {
+                required: usize::MAX,
+                actual: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn periods_below_two_are_rejected() {
+        for p in [0usize, 1] {
+            let err =
+                seasonally_adjust(&vec![1.0; 50], &Seasonality::Periods(vec![p])).unwrap_err();
+            assert!(
+                matches!(err, TimeSeriesAnalysisError::InvalidParameter { ref name, .. } if name == "period"),
+                "{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn period_above_half_the_series_is_rejected() {
+        let err = seasonally_adjust(&vec![1.0; 50], &Seasonality::Periods(vec![26])).unwrap_err();
+        assert!(matches!(
+            err,
+            TimeSeriesAnalysisError::InsufficientData {
+                required: 52,
+                actual: 50,
+                ..
+            }
+        ));
     }
 }
