@@ -522,7 +522,7 @@ Detect pattern-based anomalies using a sliding window:
     * For `SEASONALITY`: requires at least `2 × max(period)` samples
 * **Seasonality constraints:**
     * Maximum 4 periods allowed
-    * Periods must be unique positive integers
+    * Periods must be unique integers ≥ 2 and ≤ half the number of finite samples
     * Automatically sorted in ascending order
 * **Score normalization:**
     * All anomaly scores normalized to [0.0, 1.0] range
