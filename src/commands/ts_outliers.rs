@@ -5,7 +5,8 @@ use crate::analysis::outliers::{
     SmoothedZScoreOptions, detect_anomalies,
 };
 use crate::analysis::seasonality::{MAX_SEASONALITY_PERIODS, MIN_SEASONALITY_PERIOD, Seasonality};
-use crate::commands::analysis_runner::run_on_analysis_lane;
+use crate::commands::analysis_runner::{reserve_analysis_slot, run_reserved_on_analysis_lane};
+use crate::commands::outliers_cost::{INLINE_COST_BUDGET_MICROS, estimated_cost_micros};
 use crate::commands::{
     CommandArgIterator, CommandArgToken, parse_command_arg_token, parse_timestamp_range,
 };
@@ -13,6 +14,7 @@ use crate::common::Sample;
 use crate::common::context::is_blocking_denied;
 use crate::common::hash::{IntMap, IntSet};
 use crate::common::replies::{ReplyContext, reply_with_counted_array, reply_with_sample};
+use crate::config::outliers_max_samples;
 use crate::series::{TimestampRange, get_timeseries};
 use valkey_module::{
     AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
@@ -137,17 +139,34 @@ fn process_request(
     anomaly_direction: AnomalyDirection,
     output_format: OutputFormat,
 ) -> ValkeyResult {
-    let samples = {
+    // Everything that can refuse the request runs before the decode, which is the expensive part
+    // on the main thread: the sample cap, the RCF budget and, for the lane, its queue place.
+    let (samples, lane_slot) = {
         let series = get_timeseries(ctx, &key, Some(AclPermissions::ACCESS))?;
         let (start, end) = date_range.get_series_range(&series, None, false);
-        series.get_range(start, end)
+
+        let estimate = series.estimated_sample_count_in_range(start, end);
+        let limit = outliers_max_samples();
+        if estimate > limit {
+            return Err(ValkeyError::String(format!(
+                "TSDB: outlier detection: range holds about {estimate} samples, limit is {limit}"
+            )));
+        }
+        validate_rcf_budget(&options)?;
+
+        // A deny-blocking client (MULTI, a script, an `RM_Call` without the K flag) runs inline
+        // whatever the cost: the server asserts on blocking one.
+        let lane_slot = (estimated_cost_micros(estimate, &options) > INLINE_COST_BUDGET_MICROS
+            && !is_blocking_denied(ctx))
+        .then(|| reserve_analysis_slot(ctx, "outlier detection"))
+        .transpose()?;
+
+        (series.get_range(start, end), lane_slot)
     };
 
-    validate_rcf_options(&options, samples.len())?;
+    validate_rcf_shingle_size(&options, samples.len())?;
 
-    // Inline when a deny-blocking client (MULTI, a script, an `RM_Call` without the K flag)
-    // could not be blocked anyway: the server asserts on blocking one.
-    if !should_run_in_background(samples.len(), options.method()) || is_blocking_denied(ctx) {
+    let Some(lane_slot) = lane_slot else {
         let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
         let reply_ctx = ReplyContext::new(ctx.ctx);
         return match detect_anomalies(&values, &options) {
@@ -163,9 +182,9 @@ fn process_request(
                 &options,
             ),
         };
-    }
+    };
 
-    run_on_analysis_lane(ctx, "outlier detection", move |thread_ctx| {
+    run_reserved_on_analysis_lane(ctx, lane_slot, move |thread_ctx| {
         let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
         match detect_anomalies(&values, &options) {
             Err(err) => {
@@ -186,21 +205,6 @@ fn process_request(
             }
         }
     })
-}
-
-const SPAWN_THRESHOLD_SAMPLES: usize = 1000;
-
-fn is_cpu_intensive(method: AnomalyMethod) -> bool {
-    matches!(method, AnomalyMethod::RandomCutForest | AnomalyMethod::Esd)
-}
-
-/// Just a naive heuristic to decide whether to spawn a background thread for anomaly detection
-/// based on the number of samples and method complexity.
-fn should_run_in_background(samples: usize, method: AnomalyMethod) -> bool {
-    match is_cpu_intensive(method) {
-        true => samples > SPAWN_THRESHOLD_SAMPLES,
-        false => samples > 5_000, // For lightweight methods, we can allow more samples before spawning
-    }
 }
 
 fn parse_method_options(
@@ -663,7 +667,7 @@ fn parse_bounded_integer(
     Ok(value as usize)
 }
 
-fn validate_rcf_options(options: &AnomalyOptions, sample_count: usize) -> ValkeyResult<()> {
+fn validate_rcf_shingle_size(options: &AnomalyOptions, sample_count: usize) -> ValkeyResult<()> {
     let AnomalyDetectionMethodOptions::Rcf(rcf_options) = &options.options else {
         return Ok(());
     };
@@ -675,6 +679,14 @@ fn validate_rcf_options(options: &AnomalyOptions, sample_count: usize) -> Valkey
             "TSDB: SHINGLE_SIZE ({shingle_size}) cannot exceed the number of samples ({sample_count})"
         )));
     }
+
+    Ok(())
+}
+
+fn validate_rcf_budget(options: &AnomalyOptions) -> ValkeyResult<()> {
+    let AnomalyDetectionMethodOptions::Rcf(rcf_options) = &options.options else {
+        return Ok(());
+    };
 
     let num_trees = rcf_options.num_trees.unwrap_or(RCF_DEFAULT_NUM_TREES);
     let sample_size = rcf_options.sample_size.unwrap_or(RCF_DEFAULT_SAMPLE_SIZE);
@@ -1125,7 +1137,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_rcf_options_rejects_max_combination() {
+    fn validate_rcf_budget_rejects_max_combination() {
         let options = AnomalyOptions {
             options: AnomalyDetectionMethodOptions::Rcf(RCFOptions {
                 num_trees: Some(MAX_RCF_NUM_TREES),
@@ -1136,7 +1148,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = validate_rcf_options(&options, MAX_RCF_SAMPLE_SIZE)
+        let err = validate_rcf_budget(&options)
             .expect_err("maximum NUM_TREES/SAMPLE_SIZE/SHINGLE_SIZE combination must be rejected");
         assert!(
             err.to_string().contains("combined"),
@@ -1145,13 +1157,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_rcf_options_accepts_default_combination() {
+    fn validate_rcf_budget_accepts_default_combination() {
         let options = AnomalyOptions {
             options: AnomalyDetectionMethodOptions::Rcf(RCFOptions::default()),
             ..Default::default()
         };
 
-        validate_rcf_options(&options, RCF_DEFAULT_SAMPLE_SIZE)
+        validate_rcf_budget(&options)
             .expect("default RCF option combination must be within the budget");
     }
 }

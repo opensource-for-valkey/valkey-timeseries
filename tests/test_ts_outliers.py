@@ -1,4 +1,5 @@
 import math
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Any
 
 import pytest
@@ -32,6 +33,8 @@ def create_series_with_outliers(client, key, start_time=1000):
 
 # Above the inline limit for lightweight methods, so the detection runs on the analysis lane.
 BACKGROUND_SAMPLE_COUNT = 6000
+
+MAX_SAMPLES_CONFIG = 'ts.ts-outliers-max-samples'
 
 
 def create_background_sized_series(client, key):
@@ -91,6 +94,60 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
         tx.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
         [in_multi] = tx.execute()
         assert in_multi == expected
+
+    def test_sample_cap_refuses_before_decoding(self):
+        """The cap is checked against an upper-bound estimate at chunk granularity: a narrow
+        range counts as every chunk it touches, so it is only tested well under the cap."""
+        key = 'test:outliers:cap'
+        create_background_sized_series(self.client, key)
+        self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 5000)
+        try:
+            with pytest.raises(ResponseError, match='limit is 5000'):
+                self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
+            # a narrower range under the cap still works
+            narrow = self.client.execute_command(
+                'TS.OUTLIERS', key, 1000, 1000 + 9 * 1000, 'METHOD', 'zscore')
+            assert narrow is not None
+        finally:
+            self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000000)
+
+    def test_sample_cap_applies_inside_multi(self):
+        """A client that cannot block runs inline whatever the cost, but not whatever the size."""
+        key = 'test:outliers:cap:multi'
+        create_background_sized_series(self.client, key)
+        self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 5000)
+        try:
+            tx = self.client.pipeline(transaction=True)
+            tx.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
+            [in_multi] = tx.execute(raise_on_error=False)
+            assert isinstance(in_multi, ResponseError)
+            assert 'limit is 5000' in str(in_multi)
+        finally:
+            self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000000)
+
+    def test_lowering_the_cap_does_not_cancel_a_queued_job(self):
+        """Admission is checked once, at submission."""
+        key = 'test:outliers:cap:queued'
+        create_background_sized_series(self.client, key)
+        other = StrictValkey(host=self.server.bind_ip, port=self.server.port, socket_timeout=120)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            # The long job blocks `other`, so it gets its own thread. Wait until the server has
+            # admitted it. If it finishes before the cap is lowered the test still passes, with
+            # less to say; no wait can rule that out.
+            queued = pool.submit(
+                other.execute_command,
+                'TS.OUTLIERS', key, '-', '+', 'METHOD', 'esd', 'MAX_OUTLIERS', 1000)
+            wait_for_true(lambda: queued.done()
+                          or self.client.info('clients')['blocked_clients'] > 0)
+            self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000)
+            try:
+                with pytest.raises(ResponseError, match='limit is 1000'):
+                    self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
+                # Admitted before the change: it still gets its answer.
+                assert isinstance(queued.result(timeout=120), list)
+            finally:
+                self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000000)
 
     def test_outliers_nonexistent_key(self):
         """Test outlier detection on non-existent key."""
@@ -931,3 +988,18 @@ class TestOutliersLaneFailureStillReplies(ValkeyTimeSeriesTestCaseDebugMode):
         result = client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
         assert any(entry.value == 50.0 for entry in convert_anomaly_entries(result))
         assert self.server.is_alive()
+
+    def test_placement_follows_estimated_cost(self):
+        client = self._client()
+        key = 'test:outliers:placement'
+        create_normal_series(client, key, count=2000)
+
+        # 2,000 cheap samples stay inline: the armed panic is not consumed.
+        client.execute_command('TS._DEBUG', 'PANIC_NEXT_ANALYSIS_JOB')
+        client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
+
+        # The same range with two seasonal periods goes to the lane and consumes it.
+        with pytest.raises(ResponseError, match='internal error'):
+            client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore', 'SEASONALITY', 24, 168)
+        wait_for_true(lambda: self.server.verify_string_in_logfile(
+            'job panicked: TS._DEBUG PANIC_NEXT_ANALYSIS_JOB'))

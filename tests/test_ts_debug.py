@@ -264,6 +264,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
             'ts-fanout-command-timeout',
             'ts-cluster-map-expiration-ms',
             'ts-index-build-max-memory',
+            'ts-outliers-max-samples',
             'ts-index-persist',
             'debug-mode',
         ]

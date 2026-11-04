@@ -546,14 +546,25 @@ Detect pattern-based anomalies using a sliding window:
       scored. In `FULL` output they appear with a `nan` score and a `0` signal.
 * **Timestamp preservation:**
     * Output timestamps match original series timestamps
-* **Large ranges run in the background:**
-    * Above 1,000 samples for `rcf` and `esd`, or 5,000 samples for the other methods, the detection runs on the
-      analysis lane, a small pool of worker threads (`ts-num-threads`, clamped to 2–8), so the server keeps serving
-      other clients meanwhile.
+* **Expensive detections run in the background:**
+    * Where a detection runs depends on its estimated cost, which the sample count, the method, its options and
+      `SEASONALITY` all raise. The lightest methods with no seasonality stay on the main thread up to about 5,000
+      samples. With default options `esd` leaves it from about 500 samples and `rcf` from about a dozen; two-period
+      seasonality leaves it from about 150. Past that point the detection runs on the analysis lane, a small pool of
+      worker threads (`ts-num-threads`, clamped to 2–8), so the server keeps serving other clients meanwhile.
     * The lane queues up to 256 detections. When it is full the command is refused at once with
       `TSDB: outlier detection: too many queued jobs (limit 256)`; retry later.
     * Inside `MULTI`, a Lua script or a module call the client cannot be blocked, so the detection runs inline on
-      the main thread instead, whatever its size.
+      the main thread instead, whatever its cost.
+* **Sample limit:**
+    * The config `ts-outliers-max-samples` (default 1,000,000, minimum 1,000, changeable at runtime with
+      `CONFIG SET ts.ts-outliers-max-samples <n>`) limits the samples one request may read. A larger request is
+      refused before any sample is decoded, with
+      `TSDB: outlier detection: range holds about N samples, limit is M`. The limit also applies inside `MULTI`, a
+      Lua script or a module call.
+    * The count is an upper-bound estimate at chunk granularity: every chunk the range touches counts in full, so a
+      narrow range can read as more samples than it holds.
+    * The limit is checked once, on submission. Lowering it does not cancel a detection already admitted.
 * **Performance tips:**
     * Use `DIRECTION` to filter results when only interested in one type of anomaly
     * Single seasonality periods are faster than multiple
