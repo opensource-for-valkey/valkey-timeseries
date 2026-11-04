@@ -322,6 +322,7 @@ Returns anomaly information based on the `OUTPUT` format:
     * For the fence-based methods (ZSCORE, MODIFIED-ZSCORE, MAD, DOUBLE-MAD, IQR): `lower_fence`, `upper_fence`, and
       `center_line` where the method defines one
     * For SPC methods (CUSUM, EWMA): `control_limits`, `center_line`
+      EWMA reports the steady-state limits; the first few positions use tighter limits that converge to these.
     * Omitted for ESD, RCF, and SMOOTHED-ZSCORE, which fit no fences or control limits
 
 #### CLEANED format
