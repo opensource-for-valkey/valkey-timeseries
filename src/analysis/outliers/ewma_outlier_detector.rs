@@ -65,23 +65,29 @@ impl EwmaOutlierDetector {
             self.detect_smoothed(ts)
         };
 
-        let distance = self.multiplier * self.sigma;
         Ok(AnomalyResult {
             scores,
             anomalies,
             threshold: self.multiplier,
             method: AnomalyMethod::Ewma,
-            method_info: Some(MethodInfo::Spc {
-                control_limits: (self.target - distance, self.target + distance),
-                center_line: self.target,
-            }),
+            method_info: self.model_info(),
         })
+    }
+
+    /// Half-width of the control limits once the smoothed average has been running
+    /// long enough for its variance to settle: `multiplier * sigma * sqrt(alpha / (2 - alpha))`.
+    ///
+    /// The limits applied at each position are narrower than this and converge to it
+    /// (see `detect_smoothed`), so this is the width the chart tests against in the
+    /// long run, and the one `model_info` reports.
+    fn steady_state_half_width(&self) -> f64 {
+        self.multiplier * (self.sigma * (self.alpha / (2.0 - self.alpha)).sqrt())
     }
 
     /// True when the fitted sigma leaves the control limits with zero width.
     fn is_collapsed(&self) -> bool {
         self.target.is_finite()
-            && usable_fence_distance(self.target, self.multiplier * self.sigma) == 0.0
+            && usable_fence_distance(self.target, self.steady_state_half_width()) == 0.0
     }
 
     fn detect_smoothed(&self, ts: &[f64]) -> (Vec<f64>, Vec<Anomaly>) {
@@ -98,9 +104,13 @@ impl EwmaOutlierDetector {
             // by exactly nothing.
             ewma += self.alpha * (value - ewma);
 
-            let ewma_variance = self.sigma * self.sigma * self.alpha / (2.0 - self.alpha)
-                * (1.0 - (1.0 - self.alpha).powi(2 * (i as i32 + 1)));
-            let ewma_std = ewma_variance.sqrt();
+            // Sigma scales the root rather than being squared inside it: `sigma * sigma`
+            // underflows below ~1e-154 and overflows above ~1e154, whatever the
+            // limit it describes.
+            let ewma_std = self.sigma
+                * (self.alpha / (2.0 - self.alpha)
+                    * (1.0 - (1.0 - self.alpha).powi(2 * (i as i32 + 1))))
+                .sqrt();
 
             // The smoothed average's departure from target is the evidence; the
             // control limit that departure is tested against is the boundary.
@@ -151,9 +161,9 @@ impl AnomalyDetector for EwmaOutlierDetector {
     }
 
     fn model_info(&self) -> Option<MethodInfo> {
-        let distance = self.multiplier * self.sigma;
+        let half_width = self.steady_state_half_width();
         Some(MethodInfo::Spc {
-            control_limits: (self.target - distance, self.target + distance),
+            control_limits: (self.target - half_width, self.target + half_width),
             center_line: self.target,
         })
     }
@@ -453,6 +463,101 @@ mod tests {
         // Very high alpha (0.99) - minimal smoothing
         let high_result = detect_anomalies_spc_ewma(&ts, Some(0.99));
         assert!(high_result.is_ok(), "Should handle very high alpha");
+    }
+
+    fn spc_limits(info: Option<MethodInfo>) -> ((f64, f64), f64) {
+        let Some(MethodInfo::Spc {
+            control_limits,
+            center_line,
+        }) = info
+        else {
+            panic!("EWMA must report SPC method info, got {info:?}");
+        };
+        (control_limits, center_line)
+    }
+
+    #[test]
+    fn reported_limits_equal_the_steady_state_detection_limit() {
+        let ts: Vec<f64> = (0..400)
+            .map(|i| 1.0 + 0.1 * (i as f64 * 0.1).sin())
+            .collect();
+        let d = EwmaOutlierDetector::from_series(&ts, 0.3).unwrap();
+        let Some(MethodInfo::Spc {
+            control_limits,
+            center_line,
+        }) = d.model_info()
+        else {
+            panic!()
+        };
+        let w = d.multiplier * d.sigma * (0.3f64 / 1.7).sqrt();
+        assert!((control_limits.1 - (center_line + w)).abs() < 1e-12);
+        assert!((control_limits.0 - (center_line - w)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn detect_reports_the_limits_model_info_reports() {
+        let smooth: Vec<f64> = (0..100)
+            .map(|i| 1.0 + 0.1 * (i as f64 * 0.1).sin())
+            .collect();
+        let constant = vec![3.0; 20];
+        for ts in [&smooth, &constant] {
+            let d = EwmaOutlierDetector::from_series(ts, 0.3).unwrap();
+            let from_detect = spc_limits(d.detect(ts).unwrap().method_info);
+            let from_info = spc_limits(d.model_info());
+            assert_eq!(from_detect, from_info);
+        }
+    }
+
+    #[test]
+    fn collapsed_chart_reports_zero_width_limits_and_flags_any_departure() {
+        let mut ts = vec![3.0; 20];
+        ts[12] = 3.5;
+        let d = EwmaOutlierDetector::from_series(&ts[..10], 0.3).unwrap();
+        assert!(d.is_collapsed());
+
+        let result = d.detect(&ts).unwrap();
+        let ((lo, hi), center) = spc_limits(result.method_info);
+        assert_eq!((lo, hi, center), (3.0, 3.0, 3.0));
+        let flagged: Vec<usize> = result.anomalies.iter().map(|a| a.index).collect();
+        assert_eq!(flagged, vec![12]);
+    }
+
+    /// The per-step limit takes no square of sigma, so a spike is found at a
+    /// scale where `sigma * sigma` underflows to zero (flagging every wobble) or
+    /// overflows to infinity (flagging nothing).
+    #[test]
+    fn spike_is_found_at_extreme_scales() {
+        fn flagged_at(scale: f64) -> Vec<usize> {
+            let mut ts: Vec<f64> = (0..100)
+                .map(|i| scale * (1.0 + 0.02 * (i as f64 * 0.1).sin()))
+                .collect();
+            ts[60] = scale * 5.0;
+            // The fitted sigma is built directly: `calculate_variance` squares its
+            // deviations, which is out of range at these scales on its own.
+            let d = EwmaOutlierDetector {
+                alpha: 0.3,
+                target: scale,
+                sigma: scale * 0.035,
+                multiplier: 3.0,
+            };
+            assert!(!d.is_collapsed(), "scale {scale}");
+            d.detect(&ts)
+                .unwrap()
+                .anomalies
+                .iter()
+                .map(|a| a.index)
+                .collect()
+        }
+
+        let reference = flagged_at(1.0);
+        assert!(reference.contains(&60), "reference: {reference:?}");
+        assert!(
+            reference.iter().all(|&i| i >= 60),
+            "reference: {reference:?}"
+        );
+        for scale in [1e-200, 1e200] {
+            assert_eq!(flagged_at(scale), reference, "scale {scale:e}");
+        }
     }
 
     #[test]
