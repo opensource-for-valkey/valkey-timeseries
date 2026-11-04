@@ -287,7 +287,7 @@ fn parse_ewma_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOpti
         let slice = arg.as_slice();
         if slice.len() == 5 && slice.eq_ignore_ascii_case(b"alpha") {
             args.next(); // consume ALPHA
-            Some(parse_single_value(args, "ALPHA")?)
+            Some(parse_half_open_unit_value(args, "ALPHA")?)
         } else {
             None
         }
@@ -354,7 +354,7 @@ fn parse_zscore_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOp
                 influence = Some(parse_unit_interval_value(args, "INFLUENCE")?);
             },
             "LAG" => {
-                lag = Some(parse_positive_value(args, "LAG")? as usize);
+                lag = Some(parse_bounded_integer(args, "LAG", 1, usize::MAX)?);
             },
             _ => {
                 return Err(ValkeyError::String(format!("TSDB: unknown zscore option {arg}")));
@@ -414,7 +414,7 @@ fn parse_smoothed_zscore_options(args: &mut CommandArgIterator) -> ValkeyResult<
                 smoothed_options.influence = parse_unit_interval_value(args, "INFLUENCE")?;
             },
             "LAG" => {
-                smoothed_options.lag = parse_positive_value(args, "LAG")? as usize;
+                smoothed_options.lag = parse_bounded_integer(args, "LAG", 1, usize::MAX)?;
             },
             _ => {
                 return Err(ValkeyError::String(format!("TSDB: unknown smoothed zscore option {arg}")));
@@ -549,7 +549,7 @@ fn parse_rcf_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
                 );
             },
             "DECAY" => {
-                rcf_options.time_decay = Some(parse_single_value(args, "DECAY")?);
+                rcf_options.time_decay = Some(parse_unit_interval_value(args, "DECAY")?);
             },
             "SHINGLE_SIZE" => {
                 rcf_options.shingle_size = Some(parse_bounded_integer(
@@ -560,7 +560,12 @@ fn parse_rcf_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
                 )?);
             },
             "OUTPUT_AFTER" => {
-                rcf_options.output_after = Some(parse_positive_value(args, "OUTPUT_AFTER")? as usize);
+                rcf_options.output_after = Some(parse_bounded_integer(
+                    args,
+                    "OUTPUT_AFTER",
+                    1,
+                    usize::MAX,
+                )?);
             },
             _ => {
                 return Err(ValkeyError::String(format!("TSDB: unknown RCF option {arg}")));
@@ -602,7 +607,12 @@ fn parse_esd_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
                 esd_options.estimator = EsdEstimator::Classic;
             },
             "MAX_OUTLIERS" => {
-                esd_options.max_outliers = Some(parse_positive_value(args, "MAX_OUTLIERS")? as usize);
+                esd_options.max_outliers = Some(parse_bounded_integer(
+                    args,
+                    "MAX_OUTLIERS",
+                    1,
+                    usize::MAX,
+                )?);
             },
             _ => {
                 return Err(ValkeyError::String(format!("TSDB: unknown ESD option {arg}")));
@@ -709,7 +719,7 @@ fn parse_positive_value(iter: &mut CommandArgIterator, option_name: &str) -> Val
 /// an invalid quantile probability in the ESD detector.
 fn parse_esd_alpha(iter: &mut CommandArgIterator) -> ValkeyResult<f64> {
     let value = parse_finite_value(iter, "ALPHA")?;
-    if !(0.0..1.0).contains(&value) {
+    if !(value > 0.0 && value < 1.0) {
         return Err(ValkeyError::Str(
             "TSDB: ALPHA must be greater than 0 and less than 1",
         ));
@@ -726,6 +736,22 @@ fn parse_finite_value(iter: &mut CommandArgIterator, option_name: &str) -> Valke
     if !value.is_finite() {
         return Err(ValkeyError::String(format!(
             "TSDB: {option_name} must be finite"
+        )));
+    }
+    Ok(value)
+}
+
+/// A smoothing weight in `(0, 1]`, such as the EWMA `ALPHA`. Zero is excluded
+/// because the average would never move; one is the "no smoothing" limit, so it
+/// is valid. Rejects NaN and infinities along with the out-of-range values.
+fn parse_half_open_unit_value(
+    iter: &mut CommandArgIterator,
+    option_name: &str,
+) -> ValkeyResult<f64> {
+    let value = parse_single_value(iter, option_name)?;
+    if !(value > 0.0 && value <= 1.0) {
+        return Err(ValkeyError::String(format!(
+            "TSDB: {option_name} must be greater than 0 and at most 1"
         )));
     }
     Ok(value)

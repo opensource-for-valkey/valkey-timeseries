@@ -78,7 +78,7 @@ impl Detector {
                 Detector::Cusum(CusumOutlierDetector::default())
             }
             AnomalyDetectionMethodOptions::Ewma(alpha) => Detector::Ewma(
-                EwmaOutlierDetector::from_series(values, alpha.unwrap_or(EWMA_DEFAULT_ALPHA)),
+                EwmaOutlierDetector::from_series(values, alpha.unwrap_or(EWMA_DEFAULT_ALPHA))?,
             ),
             AnomalyDetectionMethodOptions::InterQuartileRange(threshold) => {
                 Detector::InterquartileRange(IQROutlierDetector::new(

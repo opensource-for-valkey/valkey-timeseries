@@ -105,6 +105,46 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
                 'METHOD', 'esd', 'ALPHA', 13,
             )
 
+    def test_option_validation_rejects_out_of_range_values(self):
+        """EWMA/ESD alpha, integer options and RCF decay are validated at parse time."""
+        key = 'test:outliers:validation'
+        create_normal_series(self.client, key, count=50)
+        bad = [
+            ('METHOD', 'ewma', 'ALPHA', 0), ('METHOD', 'ewma', 'ALPHA', 2), ('METHOD', 'ewma', 'ALPHA', 'nan'),
+            ('METHOD', 'esd', 'ALPHA', 0),
+            ('METHOD', 'smoothed-zscore', 'LAG', 3.9),
+            ('METHOD', 'zscore', 'SMOOTHED', 'LAG', 3.9),
+            ('METHOD', 'esd', 'MAX_OUTLIERS', 2.5),
+            ('METHOD', 'rcf', 'OUTPUT_AFTER', 0), ('METHOD', 'rcf', 'OUTPUT_AFTER', 2.5),
+            ('METHOD', 'rcf', 'DECAY', -1), ('METHOD', 'rcf', 'DECAY', 5), ('METHOD', 'rcf', 'DECAY', 'nan'),
+        ]
+        for args in bad:
+            with pytest.raises(ResponseError):
+                self.client.execute_command('TS.OUTLIERS', key, '-', '+', *args)
+
+    def test_option_validation_accepts_boundary_values(self):
+        """The closed ends of the documented ranges are valid."""
+        key = 'test:outliers:validation:bounds'
+        create_normal_series(self.client, key, count=50)
+        good = [
+            ('METHOD', 'ewma', 'ALPHA', 1),
+            ('METHOD', 'rcf', 'DECAY', 0),
+            ('METHOD', 'rcf', 'DECAY', 1),
+        ]
+        for args in good:
+            self.client.execute_command('TS.OUTLIERS', key, '-', '+', *args)
+
+    def test_huge_lag_is_an_error_not_a_panic(self):
+        """A LAG beyond any series length reports the shortfall; it must not overflow."""
+        key = 'test:outliers:validation:lag'
+        create_normal_series(self.client, key, count=50)
+        with pytest.raises(ResponseError, match="insufficient samples"):
+            self.client.execute_command(
+                'TS.OUTLIERS', key, '-', '+',
+                'METHOD', 'smoothed-zscore', 'LAG', 18446744073709551615,
+            )
+        assert self.client.ping()
+
     def test_method_spc_cusum_negative_spike(self):
         """Test SPC CUSUM control chart method negative spike."""
         key = 'test:outliers:method:cusum'
