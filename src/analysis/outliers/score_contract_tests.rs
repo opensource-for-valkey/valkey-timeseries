@@ -464,12 +464,10 @@ fn infinities_are_maximal_and_nan_is_never_flagged() {
 
     // And through the batch path, where `detect_pointwise` skips NaN outright.
     //
-    // Scoped to the pointwise detectors. The sequential ones still substitute
-    // `0.0` for a missing reading and let the substitute enter their running
-    // statistic, so an EWMA or CUSUM baseline is dragged toward zero by a gap in
-    // the data — a separate defect, tracked as out of scope for the score
-    // contract because it concerns what NaN contributes to a *fitted baseline*,
-    // not how it is scored.
+    // Scoped to the pointwise detectors, which can be fitted on the fixture
+    // as given. EWMA and CUSUM fit their baseline from the head of the series, so
+    // a NaN there leaves no baseline to score against; that they keep their
+    // running state across a NaN later in the series is pinned by their own tests.
     for case in method_cases() {
         let mut values = baseline(64);
         values[7] = f64::NAN;

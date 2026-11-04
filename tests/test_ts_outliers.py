@@ -5,7 +5,7 @@ from typing import List, Any
 import pytest
 from valkey import ResponseError, StrictValkey
 
-from outlier_result import AnomalyEntry, TSOutliersFullResult, TSOutliersCleanedResult
+from outlier_result import AnomalyEntry, AnomalyMethod, TSOutliersFullResult, TSOutliersCleanedResult
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase, ValkeyTimeSeriesTestCaseDebugMode
 from valkeytestframework.conftest import resource_port_tracker
 from valkeytestframework.util.waiters import *
@@ -80,6 +80,28 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
         )
 
         assert len(TSOutliersFullResult.parse(result).samples) == 3
+
+    def test_outliers_without_method_defaults_to_zscore(self):
+        key = 'test:outliers:default_method'
+        create_series_with_outliers(self.client, key)
+        plain = self.client.execute_command('TS.OUTLIERS', key, '-', '+')
+        explicit = self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore', 'THRESHOLD', 3.0)
+        assert plain == explicit
+
+        # FULL output carries every score and the method name, so a different default would show.
+        plain_full = self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'OUTPUT', 'full')
+        explicit_full = self.client.execute_command(
+            'TS.OUTLIERS', key, '-', '+', 'OUTPUT', 'full', 'METHOD', 'zscore', 'THRESHOLD', 3.0)
+        assert plain_full == explicit_full
+        assert TSOutliersFullResult.parse(plain_full).method == AnomalyMethod.ZSCORE
+
+    def test_auto_seasonality_with_a_gap_is_documented_as_compressed(self):
+        """Review Focus 1: a NaN gap closes up before decomposition; the reply must still have one entry per sample."""
+        key = 'test:outliers:seasonality:gap'
+        for i in range(96):
+            self.client.execute_command('TS.ADD', key, 1000 + i * 1000, 'nan' if i == 40 else math.sin(i * math.tau / 24))
+        res = TSOutliersFullResult.parse(self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'OUTPUT', 'full', 'METHOD', 'zscore', 'SEASONALITY', 'auto'))
+        assert len(res.samples) == 96 and math.isnan(res.samples[40].score)
 
     def test_background_detection_runs_inline_inside_multi(self):
         """A detection large enough for the analysis lane cannot block a client inside

@@ -1,4 +1,4 @@
-use super::utils::{deviation_and_fence_distance, normalize_evidence, normalize_value};
+use super::utils::{deviation_and_fence_distance, normalize_evidence};
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::math::quantile_sorted;
 use crate::analysis::outliers::{
@@ -22,7 +22,8 @@ pub struct IQROutlierDetector {
 
 impl IQROutlierDetector {
     pub fn new(ts: &[f64], threshold: f64) -> Self {
-        let mut sorted_values: Vec<f64> = ts.iter().map(|&x| normalize_value(x)).collect();
+        // A missing reading is left out of the quartiles rather than counted as a zero.
+        let mut sorted_values: Vec<f64> = ts.iter().copied().filter(|x| !x.is_nan()).collect();
         sorted_values.sort_by(|&a, &b| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal));
 
         // Hyndman & Fan type 7: interpolated between the order statistics either
@@ -134,6 +135,24 @@ mod tests {
 
         assert_eq!(detector.classify(detector.center), AnomalySignal::None);
         assert_eq!(detector.score(detector.center), 0.0);
+    }
+
+    /// A missing reading is left out of the quartiles, not counted as a zero: the
+    /// fit over a series with gaps is the fit over the series without them.
+    #[test]
+    fn nan_samples_are_left_out_of_the_fit() {
+        let values: Vec<f64> = (0..24).map(|i| 40.0 + (i % 6) as f64).collect();
+        let mut with_gaps = values.clone();
+        with_gaps.insert(3, f64::NAN);
+        with_gaps.insert(17, f64::NAN);
+        with_gaps.push(f64::NAN);
+
+        let clean = IQROutlierDetector::new(&values, IQR_DEFAULT_THRESHOLD);
+        let gapped = IQROutlierDetector::new(&with_gaps, IQR_DEFAULT_THRESHOLD);
+
+        assert_eq!(gapped.lower_fence, clean.lower_fence);
+        assert_eq!(gapped.upper_fence, clean.upper_fence);
+        assert_eq!(gapped.center, clean.center);
     }
 
     #[test]

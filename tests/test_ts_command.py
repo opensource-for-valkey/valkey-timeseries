@@ -54,7 +54,7 @@ class TestTimeSeriesCommand(ValkeyTimeSeriesTestCaseBase):
         "TS.LABELSTATS":  (-1, 0,  0, 0, [b"readonly", b"module"]),
         "TS.CREATERULE":  (-6, 1,  2, 1, [b"write", b"denyoom", b"module"]),
         "TS.DELETERULE":   (3, 1,  2, 1, [b"write", b"denyoom", b"module"]),
-        "TS.OUTLIERS":    (-6, 1,  1, 1, [b"readonly", b"module"]),
+        "TS.OUTLIERS":    (-4, 1,  1, 1, [b"readonly", b"module"]),
     }
 
     def command_info(self, command):

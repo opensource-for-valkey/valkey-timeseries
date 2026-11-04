@@ -1,6 +1,4 @@
-use super::utils::{
-    detect_own_departures, normalize_evidence, normalize_value, snap_dust, usable_fence_distance,
-};
+use super::utils::{detect_own_departures, normalize_evidence, snap_dust, usable_fence_distance};
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::math::calculate_mean_std_dev;
 use crate::analysis::outliers::{
@@ -108,8 +106,13 @@ impl CusumOutlierDetector {
         let mut cusum_neg = 0.0;
 
         for (index, &v) in ts.iter().enumerate() {
-            let value = normalize_value(v);
-            let deviation = (value - self.target) / self.std_dev;
+            // A missing reading is not an observation: both arms keep their value,
+            // so the gap neither relieves nor adds to a drift under way.
+            if v.is_nan() {
+                scores.push(0.0);
+                continue;
+            }
+            let deviation = (v - self.target) / self.std_dev;
             cusum_pos = f64::max(0.0, cusum_pos + deviation - self.k);
             cusum_neg = f64::max(0.0, cusum_neg - deviation - self.k);
 
@@ -368,6 +371,53 @@ mod tests {
 
         // Should handle NaN values gracefully
         assert_eq!(anomaly_result.scores.len(), 3);
+    }
+
+    /// A missing reading is not an observation: both arms keep the value they had,
+    /// so the gap neither relieves nor adds to a drift under way. Scores and flags
+    /// after the gap are those of the series with the gap removed.
+    #[test]
+    fn test_nan_leaves_the_accumulators_untouched() {
+        let detector = CusumOutlierDetector::with_params(0.0, 1.0);
+        let shifted = vec![1.5; 12];
+        let mut with_gap = shifted.clone();
+        with_gap.insert(4, f64::NAN);
+
+        let clean = detector.detect(&shifted).unwrap();
+        let gapped = detector.detect(&with_gap).unwrap();
+
+        assert!(
+            !clean.anomalies.is_empty(),
+            "the drift must reach the limit"
+        );
+        let mut expected_scores = clean.scores.clone();
+        expected_scores.insert(4, 0.0);
+        assert_eq!(gapped.scores, expected_scores);
+
+        let place = |index: usize| if index < 4 { index } else { index + 1 };
+        let expected_flags: Vec<_> = clean
+            .anomalies
+            .iter()
+            .map(|a| (place(a.index), a.signal, a.score))
+            .collect();
+        let flags: Vec<_> = gapped
+            .anomalies
+            .iter()
+            .map(|a| (a.index, a.signal, a.score))
+            .collect();
+        assert_eq!(flags, expected_flags);
+        assert!(gapped.anomalies.iter().all(|a| a.index != 4));
+    }
+
+    /// Zero-width limits take the same view of a gap: nothing to score, nothing to flag.
+    #[test]
+    fn test_nan_is_not_a_departure_when_the_scale_has_collapsed() {
+        let detector = CusumOutlierDetector::with_params(5.0, 0.0);
+
+        let result = detector.detect(&[5.0, f64::NAN, 5.0]).unwrap();
+
+        assert_eq!(result.scores, vec![0.0; 3]);
+        assert!(result.anomalies.is_empty());
     }
 
     #[test]

@@ -55,7 +55,7 @@ enum ZScoreType {
 
 acl_categories!(TS_OUTLIERS, "ts.outliers", "read timeseries");
 /// TS.OUTLIERS key fromTimestamp toTimestamp
-///     METHOD <method> [method-specific-options]
+///     [METHOD <method> [method-specific-options]]
 ///     [OUTPUT <full|simple|cleaned>]
 ///     [DIRECTION <positive|negative|both>]
 ///     [SEASONALITY <period1> [period2] ...]
@@ -63,9 +63,9 @@ acl_categories!(TS_OUTLIERS, "ts.outliers", "read timeseries");
     name: "ts.outliers",
     flags: [ReadOnly],
     summary: "Detect outlier samples in a time series over a timestamp range.",
-    complexity: "O(N) where N is the number of samples in the requested range.",
+    complexity: "O(N log N) for the fence-based methods; ESD O(N*MAX_OUTLIERS), RCF O(N*NUM_TREES*log(SAMPLE_SIZE)), multi-period SEASONALITY O(N^2).",
     since: "1.0.0",
-    arity: -6,
+    arity: -4,
     key_spec: [{
         flags: [ReadOnly, Access],
         begin_search: Index({ index: 1 }),
@@ -73,7 +73,7 @@ acl_categories!(TS_OUTLIERS, "ts.outliers", "read timeseries");
     }]
 })]
 pub fn ts_outliers_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
-    if args.len() < 6 {
+    if args.len() < 4 {
         return Err(ValkeyError::WrongArity);
     }
 

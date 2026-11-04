@@ -828,15 +828,18 @@ class TestRCFOutlierDetector(ValkeyTimeSeriesTestCaseBase):
                 "METHOD", "rcf",
             )
 
-    def test_rcf_missing_method_raises_wrong_arity(self):
-        """Omitting METHOD entirely causes a wrong-arity or missing-argument error."""
-        key = "rcf:error:no_method"
+    def test_rcf_omitted_method_defaults_to_zscore(self):
+        """Omitting METHOD runs the default ZSCORE THRESHOLD 3.0, not the forest."""
+        key = "rcf:options:no_method"
         data = _baseline_with_spikes(n_baseline=120, spike_indices=[60], spike=500.0)
         _add(self.client, key, 1_000, data)
 
-        with pytest.raises(Exception):
-            # Too few args; the command requires at least key, from, to, and METHOD
-            self.client.execute_command("TS.OUTLIERS", key, "-", "+")
+        plain = self.client.execute_command("TS.OUTLIERS", key, "-", "+")
+        explicit = self.client.execute_command(
+            "TS.OUTLIERS", key, "-", "+", "METHOD", "zscore", "THRESHOLD", 3.0,
+        )
+        assert plain == explicit
+        assert plain, "the spike must be reported"
 
     # ── score properties ──────────────────────────────────────────────────────
 

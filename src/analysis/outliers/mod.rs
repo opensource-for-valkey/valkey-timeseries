@@ -423,9 +423,14 @@ pub trait AnomalyDetector {
     /// - RCF's warmup window (`0..output_after`),
     /// - the smoothed z-score's first `lag` samples.
     ///
-    /// `±∞` observations are maximally anomalous: they score `1.0` and are
-    /// flagged. `NaN` observations score `0.0` and are never flagged — a missing
-    /// reading is not evidence of an anomaly.
+    /// # Non-finite observations
+    ///
+    /// Through [`detect_anomalies`] non-finite samples never reach a detector:
+    /// they are excluded first and reported with a `NaN` score. A detector called
+    /// directly treats `±∞` as maximally anomalous: it scores `1.0` and is
+    /// flagged. `NaN` is a missing reading, not evidence of an anomaly: it scores
+    /// `0.0` and is never flagged, and the sequential methods (CUSUM, EWMA) leave
+    /// their running state as it was.
     fn detect(&mut self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult>;
 }
 
