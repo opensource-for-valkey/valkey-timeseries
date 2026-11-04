@@ -1,4 +1,6 @@
-use super::utils::{normalize_evidence, normalize_value, snap_dust, usable_fence_distance};
+use super::utils::{
+    detect_own_departures, normalize_evidence, normalize_value, snap_dust, usable_fence_distance,
+};
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::math::calculate_mean_std_dev;
 use crate::analysis::outliers::{
@@ -75,34 +77,6 @@ impl CusumOutlierDetector {
         self.decision_distance() > 0.0
     }
 
-    /// A collapsed baseline has no sigma to standardize by, and with no slack an
-    /// arm would never decay, so one spike would flag the whole tail. Each sample
-    /// is tested on its own departure against the zero-width boundary instead.
-    fn detect_collapsed(&self, ts: &[f64]) -> (Vec<f64>, Vec<Anomaly>) {
-        let mut scores = Vec::with_capacity(ts.len());
-        let mut anomalies = Vec::new();
-        for (index, &v) in ts.iter().enumerate() {
-            let departure = normalize_value(v) - self.target;
-            let evidence = snap_dust(departure.abs(), self.target);
-            let score = normalize_evidence(evidence, 0.0);
-            scores.push(score);
-            if evidence > 0.0 {
-                let signal = if departure > 0.0 {
-                    AnomalySignal::Positive
-                } else {
-                    AnomalySignal::Negative
-                };
-                anomalies.push(Anomaly {
-                    index,
-                    value: v,
-                    signal,
-                    score,
-                });
-            }
-        }
-        (scores, anomalies)
-    }
-
     pub fn detect(&self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
         let n = ts.len();
 
@@ -114,7 +88,7 @@ impl CusumOutlierDetector {
             // An unusable fit has nothing to test against; a collapsed one has
             // zero-width limits.
             let (scores, anomalies) = if self.decision_distance() == 0.0 {
-                self.detect_collapsed(ts)
+                detect_own_departures(ts, self.target)
             } else {
                 (vec![0.0; n], Vec::new())
             };

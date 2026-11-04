@@ -336,10 +336,11 @@ grows, but only degenerate or non-finite input reaches it exactly:
 * A `NaN` sample scores `0.0` and is never flagged — a missing reading is not evidence of an anomaly.
 * When a method's fitted scale collapses (it is zero, or so small relative to the center that it is lost to rounding),
   all of `MAD`, `DOUBLE-MAD`, `IQR`, `ZSCORE`, `MODIFIED-ZSCORE`, `CUSUM`, and `EWMA` treat the limits as zero-width: any
-  real departure from the center scores `1.0` and is flagged. The test is relative to the center, so a series gets the
-  same verdict whatever unit it is stored in. Departures that are only floating-point rounding error do not count, so a
-  constant series flags nothing. A collapsed `CUSUM` has no sigma to accumulate in, so it tests each sample on its own
-  departure rather than flagging everything after the first one.
+  departure from the center scores `1.0` and is flagged. The test is relative to the center, so a series gets the same
+  verdict whatever unit it is stored in. `ZSCORE`, `MODIFIED-ZSCORE`, `CUSUM`, and `EWMA` do not count departures that
+  are only floating-point rounding error; `MAD`, `DOUBLE-MAD`, and `IQR` make no such allowance. A collapsed `CUSUM` or
+  `EWMA` has no sigma to accumulate or smooth in, so it tests each sample on its own departure: a lone spike flags that
+  sample and not the clean samples after it.
 
 The `THRESHOLD` echoed back in `parameters` stays on the **method's own** scale — standard deviations for `ZSCORE`, `k`
 for `MAD`, the decision interval for `CUSUM`, a fraction for `CONTAMINATION`. It is not on the score scale, and under

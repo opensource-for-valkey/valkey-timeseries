@@ -939,6 +939,7 @@ fn constant_series_with_rounding_in_its_mean_flags_nothing() {
                 AnomalyDetectionMethodOptions::Ewma(Some(0.3)),
                 AnomalyDetectionMethodOptions::Ewma(Some(1.0)),
                 AnomalyDetectionMethodOptions::ZScore(None),
+                AnomalyDetectionMethodOptions::ZScore(Some(0.5)),
                 AnomalyDetectionMethodOptions::ModifiedZScore(None),
             ] {
                 let label = format!("{options:?} on {n} x {level}");
@@ -984,31 +985,52 @@ fn constant_series_with_seasonality_flags_nothing() {
     }
 }
 
-/// With a collapsed baseline CUSUM has no slack to bleed an arm off with, so
-/// accumulating would flag the whole tail after one spike. Each sample answers
-/// for its own departure instead, in the direction it departs.
+/// With a collapsed baseline neither SPC method has a sigma to work in. CUSUM has
+/// no slack to bleed an arm off with, so accumulating would flag the whole tail
+/// after one spike, and a decaying EWMA would stay outside zero-width limits long
+/// after the spike has passed. Each sample answers for its own departure instead,
+/// in the direction it departs.
 #[test]
-fn collapsed_cusum_flags_only_the_samples_that_depart() {
+fn collapsed_spc_methods_flag_only_the_samples_that_depart() {
     let mut values = vec![5.0; 200];
     values[150] = 500.0;
     values[170] = -500.0;
 
-    let result = detect(&values, AnomalyDetectionMethodOptions::Cusum);
+    for options in [
+        AnomalyDetectionMethodOptions::Cusum,
+        AnomalyDetectionMethodOptions::Ewma(Some(0.05)),
+        AnomalyDetectionMethodOptions::Ewma(Some(0.3)),
+    ] {
+        let name = format!("{options:?}");
+        let result = detect(&values, options);
 
-    let signals: Vec<(usize, AnomalySignal)> = result
-        .anomalies
-        .iter()
-        .map(|a| (a.index, a.signal))
-        .collect();
-    assert_eq!(
-        signals,
-        vec![
-            (150, AnomalySignal::Positive),
-            (170, AnomalySignal::Negative)
-        ]
-    );
-    assert_eq!(result.scores[150], 1.0);
-    assert_eq!(result.scores[151], 0.0);
+        let signals: Vec<(usize, AnomalySignal)> = result
+            .anomalies
+            .iter()
+            .map(|a| (a.index, a.signal))
+            .collect();
+        assert_eq!(
+            signals,
+            vec![
+                (150, AnomalySignal::Positive),
+                (170, AnomalySignal::Negative)
+            ],
+            "{name}"
+        );
+        assert_eq!(result.scores[150], 1.0, "{name}");
+        assert_eq!(result.scores[151], 0.0, "{name}");
+    }
+}
+
+#[test]
+fn collapsed_ewma_flags_a_spike_and_nothing_after_it() {
+    let mut values = vec![5.0; 200];
+    values[150] = 500.0;
+
+    let result = detect(&values, AnomalyDetectionMethodOptions::Ewma(Some(0.3)));
+
+    let indices: Vec<usize> = result.anomalies.iter().map(|a| a.index).collect();
+    assert_eq!(indices, vec![150]);
 }
 
 /// A tiny standard deviation around a tiny center is a real scale. An absolute

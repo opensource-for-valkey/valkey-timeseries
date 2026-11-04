@@ -1,5 +1,6 @@
 use super::utils::{
-    normalize_evidence, normalize_value, snap_dust, snap_dust_if_collapsed, usable_fence_distance,
+    detect_own_departures, normalize_evidence, normalize_value, snap_dust, snap_dust_if_collapsed,
+    usable_fence_distance,
 };
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::math::{calculate_mean, calculate_std_dev};
@@ -46,8 +47,33 @@ impl EwmaOutlierDetector {
     }
 
     pub fn detect(&self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
-        let n = ts.len();
-        let mut scores = Vec::with_capacity(n);
+        let (scores, anomalies) = if self.is_collapsed() {
+            detect_own_departures(ts, self.target)
+        } else {
+            self.detect_smoothed(ts)
+        };
+
+        let distance = self.multiplier * self.sigma;
+        Ok(AnomalyResult {
+            scores,
+            anomalies,
+            threshold: self.multiplier,
+            method: AnomalyMethod::Ewma,
+            method_info: Some(MethodInfo::Spc {
+                control_limits: (self.target - distance, self.target + distance),
+                center_line: self.target,
+            }),
+        })
+    }
+
+    /// True when the fitted sigma leaves the control limits with zero width.
+    fn is_collapsed(&self) -> bool {
+        self.target.is_finite()
+            && usable_fence_distance(self.target, self.multiplier * self.sigma) == 0.0
+    }
+
+    fn detect_smoothed(&self, ts: &[f64]) -> (Vec<f64>, Vec<Anomaly>) {
+        let mut scores = Vec::with_capacity(ts.len());
         let mut anomalies: Vec<Anomaly> = Vec::with_capacity(4);
 
         let mut ewma = self.target;
@@ -69,9 +95,9 @@ impl EwmaOutlierDetector {
             // Both grow with the observation index, which is why the limits are
             // recomputed each step rather than fixed at `multiplier * sigma`.
             //
-            // A collapsed limit is zero-width, so any real departure is flagged.
-            // The fitted target carries rounding error of its own, which must not
-            // read as a departure.
+            // Even with a real sigma, the limit can be lost to rounding in the
+            // target while it is still narrow. Rounding error in the average must
+            // not read as a departure then.
             let boundary = usable_fence_distance(self.target, self.multiplier * ewma_std);
             let deviation = snap_dust_if_collapsed(ewma - self.target, boundary, self.target);
 
@@ -100,17 +126,7 @@ impl EwmaOutlierDetector {
             }
         }
 
-        let distance = self.multiplier * self.sigma;
-        Ok(AnomalyResult {
-            scores,
-            anomalies,
-            threshold: self.multiplier,
-            method: AnomalyMethod::Ewma,
-            method_info: Some(MethodInfo::Spc {
-                control_limits: (self.target - distance, self.target + distance),
-                center_line: self.target,
-            }),
-        })
+        (scores, anomalies)
     }
 }
 

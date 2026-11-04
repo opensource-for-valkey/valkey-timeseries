@@ -1,5 +1,4 @@
-#[cfg(test)]
-use crate::analysis::outliers::AnomalySignal;
+use crate::analysis::outliers::{Anomaly, AnomalySignal};
 
 /// Map `evidence` against a detection `boundary` onto `[0, 1]`, with `0.5` at the
 /// boundary.
@@ -156,6 +155,37 @@ pub(super) fn snap_dust_if_collapsed(deviation: f64, boundary: f64, center: f64)
     } else {
         deviation
     }
+}
+
+/// Scores and anomalies for an SPC chart whose baseline scale has collapsed.
+///
+/// There is no sigma to accumulate in, and carrying state would keep clean samples
+/// flagged after a spike: a CUSUM arm with no slack never decays, and a decaying
+/// EWMA stays outside zero-width limits until it reaches the dust floor. Each sample
+/// is tested on its own departure from `target`, in the direction it departs.
+pub(super) fn detect_own_departures(ts: &[f64], target: f64) -> (Vec<f64>, Vec<Anomaly>) {
+    let mut scores = Vec::with_capacity(ts.len());
+    let mut anomalies = Vec::new();
+    for (index, &v) in ts.iter().enumerate() {
+        let departure = normalize_value(v) - target;
+        let evidence = snap_dust(departure.abs(), target);
+        let score = normalize_evidence(evidence, 0.0);
+        scores.push(score);
+        if evidence > 0.0 {
+            let signal = if departure > 0.0 {
+                AnomalySignal::Positive
+            } else {
+                AnomalySignal::Negative
+            };
+            anomalies.push(Anomaly {
+                index,
+                value: v,
+                signal,
+                score,
+            });
+        }
+    }
+    (scores, anomalies)
 }
 
 #[inline]
