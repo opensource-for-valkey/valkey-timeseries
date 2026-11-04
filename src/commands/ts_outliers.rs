@@ -1,8 +1,8 @@
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetectionMethodOptions, AnomalyDirection, AnomalyMethod, AnomalyOptions,
-    AnomalyResult, ESDOutlierOptions, EWMA_DEFAULT_ALPHA, EsdEstimator, MADAnomalyOptions,
-    MethodInfo, RCF_DEFAULT_NUM_TREES, RCF_DEFAULT_SAMPLE_SIZE, RCFOptions, RCFThreshold,
-    SmoothedZScoreOptions, detect_anomalies,
+    AnomalyResult, ESD_MAX_ITERATIONS, ESDOutlierOptions, EWMA_DEFAULT_ALPHA, EsdEstimator,
+    MADAnomalyOptions, MethodInfo, RCF_DEFAULT_NUM_TREES, RCF_DEFAULT_SAMPLE_SIZE, RCFOptions,
+    RCFThreshold, SmoothedZScoreOptions, detect_anomalies,
 };
 use crate::analysis::seasonality::{MAX_SEASONALITY_PERIODS, MIN_SEASONALITY_PERIOD, Seasonality};
 use crate::commands::analysis_runner::{reserve_analysis_slot, run_reserved_on_analysis_lane};
@@ -139,8 +139,9 @@ fn process_request(
     anomaly_direction: AnomalyDirection,
     output_format: OutputFormat,
 ) -> ValkeyResult {
-    // Everything that can refuse the request runs before the decode, which is the expensive part
-    // on the main thread: the sample cap, the RCF budget and, for the lane, its queue place.
+    // Everything that can refuse without the samples runs before the decode, which is the
+    // expensive part on the main thread: the sample cap, the RCF budget and, for the lane, its
+    // queue place.
     let (samples, lane_slot) = {
         let series = get_timeseries(ctx, &key, Some(AclPermissions::ACCESS))?;
         let (start, end) = date_range.get_series_range(&series, None, false);
@@ -616,7 +617,7 @@ fn parse_esd_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
                     args,
                     "MAX_OUTLIERS",
                     1,
-                    usize::MAX,
+                    ESD_MAX_ITERATIONS,
                 )?);
             },
             _ => {

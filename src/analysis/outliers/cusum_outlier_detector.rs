@@ -1,6 +1,6 @@
 use super::utils::{detect_own_departures, normalize_evidence, snap_dust, usable_fence_distance};
 use crate::analysis::TimeSeriesAnalysisResult;
-use crate::analysis::math::calculate_mean_std_dev;
+use crate::analysis::math::{calculate_mean_std_dev, is_constant};
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo,
 };
@@ -154,8 +154,10 @@ impl CusumOutlierDetector {
     /// they stay on the same scale as the `center_line` reported alongside them.
     fn method_info(&self) -> MethodInfo {
         let limit = self.h * self.std_dev;
+        // Not `-limit`: negating a collapsed limit would report `-0`.
+        let lower = if limit == 0.0 { 0.0 } else { -limit };
         MethodInfo::Spc {
-            control_limits: (-limit, limit),
+            control_limits: (lower, limit),
             center_line: self.target,
         }
     }
@@ -167,9 +169,15 @@ fn fit_baseline(ts: &[f64]) -> (f64, f64) {
     let training_size = ((ts.len() as f64 * 0.5).min(100.0) as usize)
         .max(2)
         .min(ts.len());
-    let (target, std_dev) = calculate_mean_std_dev(&ts[0..training_size]);
-    // The mean of a constant head is a few ULPs off, which makes its standard
-    // deviation that same rounding error rather than zero. That is no scale.
+    let head = &ts[0..training_size];
+    // A constant head has an exact answer. The computed mean is a few ULPs off, which
+    // makes the standard deviation that same rounding error rather than zero, and puts
+    // the target beside the value it was fitted to.
+    let (target, std_dev) = match head.first() {
+        Some(&first) if is_constant(head) => (first, 0.0),
+        _ => calculate_mean_std_dev(head),
+    };
+    // The floor stays as a backstop for a head that is constant but for rounding.
     (target, snap_dust(std_dev, target))
 }
 
@@ -591,5 +599,61 @@ mod tests {
         } else {
             panic!("Expected Spc method info");
         }
+    }
+
+    /// A constant head has an exact answer: its own value, with no scale. The computed
+    /// mean of such a head is a few ULPs off, which the dust floor would hide in the
+    /// scale but not in the target.
+    #[test]
+    fn fit_baseline_of_a_constant_head_is_exact() {
+        for value in [0.1, 1.0 / 3.0, 1e-3, 123_456.789, -7.7] {
+            let mut ts = vec![value; 100];
+            ts.extend((0..100).map(|i| value + (i as f64 * 0.1).sin()));
+            assert_eq!(fit_baseline(&ts), (value, 0.0), "value {value}");
+        }
+    }
+
+    /// A collapsed chart reports zero-width limits, and the lower bound is `0.0`, not
+    /// the `-0.0` that negating a zero produces.
+    #[test]
+    fn collapsed_method_info_reports_unsigned_zero_limits() {
+        let result = CusumOutlierDetector::with_params(5.0, 0.0)
+            .detect(&[5.0, 5.0])
+            .unwrap();
+        let Some(MethodInfo::Spc {
+            control_limits,
+            center_line,
+        }) = result.method_info
+        else {
+            panic!("Expected Spc method info");
+        };
+        assert_eq!(center_line, 5.0);
+        assert_eq!(control_limits, (0.0, 0.0));
+        assert!(
+            control_limits.0.is_sign_positive(),
+            "lower limit is {:?}",
+            control_limits.0
+        );
+    }
+
+    /// Each arm decays by `k` sigma per sample, so a lone spike of `s` sigma keeps
+    /// flagging for about `2 * (s - h)` of the samples after it. The docs say so.
+    #[test]
+    fn a_lone_spike_keeps_flagging_while_the_arm_decays() {
+        let detector = CusumOutlierDetector::with_params(0.0, 1.0);
+        let mut ts = vec![0.0; 200];
+        ts[100] = 30.0;
+
+        let flagged: Vec<usize> = detector
+            .detect(&ts)
+            .unwrap()
+            .anomalies
+            .iter()
+            .map(|a| a.index)
+            .collect();
+
+        // The arm is 29.5 after the spike and loses 0.5 per sample; it is above h = 5
+        // for the 48 samples that follow.
+        assert_eq!(flagged, (100..=148).collect::<Vec<_>>());
     }
 }

@@ -82,6 +82,10 @@ SEASONALITY [AUTO | period1 ...]
 * Non-finite samples are removed before decomposition, so a gap shifts every later sample's phase; fill gaps upstream
   if phase matters.
 
+**Caveat:** on a series that is flat apart from a spike, the decomposition leaves numeric noise in the residuals, so the
+robust methods (those built on the median, the MAD or quartiles) can flag many samples. Prefer running such a series
+without `SEASONALITY`.
+
 **Example:** `SEASONALITY 24 168` adjusts for daily (24 hours) and weekly (168 hours) patterns in hourly data.
 </details>
 
@@ -101,8 +105,14 @@ METHOD CUSUM
 
 Detects shifts in the mean by accumulating deviations from the target. No additional options.
 
-Every sample while an arm stays above `h` is reported; a sustained shift reports the whole shifted tail. CUSUM is a
-change detector, not a point-outlier detector.
+The target and the standard deviation are fitted on the first `min(n/2, 100)` samples (`n` counts the finite samples in
+the range); everything after is tested against that baseline. A constant head fits a zero standard deviation and so
+gives zero-width limits: every later sample that differs from it is reported.
+
+Every sample while an arm stays above `h` is reported; a sustained shift reports the whole shifted tail. An arm also
+decays by `k = 0.5` sigma per sample once the series is back on target, so a lone spike of `s` sigma keeps flagging for
+about `2 × (s − 5)` of the samples after it (`h` is 5 sigma; roughly `2s` for a large spike): one spike on a flat or
+very regular series can report a long trailing run. CUSUM is a change detector, not a point-outlier detector.
 
 ---
 
@@ -119,8 +129,8 @@ METHOD ESD [ALPHA alpha] [MAX_OUTLIERS max] [HYBRID | CLASSIC]
 * `ALPHA` - Significance level for the test, in the range `(0, 1)`. Default: `0.05`. Lower values are more conservative
   and report fewer outliers.
 * `MAX_OUTLIERS` - Upper bound on how many outliers to search for. Must be a positive integer, less than half the
-  number of samples in the range, and at most `1000`. Default: `min(n/2, 100)`, where `n` is the number of samples in
-  the range; pass a larger value explicitly if you expect more than 100 outliers.
+  number of finite samples in the range, and at most `1000`. Default: `min(n/2, 100)`, where `n` is the number of
+  finite samples in the range; pass a larger value explicitly if you expect more than 100 outliers.
 * `HYBRID` - Studentize against the median and a normal-consistent MAD. **Default.** Robust: the reference point barely
   moves as outliers are removed.
 * `CLASSIC` - Studentize against the mean and sample standard deviation, as in Rosner's original procedure. Both are
@@ -154,6 +164,10 @@ METHOD EWMA [ALPHA alpha]
 **Options:**
 
 * `ALPHA` - Smoothing factor, in the range `(0, 1]`. Default: `0.3`. Higher values give more weight to recent observations.
+
+The target and sigma are fitted on the first `min(n/2, 100)` samples (`n` counts the finite samples in the range);
+everything after is tested against that baseline. A constant head fits a zero sigma and so gives zero-width limits:
+every later sample that differs from it is reported.
 
 ---
 
