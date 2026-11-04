@@ -167,6 +167,9 @@ METHOD IQR [THRESHOLD k]
 * `THRESHOLD` - IQR multiplier for fence boundaries. Default: `1.5`. Values beyond `Q1 - k×IQR` or `Q3 + k×IQR` are
   outliers.
 
+Q1 and Q3 are the 25th and 75th percentiles, linearly interpolated between neighbouring samples (Hyndman and Fan
+type 7, the default of R and NumPy).
+
 ---
 
 #### ZSCORE
