@@ -2,7 +2,7 @@ use super::utils::{
     detect_own_departures, normalize_evidence, snap_dust, snap_dust_if_collapsed,
     usable_fence_distance,
 };
-use crate::analysis::math::{calculate_mean, calculate_std_dev};
+use crate::analysis::math::{calculate_mean, calculate_std_dev, is_constant};
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo,
 };
@@ -44,10 +44,18 @@ impl EwmaOutlierDetector {
             .min(ts.len());
         let training_data = &ts[0..training_size];
 
-        let target = calculate_mean(training_data);
-        // The mean of a constant head is a few ULPs off, which makes its standard
-        // deviation that same rounding error rather than zero. That is no scale.
-        let sigma = snap_dust(calculate_std_dev(training_data), target);
+        // A constant head has an exact answer. The computed mean is a few ULPs off, which
+        // makes the standard deviation that same rounding error rather than zero, and puts
+        // the target beside the value it was fitted to.
+        let (target, sigma) = match training_data.first() {
+            Some(&first) if is_constant(training_data) => (first, 0.0),
+            _ => (
+                calculate_mean(training_data),
+                calculate_std_dev(training_data),
+            ),
+        };
+        // The floor stays as a backstop for a head that is constant but for rounding.
+        let sigma = snap_dust(sigma, target);
         let multiplier = 3.0;
 
         Ok(EwmaOutlierDetector {
@@ -615,6 +623,19 @@ mod tests {
         );
         for scale in [1e-200, 1e200] {
             assert_eq!(flagged_at(scale), reference, "scale {scale:e}");
+        }
+    }
+
+    /// A constant head has an exact answer: its own value, with no scale. The computed
+    /// mean of such a head is a few ULPs off, which the dust floor would hide in the
+    /// sigma but not in the target.
+    #[test]
+    fn from_series_fits_a_constant_head_exactly() {
+        for value in [0.1, 1.0 / 3.0, 1e-3, 123_456.789, -7.7] {
+            let mut ts = vec![value; 100];
+            ts.extend((0..100).map(|i| value + (i as f64 * 0.1).sin()));
+            let d = EwmaOutlierDetector::from_series(&ts, EWMA_DEFAULT_ALPHA).unwrap();
+            assert_eq!((d.target, d.sigma), (value, 0.0), "value {value}");
         }
     }
 

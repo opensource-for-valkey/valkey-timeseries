@@ -201,6 +201,14 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
             with pytest.raises(ResponseError):
                 self.client.execute_command('TS.OUTLIERS', key, '-', '+', *args)
 
+    def test_esd_max_outliers_above_the_cap_is_refused_at_parse_time(self):
+        """The documented 1..1000 range is enforced by the parser, before a lane slot or the decode."""
+        key = 'test:outliers:validation:max_outliers'
+        create_normal_series(self.client, key, count=50)
+        for value in (0, 1001, 18446744073709551615):
+            with pytest.raises(ResponseError, match="MAX_OUTLIERS must be between 1 and 1000"):
+                self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'esd', 'MAX_OUTLIERS', value)
+
     def test_option_validation_accepts_boundary_values(self):
         """The closed ends of the documented ranges are valid."""
         key = 'test:outliers:validation:bounds'
@@ -263,6 +271,38 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
         positive_count = sum(1 for entry in outliers if entry.signal == 1)
         assert positive_count >= 4
 
+
+    def test_spc_baseline_is_fitted_on_the_first_hundred_samples(self):
+        """CUSUM and EWMA fit target and sigma on the first min(n/2, 100) samples (documented).
+
+        A constant head fits a zero sigma, so the limits have no width and every later sample
+        that differs from it is reported. There is no whole-series fallback.
+        """
+        head = 100
+        values = [50.0] * head + [50.0 + math.sin(i * 0.1) for i in range(1, 201)]
+        first_after_head = 1000 + head * 1000
+
+        for method in ('cusum', 'ewma'):
+            key = f'test:outliers:spc_baseline:{method}'
+            pipe = self.client.pipeline(transaction=False)
+            for i, val in enumerate(values):
+                pipe.execute_command('TS.ADD', key, 1000 + i * 1000, val)
+            pipe.execute()
+
+            result = TSOutliersFullResult.parse(self.client.execute_command(
+                'TS.OUTLIERS', key, '-', '+', 'OUTPUT', 'full', 'METHOD', method))
+
+            flagged = result.anomalies()
+            assert len(flagged) > 150, f"{method}: {len(flagged)} flagged"
+            assert all(s.timestamp >= first_after_head for s in flagged), f"{method}: flagged inside the head"
+
+            info = result.method_info
+            assert info is not None, method
+            assert info.center_line == 50.0, method
+            low, high = info.control_limits
+            assert high - low == 0.0, f"{method}: limits {info.control_limits} have width"
+            # CUSUM reports its limits as offsets from the center: collapsed, that is 0, never -0.
+            assert math.copysign(1.0, low) > 0, f"{method}: lower limit {low!r}"
 
     def test_invalid_method(self):
         """Test with an invalid method name."""

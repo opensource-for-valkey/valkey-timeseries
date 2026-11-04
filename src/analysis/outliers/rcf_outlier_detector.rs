@@ -141,7 +141,8 @@ impl RCFOptions {
     /// full, so its run of `0.0` scores is `shingle_size - 1` points longer than
     /// `output_after`.
     pub fn first_scored_index(&self) -> usize {
-        self.effective_output_after() + self.shingle_size.unwrap_or(1).saturating_sub(1)
+        self.effective_output_after()
+            .saturating_add(self.shingle_size.unwrap_or(1).saturating_sub(1))
     }
 
     /// Heuristic: decide whether to enable parallel execution for RCF operations.
@@ -1267,11 +1268,11 @@ mod tests {
     }
 
     /// Under the default options a smooth series flags nothing in the warmup and next to
-    /// nothing after it. This holds with and without the warmup zeros in the fit, so it
-    /// guards the default warmup, not the cutoff fit: that is
-    /// `cutoffs_are_fitted_on_the_scores_after_the_warmup`.
+    /// nothing after it. It passes with or without the warmup zeros in the cutoff fit, so
+    /// it says nothing about that fit: `cutoffs_are_fitted_on_the_scores_after_the_warmup`
+    /// does.
     #[test]
-    fn warmup_zeros_do_not_shape_the_cutoff() {
+    fn smooth_series_has_no_false_positives_under_the_default_warmup() {
         let ts: Vec<f64> = (0..300).map(|i| 10.0 + (i as f64 * 0.1).sin()).collect();
         let mut d = RcfOutlierDetector::new(RCFOptions::default()).unwrap(); // output_after None -> 65
         let r = d.detect(&ts).unwrap();
@@ -1281,6 +1282,18 @@ mod tests {
             "{} flagged on a smooth series",
             r.anomalies.len()
         );
+    }
+
+    /// A warmup of `usize::MAX` plus a shingle must not overflow the index sum: the
+    /// fit start saturates, and `detect` clamps it to the series length.
+    #[test]
+    fn first_scored_index_saturates() {
+        let options = RCFOptions {
+            output_after: Some(usize::MAX),
+            shingle_size: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(options.first_scored_index(), usize::MAX);
     }
 
     /// With `OUTPUT_AFTER` unset the module and the forest must agree on the warmup, or
