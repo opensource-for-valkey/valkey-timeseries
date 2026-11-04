@@ -4,6 +4,7 @@ pub mod stl;
 #[cfg(test)]
 pub mod test_data;
 
+use crate::analysis::math::is_constant;
 use crate::analysis::seasonality::mstl::Mstl;
 use crate::analysis::seasonality::stl::Stl;
 use crate::analysis::{INSUFFICIENT_DATA_ERROR, TimeSeriesAnalysisError, TimeSeriesAnalysisResult};
@@ -66,11 +67,6 @@ pub fn seasonally_adjust(
                 TimeSeriesAnalysisError::DecompositionError("MSTL decomposition failed".to_string())
             })
     }
-}
-
-/// True when every sample is exactly equal. A NaN compares unequal, so it is never constant.
-fn is_constant(ts: &[f64]) -> bool {
-    ts.windows(2).all(|w| w[0] == w[1])
 }
 
 /// Checks every period against a series of `n` samples before any arithmetic or allocation

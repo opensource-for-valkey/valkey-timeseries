@@ -1,5 +1,5 @@
 use crate::analysis::TimeSeriesAnalysisResult;
-use crate::analysis::math::calculate_mean_std_dev;
+use crate::analysis::math::{calculate_mean_std_dev, is_constant};
 use crate::analysis::outliers::utils::{
     deviation_and_fence_distance, normalize_evidence, snap_dust_if_collapsed, usable_fence_distance,
 };
@@ -83,7 +83,13 @@ impl AnomalyDetector for ZScoreOutlierDetector {
 
     fn train(&mut self, data: &[f64]) -> TimeSeriesAnalysisResult<()> {
         // maybe use welford here ?
-        let (mean, std_dev) = calculate_mean_std_dev(data);
+        // A constant series has an exact answer. The computed mean is off by rounding,
+        // which makes every deviation about one computed std dev, so any threshold
+        // below 1 would otherwise flag every sample.
+        let (mean, std_dev) = match data.first() {
+            Some(&first) if is_constant(data) => (first, 0.0),
+            _ => calculate_mean_std_dev(data),
+        };
 
         // store computed stats
         self.mean = mean;
