@@ -1,4 +1,6 @@
-use super::utils::{normalize_evidence, normalize_value};
+use super::utils::{
+    normalize_evidence, normalize_value, snap_dust, snap_dust_if_collapsed, usable_fence_distance,
+};
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::math::{calculate_mean, calculate_std_dev};
 use crate::analysis::outliers::{
@@ -23,11 +25,16 @@ pub struct EwmaOutlierDetector {
 
 impl EwmaOutlierDetector {
     pub fn from_series(ts: &[f64], alpha: f64) -> Self {
-        let training_size = (ts.len() as f64 * 0.5).min(100.0) as usize;
+        // At least two samples: one fits a zero scale by construction.
+        let training_size = ((ts.len() as f64 * 0.5).min(100.0) as usize)
+            .max(2)
+            .min(ts.len());
         let training_data = &ts[0..training_size];
 
         let target = calculate_mean(training_data);
-        let sigma = calculate_std_dev(training_data);
+        // The mean of a constant head is a few ULPs off, which makes its standard
+        // deviation that same rounding error rather than zero. That is no scale.
+        let sigma = snap_dust(calculate_std_dev(training_data), target);
         let multiplier = 3.0;
 
         EwmaOutlierDetector {
@@ -47,7 +54,11 @@ impl EwmaOutlierDetector {
 
         for (i, &v) in ts.iter().enumerate() {
             let value = normalize_value(v);
-            ewma = self.alpha * value + (1.0 - self.alpha) * ewma;
+            // The update form, not `alpha * value + (1 - alpha) * ewma`: at a small
+            // alpha that form's rounding bias accumulates to hundreds of ULPs on a
+            // constant series, whereas here a sample equal to the average moves it
+            // by exactly nothing.
+            ewma += self.alpha * (value - ewma);
 
             let ewma_variance = self.sigma * self.sigma * self.alpha / (2.0 - self.alpha)
                 * (1.0 - (1.0 - self.alpha).powi(2 * (i as i32 + 1)));
@@ -57,26 +68,18 @@ impl EwmaOutlierDetector {
             // control limit that departure is tested against is the boundary.
             // Both grow with the observation index, which is why the limits are
             // recomputed each step rather than fixed at `multiplier * sigma`.
-            let deviation = ewma - self.target;
-            let boundary = self.multiplier * ewma_std;
-
-            // A control limit at or below rounding noise is not a limit. The
-            // EWMA recurrence carries its own error — `0.3*3.0 + 0.7*3.0` is not
-            // exactly `3.0` — so a zero-width limit would flag every point of a
-            // constant series on floating-point dust. NaN is the module's
-            // "no boundary to be past" sentinel: it scores 0.0 and fails the
-            // comparison below, so both agree that nothing is testable here.
-            let boundary = if boundary <= f64::EPSILON {
-                f64::NAN
-            } else {
-                boundary
-            };
+            //
+            // A collapsed limit is zero-width, so any real departure is flagged.
+            // The fitted target carries rounding error of its own, which must not
+            // read as a departure.
+            let boundary = usable_fence_distance(self.target, self.multiplier * ewma_std);
+            let deviation = snap_dust_if_collapsed(ewma - self.target, boundary, self.target);
 
             let score = normalize_evidence(deviation.abs(), boundary);
             scores.push(score);
 
-            // A NaN limit — the degenerate case above — fails this comparison,
-            // which is how it stays unflagged.
+            // A NaN limit — no usable sigma — fails this comparison, which is how
+            // it stays unflagged.
             let signal = if deviation.abs() > boundary {
                 if deviation > 0.0 {
                     AnomalySignal::Positive

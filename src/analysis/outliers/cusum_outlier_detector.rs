@@ -1,4 +1,4 @@
-use super::utils::{normalize_evidence, normalize_value};
+use super::utils::{normalize_evidence, normalize_value, snap_dust, usable_fence_distance};
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::math::calculate_mean_std_dev;
 use crate::analysis::outliers::{
@@ -57,11 +57,50 @@ impl CusumOutlierDetector {
         Self::with_params(target, std_dev)
     }
 
+    /// The decision interval in raw units, under the one degenerate-scale rule:
+    /// positive when the baseline supports a standardized cusum, `0.0` when its
+    /// scale has collapsed, `NaN` when the fit is unusable.
+    #[inline]
+    fn decision_distance(&self) -> f64 {
+        if self.target.is_finite() {
+            usable_fence_distance(self.target, self.h * self.std_dev)
+        } else {
+            f64::NAN
+        }
+    }
+
     /// True when the fitted baseline supports a meaningful standardized cusum.
-    /// A constant (or degenerate) baseline has no scale to measure shifts against.
     #[inline]
     fn has_valid_scale(&self) -> bool {
-        self.std_dev.is_finite() && self.std_dev > f64::EPSILON && self.target.is_finite()
+        self.decision_distance() > 0.0
+    }
+
+    /// A collapsed baseline has no sigma to standardize by, and with no slack an
+    /// arm would never decay, so one spike would flag the whole tail. Each sample
+    /// is tested on its own departure against the zero-width boundary instead.
+    fn detect_collapsed(&self, ts: &[f64]) -> (Vec<f64>, Vec<Anomaly>) {
+        let mut scores = Vec::with_capacity(ts.len());
+        let mut anomalies = Vec::new();
+        for (index, &v) in ts.iter().enumerate() {
+            let departure = normalize_value(v) - self.target;
+            let evidence = snap_dust(departure.abs(), self.target);
+            let score = normalize_evidence(evidence, 0.0);
+            scores.push(score);
+            if evidence > 0.0 {
+                let signal = if departure > 0.0 {
+                    AnomalySignal::Positive
+                } else {
+                    AnomalySignal::Negative
+                };
+                anomalies.push(Anomaly {
+                    index,
+                    value: v,
+                    signal,
+                    score,
+                });
+            }
+        }
+        (scores, anomalies)
     }
 
     pub fn detect(&self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
@@ -71,12 +110,17 @@ impl CusumOutlierDetector {
         // decision interval is used directly as the threshold.
         let threshold = self.h;
 
-        // Without a usable scale every point standardizes to infinity or NaN;
-        // report a flat, anomaly-free result rather than propagating that.
         if !self.has_valid_scale() {
+            // An unusable fit has nothing to test against; a collapsed one has
+            // zero-width limits.
+            let (scores, anomalies) = if self.decision_distance() == 0.0 {
+                self.detect_collapsed(ts)
+            } else {
+                (vec![0.0; n], Vec::new())
+            };
             return Ok(AnomalyResult {
-                scores: vec![0.0; n],
-                anomalies: Vec::new(),
+                scores,
+                anomalies,
                 threshold,
                 method: AnomalyMethod::Cusum,
                 method_info: Some(self.method_info()),
@@ -142,8 +186,14 @@ impl CusumOutlierDetector {
 
 /// Fit the baseline mean and standard deviation from the head of the series.
 fn fit_baseline(ts: &[f64]) -> (f64, f64) {
-    let training_size = (ts.len() as f64 * 0.5).min(100.0) as usize;
-    calculate_mean_std_dev(&ts[0..training_size])
+    // At least two samples: one fits a zero scale by construction.
+    let training_size = ((ts.len() as f64 * 0.5).min(100.0) as usize)
+        .max(2)
+        .min(ts.len());
+    let (target, std_dev) = calculate_mean_std_dev(&ts[0..training_size]);
+    // The mean of a constant head is a few ULPs off, which makes its standard
+    // deviation that same rounding error rather than zero. That is no scale.
+    (target, snap_dust(std_dev, target))
 }
 
 /// CUSUM implements only [`AnomalyDetector`], not [`PointDetector`]. Its whole
@@ -303,9 +353,35 @@ mod tests {
 
         let anomaly_result = detector.detect(&ts).unwrap();
 
-        // All scores should be zero when std_dev is invalid
-        for score in &anomaly_result.scores {
-            assert_eq!(*score, 0.0);
+        // A zero-variance head collapses the limits to zero width, so only the
+        // two samples that depart from it are flagged, each in its own direction.
+        let signals: Vec<(usize, AnomalySignal)> = anomaly_result
+            .anomalies
+            .iter()
+            .map(|a| (a.index, a.signal))
+            .collect();
+        assert_eq!(
+            signals,
+            vec![(5, AnomalySignal::Negative), (6, AnomalySignal::Positive)]
+        );
+        for (i, score) in anomaly_result.scores.iter().enumerate() {
+            let expected = if i == 5 || i == 6 { 1.0 } else { 0.0 };
+            assert_eq!(*score, expected, "score[{i}]");
+        }
+    }
+
+    /// Overflow in the fitted scale is not a collapse: there is no boundary at
+    /// all, so nothing is flagged.
+    #[test]
+    fn test_detect_with_unusable_scale_flags_nothing() {
+        for detector in [
+            CusumOutlierDetector::with_params(5.0, f64::INFINITY),
+            CusumOutlierDetector::with_params(f64::INFINITY, 1.0),
+            CusumOutlierDetector::with_params(f64::NAN, 1.0),
+        ] {
+            let result = detector.detect(&[5.0, 50.0, 500.0]).unwrap();
+            assert!(result.anomalies.is_empty());
+            assert_eq!(result.scores, vec![0.0; 3]);
         }
     }
 

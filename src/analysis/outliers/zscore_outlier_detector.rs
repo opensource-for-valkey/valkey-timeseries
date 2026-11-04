@@ -1,6 +1,8 @@
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::math::calculate_mean_std_dev;
-use crate::analysis::outliers::utils::{deviation_and_fence_distance, normalize_evidence};
+use crate::analysis::outliers::utils::{
+    deviation_and_fence_distance, normalize_evidence, snap_dust_if_collapsed, usable_fence_distance,
+};
 use crate::analysis::outliers::{
     AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo, PointDetector,
     detect_pointwise,
@@ -50,11 +52,12 @@ impl ZScoreOutlierDetector {
     /// the identical subtraction and scores exactly `0.5`.
     #[inline]
     fn deviation_and_boundary(&self, value: f64) -> (f64, f64) {
-        if self.std_dev < f64::EPSILON {
-            // Constant to within rounding: no scale, so nothing to be past.
-            return (value - self.mean, f64::NAN);
-        }
-        deviation_and_fence_distance(value, self.mean, self.lower_fence, self.upper_fence)
+        let (deviation, boundary) =
+            deviation_and_fence_distance(value, self.mean, self.lower_fence, self.upper_fence);
+        (
+            snap_dust_if_collapsed(deviation, boundary, self.mean),
+            boundary,
+        )
     }
 
     pub fn detect(&mut self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
@@ -86,8 +89,9 @@ impl AnomalyDetector for ZScoreOutlierDetector {
         self.mean = mean;
         self.std_dev = std_dev;
 
-        self.lower_fence = mean - self.threshold * std_dev;
-        self.upper_fence = mean + self.threshold * std_dev;
+        let delta = usable_fence_distance(mean, self.threshold * std_dev);
+        self.lower_fence = mean - delta;
+        self.upper_fence = mean + delta;
         self.is_trained = true;
         Ok(())
     }
