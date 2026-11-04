@@ -115,8 +115,9 @@ METHOD ESD [ALPHA alpha] [MAX_OUTLIERS max] [HYBRID | CLASSIC]
 
 * `ALPHA` - Significance level for the test, in the range `(0, 1)`. Default: `0.05`. Lower values are more conservative
   and report fewer outliers.
-* `MAX_OUTLIERS` - Upper bound on how many outliers to search for. Must be a positive integer, and less than half the
-  number of samples in the range. Default: `n/2`.
+* `MAX_OUTLIERS` - Upper bound on how many outliers to search for. Must be a positive integer, less than half the
+  number of samples in the range, and at most `1000`. Default: `min(n/2, 100)`, where `n` is the number of samples in
+  the range; pass a larger value explicitly if you expect more than 100 outliers.
 * `HYBRID` - Studentize against the median and a normal-consistent MAD. **Default.** Robust: the reference point barely
   moves as outliers are removed.
 * `CLASSIC` - Studentize against the mean and sample standard deviation, as in Rosner's original procedure. Both are
@@ -557,8 +558,9 @@ Detect pattern-based anomalies using a sliding window:
     * Use `DIRECTION` to filter results when only interested in one type of anomaly
     * Single seasonality periods are faster than multiple
     * RCF is more computationally expensive but better for complex patterns
-    * ESD re-tests the sample after each removal, so its cost scales with `MAX_OUTLIERS`; lower that bound if you only
-      care about the few most extreme samples
+    * ESD re-tests the sample after each removal, so its cost grows with `MAX_OUTLIERS` times the number of samples
+      (`MAX_OUTLIERS` defaults to `min(n/2, 100)` and is capped at `1000`); lower that bound if you only care about the
+      few most extreme samples
 
 ## See also
 
