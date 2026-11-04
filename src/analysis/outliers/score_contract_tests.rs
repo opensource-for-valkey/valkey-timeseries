@@ -22,6 +22,7 @@ use super::{
     detect_anomalies,
 };
 use crate::analysis::outliers::esd_outlier_detector::ESDOutlierOptions;
+use crate::analysis::seasonality::Seasonality;
 
 /// Warmup length shared by the RCF cases, so the carve-out and the options
 /// cannot drift apart.
@@ -948,6 +949,37 @@ fn constant_series_with_rounding_in_its_mean_flags_nothing() {
                     result.anomalies
                 );
             }
+        }
+    }
+}
+
+/// Decomposing a constant series leaves a remainder of pure rounding noise, and
+/// with no spread but that noise every method would read it as signal.
+#[test]
+fn constant_series_with_seasonality_flags_nothing() {
+    let mut methods: Vec<AnomalyDetectionMethodOptions> = fenced_cases()
+        .into_iter()
+        .map(|case| case.options)
+        .collect();
+    methods.push(AnomalyDetectionMethodOptions::Cusum);
+    methods.push(AnomalyDetectionMethodOptions::Ewma(None));
+
+    for level in [5.0, 0.1] {
+        let values = vec![level; 400];
+        for options in &methods {
+            let result = detect_anomalies(
+                &values,
+                &AnomalyOptions {
+                    seasonality: Some(Seasonality::Periods(vec![24])),
+                    options: options.clone(),
+                },
+            )
+            .unwrap();
+            assert!(
+                result.anomalies.is_empty(),
+                "{options:?} on 400 x {level} flagged {} samples",
+                result.anomalies.len()
+            );
         }
     }
 }

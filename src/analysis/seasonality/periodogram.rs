@@ -147,7 +147,7 @@ impl Detector {
         //
         // A constant series has no cycle either; centering it would leave only the rounding
         // error of its mean, which the relative peak threshold would then report as a period.
-        if max_fft_size == 0 || data.windows(2).all(|w| w[0] == w[1]) {
+        if max_fft_size == 0 || super::is_constant(data) {
             return Periodogram {
                 periods: Vec::new(),
                 powers: Vec::new(),
