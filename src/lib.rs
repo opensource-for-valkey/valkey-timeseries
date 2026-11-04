@@ -16,7 +16,7 @@ use valkey_module::{Context, Status, ValkeyString, Version, valkey_module};
 use valkey_module_macros::shutdown_event_handler;
 
 pub mod aggregators;
-mod analysis;
+pub mod analysis;
 mod commands;
 pub mod common;
 pub mod config;
