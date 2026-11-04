@@ -4,7 +4,7 @@ use crate::analysis::outliers::{
     MethodInfo, RCF_DEFAULT_NUM_TREES, RCF_DEFAULT_SAMPLE_SIZE, RCFOptions, RCFThreshold,
     SmoothedZScoreOptions, detect_anomalies,
 };
-use crate::analysis::seasonality::Seasonality;
+use crate::analysis::seasonality::{MAX_SEASONALITY_PERIODS, MIN_SEASONALITY_PERIOD, Seasonality};
 use crate::commands::analysis_runner::run_on_analysis_lane;
 use crate::commands::{
     CommandArgIterator, CommandArgToken, parse_command_arg_token, parse_timestamp_range,
@@ -17,8 +17,6 @@ use crate::series::{TimestampRange, get_timeseries};
 use valkey_module::{
     AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
-
-const MAX_SEASONALITY_PERIODS: usize = 4;
 
 // Keep the RCF resource requirements bounded before they reach krcf. In
 // particular, krcf allocates storage proportional to sample_size * num_trees
@@ -250,6 +248,11 @@ fn parse_seasonality(args: &mut CommandArgIterator) -> ValkeyResult<Seasonality>
     }
     if periods.is_empty() || periods.len() > MAX_SEASONALITY_PERIODS {
         return Err(ValkeyError::Str("TSDB: invalid SEASONALITY periods"));
+    }
+    if periods.iter().any(|&p| p < MIN_SEASONALITY_PERIOD) {
+        return Err(ValkeyError::Str(
+            "TSDB: SEASONALITY periods must be integers >= 2",
+        ));
     }
     // periods should be unique and sorted
     periods.sort_unstable();
