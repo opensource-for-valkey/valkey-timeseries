@@ -155,7 +155,10 @@ requests stay bounded.
 
 ### Anomaly Detection
 
-* `TS.OUTLIERS`: Identify outliers in a series based on a specified algorithm and parameters.
+* `TS.OUTLIERS`: Identify outliers in a series based on a specified algorithm and parameters. Detections run on the
+  main thread or on a background lane according to their estimated cost. The config `ts-outliers-max-samples`
+  (default 1,000,000, minimum 1,000, changeable at runtime) refuses a larger request before it decodes any sample.
+  See [TS.OUTLIERS](commands/ts.outliers.md).
 
 ## Indexes
 

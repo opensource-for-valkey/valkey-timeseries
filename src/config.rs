@@ -75,6 +75,9 @@ pub(crate) const DEFAULT_COMPACTION_POLICY: &str = "";
 pub const INDEX_BUILD_MAX_MEMORY_MIN: i64 = 0; // 0 = unlimited
 pub const INDEX_BUILD_MAX_MEMORY_MAX: i64 = i64::MAX;
 pub const INDEX_BUILD_MAX_MEMORY_DEFAULT: i64 = 256 * 1024 * 1024; // 256 MiB
+pub const OUTLIERS_MAX_SAMPLES_MIN: i64 = 1_000;
+pub const OUTLIERS_MAX_SAMPLES_MAX: i64 = i64::MAX;
+pub const OUTLIERS_MAX_SAMPLES_DEFAULT: i64 = 1_000_000;
 
 pub const CLUSTER_MAP_EXPIRATION_MS_DEFAULT: u64 = 750; // default: 0.75 seconds
 pub(crate) const CLUSTER_MAP_EXPIRATION_MIN_MS: i64 = 0; // min: 0 (no cache)
@@ -497,6 +500,15 @@ pub fn index_build_max_memory() -> i64 {
     INDEX_BUILD_MAX_MEMORY.load(Ordering::Relaxed)
 }
 
+/// The most samples one `TS.OUTLIERS` request may read (`ts-outliers-max-samples`). Checked
+/// once, before decoding, against an upper-bound estimate at chunk granularity, so a request
+/// already admitted is unaffected by lowering it.
+pub static OUTLIERS_MAX_SAMPLES: AtomicI64 = AtomicI64::new(OUTLIERS_MAX_SAMPLES_DEFAULT);
+
+pub fn outliers_max_samples() -> usize {
+    OUTLIERS_MAX_SAMPLES.load(Ordering::Relaxed) as usize
+}
+
 fn parse_duration_in_range(name: &str, value: &str, min: i64, max: i64) -> ValkeyResult<i64> {
     let duration = parse_duration_value(value).map_err(|_e| {
         ValkeyError::String(format!(
@@ -811,6 +823,10 @@ fn read_index_build_max_memory() -> ConfigValue {
     ConfigValue::Integer(index_build_max_memory())
 }
 
+fn read_outliers_max_samples() -> ConfigValue {
+    ConfigValue::Integer(OUTLIERS_MAX_SAMPLES.load(Ordering::Relaxed))
+}
+
 fn read_fanout_aggregation_pushdown() -> ConfigValue {
     ConfigValue::Boolean(is_fanout_aggregation_pushdown_enabled())
 }
@@ -1073,6 +1089,20 @@ pub static CONFIGS: &[ConfigDesc] = &[
         },
     },
     ConfigDesc {
+        name: "ts-outliers-max-samples",
+        read: read_outliers_max_samples,
+        kind: ConfigType::Integer,
+        default: ConfigValue::Integer(OUTLIERS_MAX_SAMPLES_DEFAULT),
+        min: Some(ConfigValue::Integer(OUTLIERS_MAX_SAMPLES_MIN)),
+        max: Some(ConfigValue::Integer(OUTLIERS_MAX_SAMPLES_MAX)),
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Most samples one TS.OUTLIERS request may read, estimated before decoding",
+        storage: ConfigStorage::I64 {
+            cell: || &OUTLIERS_MAX_SAMPLES,
+            validate: None,
+        },
+    },
+    ConfigDesc {
         name: "ts-fanout-aggregation-pushdown",
         read: read_fanout_aggregation_pushdown,
         kind: ConfigType::Boolean,
@@ -1311,6 +1341,7 @@ mod tests {
         ("ts-fanout-command-timeout", "5000"),
         ("ts-cluster-map-expiration-ms", "750"),
         ("ts-index-build-max-memory", "268435456"),
+        ("ts-outliers-max-samples", "1000000"),
         ("ts-fanout-aggregation-pushdown", "yes"),
         ("ts-index-persist", "yes"),
         ("debug-mode", "no"),

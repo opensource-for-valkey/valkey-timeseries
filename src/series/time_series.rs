@@ -656,6 +656,23 @@ impl TimeSeries {
         samples
     }
 
+    /// An upper bound on how many samples [`Self::get_range`] returns for this range, without
+    /// decoding anything: the full length of every chunk the range touches, so a narrow range
+    /// inside one chunk counts as that whole chunk.
+    pub fn estimated_sample_count_in_range(&self, start: Timestamp, end: Timestamp) -> usize {
+        let start = start.max(self.get_min_timestamp());
+        if start > end || !self.overlaps(start, end) {
+            return 0;
+        }
+        let Some((start_index, end_index)) = self.get_chunk_index_bounds(start, end) else {
+            return 0;
+        };
+        self.chunks[start_index..=end_index]
+            .iter()
+            .map(|chunk| chunk.len())
+            .sum()
+    }
+
     pub fn get_range_filtered(
         &self,
         start_timestamp: Timestamp,
