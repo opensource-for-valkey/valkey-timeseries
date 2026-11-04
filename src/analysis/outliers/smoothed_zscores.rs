@@ -219,11 +219,23 @@ impl SmoothedZScoreAnomalyDetector {
         normalize_evidence(deviation, self.threshold * self.prev_std_dev)
     }
 
+    fn insufficient_data(&self, actual: usize) -> TimeSeriesAnalysisError {
+        TimeSeriesAnalysisError::InsufficientData {
+            message: "TSDB: insufficient samples for smoothed z-score lag".to_string(),
+            required: self.lag + 1,
+            actual,
+        }
+    }
+
+    /// The first `lag` samples only warm up the moving window and are never
+    /// classified, so a series of `lag` samples or fewer has nothing to detect.
+    /// That is reported as an error rather than an empty result that looks like
+    /// "no anomalies".
     pub fn detect(&mut self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
-        // Use the smaller of the timeseries length and lag to form the initial window.
-        // Previously max() was used which caused the initial window to be the entire
-        // timeseries when ts.len() >= lag, leaving nothing to process in `rest`.
-        let n = ts.len().min(self.lag);
+        let n = self.lag;
+        if ts.len() <= n {
+            return Err(self.insufficient_data(ts.len()));
+        }
         let (_initial, rest) = ts.split_at(n);
         if !self.is_trained {
             self.train(ts)?;
@@ -285,22 +297,18 @@ impl AnomalyDetector for SmoothedZScoreAnomalyDetector {
     }
 
     fn train(&mut self, data: &[f64]) -> TimeSeriesAnalysisResult<()> {
-        // Use the smaller of the input data length and the configured lag for
-        // initializing the moving statistics.
-        let mut n = self.lag;
-        if n >= data.len() {
-            n = if !data.is_empty() { data.len() - 1 } else { 0 };
-        }
-        if n == 0 && !data.is_empty() {
-            // If lag is 0 or data.len() is 1, use the first element
-            n = 1;
-        }
+        // The moving statistics are seeded from exactly the first `lag` samples,
+        // the same window `detect` skips. `lag` samples are enough to train (the
+        // caller can stream the rest through `next`); `detect` additionally needs
+        // one sample to classify, hence `required` is `lag + 1` in both.
+        let n = self.lag;
         if n == 0 {
-            return Err(TimeSeriesAnalysisError::InsufficientData {
-                message: "insufficient data to train smoothed z-score".to_string(),
-                required: 1,
-                actual: 0,
-            });
+            return Err(TimeSeriesAnalysisError::InvalidInput(
+                "smoothed z-score lag must be at least 1".to_string(),
+            ));
+        }
+        if data.len() < n {
+            return Err(self.insufficient_data(data.len()));
         }
         let (initial, _rest) = data.split_at(n);
         let (mean, std_dev) = self.moving_stats.initialize(initial);
@@ -375,7 +383,7 @@ impl Default for SmoothedZScoreOptions {
     fn default() -> Self {
         Self {
             threshold: 3.5,
-            influence: 0.0,
+            influence: 0.5,
             lag: 10,
         }
     }
@@ -395,15 +403,6 @@ mod tests {
             influence,
             threshold,
         } = options;
-
-        let n = ts.len();
-        if n < lag {
-            return Err(TimeSeriesAnalysisError::InsufficientData {
-                message: "TSDB: insufficient samples for smoothed z-score lag".to_string(),
-                required: lag,
-                actual: n,
-            });
-        }
 
         let mut detector = SmoothedZScoreAnomalyDetector::new(influence, threshold, lag)?;
         detector.train(ts)?;
@@ -648,7 +647,7 @@ mod tests {
             TimeSeriesAnalysisError::InsufficientData {
                 required, actual, ..
             } => {
-                assert_eq!(required, 10);
+                assert_eq!(required, 11);
                 assert_eq!(actual, 3);
             }
             _ => panic!("Expected InsufficientData error"),
@@ -751,10 +750,15 @@ mod tests {
             lag: 5,
         };
 
-        let anomaly_result = detect_anomalies_smoothed_zscore(&ts, options).unwrap();
-
-        assert_eq!(anomaly_result.anomalies.len(), 0);
-        assert_eq!(anomaly_result.scores.len(), 5);
+        // `lag` samples fill the warm-up window and leave nothing to classify.
+        match detect_anomalies_smoothed_zscore(&ts, options) {
+            Err(TimeSeriesAnalysisError::InsufficientData {
+                required: 6,
+                actual: 5,
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -801,5 +805,96 @@ mod tests {
 
         // All should be non-anomalous in flat data
         assert_eq!(result.anomalies.len(), 0);
+    }
+
+    #[test]
+    fn short_series_is_an_error_not_silence() {
+        let mut d = SmoothedZScoreAnomalyDetector::new(0.5, 3.5, 10).unwrap();
+        let ts = [1.0, 1.0, 1.0, 1.0, 1.0, 500.0, 1.0, 1.0];
+        match d.train(&ts) {
+            Err(TimeSeriesAnalysisError::InsufficientData {
+                required: 11,
+                actual: 8,
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+
+        // `detect` reports the same shortfall rather than returning an empty result.
+        let mut d = SmoothedZScoreAnomalyDetector::new(0.5, 3.5, 10).unwrap();
+        match d.detect(&ts) {
+            Err(TimeSeriesAnalysisError::InsufficientData {
+                required: 11,
+                actual: 8,
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `lag` samples fill the warm-up window and leave nothing to classify, so
+    /// `detect` needs `lag + 1`. `train` only needs the window itself: callers
+    /// train on exactly `lag` samples and then stream the rest through `next`.
+    #[test]
+    fn exactly_lag_samples_train_but_do_not_detect() {
+        let ts = [1.0; 10];
+
+        let mut d = SmoothedZScoreAnomalyDetector::new(0.5, 3.5, 10).unwrap();
+        d.train(&ts).unwrap();
+
+        let mut d = SmoothedZScoreAnomalyDetector::new(0.5, 3.5, 10).unwrap();
+        match d.detect(&ts) {
+            Err(TimeSeriesAnalysisError::InsufficientData {
+                required: 11,
+                actual: 10,
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+
+        let mut d = SmoothedZScoreAnomalyDetector::new(0.5, 3.5, 10).unwrap();
+        assert!(d.detect(&[1.0; 11]).is_ok());
+    }
+
+    #[test]
+    fn default_options_are_the_documented_values() {
+        let options = SmoothedZScoreOptions::default();
+        assert_eq!(options.threshold, 3.5);
+        assert_eq!(options.influence, 0.5);
+        assert_eq!(options.lag, 10);
+    }
+
+    #[test]
+    fn default_influence_tracks_a_drifting_baseline() {
+        use crate::analysis::outliers::{
+            AnomalyDetectionMethodOptions, AnomalyOptions, detect_anomalies,
+        };
+
+        let ts: Vec<f64> = (0..2000)
+            .map(|i| {
+                100.0
+                    + 10.0 * (i as f64 * std::f64::consts::TAU / 24.0).sin()
+                    + ((i * 7919) % 41) as f64 / 10.0
+            })
+            .collect();
+        let r = detect_anomalies(
+            &ts,
+            &AnomalyOptions {
+                seasonality: None,
+                options: AnomalyDetectionMethodOptions::SmoothedZScore(
+                    SmoothedZScoreOptions::default(),
+                ),
+            },
+        )
+        .unwrap();
+        // Measured: influence 0.0 flags 1972 of 2000 samples, 0.5 flags 105. The
+        // 105 are structural: with lag 10 against a 24-sample cycle the window's
+        // stddev dips to ~2 (vs ~6 elsewhere) twice per cycle while the signal is
+        // still moving up to ~2.6 per step. Hence 10%, not 5%.
+        assert!(
+            r.anomalies.len() < ts.len() / 10,
+            "{} flagged",
+            r.anomalies.len()
+        );
     }
 }

@@ -211,10 +211,14 @@ METHOD SMOOTHED-ZSCORE [THRESHOLD threshold] [LAG lag] [INFLUENCE influence]
 
 **Options:**
 
-* `THRESHOLD` - Z-score threshold. Default: `3.0`
-* `LAG` - Window size for moving average. Default: `5`
+* `THRESHOLD` - Z-score threshold. Default: `3.5`
+* `LAG` - Window size for moving average. Default: `10`
 * `INFLUENCE` - Weight of anomalies in calculations (0-1). Default: `0.5`. Lower values reduce the anomaly's impact on
-  subsequent detection.
+  subsequent detection; `0` freezes the baseline against flagged samples, which suits stationary data but flags most of
+  a series whose level drifts.
+
+The first `LAG` samples only seed the moving window and are never flagged. Requires at least `LAG + 1` finite samples;
+a shorter series is an error rather than an empty result.
 
 ---
 
@@ -526,6 +530,7 @@ Detect pattern-based anomalies using a sliding window:
 * **Minimum data requirements:**
     * At least 3 data points required for analysis (not counting NaN or infinite values)
     * For `SEASONALITY`: requires at least `2 × max(period)` samples
+    * For `SMOOTHED-ZSCORE`: requires at least `LAG + 1` finite samples
 * **Seasonality constraints:**
     * Maximum 4 periods allowed
     * Periods must be unique integers ≥ 2 and ≤ half the number of finite samples
