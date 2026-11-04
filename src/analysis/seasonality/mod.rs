@@ -43,6 +43,12 @@ pub fn seasonally_adjust(
     periods.sort_unstable();
     validate_periods(&periods, ts.len())?;
 
+    // Nothing to remove, and decomposing would only leave rounding noise that
+    // detectors then read as signal.
+    if is_constant(ts) {
+        return Ok(ts.to_vec());
+    }
+
     if periods.len() == 1 {
         Stl::new(periods[0])
             .robust()
@@ -60,6 +66,11 @@ pub fn seasonally_adjust(
                 TimeSeriesAnalysisError::DecompositionError("MSTL decomposition failed".to_string())
             })
     }
+}
+
+/// True when every sample is exactly equal. A NaN compares unequal, so it is never constant.
+fn is_constant(ts: &[f64]) -> bool {
+    ts.windows(2).all(|w| w[0] == w[1])
 }
 
 /// Checks every period against a series of `n` samples before any arithmetic or allocation
@@ -93,6 +104,28 @@ mod tests {
     use super::*;
     use crate::analysis::TimeSeriesAnalysisError;
     use crate::analysis::seasonality::test_data::SEASON_SEVEN;
+
+    #[test]
+    fn constant_series_is_returned_undecomposed() {
+        let values = vec![0.1; 100];
+        for periods in [vec![24], vec![7, 24]] {
+            let adjusted = seasonally_adjust(&values, &Seasonality::Periods(periods)).unwrap();
+            assert_eq!(adjusted, values);
+        }
+    }
+
+    #[test]
+    fn constant_series_still_has_its_periods_validated() {
+        let values = vec![5.0; 10];
+        let too_long = seasonally_adjust(&values, &Seasonality::Periods(vec![24])).unwrap_err();
+        assert_insufficient_data(&too_long, 48, 10);
+
+        let too_short = seasonally_adjust(&values, &Seasonality::Periods(vec![1])).unwrap_err();
+        assert!(matches!(
+            too_short,
+            TimeSeriesAnalysisError::InvalidParameter { .. }
+        ));
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
