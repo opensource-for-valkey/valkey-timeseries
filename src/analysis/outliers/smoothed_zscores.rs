@@ -222,7 +222,7 @@ impl SmoothedZScoreAnomalyDetector {
     fn insufficient_data(&self, actual: usize) -> TimeSeriesAnalysisError {
         TimeSeriesAnalysisError::InsufficientData {
             message: "TSDB: insufficient samples for smoothed z-score lag".to_string(),
-            required: self.lag + 1,
+            required: self.lag.saturating_add(1),
             actual,
         }
     }
@@ -854,6 +854,22 @@ mod tests {
 
         let mut d = SmoothedZScoreAnomalyDetector::new(0.5, 3.5, 10).unwrap();
         assert!(d.detect(&[1.0; 11]).is_ok());
+    }
+
+    /// A huge `LAG` is accepted by the parser, so the shortfall report must not
+    /// overflow computing `lag + 1`.
+    #[test]
+    fn huge_lag_reports_insufficient_data_without_overflow() {
+        let mut d = SmoothedZScoreAnomalyDetector::new(0.5, 3.5, usize::MAX).unwrap();
+        match d.detect(&[1.0; 20]) {
+            Err(TimeSeriesAnalysisError::InsufficientData {
+                required, actual, ..
+            }) => {
+                assert_eq!(required, usize::MAX);
+                assert_eq!(actual, 20);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

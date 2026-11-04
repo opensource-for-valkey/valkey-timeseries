@@ -196,7 +196,7 @@ fn esd_test(
     // This is normally enforced by the command parser, but ESD is also used
     // through the analysis API. Keeping the invariant here prevents invalid
     // quantiles from reaching `statrs`, which asserts its CDF input range.
-    if !alpha.is_finite() || !(0.0..1.0).contains(&alpha) {
+    if !(alpha > 0.0 && alpha < 1.0) {
         return Err(TimeSeriesAnalysisError::InvalidParameter {
             name: "alpha".to_string(),
             message: format!("alpha must be in the range (0, 1), got {alpha}"),
@@ -565,6 +565,14 @@ mod tests {
         assert!(matches!(
             err,
             TimeSeriesAnalysisError::InvalidParameter { ref name, .. } if name == "alpha"
+        ));
+    }
+
+    #[test]
+    fn alpha_zero_is_rejected() {
+        assert!(matches!(
+            detect_anomalies_esd(&[1.0, 2.0, 3.0, 9.0], 0.0, EsdEstimator::Hybrid, Some(1)),
+            Err(TimeSeriesAnalysisError::InvalidParameter { ref name, .. }) if name == "alpha"
         ));
     }
 

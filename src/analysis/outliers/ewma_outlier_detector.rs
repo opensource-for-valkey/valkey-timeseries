@@ -2,11 +2,11 @@ use super::utils::{
     detect_own_departures, normalize_evidence, normalize_value, snap_dust, snap_dust_if_collapsed,
     usable_fence_distance,
 };
-use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::math::{calculate_mean, calculate_std_dev};
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo,
 };
+use crate::analysis::{TimeSeriesAnalysisError, TimeSeriesAnalysisResult};
 
 /// Default alpha for Ewma SPC
 pub const EWMA_DEFAULT_ALPHA: f64 = 0.3;
@@ -25,7 +25,19 @@ pub struct EwmaOutlierDetector {
 }
 
 impl EwmaOutlierDetector {
-    pub fn from_series(ts: &[f64], alpha: f64) -> Self {
+    /// Fits the control chart to the head of `ts`.
+    ///
+    /// `alpha` is a smoothing weight and must lie in `(0, 1]`: at `0` the average
+    /// never moves, and above `1` the update overshoots the sample it is pulled
+    /// toward (at `2` the variance factor `alpha / (2 - alpha)` is not finite).
+    pub fn from_series(ts: &[f64], alpha: f64) -> TimeSeriesAnalysisResult<Self> {
+        if !(alpha > 0.0 && alpha <= 1.0) {
+            return Err(TimeSeriesAnalysisError::InvalidParameter {
+                name: "alpha".to_string(),
+                message: format!("alpha must be in the range (0, 1], got {alpha}"),
+            });
+        }
+
         // At least two samples: one fits a zero scale by construction.
         let training_size = ((ts.len() as f64 * 0.5).min(100.0) as usize)
             .max(2)
@@ -38,12 +50,12 @@ impl EwmaOutlierDetector {
         let sigma = snap_dust(calculate_std_dev(training_data), target);
         let multiplier = 3.0;
 
-        EwmaOutlierDetector {
+        Ok(EwmaOutlierDetector {
             alpha,
             target,
             sigma,
             multiplier,
-        }
+        })
     }
 
     pub fn detect(&self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
@@ -162,7 +174,7 @@ mod tests {
     ) -> TimeSeriesAnalysisResult<AnomalyResult> {
         // Ewma control chart implementation
         let alpha = alpha.unwrap_or(EWMA_DEFAULT_ALPHA);
-        let detector = EwmaOutlierDetector::from_series(ts, alpha);
+        let detector = EwmaOutlierDetector::from_series(ts, alpha)?;
         detector.detect(ts)
     }
 
@@ -441,5 +453,21 @@ mod tests {
         // Very high alpha (0.99) - minimal smoothing
         let high_result = detect_anomalies_spc_ewma(&ts, Some(0.99));
         assert!(high_result.is_ok(), "Should handle very high alpha");
+    }
+
+    #[test]
+    fn from_series_rejects_alpha_outside_the_half_open_unit_interval() {
+        for alpha in [0.0, -1.0, 1.5, f64::NAN, f64::INFINITY] {
+            let err = EwmaOutlierDetector::from_series(&[1.0, 2.0, 3.0, 4.0], alpha)
+                .expect_err(&format!("alpha {alpha} must be rejected"));
+            assert!(
+                matches!(
+                    err,
+                    TimeSeriesAnalysisError::InvalidParameter { ref name, .. } if name == "alpha"
+                ),
+                "{alpha}: {err:?}"
+            );
+        }
+        assert!(EwmaOutlierDetector::from_series(&[1.0, 2.0, 3.0, 4.0], 1.0).is_ok());
     }
 }

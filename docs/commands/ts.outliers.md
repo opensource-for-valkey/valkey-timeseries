@@ -115,8 +115,8 @@ METHOD ESD [ALPHA alpha] [MAX_OUTLIERS max] [HYBRID | CLASSIC]
 
 * `ALPHA` - Significance level for the test, in the range `(0, 1)`. Default: `0.05`. Lower values are more conservative
   and report fewer outliers.
-* `MAX_OUTLIERS` - Upper bound on how many outliers to search for. Must be less than half the number of samples in the
-  range. Default: `n/2`.
+* `MAX_OUTLIERS` - Upper bound on how many outliers to search for. Must be a positive integer, and less than half the
+  number of samples in the range. Default: `n/2`.
 * `HYBRID` - Studentize against the median and a normal-consistent MAD. **Default.** Robust: the reference point barely
   moves as outliers are removed.
 * `CLASSIC` - Studentize against the mean and sample standard deviation, as in Rosner's original procedure. Both are
@@ -149,7 +149,7 @@ METHOD EWMA [ALPHA alpha]
 
 **Options:**
 
-* `ALPHA` - Smoothing factor (0 < alpha ≤ 1). Default: `0.3`. Higher values give more weight to recent observations.
+* `ALPHA` - Smoothing factor, in the range `(0, 1]`. Default: `0.3`. Higher values give more weight to recent observations.
 
 ---
 
@@ -212,7 +212,7 @@ METHOD SMOOTHED-ZSCORE [THRESHOLD threshold] [LAG lag] [INFLUENCE influence]
 **Options:**
 
 * `THRESHOLD` - Z-score threshold. Default: `3.5`
-* `LAG` - Window size for moving average. Default: `10`
+* `LAG` - Window size for moving average. Must be a positive integer. Default: `10`
 * `INFLUENCE` - Weight of anomalies in calculations (0-1). Default: `0.5`. Lower values reduce the anomaly's impact on
   subsequent detection; `0` freezes the baseline against flagged samples, which suits stationary data but flags most of
   a series whose level drifts.
@@ -273,8 +273,8 @@ METHOD RCF [NUM_TREES trees]
 * `THRESHOLD` - Anomaly score threshold in standard deviations. Default: `3.0`
 * `CONTAMINATION` - The amount of contamination in the data set, i.e., the proportion of outliers in the data set.
 * `SHINGLE_SIZE` - Sliding window size. Default: `1`. Must be an integer from `1` to `128` and no larger than the number of samples in the query range. Use values > 1 for contextual anomalies.
-* `OUTPUT_AFTER` - Warmup period (samples). Default: `32`
-* `DECAY` - Time decay factor (0-1). Default: `0.1`. Controls how quickly old data is forgotten.
+* `OUTPUT_AFTER` - Warmup period (samples). Must be a positive integer. Default: `32`
+* `DECAY` - Time decay factor, from `0` to `1`. Default: `0.1`. Controls how quickly old data is forgotten.
 
 Either `THRESHOLD` or `CONTAMINATION` must be specified to determine the cutoff for anomaly scores. `THRESHOLD` sets a
 fixed score
