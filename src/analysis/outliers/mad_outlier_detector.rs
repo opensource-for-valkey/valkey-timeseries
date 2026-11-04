@@ -263,7 +263,9 @@ mod tests {
         let score_nan = detector.get_anomaly_score(f64::NAN);
         assert_eq!(score_nan, 0.0);
 
-        // An infinite reading is maximally anomalous, and is flagged as such.
+        // Called directly, a detector treats an infinite reading as maximal and flags
+        // it. Through `detect_anomalies` it never gets this far: non-finite samples
+        // are excluded before any detector sees them.
         assert_eq!(detector.get_anomaly_score(f64::INFINITY), 1.0);
         assert!(detector.is_outlier(f64::INFINITY));
     }

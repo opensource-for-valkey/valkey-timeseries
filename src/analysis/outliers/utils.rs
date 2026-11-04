@@ -167,7 +167,12 @@ pub(super) fn detect_own_departures(ts: &[f64], target: f64) -> (Vec<f64>, Vec<A
     let mut scores = Vec::with_capacity(ts.len());
     let mut anomalies = Vec::new();
     for (index, &v) in ts.iter().enumerate() {
-        let departure = normalize_value(v) - target;
+        // A missing reading is not evidence of a departure.
+        if v.is_nan() {
+            scores.push(0.0);
+            continue;
+        }
+        let departure = v - target;
         let evidence = snap_dust(departure.abs(), target);
         let score = normalize_evidence(evidence, 0.0);
         scores.push(score);
@@ -186,11 +191,6 @@ pub(super) fn detect_own_departures(ts: &[f64], target: f64) -> (Vec<f64>, Vec<A
         }
     }
     (scores, anomalies)
-}
-
-#[inline]
-pub(super) fn normalize_value(v: f64) -> f64 {
-    if v.is_nan() { 0.0 } else { v }
 }
 
 #[inline]

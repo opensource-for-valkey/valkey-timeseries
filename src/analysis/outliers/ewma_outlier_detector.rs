@@ -1,5 +1,5 @@
 use super::utils::{
-    detect_own_departures, normalize_evidence, normalize_value, snap_dust, snap_dust_if_collapsed,
+    detect_own_departures, normalize_evidence, snap_dust, snap_dust_if_collapsed,
     usable_fence_distance,
 };
 use crate::analysis::math::{calculate_mean, calculate_std_dev};
@@ -95,22 +95,29 @@ impl EwmaOutlierDetector {
         let mut anomalies: Vec<Anomaly> = Vec::with_capacity(4);
 
         let mut ewma = self.target;
+        // Observations folded into `ewma` so far. A missing reading is not one: it
+        // leaves the average alone and the control limits where they were, rather
+        // than widening them for a sample that never informed the average.
+        let mut observed: i32 = 0;
 
         for (i, &v) in ts.iter().enumerate() {
-            let value = normalize_value(v);
+            if v.is_nan() {
+                scores.push(0.0);
+                continue;
+            }
+            observed += 1;
             // The update form, not `alpha * value + (1 - alpha) * ewma`: at a small
             // alpha that form's rounding bias accumulates to hundreds of ULPs on a
             // constant series, whereas here a sample equal to the average moves it
             // by exactly nothing.
-            ewma += self.alpha * (value - ewma);
+            ewma += self.alpha * (v - ewma);
 
             // Sigma scales the root rather than being squared inside it: `sigma * sigma`
             // underflows below ~1e-154 and overflows above ~1e154, whatever the
             // limit it describes.
             let ewma_std = self.sigma
-                * (self.alpha / (2.0 - self.alpha)
-                    * (1.0 - (1.0 - self.alpha).powi(2 * (i as i32 + 1))))
-                .sqrt();
+                * (self.alpha / (2.0 - self.alpha) * (1.0 - (1.0 - self.alpha).powi(2 * observed)))
+                    .sqrt();
 
             // The smoothed average's departure from target is the evidence; the
             // control limit that departure is tested against is the boundary.
@@ -142,7 +149,7 @@ impl EwmaOutlierDetector {
                 anomalies.push(Anomaly {
                     index: i,
                     signal,
-                    value,
+                    value: v,
                     score,
                 });
             }
@@ -443,13 +450,64 @@ mod tests {
 
     #[test]
     fn test_ewma_nan_handling() {
-        // Test with NaN values (should be normalized to 0.0)
         let ts = vec![1.0, 1.1, f64::NAN, 1.2, 1.0, f64::NAN, 1.1];
 
         let result = detect_anomalies_spc_ewma(&ts, Some(0.3));
 
         // Should not panic and should complete successfully
         assert!(result.is_ok(), "Should handle NaN values gracefully");
+    }
+
+    /// A missing reading is not an observation: the average keeps its value and the
+    /// control limits do not widen for it. Scores and flags after the gap are those
+    /// of the series with the gap removed.
+    #[test]
+    fn test_ewma_nan_leaves_the_state_untouched() {
+        let baseline: Vec<f64> = (0..40)
+            .map(|i| 1.0 + 0.1 * (i as f64 * 0.7).sin())
+            .collect();
+        let detector = EwmaOutlierDetector::from_series(&baseline, 0.3).unwrap();
+
+        // A sustained shift, so the average is mid-move when the gap arrives.
+        let shifted = vec![1.6; 12];
+        let mut with_gap = shifted.clone();
+        with_gap.insert(4, f64::NAN);
+
+        let clean = detector.detect(&shifted).unwrap();
+        let gapped = detector.detect(&with_gap).unwrap();
+
+        assert!(
+            !clean.anomalies.is_empty(),
+            "the shift must leave the limits"
+        );
+        let mut expected_scores = clean.scores.clone();
+        expected_scores.insert(4, 0.0);
+        assert_eq!(gapped.scores, expected_scores);
+
+        let place = |index: usize| if index < 4 { index } else { index + 1 };
+        let expected_flags: Vec<_> = clean
+            .anomalies
+            .iter()
+            .map(|a| (place(a.index), a.signal, a.score))
+            .collect();
+        let flags: Vec<_> = gapped
+            .anomalies
+            .iter()
+            .map(|a| (a.index, a.signal, a.score))
+            .collect();
+        assert_eq!(flags, expected_flags);
+        assert!(gapped.anomalies.iter().all(|a| a.index != 4));
+    }
+
+    /// Zero-width limits take the same view of a gap: nothing to score, nothing to flag.
+    #[test]
+    fn test_ewma_nan_is_not_a_departure_when_the_scale_has_collapsed() {
+        let detector = EwmaOutlierDetector::from_series(&[5.0; 10], 0.3).unwrap();
+
+        let result = detector.detect(&[5.0, f64::NAN, 5.0]).unwrap();
+
+        assert_eq!(result.scores, vec![0.0; 3]);
+        assert!(result.anomalies.is_empty());
     }
 
     #[test]

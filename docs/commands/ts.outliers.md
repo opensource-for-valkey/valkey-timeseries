@@ -6,7 +6,7 @@ Detect outliers in a time series.
 
 ```
 TS.OUTLIERS key fromTimestamp toTimestamp
-  METHOD method [method-options]
+  [METHOD method [method-options]]
   [OUTPUT <FULL | SIMPLE | CLEANED>]
   [DIRECTION <POSITIVE | NEGATIVE | BOTH>]
   [SEASONALITY period1 [period2 [period3 [period4]]]]
@@ -79,6 +79,8 @@ SEASONALITY [AUTO | period1 ...]
 * For multiple periods: Uses MSTL (Multiple Seasonal-Trend decomposition using LOESS)
 * Periods must be unique integers ≥ 2 and ≤ half the number of finite samples in the range.
 * Requires at least `2 × max(period)` data points
+* Non-finite samples are removed before decomposition, so a gap shifts every later sample's phase; fill gaps upstream
+  if phase matters.
 
 **Example:** `SEASONALITY 24 168` adjusts for daily (24 hours) and weekly (168 hours) patterns in hourly data.
 </details>
@@ -86,7 +88,8 @@ SEASONALITY [AUTO | period1 ...]
 <details open>
 <summary><code>METHOD</code></summary>
 
-Specifies the outlier detection algorithm. **Required**. The following methods are supported:
+Specifies the outlier detection algorithm. Optional: without it the command runs `METHOD ZSCORE THRESHOLD 3.0`. The
+following methods are supported:
 
 #### CUSUM
 
@@ -299,7 +302,8 @@ Returns anomaly information based on the `OUTPUT` format:
 
 #### SIMPLE format
 
-**Array reply:** Each anomaly as `[timestamp, value, signal, score]`
+**Array reply:** Each anomaly as `[timestamp, value, signal, score]`. The signal comes before the score here, the
+reverse of the `samples` tuples in the `FULL` format.
 
 * `timestamp` - Sample timestamp (integer)
 * `value` - Sample value (float)
@@ -313,7 +317,8 @@ Returns anomaly information based on the `OUTPUT` format:
 
 * `method` - Detection method name (string)
 * `direction` - Detection direction: `positive`, `negative`, or `both` (string)
-* `samples` - Array of sample tuples: `[[timestamp, value, score, signal], ...]`
+* `samples` - Array of sample tuples: `[[timestamp, value, score, signal], ...]`. The score comes before the signal
+  here, the reverse of the `SIMPLE` format's `[timestamp, value, signal, score]`.
     * `timestamp` - Sample timestamp (integer)
     * `value` - Original sample value (double)
     * `score` - Calculated anomaly score (0.0-1.0). `score > 0.5` for the samples the method flagged, `score <= 0.5` for
@@ -324,8 +329,8 @@ Returns anomaly information based on the `OUTPUT` format:
 * `method_info` - Algorithm-specific metadata (map, if available):
     * For the fence-based methods (ZSCORE, MODIFIED-ZSCORE, MAD, DOUBLE-MAD, IQR): `lower_fence`, `upper_fence`, and
       `center_line` where the method defines one
-    * For SPC methods (CUSUM, EWMA): `control_limits`, `center_line`
-      EWMA reports the steady-state limits; the first few positions use tighter limits that converge to these.
+    * For SPC methods (CUSUM, EWMA): `control_limits`, `center_line`. EWMA reports the steady-state limits; the first
+      few positions use tighter limits that converge to these.
     * Omitted for ESD, RCF, and SMOOTHED-ZSCORE, which fit no fences or control limits
 
 #### CLEANED format
@@ -344,17 +349,16 @@ as an anomaly.
 
 This makes `score > 0.5` a valid anomaly test without knowing which method produced the number or what threshold it was
 given, and makes scores comparable across methods. `0.0` and `1.0` are asymptotic — a score approaches `1.0` as evidence
-grows, but only degenerate or non-finite input reaches it exactly:
+grows, but only degenerate input reaches it exactly. Non-finite samples are never scored at all; see
+[Notes](#notes).
 
-* An infinite sample value is maximally anomalous: score `1.0`, and flagged.
-* A `NaN` sample scores `0.0` and is never flagged — a missing reading is not evidence of an anomaly.
-* When a method's fitted scale collapses (it is zero, or so small relative to the center that it is lost to rounding),
-  all of `MAD`, `DOUBLE-MAD`, `IQR`, `ZSCORE`, `MODIFIED-ZSCORE`, `CUSUM`, and `EWMA` treat the limits as zero-width: any
-  departure from the center scores `1.0` and is flagged. The test is relative to the center, so a series gets the same
-  verdict whatever unit it is stored in. `ZSCORE`, `MODIFIED-ZSCORE`, `CUSUM`, and `EWMA` do not count departures that
-  are only floating-point rounding error; `MAD`, `DOUBLE-MAD`, and `IQR` make no such allowance. A collapsed `CUSUM` or
-  `EWMA` has no sigma to accumulate or smooth in, so it tests each sample on its own departure: a lone spike flags that
-  sample and not the clean samples after it.
+When a method's fitted scale collapses (it is zero, or so small relative to the center that it is lost to rounding),
+all of `MAD`, `DOUBLE-MAD`, `IQR`, `ZSCORE`, `MODIFIED-ZSCORE`, `CUSUM`, and `EWMA` treat the limits as zero-width: any
+departure from the center scores `1.0` and is flagged. The test is relative to the center, so a series gets the same
+verdict whatever unit it is stored in. `ZSCORE`, `MODIFIED-ZSCORE`, `CUSUM`, and `EWMA` do not count departures that
+are only floating-point rounding error; `MAD`, `DOUBLE-MAD`, and `IQR` make no such allowance. A collapsed `CUSUM` or
+`EWMA` has no sigma to accumulate or smooth in, so it tests each sample on its own departure: a lone spike flags that
+sample and not the clean samples after it.
 
 The `THRESHOLD` echoed back in `parameters` stays on the **method's own** scale — standard deviations for `ZSCORE`, `k`
 for `MAD`, the decision interval for `CUSUM`, a fraction for `CONTAMINATION`. It is not on the score scale, and under
@@ -366,14 +370,12 @@ actually tested. Scores are comparable across methods only when computed over th
 
 ## Complexity
 
-O(N × M) where:
+N is the number of samples in the range.
 
-* N = number of samples in the range
-* M = method complexity factor (varies by algorithm)
-
-**Additional complexity for SEASONALITY:**
-
-* O(N × P × I) where P = number of periods, I = decomposition iterations (default: 2)
+* Fence-based methods: O(N log N)
+* ESD: O(N × MAX_OUTLIERS)
+* RCF: O(N × NUM_TREES × log(SAMPLE_SIZE))
+* Multi-period `SEASONALITY`: O(N²)
 
 ## Examples
 
@@ -419,7 +421,7 @@ Get detailed analysis with metadata for API request spikes:
 ```valkey-cli
 127.0.0.1:6379> TS.OUTLIERS requests:api - + OUTPUT FULL DIRECTION POSITIVE METHOD IQR THRESHOLD 1.5
 1) "method"
-2) "InterquartileRange"
+2) "iqr"
 3) "direction"
 4) "positive"
 5) "samples"
@@ -440,6 +442,8 @@ Get detailed analysis with metadata for API request spikes:
     2) "-50.3"
     3) "upper_fence"
     4) "250.7"
+    5) "center_line"
+    6) "100.2"
 ```
 
 </details>
