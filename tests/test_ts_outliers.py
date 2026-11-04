@@ -304,6 +304,18 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
         assert anomalies[0].signal == 1  # Positive anomaly
         assert anomalies[0].value == 5.0
 
+    def test_smoothed_zscore_short_series_is_an_error(self):
+        """A series no longer than LAG has nothing to classify: error, not an empty reply."""
+        key = 'test:outliers:method:smoothed:short'
+
+        for i, val in enumerate([1.0, 1.0, 1.0, 1.0, 1.0, 500.0, 1.0, 1.0]):
+            self.client.execute_command('TS.ADD', key, 1000 + i * 1000, val)
+
+        with pytest.raises(ResponseError, match='Need at least 11 observations, got 8'):
+            self.client.execute_command(
+                'TS.OUTLIERS', key, '-', '+', 'METHOD', 'smoothed-zscore', 'LAG', 10
+            )
+
     def test_method_mad(self):
         """Test Median Absolute Deviation (Mad) detection"""
         key = "mad_test"
