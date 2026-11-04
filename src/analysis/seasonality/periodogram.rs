@@ -3,6 +3,8 @@ use std::cmp::Ordering;
 use itertools::Itertools;
 use welch_sde::{Build, SpectralDensity};
 
+use super::MAX_SEASONALITY_PERIODS;
+
 /// Default number of cycles of data assumed when establishing FFT window sizes.
 const DEFAULT_MIN_FFT_CYCLES: f64 = 3.0;
 
@@ -57,8 +59,10 @@ pub struct Periodogram {
 impl Periodogram {
     /// Find the peaks in the periodogram.
     ///
-    /// The peaks are defined as the periods which have a power greater than `threshold` times the
-    /// maximum power in the periodogram.
+    /// A peak is a strict local maximum with a positive power of at least `threshold` times the
+    /// maximum power in the periodogram: it must exceed its lower neighbour and be at least as
+    /// large as its upper neighbour, so the shoulders of a broad peak are not reported as peaks of
+    /// their own. Peaks are returned strongest first.
     pub fn peaks(&self, threshold: f64) -> impl Iterator<Item = Period> {
         // Scale the threshold so that it's relative to the maximum power.
         let keep = self
@@ -69,23 +73,23 @@ impl Periodogram {
             .unwrap_or(1.0)
             * threshold;
 
-        // We're going to window by 3 and zip this up with the powers, but we want the
-        // middle element to represent the periodogram value we're looking at, so
-        // we need to prepend and append a 0 to the periods.
-        std::iter::once(0)
-            .chain(self.periods.iter().copied())
-            .chain(std::iter::once(0))
-            .tuple_windows()
-            .zip(self.powers.iter().copied())
-            .filter_map(|((prev_period, period, next_period), power)| {
-                (power >= keep).then_some(Period {
+        let powers = &self.powers;
+        let len = self.periods.len().min(powers.len());
+
+        (0..len)
+            .filter_map(|i| {
+                let power = powers[i];
+                let rises = i == 0 || power > powers[i - 1];
+                let falls = i + 1 == len || power >= powers[i + 1];
+                (power > 0.0 && power >= keep && rises && falls).then(|| Period {
                     power,
-                    period,
-                    prev_period,
-                    next_period,
+                    period: self.periods[i],
+                    // The period just outside either end of the periodogram is reported as 0.
+                    prev_period: if i > 0 { self.periods[i - 1] } else { 0 },
+                    next_period: if i + 1 < len { self.periods[i + 1] } else { 0 },
                 })
             })
-            .sorted_by(|a, b| a.power.partial_cmp(&b.power).unwrap_or(Ordering::Equal))
+            .sorted_by(|a, b| b.power.partial_cmp(&a.power).unwrap_or(Ordering::Equal))
     }
 }
 
@@ -140,7 +144,10 @@ impl Detector {
         // the transform. A one-point segment produces a zero log-size, so
         // return the empty result that auto-seasonality already treats as
         // "no detectable period" instead of passing an invalid size to it.
-        if max_fft_size == 0 {
+        //
+        // A constant series has no cycle either; centering it would leave only the rounding
+        // error of its mean, which the relative peak threshold would then report as a period.
+        if max_fft_size == 0 || data.windows(2).all(|w| w[0] == w[1]) {
             return Periodogram {
                 periods: Vec::new(),
                 powers: Vec::new(),
@@ -149,7 +156,12 @@ impl Detector {
 
         let n_segments = (data_len as f64 / n_per_segment as f64).ceil() as usize;
 
-        let welch: SpectralDensity<'_, f64> = SpectralDensity::builder(data, frequency)
+        // welch-sde assumes a zero-mean signal. A large mean leaks DC power into the low
+        // frequencies (long periods), where it can outrank a real cycle.
+        let mean = data.iter().sum::<f64>() / data_len as f64;
+        let centered: Vec<f64> = data.iter().map(|x| x - mean).collect();
+
+        let welch: SpectralDensity<'_, f64> = SpectralDensity::builder(&centered, frequency)
             .n_segment(n_segments)
             .dft_log2_max_size(max_fft_size)
             .build();
@@ -182,10 +194,14 @@ impl Detector {
         Periodogram { periods, powers }
     }
 
+    /// Detect likely seasonal periods in the data.
+    ///
+    /// Returns at most [`MAX_SEASONALITY_PERIODS`] periods, strongest first.
     pub fn detect(&self, data: &[f64]) -> Vec<u32> {
         self.periodogram(data)
             .peaks(self.threshold)
             .map(|x| x.period)
+            .take(MAX_SEASONALITY_PERIODS)
             .collect()
     }
 }
@@ -226,16 +242,64 @@ mod test {
                 season_lengths: expected,
             } = test_case;
             let detector = Detector::default();
+            // Peaks come back strongest first, so compare as sorted lists.
             assert_eq!(
                 detector
                     .periodogram(data)
                     .peaks(0.5)
                     .map(|x| x.period)
+                    .sorted()
                     .collect_vec(),
-                *expected,
+                expected.iter().copied().sorted().collect_vec(),
                 "Test case {i}"
             );
         }
+    }
+
+    #[test]
+    fn flat_series_yields_no_periods() {
+        assert!(Detector::default().detect(&vec![0.0; 1000]).is_empty());
+    }
+
+    #[test]
+    fn constant_series_yields_no_periods() {
+        // 0.1 has no exact binary mean, so centering alone would leave rounding residue.
+        for c in [0.1, 5.0, -7.3] {
+            assert!(Detector::default().detect(&vec![c; 1000]).is_empty(), "{c}");
+        }
+    }
+
+    #[test]
+    fn peaks_are_local_maxima_strongest_first_and_capped() {
+        let p = Periodogram {
+            periods: vec![4, 5, 6, 7, 8, 9],
+            powers: vec![1.0, 0.95, 0.96, 0.97, 0.5, 0.98],
+        };
+        let got: Vec<u32> = p.peaks(0.9).map(|x| x.period).collect();
+        // 5 and 6 are shoulders of 7; order is by power descending.
+        assert_eq!(got, vec![4, 9, 7]);
+        assert!(
+            Detector::default()
+                .detect(crate::analysis::seasonality::test_data::SEASON_SEVEN)
+                .len()
+                <= MAX_SEASONALITY_PERIODS
+        );
+    }
+
+    #[test]
+    fn auto_finds_the_daily_period_at_two_thousand_samples() {
+        // Daily (24) and weekly (168) cycles on a large mean, with a sprinkle of spikes.
+        let series: Vec<f64> = (0..2000)
+            .map(|i| {
+                let t = i as f64;
+                100.0
+                    + 10.0 * (t * std::f64::consts::TAU / 24.0).sin()
+                    + 3.0 * (t * std::f64::consts::TAU / 168.0).sin()
+                    + ((i * 7919) % 41) as f64 / 10.0
+                    + if i % 997 == 0 { 60.0 } else { 0.0 }
+            })
+            .collect();
+        assert_eq!(Detector::default().detect(&series)[0], 24);
     }
 
     #[test]
