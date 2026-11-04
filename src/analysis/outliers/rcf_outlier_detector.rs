@@ -82,12 +82,13 @@ pub struct RCFOptions {
     /// [`RCFOptions::effective_output_after`].
     ///
     /// Three effects:
-    /// 1. krcf scores `0.0` for the first `output_after` points.
+    /// 1. krcf scores `0.0` for the first `output_after` points (`shingle_size - 1`
+    ///    more with a shingle, which only counts once it is full).
     /// 2. [`RcfOutlierDetector::detect`] suppresses anomaly flagging for indices
     ///    `0..output_after`, eliminating false positives that arise while the forest
     ///    is still learning the data distribution.
-    /// 3. Those points' scores are left out of the cutoff in both threshold modes, so
-    ///    the forest's warmup zeros cannot shape it.
+    /// 3. The forest's leading zeros are left out of the cutoff in both threshold
+    ///    modes (see [`RCFOptions::first_scored_index`]), so they cannot shape it.
     pub output_after: Option<usize>,
     /// Whether to enable parallel execution for RCF operations.
     pub parallel_enabled: Option<bool>,
@@ -127,11 +128,20 @@ impl RCFOptions {
     /// The warmup length the detector and the forest both use.
     ///
     /// An explicit `output_after` wins. Otherwise it is krcf's own default,
-    /// `1 + sample_size / 4`, so that the module's warmup window and the stretch
-    /// where the forest answers `0.0` are the same stretch.
+    /// `1 + sample_size / 4`, so that the module and the forest count the same warmup.
     pub fn effective_output_after(&self) -> usize {
         self.output_after
             .unwrap_or_else(|| 1 + self.sample_size.unwrap_or(RCF_DEFAULT_SAMPLE_SIZE) / 4)
+    }
+
+    /// The index of the first point the forest scores above `0.0`, and so where the
+    /// cutoff fit starts.
+    ///
+    /// With internal shingling the forest only counts an update once the shingle is
+    /// full, so its run of `0.0` scores is `shingle_size - 1` points longer than
+    /// `output_after`.
+    pub fn first_scored_index(&self) -> usize {
+        self.effective_output_after() + self.shingle_size.unwrap_or(1).saturating_sub(1)
     }
 
     /// Heuristic: decide whether to enable parallel execution for RCF operations.
@@ -190,8 +200,9 @@ impl From<RCFOptions> for RandomCutForestOptions {
             sample_size: options.sample_size,
             lambda: options.time_decay,
             shingle_size: options.shingle_size.unwrap_or(1),
-            // The same value the detector windows its scores on, so the forest's run of
-            // `0.0` scores and the module's warmup are one and the same stretch.
+            // The same value the detector suppresses flagging on. The forest's run of
+            // `0.0` scores is `shingle_size - 1` points longer when it shingles; the
+            // cutoff fit starts after that (`first_scored_index`).
             output_after: Some(options.effective_output_after()),
             parallel_execution_enabled,
             internal_shingling,
@@ -214,16 +225,19 @@ pub struct RcfOutlierDetector {
     forest: RandomCutForest,
     /// The anomaly score threshold above which a point is considered an outlier.
     threshold: Option<RCFThreshold>,
-    /// Number of leading points whose scores are excluded from anomaly detection and
-    /// from the cutoff. Mirrors [`RCFOptions::effective_output_after`].  Zero means no
-    /// warmup suppression.
+    /// Number of leading points that are scored but never flagged. Mirrors
+    /// [`RCFOptions::effective_output_after`].  Zero means no warmup suppression.
     output_after: usize,
+    /// Index of the first point the forest scores above `0.0`: where the cutoff fit
+    /// starts. Mirrors [`RCFOptions::first_scored_index`].
+    fit_start: usize,
 }
 
 impl RcfOutlierDetector {
     pub fn new(options: RCFOptions) -> ValkeyResult<Self> {
         // Capture output_after before options is consumed by the From impl.
         let output_after = options.effective_output_after();
+        let fit_start = options.first_scored_index();
         let threshold = options.threshold;
         let rcf_options: RandomCutForestOptions = options.into();
         let forest = RandomCutForest::new(rcf_options)
@@ -233,6 +247,7 @@ impl RcfOutlierDetector {
             forest,
             threshold,
             output_after,
+            fit_start,
         })
     }
 
@@ -332,10 +347,12 @@ impl RcfOutlierDetector {
     ///
     /// Points with index `< output_after` are scored and recorded in
     /// `AnomalyResult::scores` (preserving one score per input point), but are
-    /// **never classified as anomalies**, and take no part in fitting the cutoff in
-    /// either mode.  This suppresses false positives that occur while the forest is
-    /// still learning the data distribution.  Set `output_after` in [`RCFOptions`] to
-    /// control the size of the warmup window; unset, it is `1 + sample_size / 4`.
+    /// **never classified as anomalies**.  The forest's leading zero scores, which with
+    /// a shingle run `shingle_size - 1` points past `output_after`, take no part in
+    /// fitting the cutoff in either mode.  This suppresses false positives that occur
+    /// while the forest is still learning the data distribution.  Set `output_after`
+    /// in [`RCFOptions`] to control the size of the warmup window; unset, it is
+    /// `1 + sample_size / 4`.
     ///
     /// # Precision
     ///
@@ -475,10 +492,10 @@ impl RcfOutlierDetector {
         raw_scores: Vec<f64>,
         threshold: f64,
     ) -> AnomalyResult {
-        // The forest scores `0.0` for its first `output_after` points. Fitting the
-        // cutoff on those would let the warmup shape it, so only the scores the forest
-        // actually produced take part. (Contamination mode slices the same way.)
-        let start = self.output_after.min(raw_scores.len());
+        // The forest scores `0.0` until `fit_start`. Fitting the cutoff on those would let
+        // the warmup shape it, so only the scores the forest actually produced take
+        // part. (Contamination mode slices the same way.)
+        let start = self.fit_start.min(raw_scores.len());
         let usable_scores = &raw_scores[start..];
 
         // A spread needs at least two scores. Without them `(0, 0)` is what the fit
@@ -505,7 +522,7 @@ impl RcfOutlierDetector {
         raw_scores: Vec<f64>,
         contamination: f64,
     ) -> AnomalyResult {
-        let start = self.output_after.min(raw_scores.len());
+        let start = self.fit_start.min(raw_scores.len());
         let usable_scores = &raw_scores[start..];
 
         // Keep contamination in a safe open interval for quantile selection.
@@ -1252,7 +1269,7 @@ mod tests {
     /// Under the default options a smooth series flags nothing in the warmup and next to
     /// nothing after it. This holds with and without the warmup zeros in the fit, so it
     /// guards the default warmup, not the cutoff fit: that is
-    /// `stddev_cutoff_is_fitted_on_the_scores_after_the_warmup`.
+    /// `cutoffs_are_fitted_on_the_scores_after_the_warmup`.
     #[test]
     fn warmup_zeros_do_not_shape_the_cutoff() {
         let ts: Vec<f64> = (0..300).map(|i| 10.0 + (i as f64 * 0.1).sin()).collect();
@@ -1309,55 +1326,98 @@ mod tests {
             .collect()
     }
 
-    /// The forest answers `0.0` until it has seen `output_after` points; the module's
-    /// warmup window must start scoring on exactly the same point.
+    /// The forest answers `0.0` until it has seen `output_after` points, and with a
+    /// shingle it only counts a point once the shingle is full, so the first non-zero
+    /// score sits `shingle_size - 1` points later. That index is where the cutoff fit
+    /// has to start.
     #[test]
     fn module_and_forest_agree_on_the_warmup_boundary() {
         let ts: Vec<f64> = (0..120).map(|i| 5.0 + ((i * 7) % 11) as f64).collect();
-        let options = RCFOptions {
-            sample_size: Some(64),
-            ..Default::default()
-        };
-        let warmup = options.effective_output_after();
-        let raw = replay_raw_scores(options, &ts);
-        assert!(raw[..warmup].iter().all(|&s| s == 0.0));
-        assert!(raw[warmup..].iter().any(|&s| s > 0.0));
+        for shingle_size in [None, Some(1), Some(4), Some(8)] {
+            let options = RCFOptions {
+                sample_size: Some(64),
+                shingle_size,
+                ..Default::default()
+            };
+            let start = options.first_scored_index();
+            let raw = replay_raw_scores(options, &ts);
+            let first_nonzero = raw.iter().position(|&s| s > 0.0);
+            assert_eq!(first_nonzero, Some(start), "shingle_size {shingle_size:?}");
+        }
     }
 
-    /// The `StdDev` cutoff is `mean + threshold * std_dev` of the scores the forest
-    /// produced, not of the warmup zeros as well. The zeros inflate the spread, so the
-    /// old cutoff sat higher and hid points the forest scored as unusual.
+    /// The cutoff is fitted on the scores the forest produced, not on its leading zeros
+    /// as well. The zeros inflate the spread, so a fit that includes them puts the
+    /// cutoff higher and hides points the forest scored as unusual. The leading zeros
+    /// include the `shingle_size - 1` points a shingle needs to fill.
     #[test]
-    fn stddev_cutoff_is_fitted_on_the_scores_after_the_warmup() {
+    fn cutoffs_are_fitted_on_the_scores_after_the_warmup() {
         let ts: Vec<f64> = (0..200).map(|i| 10.0 + (i as f64 * 0.1).sin()).collect();
-        let options = RCFOptions {
-            sample_size: Some(64),
-            threshold: Some(RCFThreshold::StdDev(3.0)),
-            ..Default::default()
-        };
-        let warmup = options.effective_output_after();
-        let raw = replay_raw_scores(options, &ts);
+        for shingle_size in [None, Some(4), Some(8)] {
+            // StdDev: mean + 3 sd of the fitted scores.
+            let options = RCFOptions {
+                sample_size: Some(64),
+                shingle_size,
+                threshold: Some(RCFThreshold::StdDev(3.0)),
+                ..Default::default()
+            };
+            let start = options.first_scored_index();
+            let raw = replay_raw_scores(options, &ts);
+            let cutoff = |scores: &[f64]| {
+                let (mean, std_dev) = calculate_mean_std_dev(scores);
+                mean + 3.0 * std_dev
+            };
+            check_cutoff_fit(options, &ts, &raw, start, cutoff, "StdDev", shingle_size);
 
-        let cutoff = |scores: &[f64]| {
-            let (mean, std_dev) = calculate_mean_std_dev(scores);
-            mean + 3.0 * std_dev
-        };
-        let usable = cutoff(&raw[warmup..]);
-        let with_warmup = cutoff(&raw);
-        // The two fits have to disagree about some point, or this cannot tell them apart.
+            // Contamination: the 1 - c quantile of the fitted scores.
+            let options = RCFOptions {
+                threshold: Some(RCFThreshold::Contamination(0.1)),
+                ..options
+            };
+            let cutoff = |scores: &[f64]| quantile(scores, 0.9);
+            check_cutoff_fit(
+                options,
+                &ts,
+                &raw,
+                start,
+                cutoff,
+                "Contamination",
+                shingle_size,
+            );
+        }
+    }
+
+    /// `detect` must flag exactly the fitted-scores verdict, and the all-scores fit must
+    /// disagree about some point, or this cannot tell the two fits apart.
+    fn check_cutoff_fit(
+        options: RCFOptions,
+        ts: &[f64],
+        raw: &[f64],
+        start: usize,
+        cutoff: impl Fn(&[f64]) -> f64,
+        mode: &str,
+        shingle_size: Option<usize>,
+    ) {
+        let label = format!("{mode}, shingle_size {shingle_size:?}");
+        let fitted = cutoff(&raw[start..]);
+        let with_zeros = cutoff(raw);
         assert!(
-            raw[warmup..]
+            raw[start..]
                 .iter()
-                .any(|&r| r > usable && r <= with_warmup),
-            "no score falls between the cutoffs {usable} and {with_warmup}"
+                .any(|&r| (r > fitted) != (r > with_zeros)),
+            "{label}: no score falls between the cutoffs {fitted} and {with_zeros}"
         );
 
         let result = RcfOutlierDetector::new(options)
             .unwrap()
-            .detect(&ts)
+            .detect(ts)
             .unwrap();
-        for (index, &r) in raw.iter().enumerate().skip(warmup) {
-            assert_eq!(result.scores[index] > 0.5, r > usable, "index {index}");
+        for (index, &r) in raw.iter().enumerate().skip(start) {
+            assert_eq!(
+                result.scores[index] > 0.5,
+                r > fitted,
+                "{label}: index {index}"
+            );
         }
     }
 
