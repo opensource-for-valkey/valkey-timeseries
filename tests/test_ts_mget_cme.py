@@ -301,6 +301,23 @@ class TestTimeSeriesMgetCluster(ValkeyTimeSeriesClusterTestCase):
             # All should have the 'type' label with value 'usage'
             assert label_dict[b'type'] == b'usage'
 
+    def test_mget_reads_more_series_than_one_batch(self):
+        """A shard reads in batches of 512, and every series still comes back, once."""
+        cluster_client = self.new_cluster_client()
+        tag = self.tag_per_primary(cluster_client)[0]
+        keys = {f'batched:{{{tag}}}:{i}'.encode() for i in range(1300)}
+        for i, key in enumerate(sorted(keys)):
+            cluster_client.execute_command('TS.ADD', key, 1000, i, 'LABELS', 'batched', 'yes')
+
+        result = self.client_for_primary(1).execute_command(
+            'TS.MGET', 'WITHLABELS', 'FILTER', 'batched=yes')
+
+        assert len(result) == len(keys)
+        assert {row[0] for row in result} == keys
+        assert all(row[1] == [[b'batched', b'yes']] for row in result)
+        values = {float(row[2][1]) for row in result}
+        assert values == {float(i) for i in range(len(keys))}
+
     def tag_per_primary(self, cluster_client: ValkeyCluster):
         """Return one hash tag per primary, each owned by a different node.
 

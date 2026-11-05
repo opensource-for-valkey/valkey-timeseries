@@ -1,6 +1,7 @@
 use crate::common::acl::AclContextGuard;
 use crate::common::context::set_current_db;
 use crate::common::threads::{GilSource, LockGil};
+use crate::error_consts;
 use std::sync::OnceLock;
 use std::time::Instant;
 use valkey_module::{DetachedContext, MODULE_CONTEXT, Status, ValkeyError, ValkeyResult};
@@ -61,6 +62,27 @@ impl FanoutContext {
         self.deadline
             .get()
             .is_some_and(|deadline| Instant::now() >= *deadline)
+    }
+
+    /// When the requester stops waiting, for a read that checks it itself while holding the
+    /// lock ([`Self::lock_unexpired`]).
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline.get().copied()
+    }
+
+    /// [`Self::lock`] for a read that holds the lock throughout: fails with
+    /// [`FANOUT_REQUESTER_GAVE_UP`](error_consts::FANOUT_REQUESTER_GAVE_UP) instead of starting
+    /// a read nobody is waiting for, including when the wait for the lock used up the time.
+    pub fn lock_unexpired(&self) -> ValkeyResult<AclContextGuard> {
+        let gave_up = || Err(ValkeyError::Str(error_consts::FANOUT_REQUESTER_GAVE_UP));
+        if self.expired() {
+            return gave_up();
+        }
+        let guard = self.lock()?;
+        if self.expired() {
+            return gave_up();
+        }
+        Ok(guard)
     }
 
     /// The ACL user the request executes as, if enforcement applies.

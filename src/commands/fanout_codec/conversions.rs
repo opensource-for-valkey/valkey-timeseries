@@ -352,21 +352,26 @@ impl From<RangeGroupingOptions> for FanoutGroupingOptions {
     }
 }
 
-impl From<MGetSeriesData> for MGetValue {
-    fn from(value: MGetSeriesData) -> Self {
-        let labels = value
-            .labels
+/// An MGET result as it crosses the wire. The key is borrowed: a shard reading in batches has
+/// it only for as long as it holds the lock.
+pub(crate) fn mget_value(
+    key: &[u8],
+    labels: Vec<Option<Label>>,
+    sample: Option<Sample>,
+) -> MGetValue {
+    MGetValue {
+        key: key.to_vec(),
+        labels: labels
             .into_iter()
             .map(|l| l.map_or_else(FanoutLabel::default, |l| l.into()))
-            .collect();
+            .collect(),
+        sample: sample.map(Into::into),
+    }
+}
 
-        let sample = value.sample.map(Into::into);
-
-        MGetValue {
-            key: value.series_key.as_slice().to_vec(),
-            labels,
-            sample,
-        }
+impl From<MGetSeriesData> for MGetValue {
+    fn from(value: MGetSeriesData) -> Self {
+        mget_value(value.series_key.as_slice(), value.labels, value.sample)
     }
 }
 

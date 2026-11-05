@@ -103,7 +103,7 @@ pub static FANOUT_REJECTED_NO_HANDLER: AtomicU64 = AtomicU64::new(0);
 pub static FANOUT_REJECTED_BUSY: AtomicU64 = AtomicU64::new(0);
 /// Peer requests that waited in the queue past their time budget and were dropped unrun.
 pub static FANOUT_DROPPED_EXPIRED: AtomicU64 = AtomicU64::new(0);
-/// Peer requests whose read ran past their time budget and stopped between batches, unanswered.
+/// Peer requests whose read ran past their time budget and stopped part-way, unanswered.
 pub static FANOUT_ABANDONED_EXPIRED: AtomicU64 = AtomicU64::new(0);
 /// Peer requests rejected because the sender's cluster map disagrees with ours.
 pub static FANOUT_REJECTED_CLUSTER_MAP_MISMATCH: AtomicU64 = AtomicU64::new(0);
@@ -290,7 +290,7 @@ static COUNTERS: &[(&str, &AtomicU64, &str)] = &[
     (
         "abandoned_expired",
         &FANOUT_ABANDONED_EXPIRED,
-        "Peer fanout requests whose read ran past their time budget and stopped between batches, unanswered",
+        "Peer fanout requests whose read ran past their time budget and stopped part-way, unanswered",
     ),
     (
         "rejected_cluster_map_mismatch",

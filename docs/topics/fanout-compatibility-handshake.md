@@ -30,7 +30,9 @@ the receiver's deadline can't fall before the requester's.
 - If a request is still waiting in the fan-out lane's queue when its budget runs out, the
   receiver drops it without running it. It also sends no reply, because the requester has
   already given up (`fanout_dropped_expired_total` in `TS._DEBUG METRICS`).
-- If a read is past its budget, it stops between batches and also sends no reply
-  (`fanout_abandoned_expired_total`).
+- If a read is past its budget, it stops part-way and also sends no reply
+  (`fanout_abandoned_expired_total`). Most reads stop between batches. `TS.MRANGE` holds the lock
+  throughout, so it checks before taking the lock, once it has it, and between series or groups
+  while decoding. Selecting the series can't be interrupted, and neither can one group's reduce.
 - Operations that write (`FanoutCommand::cancellable() == false`, i.e. `TS.MDEL`) never expire on
   a shard that received them.

@@ -43,7 +43,7 @@ pub trait FanoutCommand: Default + Send + 'static {
     fn get_local_response(ctx: &FanoutContext, req: Self::Request) -> ValkeyResult<Self::Response>;
 
     /// Whether a share whose requester has given up may be abandoned: dropped unrun when it
-    /// waited in the queue past the operation's timeout, or stopped between read batches.
+    /// waited in the queue past the operation's timeout, or stopped part-way through its read.
     ///
     /// `false` for an operation that writes: abandoning it on some shards and not others
     /// would leave a partial write behind a reply that already said the command timed out,

@@ -63,6 +63,6 @@ fn mrange_internal(ctx: &Context, args: Vec<ValkeyString>, reverse: bool) -> Val
     }
 
     let shape = MRangeReplyShape::from_options(&options);
-    let result_rows = process_mrange_query(ctx, options, false, None)?;
+    let result_rows = process_mrange_query(ctx, options, false, None, None)?;
     reply_with_mrange_series_results(ctx, &result_rows, &shape)
 }
