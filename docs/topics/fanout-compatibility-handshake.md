@@ -32,7 +32,7 @@ To cover that gap, a coordinator whose timer fires sends a cancel message to the
 answer. It needs no clocks, and because it follows the request on the same link, a stalled receiver
 reads the request and then the cancel. A cancelled request is treated as if its budget had run out.
 A receiver that doesn't know the message type drops it, and its share ends at its budget instead.
-A write is never cancelled.
+A write is never cancelled, so a coordinator sends no cancel for one.
 
 - If a request is cancelled or runs out of budget while waiting in the fan-out lane's queue, the
   receiver drops it without running it. It also sends no reply, because the requester has
@@ -41,5 +41,7 @@ A write is never cancelled.
   (`fanout_abandoned_expired_total`). Most reads stop between batches. `TS.MRANGE` holds the lock
   throughout, so it checks before taking the lock, once it has it, and between series or groups
   while decoding. Selecting the series can't be interrupted, and neither can one group's reduce.
+- If a read finishes after its cancel arrives, the receiver discards the answer instead of sending
+  it (`fanout_answers_discarded_total`).
 - Operations that write (`FanoutCommand::cancellable() == false`, i.e. `TS.MDEL`) never expire on
   a shard that received them.

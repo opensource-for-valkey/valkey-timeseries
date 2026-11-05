@@ -109,6 +109,8 @@ pub static FANOUT_CANCELS_RECEIVED: AtomicU64 = AtomicU64::new(0);
 pub static FANOUT_DROPPED_EXPIRED: AtomicU64 = AtomicU64::new(0);
 /// Peer requests whose read was cancelled or ran past its time budget, stopped part-way, unanswered.
 pub static FANOUT_ABANDONED_EXPIRED: AtomicU64 = AtomicU64::new(0);
+/// Peer requests whose read finished after a cancel: the answer was discarded, not sent.
+pub static FANOUT_ANSWERS_DISCARDED: AtomicU64 = AtomicU64::new(0);
 /// Peer requests rejected because the sender's cluster map disagrees with ours.
 pub static FANOUT_REJECTED_CLUSTER_MAP_MISMATCH: AtomicU64 = AtomicU64::new(0);
 
@@ -305,6 +307,11 @@ static COUNTERS: &[(&str, &AtomicU64, &str)] = &[
         "abandoned_expired",
         &FANOUT_ABANDONED_EXPIRED,
         "Peer fanout requests whose read was cancelled or ran past its time budget and stopped part-way, unanswered",
+    ),
+    (
+        "answers_discarded",
+        &FANOUT_ANSWERS_DISCARDED,
+        "Peer fanout requests whose read finished after a cancel, so the answer was discarded",
     ),
     (
         "rejected_cluster_map_mismatch",

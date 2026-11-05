@@ -274,7 +274,12 @@ fn on_request_timeout(ctx: &Context, id: u64) {
 /// from when it reads the request, so a peer whose main thread stalled would otherwise give it a
 /// full budget after the requester has gone. This reaches it behind the request, on the same
 /// link. A lost message only leaves that budget in place, so a failed send is not an error.
+///
+/// A write always runs to the end on the shards that received it, so it gets no cancel.
 fn send_cancels(ctx: &Context, request: &InFlightRequest) {
+    if !get_fanout_request_handler(request.command).is_some_and(|op| op.cancellable) {
+        return;
+    }
     let answered = lock(&request.responded);
     for node in request.targets.iter() {
         if node.is_local() || answered.contains(&node.id) {
@@ -626,10 +631,11 @@ fn process_request_message(
 
     match (operation.run)(&fanout_ctx, request_buf, &mut dest) {
         Ok(()) => {
-            metrics::FANOUT_SERVED_OK.incr();
             if fanout_ctx.is_cancelled() {
+                metrics::FANOUT_ANSWERS_DISCARDED.incr();
                 return;
             }
+            metrics::FANOUT_SERVED_OK.incr();
             let ctx = MODULE_CONTEXT.lock_gil();
             if send_response_message(
                 &ctx,
@@ -1111,6 +1117,38 @@ mod tests {
 
         assert!(metrics::FANOUT_DROPPED_EXPIRED.load(Ordering::Relaxed) > before);
         assert!(!PEER_REQUESTS.pin().contains_key(&(sender, 11)));
+    }
+
+    fn cancelled_while_running(_: &FanoutContext, _: &[u8], _: &mut Vec<u8>) -> FanoutResult {
+        cancel_peer_request(node_id(b'e'), 1);
+        Ok(())
+    }
+
+    /// A read that finishes after its cancel has an answer nobody wants: it is not sent, which
+    /// would need the GIL here, and not counted as served.
+    #[test]
+    fn an_answer_finished_after_a_cancel_is_discarded() {
+        let discarded = metrics::FANOUT_ANSWERS_DISCARDED.load(Ordering::Relaxed);
+        let served = metrics::FANOUT_SERVED_OK.load(Ordering::Relaxed);
+        let sender = node_id(b'e');
+
+        process_request_message(
+            header(Some(Duration::from_secs(60))),
+            RegisteredOperation {
+                run: cancelled_while_running,
+                cancellable: true,
+            },
+            &[],
+            sender,
+            Instant::now(),
+            Some(PeerRequest::register(sender, 1)),
+        );
+
+        assert_eq!(
+            metrics::FANOUT_ANSWERS_DISCARDED.load(Ordering::Relaxed),
+            discarded + 1
+        );
+        assert_eq!(metrics::FANOUT_SERVED_OK.load(Ordering::Relaxed), served);
     }
 
     fn gives_up_mid_read(_: &FanoutContext, _: &[u8], _: &mut Vec<u8>) -> FanoutResult {

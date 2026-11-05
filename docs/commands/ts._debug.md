@@ -284,6 +284,7 @@ As a peer serving a coordinator:
 | `fanout_cancels_received_total` | counter | Cancel messages received from requesters that stopped waiting |
 | `fanout_dropped_expired_total` | counter | Requests dropped unrun because they were cancelled or waited in the queue past their time budget (no reply is sent: the requester has already given up) |
 | `fanout_abandoned_expired_total` | counter | Requests whose read was cancelled or ran past its time budget and stopped part-way (no reply is sent: the requester has already given up) |
+| `fanout_answers_discarded_total` | counter | Requests whose read finished after a cancel, so the answer was discarded instead of sent |
 | `fanout_rejected_cluster_map_mismatch_total` | counter | Requests rejected because the sender's cluster map disagrees with this node's |
 
 On the wire (counted by the sender):
