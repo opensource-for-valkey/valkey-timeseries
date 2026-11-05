@@ -1,5 +1,5 @@
 use super::utils::normalize_evidence;
-use crate::analysis::math::{calculate_mean, calculate_mean_std_dev, quantile};
+use crate::analysis::math::{calculate_mean_std_dev, quantile};
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal,
 };
@@ -340,9 +340,10 @@ impl RcfOutlierDetector {
     /// # Direction
     ///
     /// RCF is a symmetric detector.  The [`AnomalySignal`] direction is derived by
-    /// comparing each anomalous value to the mean of the full input slice:
-    /// - value ≥ mean → [`AnomalySignal::Positive`]
-    /// - value < mean → [`AnomalySignal::Negative`]
+    /// comparing each anomalous value to the median of the full input slice, so that
+    /// one extreme value cannot change which side of normal the others fall on:
+    /// - value ≥ median → [`AnomalySignal::Positive`]
+    /// - value < median → [`AnomalySignal::Negative`]
     ///
     /// # State
     ///
@@ -357,7 +358,7 @@ impl RcfOutlierDetector {
     ///
     /// # Precision
     ///
-    /// The forest stores `f32`, so each value is centred on the series mean in `f64`
+    /// The forest stores `f32`, so each value is centred on the series median in `f64`
     /// before the cast; otherwise a large level would round the spread away. A value
     /// that is still beyond `f32` after centring is an error.
     ///
@@ -377,10 +378,8 @@ impl RcfOutlierDetector {
             });
         }
 
-        // The forest stores `f32`. Centre on the series mean in `f64` before the cast: a
-        // level far from zero otherwise takes the whole spread with it, since `f32` keeps
-        // 24 bits of mantissa. Direction, below, still reads the original values.
-        let offset = calculate_mean(ts);
+        // Direction, below, still reads the original values.
+        let centre = series_centre(ts);
 
         // Online pattern: score each point *before* updating the model so that the
         // anomaly score reflects the distribution seen *up to but not including*
@@ -388,7 +387,7 @@ impl RcfOutlierDetector {
         let mut scores = Vec::with_capacity(ts.len());
 
         for &value in ts {
-            let point = [centre_to_f32(value, offset)?];
+            let point = [centre_to_f32(value, centre)?];
 
             let raw = self.forest.score(&point).map_err(|e| {
                 TimeSeriesAnalysisError::AnomalyDetectionError(format!(
@@ -407,9 +406,11 @@ impl RcfOutlierDetector {
         }
 
         match threshold {
-            RCFThreshold::StdDev(threshold) => Ok(self.detect_with_zscores(ts, scores, threshold)),
+            RCFThreshold::StdDev(threshold) => {
+                Ok(self.detect_with_zscores(ts, centre, scores, threshold))
+            }
             RCFThreshold::Contamination(contamination) => {
-                Ok(self.detect_with_contamination(ts, scores, contamination))
+                Ok(self.detect_with_contamination(ts, centre, scores, contamination))
             }
         }
     }
@@ -427,6 +428,7 @@ impl RcfOutlierDetector {
     fn assemble(
         &self,
         values: &[f64],
+        centre: f64,
         raw_scores: &[f64],
         evidence: impl Fn(f64) -> f64,
         boundary: f64,
@@ -437,8 +439,9 @@ impl RcfOutlierDetector {
         // unrelated units, so the reported direction depended on whether the
         // series happened to live on the same numeric scale as the forest's
         // internal statistic.
-        let value_mean = calculate_mean(values);
-
+        //
+        // `centre` is the median: a mean dragged upward by one extreme value reports an
+        // ordinary spike as a dip, and `DIRECTION POSITIVE` then drops it.
         let mut scores = Vec::with_capacity(raw_scores.len());
         let mut anomalies: Vec<Anomaly> = Vec::with_capacity(4);
 
@@ -457,7 +460,7 @@ impl RcfOutlierDetector {
             }
 
             if score > 0.5 {
-                let signal = if value >= value_mean {
+                let signal = if value >= centre {
                     AnomalySignal::Positive
                 } else {
                     AnomalySignal::Negative
@@ -490,6 +493,7 @@ impl RcfOutlierDetector {
     fn detect_with_zscores(
         &mut self,
         values: &[f64],
+        centre: f64,
         raw_scores: Vec<f64>,
         threshold: f64,
     ) -> AnomalyResult {
@@ -509,7 +513,14 @@ impl RcfOutlierDetector {
             (mean, threshold * std_dev)
         };
 
-        self.assemble(values, &raw_scores, |raw| raw - mean, boundary, threshold)
+        self.assemble(
+            values,
+            centre,
+            &raw_scores,
+            |raw| raw - mean,
+            boundary,
+            threshold,
+        )
     }
 
     /// Cutoff at the `1 - contamination` quantile of the forest scores.
@@ -520,6 +531,7 @@ impl RcfOutlierDetector {
     fn detect_with_contamination(
         &self,
         values: &[f64],
+        centre: f64,
         raw_scores: Vec<f64>,
         contamination: f64,
     ) -> AnomalyResult {
@@ -538,8 +550,30 @@ impl RcfOutlierDetector {
             quantile(usable_scores, 1.0 - contamination)
         };
 
-        self.assemble(values, &raw_scores, |raw| raw, boundary, contamination)
+        self.assemble(
+            values,
+            centre,
+            &raw_scores,
+            |raw| raw,
+            boundary,
+            contamination,
+        )
     }
+}
+
+/// The series median: what each value is centred on before the `f32` cast, and the
+/// reference for an anomaly's direction.
+///
+/// `f32` keeps 24 bits of mantissa, so a level far from zero takes the whole spread with
+/// it unless it is removed in `f64` first. It has to be the median and not the mean,
+/// because the values that matter are the ordinary ones: a single `1e12` among values
+/// near 100 moves the mean to about `2.49e9`, where `f32` steps are 256 apart and every
+/// ordinary value rounds to the same point.
+///
+/// Non-finite values are ignored. If the series is split evenly between levels too far
+/// apart for one `f32` scale, the spread within them is lost whatever the offset.
+fn series_centre(ts: &[f64]) -> f64 {
+    quantile(ts, 0.5)
 }
 
 /// `value - offset` as the `f32` the forest stores.
@@ -975,15 +1009,15 @@ mod tests {
         }
     }
 
-    /// A value clearly above the series mean must receive `Positive` signal;
+    /// A value clearly above the series median must receive `Positive` signal;
     /// a value clearly below must receive `Negative` signal.
     #[test]
-    fn detect_assigns_direction_relative_to_mean() {
-        // Build a series with mean ≈ 0.  High and low anomalies are symmetric.
+    fn detect_assigns_direction_relative_to_median() {
+        // Build a series with median 0.  High and low anomalies are symmetric.
         let n = 60usize;
         let mut ts: Vec<f64> = (0..n).map(|_| 0.0).collect();
-        ts[20] = 80.0; // well above mean → Positive
-        ts[40] = -80.0; // well below mean → Negative
+        ts[20] = 80.0; // well above median → Positive
+        ts[40] = -80.0; // well below median → Negative
 
         let mut detector = RcfOutlierDetector::new(RCFOptions {
             num_trees: Some(60),
@@ -1003,14 +1037,14 @@ mod tests {
                 assert_eq!(
                     anomaly.signal,
                     AnomalySignal::Positive,
-                    "value {} above mean should be Positive",
+                    "value {} above median should be Positive",
                     anomaly.value
                 );
             } else if anomaly.value < 0.0 {
                 assert_eq!(
                     anomaly.signal,
                     AnomalySignal::Negative,
-                    "value {} below mean should be Negative",
+                    "value {} below median should be Negative",
                     anomaly.value
                 );
             }
@@ -1025,7 +1059,7 @@ mod tests {
     /// whether the series happened to live near the forest's own numeric range.
     /// Raw RCF scores sit around 1-4; a series near 10,000 therefore has every
     /// value above that mean, and every anomaly was reported `Positive`,
-    /// including the dips. `detect_assigns_direction_relative_to_mean` above
+    /// including the dips. `detect_assigns_direction_relative_to_median` above
     /// cannot catch this: it builds a series centered on zero, where the two
     /// scales happen to agree.
     #[test]
@@ -1054,14 +1088,14 @@ mod tests {
             assert_eq!(
                 dip.unwrap().signal,
                 AnomalySignal::Negative,
-                "{threshold:?}: a value far *below* the series mean must be Negative"
+                "{threshold:?}: a value far *below* the series median must be Negative"
             );
 
             if let Some(spike) = result.anomalies.iter().find(|a| a.index == 60) {
                 assert_eq!(
                     spike.signal,
                     AnomalySignal::Positive,
-                    "{threshold:?}: a value far above the series mean must be Positive"
+                    "{threshold:?}: a value far above the series median must be Positive"
                 );
             }
         }
@@ -1267,6 +1301,37 @@ mod tests {
         }
     }
 
+    /// One extreme value must not cost the rest of the series its precision. Centring on
+    /// the mean let a final `1e12` drag the offset to about `2.49e9`, where `f32` steps
+    /// are 256 apart: `100` and `150` rounded to the same point, so the earlier spike
+    /// scored 0 and vanished.
+    #[test]
+    fn one_extreme_value_does_not_erase_an_earlier_spike() {
+        let mut ts = vec![100.0f64; 400];
+        ts[200] = 150.0;
+        ts[399] = 1e12;
+
+        for threshold in [RCFThreshold::StdDev(3.0), RCFThreshold::Contamination(0.01)] {
+            let mut detector = RcfOutlierDetector::new(RCFOptions {
+                threshold: Some(threshold),
+                ..Default::default()
+            })
+            .unwrap();
+            let result = detector.detect(&ts).unwrap();
+            let spike = result.anomalies.iter().find(|a| a.index == 200);
+            let spike = spike.unwrap_or_else(|| {
+                panic!(
+                    "{threshold:?}: spike at 200 lost; score {}, flagged {:?}",
+                    result.scores[200],
+                    result.anomalies.iter().map(|a| a.index).collect::<Vec<_>>()
+                )
+            });
+            // The same extreme value must not flip the direction either: against the mean,
+            // 150 read as below a series whose every other point is 100.
+            assert_eq!(spike.signal, AnomalySignal::Positive, "{threshold:?}");
+        }
+    }
+
     /// Under the default options a smooth series flags nothing in the warmup and next to
     /// nothing after it. It passes with or without the warmup zeros in the cutoff fit, so
     /// it says nothing about that fit: `cutoffs_are_fitted_on_the_scores_after_the_warmup`
@@ -1328,10 +1393,10 @@ mod tests {
     /// score-then-update order, from a fresh forest.
     fn replay_raw_scores(options: RCFOptions, ts: &[f64]) -> Vec<f64> {
         let mut detector = RcfOutlierDetector::new(options).unwrap();
-        let offset = calculate_mean(ts);
+        let centre = series_centre(ts);
         ts.iter()
             .map(|&v| {
-                let point = [(v - offset) as f32];
+                let point = [(v - centre) as f32];
                 let score = detector.forest.score(&point).unwrap();
                 detector.forest.update(&point).unwrap();
                 score
