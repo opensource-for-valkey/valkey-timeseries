@@ -5,8 +5,8 @@
 //! magnitude for the same sample count.
 
 use crate::analysis::outliers::{
-    AnomalyDetectionMethodOptions, AnomalyOptions, RCF_DEFAULT_NUM_TREES, RCF_DEFAULT_SAMPLE_SIZE,
-    effective_max_outliers,
+    AnomalyDetectionMethodOptions, AnomalyOptions, MIN_DETECTION_SAMPLES, RCF_DEFAULT_NUM_TREES,
+    RCF_DEFAULT_SAMPLE_SIZE, effective_max_outliers,
 };
 use crate::analysis::seasonality::{MAX_SEASONALITY_PERIODS, Seasonality};
 
@@ -34,10 +34,19 @@ fn method_cost(samples: usize, options: &AnomalyOptions) -> f64 {
             n * k * n.log2().max(1.0) / 500.0
         }
         AnomalyDetectionMethodOptions::Rcf(rcf) => {
+            // Detection refuses this range before it builds a forest.
+            if samples < MIN_DETECTION_SAMPLES {
+                return 0.0;
+            }
             let trees = rcf.num_trees.unwrap_or(RCF_DEFAULT_NUM_TREES) as f64;
             let sample_size = rcf.sample_size.unwrap_or(RCF_DEFAULT_SAMPLE_SIZE) as f64;
             let shingle = rcf.shingle_size.unwrap_or(1) as f64;
-            n * trees * shingle * sample_size.log2() / 10.0
+            // Building and dropping the forest, paid once whatever the range. Fitted to the
+            // `outliers_rcf_forest` bench; each tree has a fixed part as well as its capacity,
+            // so this is not purely `trees * sample_size`. A shingle adds little here, and a
+            // shingled range has at least `shingle` samples, so the term below covers it.
+            let forest = trees * (3.0 + sample_size / 150.0);
+            forest + n * trees * shingle * sample_size.log2() / 10.0
         }
         _ => 0.0,
     }
@@ -95,6 +104,44 @@ mod tests {
     fn esd_and_rcf_leave_the_main_thread_early() {
         assert!(estimated_cost_micros(1_000, &esd_default()) > INLINE_COST_BUDGET_MICROS);
         assert!(estimated_cost_micros(200, &rcf_default()) > INLINE_COST_BUDGET_MICROS);
+    }
+
+    fn rcf(samples: usize, num_trees: usize, sample_size: usize) -> u64 {
+        let options = AnomalyOptions {
+            options: AnomalyDetectionMethodOptions::Rcf(RCFOptions {
+                num_trees: Some(num_trees),
+                sample_size: Some(sample_size),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        estimated_cost_micros(samples, &options)
+    }
+
+    /// Three samples, the fewest detection accepts, spend almost everything on the forest.
+    /// 256 trees of 4096 took 8.1 ms and used to be estimated at 922 µs, inline.
+    #[test]
+    fn a_short_range_through_a_large_forest_leaves_the_main_thread() {
+        assert!(rcf(3, 256, 4096) > 5_000, "{}", rcf(3, 256, 4096));
+        assert!(rcf(3, 512, 256) > INLINE_COST_BUDGET_MICROS);
+        assert!(rcf(3, 100, 4096) > INLINE_COST_BUDGET_MICROS);
+    }
+
+    /// The default forest takes about 430 µs on three samples, so it may stay inline there.
+    #[test]
+    fn a_short_range_through_a_small_forest_stays_inline() {
+        assert!(estimated_cost_micros(3, &rcf_default()) <= INLINE_COST_BUDGET_MICROS);
+        assert!(rcf(3, 1, 4096) <= INLINE_COST_BUDGET_MICROS);
+        assert!(rcf(3, 1, 3) <= INLINE_COST_BUDGET_MICROS);
+    }
+
+    /// Detection refuses fewer than three samples before it builds anything, so a large
+    /// forest over an empty range costs nothing and must not take a lane slot.
+    #[test]
+    fn a_range_too_short_to_detect_builds_no_forest() {
+        for samples in [0, 1, 2] {
+            assert!(rcf(samples, 512, 4096) <= INLINE_COST_BUDGET_MICROS);
+        }
     }
 
     #[test]

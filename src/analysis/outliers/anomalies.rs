@@ -133,16 +133,20 @@ pub fn detect_anomalies(
     Ok(result)
 }
 
+/// The fewest finite samples detection accepts. Below this it refuses before building
+/// anything, whatever the method.
+pub const MIN_DETECTION_SAMPLES: usize = 3;
+
 fn detect_finite(
     values: &[f64],
     options: &AnomalyOptions,
 ) -> TimeSeriesAnalysisResult<AnomalyResult> {
     let n = values.len();
 
-    if n < 3 {
+    if n < MIN_DETECTION_SAMPLES {
         return Err(TimeSeriesAnalysisError::InsufficientData {
             message: INSUFFICIENT_DATA_ERROR.to_string(),
-            required: 3,
+            required: MIN_DETECTION_SAMPLES,
             actual: n,
         });
     }

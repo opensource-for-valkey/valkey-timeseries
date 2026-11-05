@@ -1051,6 +1051,21 @@ class TestOutliersLaneFailureStillReplies(ValkeyTimeSeriesTestCaseDebugMode):
         assert any(entry.value == 50.0 for entry in convert_anomaly_entries(result))
         assert self.server.is_alive()
 
+    def test_short_range_placement_counts_the_forest(self):
+        client = self._client()
+        key = 'test:outliers:placement:forest'
+        for ts, value in enumerate([1.0, 2.0, 3.0], start=1):
+            client.execute_command('TS.ADD', key, ts, value)
+
+        # Three samples through the default forest stay inline: the armed panic is not consumed.
+        client.execute_command('TS._DEBUG', 'PANIC_NEXT_ANALYSIS_JOB')
+        client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'rcf')
+
+        # The same three samples through a large forest go to the lane and consume it.
+        with pytest.raises(ResponseError, match='internal error'):
+            client.execute_command(
+                'TS.OUTLIERS', key, '-', '+', 'METHOD', 'rcf', 'NUM_TREES', 256, 'SAMPLE_SIZE', 4096)
+
     def test_placement_follows_estimated_cost(self):
         client = self._client()
         key = 'test:outliers:placement'
