@@ -486,10 +486,16 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         # The two deadlines race: the client's fires unless the RPC's result reached it first.
         assert stats['fanout_client_timeouts_total'] <= 1
         assert stats['fanout_inflight'] == 0
-        # Once awake, the peer answers a request the coordinator no longer has.
-        wait_for_true(lambda: debug_metrics(peer, 'fanout')['fanout_served_ok_total'] == 1)
-        wait_for_true(lambda: debug_metrics(coordinator, 'fanout')[
-            'fanout_ignored_unknown_request_total'] >= 1)
+        assert stats['fanout_cancels_sent_total'] == 1
+        # Once awake, the peer reads the request, then the cancel behind it. Whether the share
+        # gets to run in between is a race, but it ends one way or another.
+        def share_ended():
+            peer_stats = debug_metrics(peer, 'fanout')
+            return peer_stats['fanout_cancels_received_total'] == 1 and (
+                peer_stats['fanout_served_ok_total']
+                + peer_stats['fanout_dropped_expired_total']
+                + peer_stats['fanout_abandoned_expired_total']) == 1
+        wait_for_true(share_ended)
 
     def test_inflight_lists_a_request_waiting_on_a_peer(self):
         self.populate()

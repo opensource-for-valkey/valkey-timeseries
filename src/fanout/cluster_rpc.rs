@@ -41,6 +41,9 @@ use valkey_module::{
 const FANOUT_REQUEST_MESSAGE: u8 = 0x01;
 const FANOUT_RESPONSE_MESSAGE: u8 = 0x02;
 const FANOUT_ERROR_MESSAGE: u8 = 0x03;
+/// The requester has stopped waiting for a request's answer. A node without a receiver for this
+/// type drops the message, and its share then ends at its time budget instead.
+const FANOUT_CANCEL_MESSAGE: u8 = 0x04;
 
 /// Default buffer size for serializing fanout request messages (header + small protobuf payload).
 const FANOUT_RPC_BUFFER_SIZE: usize = 512;
@@ -251,7 +254,7 @@ fn next_id(counter: &AtomicU64) -> u64 {
 /// with it; observed on the first fanout timeout of a large cluster range
 /// read). The server removes and frees the firing timer itself once this
 /// returns.
-fn on_request_timeout(_ctx: &Context, id: u64) {
+fn on_request_timeout(ctx: &Context, id: u64) {
     let map = INFLIGHT_REQUESTS.pin();
     if let Some(request) = map.get(&id) {
         // Timeout can race with responses; only one path should complete the request.
@@ -261,8 +264,34 @@ fn on_request_timeout(_ctx: &Context, id: u64) {
 
         metrics::FANOUT_RPC_TIMEOUTS.incr();
         request.deliver_timeout();
+        send_cancels(ctx, request);
 
         map.remove(&id);
+    }
+}
+
+/// Tells the targets yet to answer that nobody is waiting any more. A peer's time budget counts
+/// from when it reads the request, so a peer whose main thread stalled would otherwise give it a
+/// full budget after the requester has gone. This reaches it behind the request, on the same
+/// link. A lost message only leaves that budget in place, so a failed send is not an error.
+fn send_cancels(ctx: &Context, request: &InFlightRequest) {
+    let answered = lock(&request.responded);
+    for node in request.targets.iter() {
+        if node.is_local() || answered.contains(&node.id) {
+            continue;
+        }
+        let sent = send_message_internal(
+            ctx,
+            FANOUT_CANCEL_MESSAGE,
+            request.id,
+            0,
+            node.id.raw_ptr(),
+            "",
+            &[],
+        );
+        if sent == Status::Ok {
+            metrics::FANOUT_CANCELS_SENT.incr();
+        }
     }
 }
 
@@ -549,6 +578,7 @@ fn process_request_message(
     request_buf: &[u8],
     sender_id: NodeId,
     received: Instant,
+    registration: Option<PeerRequest>,
 ) {
     let request_id = header.request_id;
 
@@ -558,10 +588,13 @@ fn process_request_message(
     if let Some(deadline) = request_deadline(operation, header.time_budget, received) {
         fanout_ctx.set_deadline(deadline);
     }
+    if let Some(registration) = &registration {
+        fanout_ctx.set_cancel_flag(registration.cancelled.clone());
+    }
     if fanout_ctx.expired() {
-        // Counted from arrival, the deadline is never earlier than the requester's, so the
-        // requester has already given up: any answer, an error included, would only be
-        // logged there as a reply to an unknown request.
+        // Cancelled, or past a deadline which, counted from arrival, is never earlier than the
+        // requester's. Either way the requester has already given up: any answer, an error
+        // included, would only be logged there as a reply to an unknown request.
         metrics::FANOUT_DROPPED_EXPIRED.incr();
         return;
     }
@@ -594,6 +627,9 @@ fn process_request_message(
     match (operation.run)(&fanout_ctx, request_buf, &mut dest) {
         Ok(()) => {
             metrics::FANOUT_SERVED_OK.incr();
+            if fanout_ctx.is_cancelled() {
+                return;
+            }
             let ctx = MODULE_CONTEXT.lock_gil();
             if send_response_message(
                 &ctx,
@@ -731,8 +767,11 @@ extern "C" fn on_request_received(
     let (request_id, db) = (header.request_id, header.db);
 
     // A blocking thread: the handler takes the GIL (R1 in `common::threads`).
+    let registration = operation
+        .cancellable
+        .then(|| PeerRequest::register(sender, request_id));
     let queued = PEER_REQUEST_EXECUTOR.try_spawn(move || {
-        process_request_message(header, operation, &buf, sender, received);
+        process_request_message(header, operation, &buf, sender, received, registration);
     });
     if queued.is_err() {
         metrics::FANOUT_REJECTED_BUSY.incr();
@@ -741,6 +780,56 @@ extern "C" fn on_request_received(
         let msg = format!("Rejecting fanout request {request_id} from node {sender}: workers busy");
         ctx.log_warning(&msg);
     }
+}
+
+/// Peer requests being served that their requester may cancel, by requester and request id.
+/// Request ids are only unique per requester.
+static PEER_REQUESTS: LazyLock<HashMap<(NodeId, u64), Arc<AtomicBool>>> =
+    LazyLock::new(HashMap::new);
+
+/// A peer request's entry in [`PEER_REQUESTS`], for as long as the request is queued or running.
+/// Dropping it removes the entry, so a request that never ran (the queue was full) leaves none.
+struct PeerRequest {
+    key: (NodeId, u64),
+    cancelled: Arc<AtomicBool>,
+}
+
+impl PeerRequest {
+    fn register(sender: NodeId, request_id: u64) -> Self {
+        let key = (sender, request_id);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        PEER_REQUESTS.pin().insert(key, cancelled.clone());
+        Self { key, cancelled }
+    }
+}
+
+impl Drop for PeerRequest {
+    fn drop(&mut self) {
+        PEER_REQUESTS.pin().remove(&self.key);
+    }
+}
+
+/// Marks a request as no longer wanted. A request that has finished has no entry, which is fine:
+/// its answer has gone already.
+fn cancel_peer_request(sender: NodeId, request_id: u64) {
+    if let Some(cancelled) = PEER_REQUESTS.pin().get(&(sender, request_id)) {
+        cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+extern "C" fn on_cancel_received(
+    ctx: *mut ValkeyModuleCtx,
+    sender_id: *const c_char,
+    _type: u8,
+    payload: *const c_uchar,
+    len: u32,
+) {
+    let ctx = Context::new(ctx as *mut RedisModuleCtx);
+    let Some(message) = parse_fanout_message(&ctx, sender_id, payload, len) else {
+        return;
+    };
+    metrics::FANOUT_CANCELS_RECEIVED.incr();
+    cancel_peer_request(NodeId::from_raw(sender_id), message.header.request_id);
 }
 
 /// Runs `f` against an in-flight request. `f` reports whether it delivered an answer that
@@ -871,6 +960,7 @@ pub fn register_cluster_message_handlers(ctx: &Context) {
     register_message_receiver(ctx, FANOUT_REQUEST_MESSAGE, Some(on_request_received));
     register_message_receiver(ctx, FANOUT_RESPONSE_MESSAGE, Some(on_response_received));
     register_message_receiver(ctx, FANOUT_ERROR_MESSAGE, Some(on_error_received));
+    register_message_receiver(ctx, FANOUT_CANCEL_MESSAGE, Some(on_cancel_received));
 }
 
 #[cfg(test)]
@@ -937,6 +1027,7 @@ mod tests {
             &[],
             NodeId::default(),
             received,
+            None,
         );
 
         assert!(metrics::FANOUT_DROPPED_EXPIRED.load(Ordering::Relaxed) > before);
@@ -966,6 +1057,62 @@ mod tests {
         assert_eq!(message.header.request_id, id);
     }
 
+    /// `from_raw` reads a full node id, however short a string it is handed.
+    fn node_id(hex_digit: u8) -> NodeId {
+        NodeId::from_raw([hex_digit; 41].as_ptr().cast())
+    }
+
+    /// A cancel marks the request it names, from the requester that sent it, and nothing else:
+    /// request ids are only unique per requester.
+    #[test]
+    fn a_cancel_marks_only_the_request_it_names() {
+        let sender = node_id(b'a');
+        let other = node_id(b'b');
+        let request = PeerRequest::register(sender, 7);
+        let same_id_elsewhere = PeerRequest::register(other, 7);
+        let another_id = PeerRequest::register(sender, 8);
+
+        cancel_peer_request(sender, 7);
+
+        assert!(request.cancelled.load(Ordering::Relaxed));
+        assert!(!same_id_elsewhere.cancelled.load(Ordering::Relaxed));
+        assert!(!another_id.cancelled.load(Ordering::Relaxed));
+    }
+
+    /// A cancel can arrive after the answer has gone, and a finished request leaves no entry.
+    #[test]
+    fn a_finished_request_is_forgotten() {
+        let sender = node_id(b'c');
+        let request = PeerRequest::register(sender, 9);
+        assert!(PEER_REQUESTS.pin().contains_key(&(sender, 9)));
+
+        drop(request);
+
+        assert!(!PEER_REQUESTS.pin().contains_key(&(sender, 9)));
+        cancel_peer_request(sender, 9);
+    }
+
+    /// A request cancelled while it waited in the queue is dropped unrun, with its budget intact.
+    #[test]
+    fn a_cancelled_request_is_dropped_unrun() {
+        let before = metrics::FANOUT_DROPPED_EXPIRED.load(Ordering::Relaxed);
+        let sender = node_id(b'd');
+        let registration = PeerRequest::register(sender, 11);
+        cancel_peer_request(sender, 11);
+
+        process_request_message(
+            header(Some(Duration::from_secs(60))),
+            operation(true),
+            &[],
+            sender,
+            Instant::now(),
+            Some(registration),
+        );
+
+        assert!(metrics::FANOUT_DROPPED_EXPIRED.load(Ordering::Relaxed) > before);
+        assert!(!PEER_REQUESTS.pin().contains_key(&(sender, 11)));
+    }
+
     fn gives_up_mid_read(_: &FanoutContext, _: &[u8], _: &mut Vec<u8>) -> FanoutResult {
         Err(ValkeyError::Str(error_consts::FANOUT_REQUESTER_GAVE_UP).into())
     }
@@ -986,6 +1133,7 @@ mod tests {
             &[],
             NodeId::default(),
             Instant::now(),
+            None,
         );
 
         assert!(metrics::FANOUT_ABANDONED_EXPIRED.load(Ordering::Relaxed) > abandoned);

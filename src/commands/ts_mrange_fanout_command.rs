@@ -131,9 +131,9 @@ impl FanoutClientCommand for MRangeFanoutCommand {
             // bucket (per-series aggregation included when present) and ship
             // partial states instead of per-series samples.
             let partials = {
-                let deadline = ctx.deadline();
+                let expired = || ctx.expired();
                 let ctx = ctx.lock_unexpired()?;
-                process_mrange_group_partials(&ctx, options, limit, deadline)?
+                process_mrange_group_partials(&ctx, options, limit, &expired)?
             };
             return Ok(MultiRangeResponse {
                 series: Vec::new(),
@@ -157,9 +157,9 @@ impl FanoutClientCommand for MRangeFanoutCommand {
         // Process the MRange query locally. The results are owned, so the
         // encoding below (including label interning) runs with the GIL released.
         let series = {
-            let deadline = ctx.deadline();
+            let expired = || ctx.expired();
             let ctx = ctx.lock_unexpired()?;
-            process_mrange_query(&ctx, options, true, limit, deadline)?
+            process_mrange_query(&ctx, options, true, limit, &expired)?
         };
 
         // Convert MRangeSeriesResult to SeriesResponse

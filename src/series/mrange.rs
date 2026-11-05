@@ -19,7 +19,6 @@ use crate::series::request_types::{
 use ahash::AHashMap;
 use orx_parallel::Par;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 use valkey_module::{Context, ValkeyError, ValkeyResult};
 
 struct MRangeSeriesMeta<'a> {
@@ -73,7 +72,7 @@ pub(crate) fn process_mrange_group_partials(
     ctx: &Context,
     options: MRangeOptions,
     limit: Option<SampleLimit>,
-    deadline: Option<Instant>,
+    expired: &(dyn Fn() -> bool + Sync),
 ) -> ValkeyResult<Vec<GroupPartialsResult>> {
     check_metadata_permissions(ctx)?;
 
@@ -120,7 +119,7 @@ pub(crate) fn process_mrange_group_partials(
         .filter(|a| a.is_multi())
         .map(|a| a.aggregations.len());
 
-    let deadline = ReadDeadline::new(deadline);
+    let deadline = ReadDeadline::new(expired);
     let results = grouped
         .into_iter()
         .iter_into_par_rayon()
@@ -196,14 +195,14 @@ pub(crate) fn process_mrange_group_partials(
     deadline.finish(results)
 }
 
-/// `deadline` is when a shard's requester stops waiting: the decode, which runs under the lock,
-/// stops between series once it passes.
+/// `expired` says whether a shard's requester has stopped waiting: the decode, which runs under
+/// the lock, stops between series once it has.
 pub(crate) fn process_mrange_query(
     ctx: &Context,
     options: MRangeOptions,
     clustered: bool,
     limit: Option<SampleLimit>,
-    deadline: Option<Instant>,
+    expired: &(dyn Fn() -> bool + Sync),
 ) -> ValkeyResult<Vec<MRangeSeriesResult>> {
     if options.filters.is_empty() {
         return Err(ValkeyError::Str(error_consts::MISSING_FILTER));
@@ -229,7 +228,7 @@ pub(crate) fn process_mrange_query(
         })
         .collect();
 
-    process_mrange(series_metas, options, clustered, limit, deadline)
+    process_mrange(series_metas, options, clustered, limit, expired)
 }
 
 fn process_mrange(
@@ -237,7 +236,7 @@ fn process_mrange(
     options: MRangeOptions,
     is_clustered: bool,
     limit: Option<SampleLimit>,
-    deadline: Option<Instant>,
+    expired: &(dyn Fn() -> bool + Sync),
 ) -> ValkeyResult<Vec<MRangeSeriesResult>> {
     let mut options = options;
     let mut metas = metas;
@@ -263,7 +262,7 @@ fn process_mrange(
         // already decided here and dropping it now only saves transfer. The
         // coordinator re-applies EXCLUDEEMPTY regardless, so a peer that ignores
         // the request flag still yields the same reply.
-        let deadline = ReadDeadline::new(deadline);
+        let deadline = ReadDeadline::new(expired);
         let items = handle_non_grouped(metas, options, true, limit, &deadline);
         let mut items = deadline.finish(items)?;
         if exclude_empty {
@@ -275,7 +274,7 @@ fn process_mrange(
     let mut items = if is_grouped {
         handle_grouping(metas, options)?
     } else {
-        handle_non_grouped(metas, options, false, None, &ReadDeadline::new(None))
+        handle_non_grouped(metas, options, false, None, &ReadDeadline::new(&|| false))
     };
 
     // EXCLUDEEMPTY is rejected together with GROUPBY at parse time, so this only
@@ -321,27 +320,24 @@ fn create_iter<'a>(
 /// series or group asks before starting, what it returns is discarded, and [`Self::finish`]
 /// turns the whole read into the error. A read that got to the end is answered however late:
 /// only a read with work left is abandoned.
-struct ReadDeadline {
-    deadline: Option<Instant>,
+struct ReadDeadline<'a> {
+    expired: &'a (dyn Fn() -> bool + Sync),
     abandoned: AtomicBool,
 }
 
-impl ReadDeadline {
-    fn new(deadline: Option<Instant>) -> Self {
+impl<'a> ReadDeadline<'a> {
+    fn new(expired: &'a (dyn Fn() -> bool + Sync)) -> Self {
         Self {
-            deadline,
+            expired,
             abandoned: AtomicBool::new(false),
         }
     }
 
     fn passed(&self) -> bool {
-        let Some(deadline) = self.deadline else {
-            return false;
-        };
         if self.abandoned.load(Ordering::Relaxed) {
             return true;
         }
-        let passed = Instant::now() >= deadline;
+        let passed = (self.expired)();
         if passed {
             self.abandoned.store(true, Ordering::Relaxed);
         }
@@ -369,7 +365,7 @@ fn handle_non_grouped(
     options: MRangeOptions,
     clustered: bool,
     limit: Option<SampleLimit>,
-    deadline: &ReadDeadline,
+    deadline: &ReadDeadline<'_>,
 ) -> Vec<MRangeSeriesResult> {
     let is_multi = options
         .range
@@ -790,13 +786,9 @@ mod tests {
             ..Default::default()
         };
 
-        let result = process_mrange(
-            vec![meta(&series, "s", None)],
-            options,
-            true,
-            None,
-            Some(Instant::now()),
-        );
+        let result = process_mrange(vec![meta(&series, "s", None)], options, true, None, &|| {
+            true
+        });
 
         match result {
             Err(ValkeyError::Str(msg)) => assert_eq!(msg, error_consts::FANOUT_REQUESTER_GAVE_UP),
@@ -812,15 +804,10 @@ mod tests {
             range: RangeOptions::with_range(0, 500).unwrap(),
             ..Default::default()
         };
-        let far_off = Instant::now() + std::time::Duration::from_secs(60);
 
-        let results = process_mrange(
-            vec![meta(&series, "s", None)],
-            options,
-            true,
-            None,
-            Some(far_off),
-        )
+        let results = process_mrange(vec![meta(&series, "s", None)], options, true, None, &|| {
+            false
+        })
         .unwrap();
 
         assert_eq!(keys_of(&results), vec!["s"]);
@@ -829,12 +816,12 @@ mod tests {
     /// Time running out after the last series is not abandonment: the read is done.
     #[test]
     fn a_finished_read_is_answered_however_late() {
-        let deadline = ReadDeadline::new(Some(Instant::now()));
+        let deadline = ReadDeadline::new(&|| true);
         assert!(deadline.finish(()).is_ok(), "nothing was skipped");
         assert!(deadline.passed());
         assert!(deadline.finish(()).is_err());
 
-        let none = ReadDeadline::new(None);
+        let none = ReadDeadline::new(&|| false);
         assert!(!none.passed());
         assert!(none.finish(()).is_ok());
     }
@@ -859,11 +846,11 @@ mod tests {
         };
 
         // Default: every matched series is reported, empty payload included.
-        let results = process_mrange(metas(), options.clone(), false, None, None).unwrap();
+        let results = process_mrange(metas(), options.clone(), false, None, &|| false).unwrap();
         assert_eq!(keys_of(&results), vec!["n", "s", "u"]);
 
         options.exclude_empty = true;
-        let results = process_mrange(metas(), options.clone(), false, None, None).unwrap();
+        let results = process_mrange(metas(), options.clone(), false, None, &|| false).unwrap();
         assert_eq!(
             keys_of(&results),
             vec!["n", "s"],
@@ -871,12 +858,12 @@ mod tests {
         );
 
         // Shard side (clustered): same decision, made before the payload ships.
-        let results = process_mrange(metas(), options.clone(), true, None, None).unwrap();
+        let results = process_mrange(metas(), options.clone(), true, None, &|| false).unwrap();
         assert_eq!(keys_of(&results), vec!["n", "s"]);
 
         // A value filter that removes every sample makes a series empty too.
         options.range.value_filter = Some(crate::series::ValueFilter::new(0.0, 200.0).unwrap());
-        let results = process_mrange(metas(), options, false, None, None).unwrap();
+        let results = process_mrange(metas(), options, false, None, &|| false).unwrap();
         assert_eq!(
             keys_of(&results),
             vec!["s"],
@@ -899,7 +886,7 @@ mod tests {
         for is_reverse in [false, true] {
             options.is_reverse = is_reverse;
             let metas = vec![meta(&in_range, "s", None), meta(&out_of_range, "u", None)];
-            let results = process_mrange(metas, options.clone(), false, None, None).unwrap();
+            let results = process_mrange(metas, options.clone(), false, None, &|| false).unwrap();
             assert_eq!(keys_of(&results), vec!["s"], "reverse={is_reverse}");
             assert_eq!(rows_of(&results[0]).len(), 2);
         }
@@ -921,7 +908,8 @@ mod tests {
         let options = multi_options(100);
         let metas = vec![meta(&s1, "a", None), meta(&s2, "b", None)];
 
-        let mut results = handle_non_grouped(metas, options, false, None, &ReadDeadline::new(None));
+        let mut results =
+            handle_non_grouped(metas, options, false, None, &ReadDeadline::new(&|| false));
         sort_mrange_results(&mut results, false);
 
         assert_eq!(results.len(), 2);
