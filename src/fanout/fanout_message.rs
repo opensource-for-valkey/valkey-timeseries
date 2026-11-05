@@ -3,6 +3,7 @@ use crate::commands::fanout_codec::EnvelopeHeader;
 use crate::fanout::{FanoutError, FanoutResult};
 use prost::Message;
 use prost::encoding::{decode_varint, encode_varint, encoded_len_varint};
+use std::time::Duration;
 
 pub const FANOUT_MESSAGE_MARKER: u32 = 0xBADCAB;
 
@@ -11,7 +12,7 @@ pub const FANOUT_MESSAGE_MARKER: u32 = 0xBADCAB;
 /// intake with [`FanoutError::unsupported_features`] instead of being silently
 /// mis-processed. No bits are defined yet: allocate one only for a future
 /// envelope/payload change the receiver cannot ignore (e.g. payload
-/// compression) — see docs/fanout-compatibility-handshake.md.
+/// compression) — see docs/topics/fanout-compatibility-handshake.md.
 pub(super) const SUPPORTED_MESSAGE_FEATURES: u64 = 0;
 
 /// True when `required_features` demands a feature outside
@@ -55,6 +56,9 @@ pub(super) struct FanoutMessageHeader {
     /// message; validated at intake against [`SUPPORTED_MESSAGE_FEATURES`].
     /// `0` means no requirements.
     pub required_features: u64,
+    /// How long the requester waits for the answer, counted by the receiver from
+    /// arrival. `None` (0 on the wire, as replies send) never expires.
+    pub time_budget: Option<Duration>,
 }
 
 impl TryFrom<EnvelopeHeader> for FanoutMessageHeader {
@@ -75,6 +79,7 @@ impl TryFrom<EnvelopeHeader> for FanoutMessageHeader {
             user: (!wire.user.is_empty()).then_some(wire.user),
             cluster_fingerprint: wire.cluster_fingerprint,
             required_features: wire.required_features,
+            time_budget: time_budget_from_wire(wire.time_budget_ms),
         })
     }
 }
@@ -91,6 +96,7 @@ impl FanoutMessageHeader {
                 user: self.user.clone().unwrap_or_default(),
                 cluster_fingerprint: self.cluster_fingerprint,
                 required_features: self.required_features,
+                time_budget_ms: self.time_budget.map_or(0, time_budget_to_wire),
             },
         );
     }
@@ -120,6 +126,17 @@ fn write_message_header(dest: &mut Vec<u8>, header: &EnvelopeHeader) {
     write_marker(dest);
     encode_varint(len as u64, dest);
     header.encode_raw(dest);
+}
+
+/// A time budget as the header carries it: whole milliseconds, at least 1 so that
+/// a budget never reads back as "none" (0).
+fn time_budget_to_wire(budget: Duration) -> u64 {
+    u64::try_from(budget.as_millis()).unwrap_or(u64::MAX).max(1)
+}
+
+/// The budget a header's milliseconds stand for; 0 means none.
+fn time_budget_from_wire(ms: u64) -> Option<Duration> {
+    (ms > 0).then(|| Duration::from_millis(ms))
 }
 
 fn write_marker(slice: &mut Vec<u8>) {
@@ -164,6 +181,9 @@ impl<'a> FanoutMessage<'a> {
     }
 }
 
+/// `time_budget` is how long the requester waits for the answer; replies and
+/// errors pass `None`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn serialize_request_message(
     dest: &mut Vec<u8>,
     request_id: u64,
@@ -171,6 +191,7 @@ pub(super) fn serialize_request_message(
     handler: &str,
     user: Option<String>,
     cluster_fingerprint: u64,
+    time_budget: Option<Duration>,
     serialized_request: &[u8],
 ) {
     write_message_header(
@@ -182,6 +203,7 @@ pub(super) fn serialize_request_message(
             user: user.unwrap_or_default(),
             cluster_fingerprint,
             required_features: 0,
+            time_budget_ms: time_budget.map_or(0, time_budget_to_wire),
         },
     );
     dest.extend_from_slice(serialized_request);
@@ -224,6 +246,7 @@ mod tests {
         user: &'a [u8],
         cluster_fingerprint: u64,
         required_features: u64,
+        time_budget_ms: u64,
     }
 
     impl Default for RawHeader<'_> {
@@ -235,6 +258,7 @@ mod tests {
                 user: b"",
                 cluster_fingerprint: 0,
                 required_features: 0,
+                time_budget_ms: 0,
             }
         }
     }
@@ -260,6 +284,9 @@ mod tests {
             if self.required_features != 0 {
                 uint64::encode(6, &self.required_features, &mut h);
             }
+            if self.time_budget_ms != 0 {
+                uint64::encode(7, &self.time_budget_ms, &mut h);
+            }
             frame(&h)
         }
     }
@@ -277,6 +304,7 @@ mod tests {
             user: None,
             cluster_fingerprint: 0xABCD_1234_5678_9F00,
             required_features: 0,
+            time_budget: None,
         };
         let mut buf = Vec::new();
         header.serialize(&mut buf);
@@ -300,6 +328,7 @@ mod tests {
             user: Some("alice".to_string()),
             cluster_fingerprint: u64::MAX,
             required_features: u64::MAX,
+            time_budget: None,
         };
         let mut buf = Vec::new();
         header.serialize(&mut buf);
@@ -325,6 +354,7 @@ mod tests {
             "handler",
             Some("alice".to_string()),
             0xDEAD_BEEF,
+            None,
             b"test_request_data",
         );
 
@@ -342,7 +372,7 @@ mod tests {
     #[test]
     fn test_empty_handler_is_accepted() {
         let mut buf = Vec::new();
-        serialize_request_message(&mut buf, 9, 0, "", None, 0, b"err");
+        serialize_request_message(&mut buf, 9, 0, "", None, 0, None, b"err");
 
         let message = FanoutMessage::new(&buf).unwrap();
         assert_eq!(message.header.request_id, 9);
@@ -363,11 +393,12 @@ mod tests {
             "mget",
             Some("bob".to_string()),
             0x0102_0304_0506_0708,
+            Some(Duration::from_millis(300)),
             b"P",
         );
 
         let mut expected = vec![0xAB, 0xDC, 0xBA, 0x00]; // marker, little-endian
-        expected.push(24); // header length
+        expected.push(27); // header length
         expected.extend_from_slice(&[0x08, 7]); // 1: request_id
         expected.extend_from_slice(&[0x10, 1]); // 2: db, zigzag(-1)
         expected.extend_from_slice(&[0x1A, 4]); // 3: handler
@@ -376,6 +407,7 @@ mod tests {
         expected.extend_from_slice(b"bob");
         expected.push(0x29); // 5: cluster_fingerprint, fixed64 little-endian
         expected.extend_from_slice(&[8, 7, 6, 5, 4, 3, 2, 1]);
+        expected.extend_from_slice(&[0x38, 0xAC, 0x02]); // 7: time_budget_ms, 300
         expected.push(b'P'); // payload
         assert_eq!(buf, expected);
     }
@@ -432,9 +464,70 @@ mod tests {
         assert!(has_unsupported_features(u64::MAX));
 
         let mut buf = Vec::new();
-        serialize_request_message(&mut buf, 7, 0, "mrange", None, 0, &[]);
+        serialize_request_message(&mut buf, 7, 0, "mrange", None, 0, None, &[]);
         let message = FanoutMessage::new(&buf).unwrap();
         assert_eq!(message.header.required_features, 0);
+    }
+
+    /// A request's time budget round-trips and sets no feature bit, and the payload
+    /// starts after the header, not inside it. A reply sends none.
+    #[test]
+    fn test_time_budget_round_trips_before_the_payload() {
+        let budget = Duration::from_millis(1500);
+        let mut buf = Vec::new();
+        serialize_request_message(&mut buf, 7, 0, "mrange", None, 0, Some(budget), b"payload");
+
+        let message = FanoutMessage::new(&buf).unwrap();
+        assert_eq!(message.header.required_features, 0);
+        assert_eq!(message.header.time_budget, Some(budget));
+        assert_eq!(message.buf, b"payload");
+
+        let mut none = Vec::new();
+        serialize_request_message(&mut none, 7, 0, "mrange", None, 0, None, b"payload");
+        let message = FanoutMessage::new(&none).unwrap();
+        assert_eq!(message.header.time_budget, None);
+        assert_eq!(message.buf, b"payload");
+    }
+
+    /// A sender that does not know the field leaves it out, and that reads as no
+    /// limit, so its request is never dropped for lateness.
+    #[test]
+    fn test_absent_time_budget_means_no_limit() {
+        let buf = RawHeader::default().encode();
+        let (header, _) = FanoutMessageHeader::deserialize(&buf).unwrap();
+        assert_eq!(header.time_budget, None);
+    }
+
+    /// The field keeps its full width: a value past 32 bits is not truncated into a
+    /// shorter budget, which would drop a request the requester still waits for.
+    #[test]
+    fn test_time_budget_past_32_bits_survives_parsing() {
+        let time_budget_ms = (1u64 << 32) + 1;
+        let buf = RawHeader {
+            time_budget_ms,
+            ..Default::default()
+        }
+        .encode();
+        let (header, _) = FanoutMessageHeader::deserialize(&buf).unwrap();
+        assert_eq!(
+            header.time_budget,
+            Some(Duration::from_millis(time_budget_ms))
+        );
+    }
+
+    /// A sub-millisecond budget is sent as 1 ms, never as 0 ("none"); a budget too
+    /// large for the wire saturates.
+    #[test]
+    fn test_time_budget_wire_rounding() {
+        assert_eq!(time_budget_to_wire(Duration::ZERO), 1);
+        assert_eq!(time_budget_to_wire(Duration::from_micros(400)), 1);
+        assert_eq!(time_budget_to_wire(Duration::from_millis(1500)), 1500);
+        assert_eq!(time_budget_to_wire(Duration::MAX), u64::MAX);
+        assert_eq!(time_budget_from_wire(0), None);
+        assert_eq!(
+            time_budget_from_wire(1500),
+            Some(Duration::from_millis(1500))
+        );
     }
 
     /// An unsupported bit must survive parsing so intake can see it and reject
@@ -652,6 +745,7 @@ mod tests {
             handler: b"mrange",
             user: b"alice",
             cluster_fingerprint: u64::MAX,
+            time_budget_ms: u64::MAX,
             ..Default::default()
         }
         .encode();
@@ -760,6 +854,7 @@ mod tests {
             user: Some(String::new()),
             cluster_fingerprint: 0,
             required_features: 0,
+            time_budget: None,
         }
         .serialize(&mut round_trip);
         assert_eq!(round_trip, from_wire);
@@ -845,6 +940,7 @@ mod tests {
             user in prop::option::of("\\PC{1,64}"),
             cluster_fingerprint in any::<u64>(),
             required_features in any::<u64>(),
+            time_budget_ms in prop::option::of(1..=u64::MAX),
         ) {
             let original = FanoutMessageHeader {
                 request_id,
@@ -853,6 +949,7 @@ mod tests {
                 user,
                 cluster_fingerprint,
                 required_features,
+                time_budget: time_budget_ms.map(Duration::from_millis),
             };
 
             let mut buf = Vec::new();
@@ -865,6 +962,7 @@ mod tests {
             prop_assert_eq!(decoded.user, original.user);
             prop_assert_eq!(decoded.cluster_fingerprint, original.cluster_fingerprint);
             prop_assert_eq!(decoded.required_features, original.required_features);
+            prop_assert_eq!(decoded.time_budget, original.time_budget);
             prop_assert!(remaining.is_empty());
         }
     }

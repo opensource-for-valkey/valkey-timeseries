@@ -49,7 +49,7 @@ pub enum ErrorKind {
     /// The message header demanded envelope features (required_features bits)
     /// this node does not support. Rejecting explicitly lets a newer peer fail
     /// fast (or degrade) instead of this node silently mis-processing the
-    /// message. See docs/fanout-compatibility-handshake.md.
+    /// message. See docs/topics/fanout-compatibility-handshake.md.
     UnsupportedFeatures = 10,
 
     /// The request selected a database that is not available on this node.
@@ -356,6 +356,12 @@ fn convert_from_string(err: &str) -> FanoutError {
         SERIALIZATION_ERROR => FanoutError::serialization(String::new()),
         BAD_REQUEST_ID_ERROR => ErrorKind::BadRequestId.into(),
         TIMEOUT_ERROR => ErrorKind::Timeout.into(),
+        // A share that stopped between batches at its deadline. The client gets the canonical
+        // timeout reply either way; the text only says why in this node's log.
+        error_consts::FANOUT_REQUESTER_GAVE_UP => FanoutError {
+            kind: ErrorKind::Timeout,
+            message: err.to_string(),
+        },
         error_consts::COMMAND_DESERIALIZATION_ERROR => ErrorKind::Serialization.into(),
         error_consts::NO_CLUSTER_NODES_AVAILABLE => ErrorKind::NodeUnreachable.into(),
         error_consts::KEY_READ_PERMISSION_ERROR => ErrorKind::KeyPermissions.into(),
@@ -655,6 +661,21 @@ mod tests {
             convert_from_string(&format!("ERR {message}")),
         ] {
             assert_eq!(error.kind, ErrorKind::DatabaseSwapped);
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
+    /// A share abandoned between batches at its deadline is a timeout, not a shard failure, so
+    /// the fan-out answers with the timeout error and counts it as one. The text stays for the
+    /// logs, which would otherwise claim a shard did not reply.
+    #[test]
+    fn an_abandoned_share_is_classified_as_a_timeout() {
+        let message = error_consts::FANOUT_REQUESTER_GAVE_UP;
+        for error in [
+            FanoutError::from(ValkeyError::Str(message)),
+            convert_from_string(&format!("ERR {message}")),
+        ] {
+            assert_eq!(error.kind, ErrorKind::Timeout);
             assert_eq!(error.to_string(), message);
         }
     }

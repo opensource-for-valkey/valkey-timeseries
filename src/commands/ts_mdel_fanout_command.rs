@@ -58,6 +58,12 @@ impl FanoutClientCommand for MDelFanoutCommand {
         }
     }
 
+    /// A write: a shard that received it deletes, however late (see
+    /// `FanoutCommand::cancellable`).
+    fn cancellable() -> bool {
+        false
+    }
+
     fn get_local_response(ctx: &FanoutContext, req: Self::Request) -> ValkeyResult<Self::Response> {
         let filters = deserialize_matchers_list(Some(req.filters))
             .map_err(|_e| ValkeyError::Str(error_consts::COMMAND_DESERIALIZATION_ERROR))?;

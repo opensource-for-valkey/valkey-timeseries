@@ -465,7 +465,7 @@ pub fn is_debug_mode_enabled() -> bool {
 ///
 /// This is NOT a mixed-version safety mechanism — the fanout compatibility
 /// handshake (self-describing responses + envelope feature gate, see
-/// `docs/fanout-compatibility-handshake.md`) makes version skew correct
+/// `docs/topics/fanout-compatibility-handshake.md`) makes version skew correct
 /// automatically, so no config action is needed across a rolling upgrade.
 ///
 /// Its remaining purpose is an emergency/diagnostic escape hatch for the

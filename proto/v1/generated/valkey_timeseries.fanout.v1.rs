@@ -359,6 +359,10 @@ pub struct EnvelopeHeader {
     /// Feature bits the receiver must understand to process this message.
     #[prost(uint64, tag = "6")]
     pub required_features: u64,
+    /// How long the requester waits for the answer, counted by the receiver from
+    /// arrival. 0 means no limit, as replies and errors send.
+    #[prost(uint64, tag = "7")]
+    pub time_budget_ms: u64,
 }
 /// The payload of a fanout error reply.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

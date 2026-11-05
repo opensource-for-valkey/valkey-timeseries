@@ -42,6 +42,9 @@ message EnvelopeHeader {
   fixed64 cluster_fingerprint = 5;
   // Feature bits the receiver must understand to process this message.
   uint64 required_features = 6;
+  // How long the requester waits for the answer, counted by the receiver from
+  // arrival. 0 means no limit, as replies and errors send.
+  uint64 time_budget_ms = 7;
 }
 
 // The payload of a fanout error reply.

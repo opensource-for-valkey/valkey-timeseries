@@ -274,12 +274,14 @@ As a peer serving a coordinator:
 | Name | Kind | Description |
 |------|------|-------------|
 | `fanout_served_ok_total` | counter | Requests served successfully |
-| `fanout_served_errors_total` | counter | Requests whose handler failed (answered with an error response) |
+| `fanout_served_errors_total` | counter | Requests whose handler failed (answered with an error response), not counting reads abandoned at their time budget |
 | `fanout_reply_send_failures_total` | counter | Successful answers the cluster bus refused to send back |
 | `fanout_rejected_parse_total` | counter | Requests that could not be parsed |
 | `fanout_rejected_unsupported_features_total` | counter | Requests demanding envelope features this node lacks |
 | `fanout_rejected_no_handler_total` | counter | Requests for an operation this node has no handler for |
 | `fanout_rejected_busy_total` | counter | Requests refused because the fan-out lane's queue was full |
+| `fanout_dropped_expired_total` | counter | Requests dropped unrun because they waited in the queue past their time budget (no reply is sent: the requester has already given up) |
+| `fanout_abandoned_expired_total` | counter | Requests whose read ran past their time budget and stopped between batches (no reply is sent: the requester has already given up) |
 | `fanout_rejected_cluster_map_mismatch_total` | counter | Requests rejected because the sender's cluster map disagrees with this node's |
 
 On the wire (counted by the sender):
