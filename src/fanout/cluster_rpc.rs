@@ -225,7 +225,19 @@ fn initial_request_id() -> u64 {
 /// - Two different nodes can safely use the same ID simultaneously for different requests
 ///
 fn generate_id() -> u64 {
-    REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+    next_id(&REQUEST_ID)
+}
+
+/// The counter's next value other than 0, which a seed or a wrap can land on. An error reply
+/// in db 0 carries nothing else in its header, and an empty header does not decode, so the
+/// requester would never see the error.
+fn next_id(counter: &AtomicU64) -> u64 {
+    loop {
+        let id = counter.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
 }
 
 /// The timeout timer's callback. Runs on the main thread inside
@@ -928,6 +940,30 @@ mod tests {
         );
 
         assert!(metrics::FANOUT_DROPPED_EXPIRED.load(Ordering::Relaxed) > before);
+    }
+
+    /// 0 is skipped whether the counter was seeded with it or wrapped onto it.
+    #[test]
+    fn request_ids_skip_zero() {
+        let seeded_with_zero = AtomicU64::new(0);
+        assert_eq!(next_id(&seeded_with_zero), 1);
+        assert_eq!(next_id(&seeded_with_zero), 2);
+
+        let about_to_wrap = AtomicU64::new(u64::MAX);
+        assert_eq!(next_id(&about_to_wrap), u64::MAX);
+        assert_eq!(next_id(&about_to_wrap), 1);
+    }
+
+    /// An error reply to the first id of a zero-seeded counter, in db 0, has no other field
+    /// set, so its id is all that keeps the header from being empty, which the decoder rejects.
+    #[test]
+    fn an_error_reply_to_a_generated_id_decodes() {
+        let id = next_id(&AtomicU64::new(0));
+        let mut buf = Vec::new();
+        serialize_request_message(&mut buf, id, 0, "", None, 0, None, &[]);
+
+        let message = FanoutMessage::new(&buf).unwrap();
+        assert_eq!(message.header.request_id, id);
     }
 
     fn gives_up_mid_read(_: &FanoutContext, _: &[u8], _: &mut Vec<u8>) -> FanoutResult {
