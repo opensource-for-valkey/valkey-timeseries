@@ -96,6 +96,9 @@ pub struct RCFOptions {
 
 pub const RCF_DEFAULT_NUM_TREES: usize = 100;
 pub const RCF_DEFAULT_SAMPLE_SIZE: usize = 256;
+/// The smallest `SAMPLE_SIZE` the forest can run. With two or more trees krcf fails
+/// partway through the series at 2 ("no more indices left in interval manager").
+pub const RCF_MIN_SAMPLE_SIZE: usize = 3;
 
 impl Default for RCFOptions {
     fn default() -> Self {
@@ -391,7 +394,7 @@ impl RcfOutlierDetector {
 
             let raw = self.forest.score(&point).map_err(|e| {
                 TimeSeriesAnalysisError::AnomalyDetectionError(format!(
-                    "failed to compute RCF score: {e:?}"
+                    "failed to compute RCF score: {e}"
                 ))
             })?;
             scores.push(raw);
@@ -399,9 +402,7 @@ impl RcfOutlierDetector {
             // A failed update leaves the forest out of step with the series, so every
             // later score would be against the wrong model. Report it.
             self.forest.update(&point).map_err(|e| {
-                TimeSeriesAnalysisError::AnomalyDetectionError(format!(
-                    "failed to update RCF: {e:?}"
-                ))
+                TimeSeriesAnalysisError::AnomalyDetectionError(format!("failed to update RCF: {e}"))
             })?;
         }
 
@@ -1299,6 +1300,34 @@ mod tests {
             let r = d.detect(&ts).unwrap();
             assert!(r.anomalies.iter().any(|a| a.index == 60), "offset {offset}");
         }
+    }
+
+    /// `RCF_MIN_SAMPLE_SIZE` is where the forest starts working, not a guess. Below it
+    /// krcf runs out of interval-manager indices once there are two trees, so this uses
+    /// varied data: flat data only hits the limit at larger tree counts. If a krcf
+    /// upgrade lifts the limit the second half fails: lower the minimum then.
+    #[test]
+    fn minimum_sample_size_is_the_smallest_the_forest_can_run() {
+        let ts: Vec<f64> = (0..120).map(|i| ((i * 7) % 11) as f64).collect();
+        let detect = |sample_size, num_trees| {
+            RcfOutlierDetector::new(RCFOptions {
+                num_trees: Some(num_trees),
+                sample_size: Some(sample_size),
+                ..Default::default()
+            })
+            .unwrap()
+            .detect(&ts)
+        };
+        for num_trees in [1, 2, 3, 100] {
+            assert!(
+                detect(RCF_MIN_SAMPLE_SIZE, num_trees).is_ok(),
+                "{num_trees} trees"
+            );
+        }
+        let err = detect(RCF_MIN_SAMPLE_SIZE - 1, 2).unwrap_err().to_string();
+        assert!(err.contains("no more indices"), "{err}");
+        // krcf's error text, not its Debug form, reaches the client.
+        assert!(!err.contains("InvalidArgument"), "{err}");
     }
 
     /// One extreme value must not cost the rest of the series its precision. Centring on

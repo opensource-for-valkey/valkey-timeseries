@@ -1,8 +1,8 @@
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetectionMethodOptions, AnomalyDirection, AnomalyMethod, AnomalyOptions,
     AnomalyResult, ESD_MAX_ITERATIONS, ESDOutlierOptions, EWMA_DEFAULT_ALPHA, EsdEstimator,
-    MADAnomalyOptions, MethodInfo, RCF_DEFAULT_NUM_TREES, RCF_DEFAULT_SAMPLE_SIZE, RCFOptions,
-    RCFThreshold, SmoothedZScoreOptions, detect_anomalies,
+    MADAnomalyOptions, MethodInfo, RCF_DEFAULT_NUM_TREES, RCF_DEFAULT_SAMPLE_SIZE,
+    RCF_MIN_SAMPLE_SIZE, RCFOptions, RCFThreshold, SmoothedZScoreOptions, detect_anomalies,
 };
 use crate::analysis::seasonality::{MAX_SEASONALITY_PERIODS, MIN_SEASONALITY_PERIOD, Seasonality};
 use crate::commands::analysis_runner::{reserve_analysis_slot, run_reserved_on_analysis_lane};
@@ -529,7 +529,7 @@ fn parse_rcf_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
                 rcf_options.sample_size = Some(parse_bounded_integer(
                     args,
                     "SAMPLE_SIZE",
-                    2,
+                    RCF_MIN_SAMPLE_SIZE,
                     MAX_RCF_SAMPLE_SIZE,
                 )?);
             },
