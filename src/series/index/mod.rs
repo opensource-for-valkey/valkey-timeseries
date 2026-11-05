@@ -13,10 +13,10 @@ use crate::common::context::{create_key_string, get_current_db};
 use croaring::Portable;
 use papaya::{Guard, HashMap, LocalGuard};
 use std::sync::LazyLock;
-use valkey_module::{AclPermissions, Context, ValkeyResult, ValkeyString};
+use valkey_module::{AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString};
 
 use crate::common::hash::BuildNoHashHasher;
-use crate::common::logging::log_warning;
+use crate::error_consts;
 use crate::series::index::postings::Postings;
 use crate::series::request_types::MatchFilterOptions;
 use crate::series::{SeriesGuardMut, SeriesRef, TimeSeries, try_get_timeseries_mut};
@@ -303,18 +303,48 @@ pub fn serialize_bitmap(bitmap: &PostingsBitmap) -> Vec<u8> {
     buffer
 }
 
-pub fn deserialize_bitmap(bitmap: &[u8]) -> PostingsBitmap {
-    if bitmap.is_empty() {
-        return PostingsBitmap::default();
-    }
-    let version = bitmap[0];
+/// The bitmap [`serialize_bitmap`] wrote. An empty buffer is an empty bitmap: a protobuf field
+/// left unset decodes to one. Anything else unreadable is an error, because treating it as empty
+/// would silently undercount whatever the bitmap holds.
+pub fn deserialize_bitmap(bitmap: &[u8]) -> ValkeyResult<PostingsBitmap> {
+    let Some((&version, serialized)) = bitmap.split_first() else {
+        return Ok(PostingsBitmap::default());
+    };
     if version != BITMAP_SERIALIZATION_VERSION {
-        let msg = format!("Unsupported bitmap serialization version: {version}");
-        log_warning(&msg);
-        return PostingsBitmap::default();
+        return Err(ValkeyError::String(format!(
+            "TSDB: unsupported postings bitmap serialization version: {version}"
+        )));
     }
-    PostingsBitmap::try_deserialize::<Portable>(&bitmap[1..]).unwrap_or_else(|| {
-        log_warning("Invalid serialized postings bitmap");
-        PostingsBitmap::default()
-    })
+    PostingsBitmap::try_deserialize::<Portable>(serialized)
+        .ok_or(ValkeyError::Str(error_consts::INVALID_POSTINGS_BITMAP))
+}
+
+#[cfg(test)]
+mod bitmap_serialization_tests {
+    use super::*;
+
+    #[test]
+    fn a_bitmap_round_trips() {
+        let bitmap = PostingsBitmap::of(&[1, 2, 1 << 40]);
+        assert_eq!(
+            deserialize_bitmap(&serialize_bitmap(&bitmap)).unwrap(),
+            bitmap
+        );
+    }
+
+    #[test]
+    fn an_empty_buffer_is_an_empty_bitmap() {
+        assert_eq!(deserialize_bitmap(&[]).unwrap(), PostingsBitmap::default());
+    }
+
+    #[test]
+    fn an_unreadable_bitmap_is_an_error() {
+        let mut other_version = serialize_bitmap(&PostingsBitmap::of(&[1]));
+        other_version[0] = BITMAP_SERIALIZATION_VERSION + 1;
+        assert!(deserialize_bitmap(&other_version).is_err());
+
+        let truncated = serialize_bitmap(&PostingsBitmap::of(&[1, 2, 3]));
+        assert!(deserialize_bitmap(&truncated[..truncated.len() - 1]).is_err());
+        assert!(deserialize_bitmap(&[BITMAP_SERIALIZATION_VERSION, 0xFF, 0xFF]).is_err());
+    }
 }

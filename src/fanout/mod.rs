@@ -35,6 +35,8 @@ pub(crate) use workers::request_lane_stats;
 #[cfg(test)]
 pub(crate) use cluster_map::NUM_SLOTS;
 pub use cluster_map::{ClusterMap, ClusterNodesSource, FanoutTarget, NodeInfo};
+#[cfg(test)]
+pub(crate) use cluster_map::{NodeRole, SocketAddress};
 pub use registry::register_fanout_operation;
 
 pub(crate) fn init_fanout(ctx: &Context) {
