@@ -576,8 +576,9 @@ Detect pattern-based anomalies using a sliding window:
 * **Expensive detections run in the background:**
     * Where a detection runs depends on its estimated cost, which the sample count, the method, its options and
       `SEASONALITY` all raise. The lightest methods with no seasonality stay on the main thread up to about 5,000
-      samples. With default options `esd` leaves it from about 500 samples and `rcf` from about a dozen; two-period
-      seasonality leaves it from about 150. Past that point the detection runs on the analysis lane, a small pool of
+      samples. With default options `esd` leaves it from about 500 samples and `rcf` from about 7, or from the fewest
+      samples detection accepts when `NUM_TREES` and `SAMPLE_SIZE` are large, since building the forest is part of
+      the cost; two-period seasonality leaves it from about 150. Past that point the detection runs on the analysis lane, a small pool of
       worker threads (`ts-num-threads`, clamped to 2–8), so the server keeps serving other clients meanwhile.
     * The lane queues up to 256 detections. When it is full the command is refused at once with
       `TSDB: outlier detection: too many queued jobs (limit 256)`; retry later.
