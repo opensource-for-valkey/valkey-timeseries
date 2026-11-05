@@ -491,6 +491,20 @@ class TestRCFOutlierDetector(ValkeyTimeSeriesTestCaseBase):
             )
             assert raw is not None
 
+    def test_rcf_smallest_sample_size_runs(self):
+        """The documented minimum works on varied data, where the forest needs its samples."""
+        key = "rcf:options:smallest_sample_size"
+        _add(self.client, key, 1_000, [float((i * 7) % 11) for i in range(120)])
+
+        for num_trees in (1, 2, 50):
+            raw = self.client.execute_command(
+                "TS.OUTLIERS", key, "-", "+",
+                "METHOD", "rcf",
+                "NUM_TREES", num_trees,
+                "SAMPLE_SIZE", 3,
+            )
+            assert raw is not None
+
     def test_rcf_option_threshold_sensitivity(self):
         """Lowering THRESHOLD finds at least as many anomalies as a higher threshold."""
         key = "rcf:options:threshold_sensitivity"
@@ -587,6 +601,7 @@ class TestRCFOutlierDetector(ValkeyTimeSeriesTestCaseBase):
             ("NUM_TREES", 513, "must be between"),
             ("SAMPLE_SIZE", "1e300", "invalid integer value"),
             ("SAMPLE_SIZE", 1, "must be between"),
+            ("SAMPLE_SIZE", 2, "SAMPLE_SIZE must be between 3 and 4096"),
             ("SAMPLE_SIZE", 4097, "must be between"),
             ("SHINGLE_SIZE", 1.5, "invalid integer value"),
             ("SHINGLE_SIZE", 129, "must be between"),
