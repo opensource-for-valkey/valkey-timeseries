@@ -36,7 +36,7 @@ macro_rules! acl_categories {
 mod analysis_runner;
 pub mod command_parser;
 mod debug;
-mod fanout_codec;
+pub(crate) mod fanout_codec;
 mod label_search_utils;
 mod ts_add;
 mod ts_addbulk;

@@ -333,7 +333,7 @@ pub(super) fn send_cluster_request(
         id,
         db,
         handler,
-        user.as_deref(),
+        user,
         cluster_fingerprint,
         request_buf,
     );
@@ -629,7 +629,11 @@ extern "C" fn on_request_received(
     len: u32,
 ) {
     let ctx = Context::new(ctx as *mut RedisModuleCtx);
-    let Some(mut message) = parse_fanout_message(&ctx, sender_id, payload, len) else {
+    let Some(FanoutMessage {
+        header,
+        buf: request_buf,
+    }) = parse_fanout_message(&ctx, sender_id, payload, len)
+    else {
         metrics::FANOUT_REJECTED_PARSE.incr();
         return;
     };
@@ -637,27 +641,27 @@ extern "C" fn on_request_received(
     // Feature gate: a newer peer may demand envelope features via the header;
     // reject explicitly (addressable, fast) rather than mis-process the
     // request. See docs/fanout-compatibility-handshake.md.
-    if has_unsupported_features(message.required_features) {
+    if has_unsupported_features(header.required_features) {
         metrics::FANOUT_REJECTED_UNSUPPORTED_FEATURES.incr();
         let e = FanoutError::unsupported_features();
-        send_error_response(&ctx, message.request_id, message.db, sender_id, e);
+        send_error_response(&ctx, header.request_id, header.db, sender_id, e);
         let msg = format!(
             "Rejecting fanout request {} from node {}: unsupported required_features {:#06x}",
-            message.request_id,
+            header.request_id,
             NodeId::from_raw(sender_id),
-            message.required_features
+            header.required_features
         );
         ctx.log_warning(&msg);
         return;
     }
 
-    let Some(handler) = get_fanout_request_handler(&message.handler) else {
+    let Some(handler) = get_fanout_request_handler(&header.handler) else {
         metrics::FANOUT_REJECTED_NO_HANDLER.incr();
         let e = FanoutError::invalid_message();
-        send_error_response(&ctx, message.request_id, message.db, sender_id, e);
+        send_error_response(&ctx, header.request_id, header.db, sender_id, e);
         let msg = format!(
             "No handler registered for fanout operation '{}'",
-            message.handler
+            header.handler
         );
         ctx.log_warning(&msg);
         return;
@@ -666,19 +670,9 @@ extern "C" fn on_request_received(
     let sender = NodeId::from_raw(sender_id);
 
     let mut buf = get_pooled_buffer(len as usize);
-    buf.extend_from_slice(message.buf);
+    buf.extend_from_slice(request_buf);
 
-    let header = FanoutMessageHeader {
-        version: message.version,
-        required_features: message.required_features,
-        request_id: message.request_id,
-        db: message.db,
-        handler: std::mem::take(&mut message.handler),
-        user: message.user.take(),
-        cluster_fingerprint: message.cluster_fingerprint,
-    };
-
-    alloc_db_if_needed(&ctx, message.db);
+    alloc_db_if_needed(&ctx, header.db);
 
     let (request_id, db) = (header.request_id, header.db);
 
@@ -732,12 +726,12 @@ extern "C" fn on_response_received(
         return;
     };
 
-    with_inflight_request(&ctx, message.request_id, |ctx, request| {
-        let _ = set_current_db(ctx, message.db);
+    with_inflight_request(&ctx, message.header.request_id, |ctx, request| {
+        let _ = set_current_db(ctx, message.header.db);
         // Feature gate: a newer peer's response may demand envelope features
         // (e.g., a payload encoding) we cannot decode; fail this node's slice
         // of the request instead of misinterpreting the payload.
-        if has_unsupported_features(message.required_features) {
+        if has_unsupported_features(message.header.required_features) {
             let err = FanoutError::unsupported_features();
             return request.handle_response(ctx, Err(err), sender_id);
         }
@@ -759,18 +753,18 @@ extern "C" fn on_error_received(
         return;
     };
 
-    with_inflight_request(&ctx, message.request_id, |ctx, request| {
-        let _ = set_current_db(ctx, message.db);
+    with_inflight_request(&ctx, message.header.request_id, |ctx, request| {
+        let _ = set_current_db(ctx, message.header.db);
 
         // Feature gate: mirror the response path — an error payload we cannot
         // decode per the demanded features still fails this node's slice.
-        if has_unsupported_features(message.required_features) {
+        if has_unsupported_features(message.header.required_features) {
             let err = FanoutError::unsupported_features();
             return request.handle_response(ctx, Err(err), sender_id);
         }
 
         match FanoutError::deserialize(message.buf) {
-            Ok((error, _)) => {
+            Ok(error) => {
                 // A peer rejected us because its view of the cluster topology
                 // differs from ours. Invalidate our local map so the next fanout
                 // rebuilds it before targeting nodes.

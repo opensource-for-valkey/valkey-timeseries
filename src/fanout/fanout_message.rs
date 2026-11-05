@@ -1,11 +1,9 @@
 use super::fanout_error::INVALID_MESSAGE_ERROR;
-use crate::common::encoding::{
-    try_read_byte_slice, try_read_signed_varint, try_read_u64_le, try_read_uvarint,
-    write_byte_slice, write_signed_varint, write_u64_le, write_uvarint,
-};
+use crate::commands::fanout_codec::EnvelopeHeader;
 use crate::fanout::{FanoutError, FanoutResult};
+use prost::Message;
+use prost::encoding::{decode_varint, encode_varint, encoded_len_varint};
 
-pub const FANOUT_MESSAGE_VERSION: u16 = 1;
 pub const FANOUT_MESSAGE_MARKER: u32 = 0xBADCAB;
 
 /// Envelope feature bits this node supports (`required_features` in the
@@ -14,42 +12,32 @@ pub const FANOUT_MESSAGE_MARKER: u32 = 0xBADCAB;
 /// mis-processed. No bits are defined yet: allocate one only for a future
 /// envelope/payload change the receiver cannot ignore (e.g. payload
 /// compression) — see docs/fanout-compatibility-handshake.md.
-pub(super) const SUPPORTED_MESSAGE_FEATURES: u16 = 0;
+pub(super) const SUPPORTED_MESSAGE_FEATURES: u64 = 0;
 
 /// True when `required_features` demands a feature outside
 /// [`SUPPORTED_MESSAGE_FEATURES`].
-pub(super) fn has_unsupported_features(required_features: u16) -> bool {
+pub(super) fn has_unsupported_features(required_features: u64) -> bool {
     required_features & !SUPPORTED_MESSAGE_FEATURES != 0
 }
 
-const HEADER_SIZE: usize = size_of::<u32>();
+const MARKER_SIZE: usize = size_of::<u32>();
 const MAX_USERNAME_LEN: usize = 1024;
 /// Registered fanout handler names are short internal identifiers (e.g. "mget",
-/// "queryindex"); this cap bounds the allocation for the handler field while
-/// leaving generous headroom.
+/// "queryindex"); this cap leaves generous headroom.
 const MAX_HANDLER_LEN: usize = 128;
+/// Upper bound on the encoded header, enforced before decoding so it bounds what
+/// a malicious or buggy peer can make the decoder allocate. Well above the field
+/// caps, to leave room for fields a newer peer may add.
+const MAX_HEADER_LEN: usize = 4096;
 
-/// Reads a length-prefixed UTF-8 string from `buf`, enforcing `max_len` on the
-/// raw byte length BEFORE allocating, so an oversized length from a malicious or
-/// buggy peer cannot force a large allocation that is only rejected afterwards.
-///
-/// [`try_read_byte_slice`] merely borrows from the already-received buffer (and
-/// errors if the claimed length exceeds the remaining data), so the length cap is
-/// the only gate before the caller allocates. Returns a borrowed `&str` and leaves
-/// the empty-vs-present decision (and any allocation) to the caller.
-fn read_bounded_str<'a>(buf: &mut &'a [u8], max_len: usize) -> FanoutResult<&'a str> {
-    let bytes =
-        try_read_byte_slice(buf).map_err(|_| FanoutError::serialization(INVALID_MESSAGE_ERROR))?;
-    if bytes.len() > max_len {
-        return Err(FanoutError::serialization(INVALID_MESSAGE_ERROR));
-    }
-    std::str::from_utf8(bytes).map_err(|_| FanoutError::serialization(INVALID_MESSAGE_ERROR))
+fn invalid_message() -> FanoutError {
+    FanoutError::serialization(INVALID_MESSAGE_ERROR)
 }
 
-/// Header for messages exchanged between cluster nodes.
+/// Header for messages exchanged between cluster nodes: an [`EnvelopeHeader`]
+/// that has passed the checks the wire format cannot express.
 #[derive(Debug, Clone)]
 pub(super) struct FanoutMessageHeader {
-    pub version: u16,
     /// Unique ID for this request, used to match responses.
     pub request_id: u64,
     /// The database to use for this request.
@@ -65,9 +53,30 @@ pub(super) struct FanoutMessageHeader {
     pub cluster_fingerprint: u64,
     /// Envelope feature bits the receiver MUST understand to process this
     /// message; validated at intake against [`SUPPORTED_MESSAGE_FEATURES`].
-    /// `0` (all senders today, and every pre-repurposing peer — this slot was
-    /// formerly `reserved`, written as 0 and ignored) means no requirements.
-    pub required_features: u16,
+    /// `0` means no requirements.
+    pub required_features: u64,
+}
+
+impl TryFrom<EnvelopeHeader> for FanoutMessageHeader {
+    type Error = FanoutError;
+
+    fn try_from(wire: EnvelopeHeader) -> FanoutResult<Self> {
+        // Reject rather than truncate: an `as i32` cast would silently fold e.g.
+        // 2^32 down to a *valid-looking* db 0 and run the request against the
+        // wrong keyspace.
+        let db = i32::try_from(wire.db).map_err(|_| invalid_message())?;
+        if wire.handler.len() > MAX_HANDLER_LEN || wire.user.len() > MAX_USERNAME_LEN {
+            return Err(invalid_message());
+        }
+        Ok(Self {
+            request_id: wire.request_id,
+            db,
+            handler: wire.handler,
+            user: (!wire.user.is_empty()).then_some(wire.user),
+            cluster_fingerprint: wire.cluster_fingerprint,
+            required_features: wire.required_features,
+        })
+    }
 }
 
 impl FanoutMessageHeader {
@@ -75,136 +84,42 @@ impl FanoutMessageHeader {
     pub fn serialize(&self, buf: &mut Vec<u8>) {
         write_message_header(
             buf,
-            self.version,
-            self.request_id,
-            self.db,
-            &self.handler,
-            self.user.as_deref(),
-            self.cluster_fingerprint,
-            self.required_features,
+            &EnvelopeHeader {
+                request_id: self.request_id,
+                db: i64::from(self.db),
+                handler: self.handler.clone(),
+                user: self.user.clone().unwrap_or_default(),
+                cluster_fingerprint: self.cluster_fingerprint,
+                required_features: self.required_features,
+            },
         );
     }
 
     /// Deserializes a MessageHeader from the beginning of the buffer.
     /// Returns the deserialized header and the payload buffer.
     pub fn deserialize(buf: &[u8]) -> FanoutResult<(Self, &[u8])> {
-        // Read and validate the marker
         let mut buf = skip_marker(buf)?;
 
-        let version =
-            read_u16_le(&mut buf).map_err(|_| FanoutError::serialization(INVALID_MESSAGE_ERROR))?;
-
-        if version != FANOUT_MESSAGE_VERSION {
-            return Err(FanoutError::serialization(INVALID_MESSAGE_ERROR));
+        let len = decode_varint(&mut buf).map_err(|_| invalid_message())?;
+        // A real header always carries a request id, so an empty one is malformed.
+        if len == 0 || len > MAX_HEADER_LEN as u64 || len > buf.len() as u64 {
+            return Err(invalid_message());
         }
 
-        // Decode request_id as uvarint
-        let request_id = read_uvarint(&mut buf)?;
-
-        // `db` is written from an `i32`, so anything outside that range is a
-        // malformed or hostile encoding. Reject it rather than truncating: an
-        // `as i32` cast would silently fold e.g. 2^32 down to a *valid-looking*
-        // db 0 and run the request against the wrong keyspace.
-        let db_raw = try_read_signed_varint(&mut buf)
-            .map_err(|_| FanoutError::serialization(INVALID_MESSAGE_ERROR))?;
-        let db =
-            i32::try_from(db_raw).map_err(|_| FanoutError::serialization(INVALID_MESSAGE_ERROR))?;
-
-        // Read the handler name, capping the raw length before allocating.
-        let handler = read_bounded_str(&mut buf, MAX_HANDLER_LEN)?.to_owned();
-
-        // Read the ACL user, capping the raw length before allocating (empty = no user).
-        let user_str = read_bounded_str(&mut buf, MAX_USERNAME_LEN)?;
-        let user = if user_str.is_empty() {
-            None
-        } else {
-            Some(user_str.to_owned())
-        };
-
-        // Cluster-map fingerprint, fixed 8-byte little-endian.
-        let cluster_fingerprint = try_read_u64_le(&mut buf)
-            .map_err(|_| FanoutError::serialization(INVALID_MESSAGE_ERROR))?;
-
-        // Read required_features as a little-endian u16
-        let required_features = read_u16_le(&mut buf)?;
-
-        Ok((
-            FanoutMessageHeader {
-                version,
-                request_id,
-                handler,
-                user,
-                db,
-                cluster_fingerprint,
-                required_features,
-            },
-            buf,
-        ))
+        let (encoded, payload) = buf.split_at(len as usize);
+        let wire = EnvelopeHeader::decode(encoded).map_err(|_| invalid_message())?;
+        Ok((wire.try_into()?, payload))
     }
 }
 
-/// Write a message header directly to `buf` without constructing a [`FanoutMessageHeader`].
-/// This avoids an unnecessary `String` allocation for the handler name in the outgoing
-/// (serialization) path, where the handler is always available as a borrowed `&str`.
-///
-/// The wire layout here must stay in lockstep with [`FanoutMessageHeader::deserialize`].
-#[allow(clippy::too_many_arguments)]
-fn write_message_header(
-    buf: &mut Vec<u8>,
-    version: u16,
-    request_id: u64,
-    db: i32,
-    handler: &str,
-    user: Option<&str>,
-    cluster_fingerprint: u64,
-    required_features: u16,
-) {
-    // Start with the marker
-    write_marker(buf);
-
-    // version is stored as a little-endian u16
-    write_u16_le(buf, version);
-
-    // Encode request_id as uvarint
-    write_uvarint(buf, request_id);
-
-    // Encode db as signed varint
-    write_signed_varint(buf, db as i64);
-
-    // Encode handler as a string
-    write_byte_slice(buf, handler.as_bytes());
-
-    // Encode user as a string (empty = no user).
-    write_byte_slice(buf, user.unwrap_or_default().as_bytes());
-
-    // Cluster-map fingerprint, fixed 8-byte little-endian.
-    write_u64_le(buf, cluster_fingerprint);
-
-    // Envelope feature bits the receiver must understand (0 = none).
-    write_u16_le(buf, required_features);
-}
-
-fn read_uvarint(input: &mut &[u8]) -> FanoutResult<u64> {
-    try_read_uvarint(input).map_err(|_| FanoutError::serialization(INVALID_MESSAGE_ERROR))
-}
-
-fn write_u16_le(slice: &mut Vec<u8>, v: u16) {
-    let bytes = v.to_le_bytes();
-    slice.extend_from_slice(bytes.as_ref());
-}
-
-fn read_u16_le(input: &mut &[u8]) -> FanoutResult<u16> {
-    if input.len() < 2 {
-        return Err(FanoutError::serialization(INVALID_MESSAGE_ERROR));
-    }
-    let (int_bytes, rest) = input.split_at(2);
-    *input = rest;
-    let val = u16::from_le_bytes(
-        int_bytes
-            .try_into()
-            .map_err(|_| FanoutError::serialization(INVALID_MESSAGE_ERROR))?,
-    );
-    Ok(val)
+/// Writes the marker and the length-prefixed header. The payload follows
+/// directly, outside the protobuf, so it is not copied through it.
+fn write_message_header(dest: &mut Vec<u8>, header: &EnvelopeHeader) {
+    let len = header.encoded_len();
+    dest.reserve(MARKER_SIZE + encoded_len_varint(len as u64) + len);
+    write_marker(dest);
+    encode_varint(len as u64, dest);
+    header.encode_raw(dest);
 }
 
 fn write_marker(slice: &mut Vec<u8>) {
@@ -213,40 +128,19 @@ fn write_marker(slice: &mut Vec<u8>) {
 }
 
 fn skip_marker(input: &[u8]) -> FanoutResult<&[u8]> {
-    if input.len() < HEADER_SIZE {
-        return Err(FanoutError::serialization(INVALID_MESSAGE_ERROR));
+    let Some((int_bytes, rest)) = input.split_first_chunk::<MARKER_SIZE>() else {
+        return Err(invalid_message());
+    };
+    if u32::from_le_bytes(*int_bytes) != FANOUT_MESSAGE_MARKER {
+        return Err(invalid_message());
     }
-    let (int_bytes, rest) = input.split_at(HEADER_SIZE);
-    let marker = u32::from_le_bytes(
-        int_bytes
-            .try_into()
-            .map_err(|_| FanoutError::serialization(INVALID_MESSAGE_ERROR))?,
-    );
-    if marker != FANOUT_MESSAGE_MARKER {
-        return Err(FanoutError::serialization(INVALID_MESSAGE_ERROR));
-    }
-
     Ok(rest)
 }
 
-/// Represents a decoded fanout message with its header and payload.
+/// A decoded fanout message: its header and the payload it borrows.
 pub(super) struct FanoutMessage<'a> {
+    pub header: FanoutMessageHeader,
     pub buf: &'a [u8],
-    /// The version of the fanout message protocol.
-    pub version: u16,
-    /// Unique ID for this request, used to match responses.
-    pub request_id: u64,
-    /// The name of the handler to process this message.
-    pub handler: String,
-    /// ACL user propagated by requester for shard-side enforcement.
-    pub user: Option<String>,
-    /// The database to use for this request.
-    pub db: i32,
-    /// Sender's cluster-map fingerprint (0 if unavailable / v1 sender).
-    pub cluster_fingerprint: u64,
-    /// Envelope feature bits the receiver must understand; checked against
-    /// [`SUPPORTED_MESSAGE_FEATURES`] at intake (0 = no requirements).
-    pub required_features: u16,
 }
 
 impl<'a> FanoutMessage<'a> {
@@ -266,26 +160,7 @@ impl<'a> FanoutMessage<'a> {
     /// There is no data to write because everything is implicit.
     pub fn new(buf: &'a [u8]) -> FanoutResult<Self> {
         let (header, buf) = FanoutMessageHeader::deserialize(buf)?;
-        let FanoutMessageHeader {
-            request_id,
-            db,
-            handler,
-            user,
-            cluster_fingerprint,
-            required_features,
-            ..
-        } = header;
-
-        Ok(Self {
-            buf,
-            request_id,
-            handler,
-            user,
-            db,
-            cluster_fingerprint,
-            required_features,
-            version: header.version,
-        })
+        Ok(Self { header, buf })
     }
 }
 
@@ -294,19 +169,20 @@ pub(super) fn serialize_request_message(
     request_id: u64,
     db: i32,
     handler: &str,
-    user: Option<&str>,
+    user: Option<String>,
     cluster_fingerprint: u64,
     serialized_request: &[u8],
 ) {
     write_message_header(
         dest,
-        FANOUT_MESSAGE_VERSION,
-        request_id,
-        db,
-        handler,
-        user,
-        cluster_fingerprint,
-        0,
+        &EnvelopeHeader {
+            request_id,
+            db: i64::from(db),
+            handler: handler.to_owned(),
+            user: user.unwrap_or_default(),
+            cluster_fingerprint,
+            required_features: 0,
+        },
     );
     dest.extend_from_slice(serialized_request);
 }
@@ -316,51 +192,85 @@ mod tests {
     use super::*;
     use crate::fanout::ErrorKind;
     use proptest::prelude::*;
+    use prost::encoding::{WireType, encode_key, fixed64, sint64, uint64};
 
-    /// The envelope feature gate: with no bits defined, any demanded bit is
-    /// unsupported; 0 (all current senders and pre-repurposing peers, which
-    /// wrote this slot as `reserved: 0`) passes. `serialize_request_message`
-    /// must keep sending 0 until a feature bit is actually defined.
-    #[test]
-    fn test_required_features_gate() {
-        assert!(!has_unsupported_features(0));
-        assert!(!has_unsupported_features(SUPPORTED_MESSAGE_FEATURES));
-        assert!(has_unsupported_features(1));
-        assert!(has_unsupported_features(0x8000));
-        assert!(has_unsupported_features(u16::MAX));
-
-        let mut buf = Vec::new();
-        serialize_request_message(&mut buf, 7, 0, "mrange", None, 0, &[]);
-        let msg = FanoutMessage::new(&buf).unwrap();
-        assert_eq!(msg.required_features, 0);
-        assert!(!has_unsupported_features(msg.required_features));
+    fn assert_serialization_error(result: FanoutResult<(FanoutMessageHeader, &[u8])>) {
+        let err = result.expect_err("expected a rejected message");
+        assert_eq!(err.kind, ErrorKind::Serialization);
+        assert_eq!(err.message, INVALID_MESSAGE_ERROR);
     }
 
-    /// A nonzero required_features round-trips the wire slot (formerly
-    /// `reserved`) and is visible to intake via `FanoutMessage`.
-    #[test]
-    fn test_required_features_roundtrip_nonzero() {
-        let header = FanoutMessageHeader {
-            version: FANOUT_MESSAGE_VERSION,
-            request_id: 99,
-            db: 2,
-            handler: "mrange".to_string(),
-            user: None,
-            cluster_fingerprint: 0,
-            required_features: 0b1010,
-        };
-        let mut buf = Vec::new();
-        header.serialize(&mut buf);
-
-        let msg = FanoutMessage::new(&buf).unwrap();
-        assert_eq!(msg.required_features, 0b1010);
-        assert!(has_unsupported_features(msg.required_features));
+    fn write_len_delimited(buf: &mut Vec<u8>, tag: u32, bytes: &[u8]) {
+        encode_key(tag, WireType::LengthDelimited, buf);
+        encode_varint(bytes.len() as u64, buf);
+        buf.extend_from_slice(bytes);
     }
 
+    /// Frames already-encoded header bytes the way a sender would.
+    fn frame(encoded_header: &[u8]) -> Vec<u8> {
+        let mut buf = FANOUT_MESSAGE_MARKER.to_le_bytes().to_vec();
+        encode_varint(encoded_header.len() as u64, &mut buf);
+        buf.extend_from_slice(encoded_header);
+        buf
+    }
+
+    /// A header builder that takes every field as a raw wire value, so tests can
+    /// express bytes no well-behaved sender would emit: over-long strings,
+    /// non-UTF-8, a `db` outside `i32`. Omits default values, as prost does.
+    struct RawHeader<'a> {
+        request_id: u64,
+        db: i64,
+        handler: &'a [u8],
+        user: &'a [u8],
+        cluster_fingerprint: u64,
+        required_features: u64,
+    }
+
+    impl Default for RawHeader<'_> {
+        fn default() -> Self {
+            Self {
+                request_id: 1,
+                db: 0,
+                handler: b"handler",
+                user: b"",
+                cluster_fingerprint: 0,
+                required_features: 0,
+            }
+        }
+    }
+
+    impl RawHeader<'_> {
+        fn encode(&self) -> Vec<u8> {
+            let mut h = Vec::new();
+            if self.request_id != 0 {
+                uint64::encode(1, &self.request_id, &mut h);
+            }
+            if self.db != 0 {
+                sint64::encode(2, &self.db, &mut h);
+            }
+            if !self.handler.is_empty() {
+                write_len_delimited(&mut h, 3, self.handler);
+            }
+            if !self.user.is_empty() {
+                write_len_delimited(&mut h, 4, self.user);
+            }
+            if self.cluster_fingerprint != 0 {
+                fixed64::encode(5, &self.cluster_fingerprint, &mut h);
+            }
+            if self.required_features != 0 {
+                uint64::encode(6, &self.required_features, &mut h);
+            }
+            frame(&h)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Round trips
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_cluster_message_header_serialize_deserialize_basic() {
+    fn test_header_round_trip_basic() {
         let header = FanoutMessageHeader {
-            version: FANOUT_MESSAGE_VERSION,
             request_id: 12345,
             db: 0,
             handler: "test_handler".to_string(),
@@ -368,387 +278,180 @@ mod tests {
             cluster_fingerprint: 0xABCD_1234_5678_9F00,
             required_features: 0,
         };
-
         let mut buf = Vec::new();
         header.serialize(&mut buf);
 
-        let (deserialized_header, remaining_buf) = FanoutMessageHeader::deserialize(&buf).unwrap();
-
-        assert_eq!(deserialized_header.version, FANOUT_MESSAGE_VERSION);
-        assert_eq!(deserialized_header.request_id, 12345);
-        assert_eq!(deserialized_header.db, 0);
-        assert_eq!(deserialized_header.handler, "test_handler");
-        assert_eq!(deserialized_header.user, None);
-        assert_eq!(deserialized_header.required_features, 0);
-        assert_eq!(
-            deserialized_header.cluster_fingerprint,
-            0xABCD_1234_5678_9F00
-        );
-        assert_eq!(remaining_buf.len(), 0);
+        let (decoded, remaining) = FanoutMessageHeader::deserialize(&buf).unwrap();
+        assert_eq!(decoded.request_id, 12345);
+        assert_eq!(decoded.db, 0);
+        assert_eq!(decoded.handler, "test_handler");
+        assert_eq!(decoded.user, None);
+        assert_eq!(decoded.required_features, 0);
+        assert_eq!(decoded.cluster_fingerprint, 0xABCD_1234_5678_9F00);
+        assert!(remaining.is_empty());
     }
 
     #[test]
-    fn test_cluster_message_header_serialize_deserialize_with_negative_db() {
+    fn test_header_round_trip_extremes() {
         let header = FanoutMessageHeader {
-            version: FANOUT_MESSAGE_VERSION,
             request_id: u64::MAX,
             db: -15,
-            handler: "negative_db_handler".to_string(),
+            handler: "with_special_字符".to_string(),
             user: Some("alice".to_string()),
             cluster_fingerprint: u64::MAX,
-            required_features: 42,
+            required_features: u64::MAX,
         };
-
         let mut buf = Vec::new();
         header.serialize(&mut buf);
 
-        let (deserialized_header, remaining_buf) = FanoutMessageHeader::deserialize(&buf).unwrap();
-
-        assert_eq!(deserialized_header.version, FANOUT_MESSAGE_VERSION);
-        assert_eq!(deserialized_header.request_id, u64::MAX);
-        assert_eq!(deserialized_header.db, -15);
-        assert_eq!(deserialized_header.handler, "negative_db_handler");
-        assert_eq!(deserialized_header.user.as_deref(), Some("alice"));
-        assert_eq!(deserialized_header.cluster_fingerprint, u64::MAX);
-        assert_eq!(deserialized_header.required_features, 42);
-        assert_eq!(remaining_buf.len(), 0);
+        let (decoded, remaining) = FanoutMessageHeader::deserialize(&buf).unwrap();
+        assert_eq!(decoded.request_id, u64::MAX);
+        assert_eq!(decoded.db, -15);
+        assert_eq!(decoded.handler, "with_special_字符");
+        assert_eq!(decoded.user.as_deref(), Some("alice"));
+        assert_eq!(decoded.cluster_fingerprint, u64::MAX);
+        assert_eq!(decoded.required_features, u64::MAX);
+        assert!(remaining.is_empty());
     }
 
+    /// Bytes after the header are the payload, returned untouched.
     #[test]
-    fn test_cluster_message_header_deserialize_with_remaining_data() {
-        let header = FanoutMessageHeader {
-            version: FANOUT_MESSAGE_VERSION,
-            request_id: 999,
-            db: 5,
-            handler: "handler_with_extra".to_string(),
-            user: Some("bob".to_string()),
-            cluster_fingerprint: 7,
-            required_features: 1,
-        };
-
+    fn test_payload_follows_header() {
         let mut buf = Vec::new();
-        header.serialize(&mut buf);
-        buf.extend_from_slice(b"extra_data");
-
-        let (deserialized_header, remaining_buf) = FanoutMessageHeader::deserialize(&buf).unwrap();
-
-        assert_eq!(deserialized_header.version, FANOUT_MESSAGE_VERSION);
-        assert_eq!(deserialized_header.request_id, 999);
-        assert_eq!(deserialized_header.db, 5);
-        assert_eq!(deserialized_header.required_features, 1);
-        assert_eq!(deserialized_header.handler, "handler_with_extra");
-        assert_eq!(deserialized_header.user.as_deref(), Some("bob"));
-        assert_eq!(deserialized_header.cluster_fingerprint, 7);
-        assert_eq!(remaining_buf, b"extra_data");
-    }
-
-    #[test]
-    fn test_cluster_message_header_deserialize_empty_buffer() {
-        let buf = &[];
-        let result = FanoutMessageHeader::deserialize(buf);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_cluster_message_header_deserialize_buffer_too_small() {
-        let buf = &[0x01, 0x02, 0x03]; // Too small for a complete header
-        let result = FanoutMessageHeader::deserialize(buf);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_cluster_message_header_deserialize_invalid_marker() {
-        let mut buf = Vec::new();
-
-        // Write invalid marker
-        let invalid_marker = 0xDEADBEEF_u32;
-        buf.extend_from_slice(&invalid_marker.to_le_bytes());
-
-        // Add some dummy data for version, request_id, db, required_features
-        buf.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05]);
-
-        let result = FanoutMessageHeader::deserialize(&buf);
-        assert!(result.is_err());
-        if let Err(res) = result {
-            assert_eq!(res.message, INVALID_MESSAGE_ERROR);
-        }
-    }
-
-    #[test]
-    fn test_cluster_message_header_deserialize_incomplete_version() {
-        let mut buf = Vec::new();
-
-        // Write correct marker but incomplete data
-        buf.extend_from_slice(&FANOUT_MESSAGE_MARKER.to_le_bytes());
-        // No version data
-
-        let result = FanoutMessageHeader::deserialize(&buf);
-        assert!(result.is_err());
-        if let Err(res) = result {
-            assert_eq!(res.message, INVALID_MESSAGE_ERROR);
-        }
-    }
-
-    #[test]
-    fn test_cluster_message_header_deserialize_incomplete_request_id() {
-        let mut buf = Vec::new();
-
-        // Write the correct marker and version
-        buf.extend_from_slice(&FANOUT_MESSAGE_MARKER.to_le_bytes());
-        buf.push(1); // version as varint
-        // Missing request_id and other fields
-
-        let result = FanoutMessageHeader::deserialize(&buf);
-        assert!(result.is_err());
-        if let Err(res) = result {
-            assert_eq!(res.message, INVALID_MESSAGE_ERROR);
-        }
-    }
-
-    fn assert_serialization_error(result: FanoutResult<(FanoutMessageHeader, &[u8])>) {
-        assert!(result.is_err());
-        if let Err(res) = result {
-            assert_eq!(res.kind, ErrorKind::Serialization);
-            assert_eq!(res.message, INVALID_MESSAGE_ERROR);
-        }
-    }
-
-    #[test]
-    fn test_cluster_message_header_deserialize_incomplete_db() {
-        let mut buf = Vec::new();
-
-        // Write the correct marker, version, and request_id
-        buf.extend_from_slice(&FANOUT_MESSAGE_MARKER.to_le_bytes());
-        buf.push(1); // version as varint
-        buf.push(42); // request_id as varint
-        // Missing db and required_features fields
-
-        let result = FanoutMessageHeader::deserialize(&buf);
-        assert_serialization_error(result);
-    }
-
-    #[test]
-    fn test_cluster_message_header_deserialize_incomplete_reserved() {
-        let mut buf = Vec::new();
-
-        // Write the correct marker, version, request_id, and db
-        buf.extend_from_slice(&FANOUT_MESSAGE_MARKER.to_le_bytes());
-        buf.push(1); // version as varint
-        buf.push(42); // request_id as varint
-        buf.push(0); // db as signed varint (0 encodes as 0)
-        // Missing handler, user, cluster_fingerprint, and required_features field
-
-        let result = FanoutMessageHeader::deserialize(&buf);
-        assert_serialization_error(result);
-    }
-
-    #[test]
-    fn test_write_marker() {
-        let mut buf = Vec::new();
-        write_marker(&mut buf);
-
-        assert_eq!(buf.len(), 4);
-        let marker = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        assert_eq!(marker, FANOUT_MESSAGE_MARKER);
-    }
-
-    #[test]
-    fn test_skip_marker_valid() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&FANOUT_MESSAGE_MARKER.to_le_bytes());
-        buf.extend_from_slice(b"remaining_data");
-
-        let result = skip_marker(&buf);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), b"remaining_data");
-    }
-
-    #[test]
-    fn test_skip_marker_invalid() {
-        let mut buf = Vec::new();
-        let invalid_marker = 0xDEADBEEF_u32;
-        buf.extend_from_slice(&invalid_marker.to_le_bytes());
-        buf.extend_from_slice(b"remaining_data");
-
-        let result = skip_marker(&buf);
-        assert!(result.is_err());
-        if let Err(res) = result {
-            assert_eq!(res.kind, ErrorKind::Serialization);
-            assert_eq!(res.message, INVALID_MESSAGE_ERROR);
-        }
-    }
-
-    #[test]
-    fn test_skip_marker_buffer_too_small() {
-        let buf = &[0x01, 0x02]; // Only 2 bytes, need 4 for u32 marker
-
-        let result = skip_marker(buf);
-        assert!(result.is_err());
-        if let Err(res) = result {
-            assert_eq!(res.kind, ErrorKind::Serialization);
-            assert_eq!(res.message, INVALID_MESSAGE_ERROR);
-        }
-    }
-
-    #[test]
-    fn test_skip_marker_empty_buffer() {
-        let buf = &[];
-
-        let result = skip_marker(buf);
-        assert!(result.is_err());
-        if let Err(res) = result {
-            assert_eq!(res.kind, ErrorKind::Serialization);
-            assert_eq!(res.message, INVALID_MESSAGE_ERROR);
-        }
-    }
-
-    #[test]
-    fn test_serialize_request_message() {
-        let mut buf = Vec::new();
-        let request_data = b"test_request_data";
-
         serialize_request_message(
             &mut buf,
             123,
             5,
             "handler",
-            Some("alice"),
+            Some("alice".to_string()),
             0xDEAD_BEEF,
-            request_data,
+            b"test_request_data",
         );
 
-        // Verify we can deserialize the header
-        let (header, remaining) = FanoutMessageHeader::deserialize(&buf).unwrap();
-
-        assert_eq!(header.version, FANOUT_MESSAGE_VERSION);
-        assert_eq!(header.request_id, 123);
-        assert_eq!(header.db, 5);
-        assert_eq!(header.required_features, 0);
-        assert_eq!(header.handler, "handler");
-        assert_eq!(header.user.as_deref(), Some("alice"));
-        assert_eq!(header.cluster_fingerprint, 0xDEAD_BEEF);
-        assert_eq!(remaining, request_data);
+        let message = FanoutMessage::new(&buf).unwrap();
+        assert_eq!(message.header.request_id, 123);
+        assert_eq!(message.header.db, 5);
+        assert_eq!(message.header.required_features, 0);
+        assert_eq!(message.header.handler, "handler");
+        assert_eq!(message.header.user.as_deref(), Some("alice"));
+        assert_eq!(message.header.cluster_fingerprint, 0xDEAD_BEEF);
+        assert_eq!(message.buf, b"test_request_data");
     }
 
+    /// Error replies are sent with an empty handler; that must stay legal.
     #[test]
-    fn test_request_message_new_valid() {
+    fn test_empty_handler_is_accepted() {
         let mut buf = Vec::new();
-        let request_data = b"test_payload";
+        serialize_request_message(&mut buf, 9, 0, "", None, 0, b"err");
 
-        serialize_request_message(&mut buf, 456, -3, "test_handler", None, 99, request_data);
-
-        let request_message = FanoutMessage::new(&buf).unwrap();
-
-        assert_eq!(request_message.request_id, 456);
-        assert_eq!(request_message.db, -3);
-        assert_eq!(request_message.handler, "test_handler");
-        assert_eq!(request_message.user, None);
-        assert_eq!(request_message.cluster_fingerprint, 99);
-        assert_eq!(request_message.buf, request_data);
+        let message = FanoutMessage::new(&buf).unwrap();
+        assert_eq!(message.header.request_id, 9);
+        assert_eq!(message.header.handler, "");
+        assert_eq!(message.buf, b"err");
     }
 
+    /// Pins the wire layout. Field numbers are the compatibility contract, so
+    /// renumbering one must fail here rather than only between mixed-version
+    /// nodes.
     #[test]
-    fn test_cluster_message_header_deserialize_rejects_version_mismatch() {
+    fn test_wire_layout_is_stable() {
         let mut buf = Vec::new();
-        write_marker(&mut buf);
-        write_u16_le(&mut buf, FANOUT_MESSAGE_VERSION - 1);
-        write_uvarint(&mut buf, 1);
-        write_signed_varint(&mut buf, 0);
-        write_byte_slice(&mut buf, b"handler");
-        write_byte_slice(&mut buf, b"");
-        write_u64_le(&mut buf, 0);
-        write_u16_le(&mut buf, 0);
+        serialize_request_message(
+            &mut buf,
+            7,
+            -1,
+            "mget",
+            Some("bob".to_string()),
+            0x0102_0304_0506_0708,
+            b"P",
+        );
 
-        let result = FanoutMessageHeader::deserialize(&buf);
-        assert_serialization_error(result);
+        let mut expected = vec![0xAB, 0xDC, 0xBA, 0x00]; // marker, little-endian
+        expected.push(24); // header length
+        expected.extend_from_slice(&[0x08, 7]); // 1: request_id
+        expected.extend_from_slice(&[0x10, 1]); // 2: db, zigzag(-1)
+        expected.extend_from_slice(&[0x1A, 4]); // 3: handler
+        expected.extend_from_slice(b"mget");
+        expected.extend_from_slice(&[0x22, 3]); // 4: user
+        expected.extend_from_slice(b"bob");
+        expected.push(0x29); // 5: cluster_fingerprint, fixed64 little-endian
+        expected.extend_from_slice(&[8, 7, 6, 5, 4, 3, 2, 1]);
+        expected.push(b'P'); // payload
+        assert_eq!(buf, expected);
     }
 
+    // -----------------------------------------------------------------------
+    // Forward compatibility
+    // -----------------------------------------------------------------------
+
+    /// A newer peer's fields are skipped, in every wire type, and the payload
+    /// boundary still comes from the length prefix.
     #[test]
-    fn test_cluster_message_header_deserialize_rejects_oversized_user() {
+    fn test_unknown_header_fields_are_ignored() {
+        let mut h = Vec::new();
+        uint64::encode(1, &7, &mut h);
+        write_len_delimited(&mut h, 3, b"mrange");
+        uint64::encode(50, &1, &mut h);
+        fixed64::encode(51, &1, &mut h);
+        write_len_delimited(&mut h, 52, b"from the future");
+
+        let mut buf = frame(&h);
+        buf.extend_from_slice(b"PAYLOAD");
+
+        let message = FanoutMessage::new(&buf).unwrap();
+        assert_eq!(message.header.request_id, 7);
+        assert_eq!(message.header.handler, "mrange");
+        assert_eq!(message.buf, b"PAYLOAD");
+    }
+
+    /// Fields an older peer does not send decode to values meaning "nothing to
+    /// enforce or check".
+    #[test]
+    fn test_absent_fields_take_their_defaults() {
+        let mut h = Vec::new();
+        uint64::encode(1, &7, &mut h);
+        let buf = frame(&h);
+
+        let message = FanoutMessage::new(&buf).unwrap();
+        assert_eq!(message.header.db, 0);
+        assert_eq!(message.header.handler, "");
+        assert_eq!(message.header.user, None);
+        assert_eq!(message.header.cluster_fingerprint, 0);
+        assert_eq!(message.header.required_features, 0);
+    }
+
+    /// The envelope feature gate: with no bits defined, any demanded bit is
+    /// unsupported, and `serialize_request_message` keeps sending 0 until a
+    /// feature bit is actually defined.
+    #[test]
+    fn test_required_features_gate() {
+        assert!(!has_unsupported_features(0));
+        assert!(!has_unsupported_features(SUPPORTED_MESSAGE_FEATURES));
+        assert!(has_unsupported_features(1));
+        assert!(has_unsupported_features(1 << 32));
+        assert!(has_unsupported_features(u64::MAX));
+
         let mut buf = Vec::new();
-        write_marker(&mut buf);
-        write_u16_le(&mut buf, FANOUT_MESSAGE_VERSION);
-        write_uvarint(&mut buf, 1);
-        write_signed_varint(&mut buf, 0);
-        write_byte_slice(&mut buf, b"handler");
-        let oversized_user = vec![b'a'; MAX_USERNAME_LEN + 1];
-        write_byte_slice(&mut buf, &oversized_user);
-        write_u64_le(&mut buf, 0);
-        write_u16_le(&mut buf, 0);
-
-        let result = FanoutMessageHeader::deserialize(&buf);
-        assert_serialization_error(result);
+        serialize_request_message(&mut buf, 7, 0, "mrange", None, 0, &[]);
+        let message = FanoutMessage::new(&buf).unwrap();
+        assert_eq!(message.header.required_features, 0);
     }
 
+    /// An unsupported bit must survive parsing so intake can see it and reject
+    /// the message. Bits above 32 guard the field's width: a 32-bit field would
+    /// truncate them away and let the request through as if it demanded nothing.
     #[test]
-    fn test_cluster_message_header_deserialize_rejects_oversized_handler() {
-        let mut buf = Vec::new();
-        write_marker(&mut buf);
-        write_u16_le(&mut buf, FANOUT_MESSAGE_VERSION);
-        write_uvarint(&mut buf, 1);
-        write_signed_varint(&mut buf, 0);
-        let oversized_handler = vec![b'a'; MAX_HANDLER_LEN + 1];
-        write_byte_slice(&mut buf, &oversized_handler);
-        write_byte_slice(&mut buf, b"");
-        write_u64_le(&mut buf, 0);
-        write_u16_le(&mut buf, 0);
-
-        let result = FanoutMessageHeader::deserialize(&buf);
-        assert_serialization_error(result);
-    }
-
-    #[test]
-    fn test_request_message_new_invalid_header() {
-        let buf = b"invalid_data";
-
-        let result = FanoutMessage::new(buf);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_cluster_message_header_roundtrip_property_based() {
-        // Property-based test: any valid ClusterMessageHeader should roundtrip,
-        // including various handler strings and fingerprints.
-        let test_cases = vec![
-            (0, i32::MIN, 0, "", 0u64),
-            (1, -1, 1, "handler1", 1),
-            (u64::MAX, i32::MAX, u16::MAX, "h", u64::MAX),
-            (1234567890, 0, 999, "property_based_test", 0xABCD),
-            (555, -42, 200, "with_special_字符", 0x0102_0304_0506_0708),
-            (3, 4, 5, "another_handler", 42),
-        ];
-
-        for (request_id, db, required_features, handler, cluster_fingerprint) in test_cases {
-            let original_header = FanoutMessageHeader {
-                version: FANOUT_MESSAGE_VERSION,
-                request_id,
-                db,
-                handler: handler.to_string(),
-                user: Some("user".to_string()),
+    fn test_unsupported_features_survive_parsing_for_intake() {
+        for required_features in [1u64, 0x8000, 1 << 32, 1 << 63, u64::MAX] {
+            let buf = RawHeader {
                 required_features,
-                cluster_fingerprint,
-            };
+                ..Default::default()
+            }
+            .encode();
 
-            let mut buf = Vec::new();
-            original_header.serialize(&mut buf);
-
-            let (deserialized_header, remaining_buf) =
-                FanoutMessageHeader::deserialize(&buf).unwrap();
-
-            assert_eq!(deserialized_header.version, original_header.version);
-            assert_eq!(deserialized_header.request_id, original_header.request_id);
-            assert_eq!(deserialized_header.db, original_header.db);
-            assert_eq!(
-                deserialized_header.required_features,
-                original_header.required_features
-            );
-            assert_eq!(deserialized_header.handler, original_header.handler);
-            assert_eq!(deserialized_header.user, original_header.user);
-            assert_eq!(
-                deserialized_header.cluster_fingerprint,
-                original_header.cluster_fingerprint
-            );
-            assert_eq!(remaining_buf.len(), 0);
+            let message = FanoutMessage::new(&buf).unwrap();
+            assert_eq!(message.header.required_features, required_features);
+            assert!(has_unsupported_features(message.header.required_features));
         }
     }
 
@@ -763,47 +466,119 @@ mod tests {
     // proportionally to an attacker-chosen number.
     // -----------------------------------------------------------------------
 
-    /// A header builder that takes every field as a raw wire value, so tests can
-    /// express bytes no well-behaved sender would emit: over-long strings,
-    /// non-UTF-8, a `db` outside `i32`, a version we do not speak.
-    struct RawHeader<'a> {
-        version: u16,
-        request_id: u64,
-        db: i64,
-        handler: &'a [u8],
-        user: &'a [u8],
-        cluster_fingerprint: u64,
-        required_features: u16,
-    }
+    #[test]
+    fn test_skip_marker() {
+        let mut buf = Vec::new();
+        write_marker(&mut buf);
+        assert_eq!(buf.len(), MARKER_SIZE);
+        buf.extend_from_slice(b"remaining_data");
+        assert_eq!(skip_marker(&buf).unwrap(), b"remaining_data");
 
-    impl Default for RawHeader<'_> {
-        fn default() -> Self {
-            Self {
-                version: FANOUT_MESSAGE_VERSION,
-                request_id: 1,
-                db: 0,
-                handler: b"handler",
-                user: b"",
-                cluster_fingerprint: 0,
-                required_features: 0,
-            }
+        let mut invalid = 0xDEADBEEF_u32.to_le_bytes().to_vec();
+        invalid.extend_from_slice(b"remaining_data");
+        for bad in [&invalid[..], &[0x01, 0x02], &[]] {
+            let err = skip_marker(bad).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Serialization);
+            assert_eq!(err.message, INVALID_MESSAGE_ERROR);
         }
     }
 
-    impl RawHeader<'_> {
-        /// Mirrors `write_message_header` field for field.
-        fn encode(&self) -> Vec<u8> {
-            let mut buf = Vec::new();
-            write_marker(&mut buf);
-            write_u16_le(&mut buf, self.version);
-            write_uvarint(&mut buf, self.request_id);
-            write_signed_varint(&mut buf, self.db);
-            write_byte_slice(&mut buf, self.handler);
-            write_byte_slice(&mut buf, self.user);
-            write_u64_le(&mut buf, self.cluster_fingerprint);
-            write_u16_le(&mut buf, self.required_features);
-            buf
+    #[test]
+    fn test_deserialize_rejects_invalid_marker() {
+        let mut buf = RawHeader::default().encode();
+        buf[0] ^= 0xFF;
+        assert_serialization_error(FanoutMessageHeader::deserialize(&buf));
+    }
+
+    #[test]
+    fn test_request_message_new_invalid_header() {
+        assert!(FanoutMessage::new(b"invalid_data").is_err());
+    }
+
+    /// A zero-length header would otherwise decode to all defaults.
+    #[test]
+    fn test_deserialize_rejects_empty_header() {
+        assert_serialization_error(FanoutMessageHeader::deserialize(&frame(&[])));
+    }
+
+    /// A message in the previous hand-rolled layout (marker, u16 version, then
+    /// positional fields) is rejected rather than misread.
+    #[test]
+    fn test_deserialize_rejects_previous_format() {
+        let mut buf = FANOUT_MESSAGE_MARKER.to_le_bytes().to_vec();
+        buf.extend_from_slice(&1u16.to_le_bytes()); // version
+        buf.push(42); // request_id
+        buf.push(0); // db
+        buf.push(6); // handler
+        buf.extend_from_slice(b"mrange");
+        buf.push(0); // user
+        buf.extend_from_slice(&[0; 8]); // cluster_fingerprint
+        buf.extend_from_slice(&[0; 2]); // required_features
+
+        assert_serialization_error(FanoutMessageHeader::deserialize(&buf));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_oversized_user() {
+        let user = vec![b'a'; MAX_USERNAME_LEN + 1];
+        let buf = RawHeader {
+            user: &user,
+            ..Default::default()
         }
+        .encode();
+        assert_serialization_error(FanoutMessageHeader::deserialize(&buf));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_oversized_handler() {
+        let handler = vec![b'a'; MAX_HANDLER_LEN + 1];
+        let buf = RawHeader {
+            handler: &handler,
+            ..Default::default()
+        }
+        .encode();
+        assert_serialization_error(FanoutMessageHeader::deserialize(&buf));
+    }
+
+    /// The length caps are `>`, not `>=`: a name of exactly the maximum length
+    /// is legitimate and must still decode. Guards the oversized-* tests against
+    /// passing for an off-by-one reason.
+    #[test]
+    fn test_deserialize_accepts_fields_exactly_at_length_cap() {
+        let handler = vec![b'h'; MAX_HANDLER_LEN];
+        let user = vec![b'u'; MAX_USERNAME_LEN];
+        let buf = RawHeader {
+            handler: &handler,
+            user: &user,
+            ..Default::default()
+        }
+        .encode();
+
+        let (header, remaining) = FanoutMessageHeader::deserialize(&buf).unwrap();
+        assert_eq!(header.handler.len(), MAX_HANDLER_LEN);
+        assert_eq!(header.user.as_deref().map(str::len), Some(MAX_USERNAME_LEN));
+        assert!(remaining.is_empty());
+    }
+
+    /// The cap on the whole header applies to unknown fields too, which the
+    /// per-field caps cannot see: exactly at the cap decodes, one byte over does
+    /// not.
+    #[test]
+    fn test_header_length_cap() {
+        let header_of_len = |len: usize| {
+            let mut h = Vec::new();
+            uint64::encode(1, &7, &mut h);
+            // Tag 50 takes 2 bytes and the length prefix 2 more at this size.
+            let filler = vec![0; len - h.len() - 4];
+            write_len_delimited(&mut h, 50, &filler);
+            assert_eq!(h.len(), len);
+            frame(&h)
+        };
+
+        assert!(FanoutMessageHeader::deserialize(&header_of_len(MAX_HEADER_LEN)).is_ok());
+        assert_serialization_error(FanoutMessageHeader::deserialize(&header_of_len(
+            MAX_HEADER_LEN + 1,
+        )));
     }
 
     /// Non-UTF-8 handler bytes must be rejected, not lossily converted. The
@@ -811,7 +586,7 @@ mod tests {
     #[test]
     fn test_deserialize_rejects_non_utf8_handler() {
         // Lone continuation byte, a truncated 2-byte sequence, and a surrogate
-        // half — the three shapes `from_utf8` must catch.
+        // half — the three shapes UTF-8 validation must catch.
         for bad in [&[0x80u8][..], &[0xC3][..], &[0xED, 0xA0, 0x80][..]] {
             let buf = RawHeader {
                 handler: bad,
@@ -836,63 +611,39 @@ mod tests {
         }
     }
 
-    /// The length caps are `>`, not `>=`: a name of exactly the maximum length
-    /// is legitimate and must still decode. Guards the oversized-* tests against
-    /// passing for an off-by-one reason.
+    /// A header length that overstates the bytes actually present must fail on
+    /// the remaining-data check.
     #[test]
-    fn test_deserialize_accepts_fields_exactly_at_length_cap() {
-        let handler = vec![b'h'; MAX_HANDLER_LEN];
-        let user = vec![b'u'; MAX_USERNAME_LEN];
-        let buf = RawHeader {
-            handler: &handler,
-            user: &user,
-            ..Default::default()
-        }
-        .encode();
-
-        let (header, remaining) = FanoutMessageHeader::deserialize(&buf).unwrap();
-        assert_eq!(header.handler.len(), MAX_HANDLER_LEN);
-        assert_eq!(header.user.as_deref().map(str::len), Some(MAX_USERNAME_LEN));
-        assert!(remaining.is_empty());
-    }
-
-    /// A length prefix that overstates the bytes actually present must fail on
-    /// the remaining-data check. This is the shape that would otherwise read
-    /// past the end of the received payload.
-    #[test]
-    fn test_deserialize_rejects_length_prefix_exceeding_buffer() {
-        let mut buf = Vec::new();
-        write_marker(&mut buf);
-        write_u16_le(&mut buf, FANOUT_MESSAGE_VERSION);
-        write_uvarint(&mut buf, 1);
-        write_signed_varint(&mut buf, 0);
-        write_uvarint(&mut buf, 64); // handler claims 64 bytes...
+    fn test_deserialize_rejects_header_length_exceeding_buffer() {
+        let mut buf = FANOUT_MESSAGE_MARKER.to_le_bytes().to_vec();
+        encode_varint(64, &mut buf); // claims 64 bytes...
         buf.extend_from_slice(b"short"); // ...only 5 follow
 
         assert_serialization_error(FanoutMessageHeader::deserialize(&buf));
     }
 
-    /// An absurd length prefix must be rejected by the remaining-data check
-    /// before anything is sized from it. If the parser ever pre-allocated on the
-    /// claimed length, these values would OOM or panic on capacity overflow
-    /// rather than return an error.
+    /// An absurd length, at either framing level, must be rejected before
+    /// anything is sized from it. If the parser ever pre-allocated on the claimed
+    /// length, these values would OOM or panic on capacity overflow rather than
+    /// return an error.
     #[test]
-    fn test_deserialize_rejects_absurd_length_prefix() {
+    fn test_deserialize_rejects_absurd_lengths() {
         for claimed in [u64::MAX, u64::MAX / 2, 1 << 40, usize::MAX as u64] {
-            let mut buf = Vec::new();
-            write_marker(&mut buf);
-            write_u16_le(&mut buf, FANOUT_MESSAGE_VERSION);
-            write_uvarint(&mut buf, 1);
-            write_signed_varint(&mut buf, 0);
-            write_uvarint(&mut buf, claimed);
-
+            let mut buf = FANOUT_MESSAGE_MARKER.to_le_bytes().to_vec();
+            encode_varint(claimed, &mut buf);
             assert_serialization_error(FanoutMessageHeader::deserialize(&buf));
+
+            let mut h = Vec::new();
+            encode_key(3, WireType::LengthDelimited, &mut h);
+            encode_varint(claimed, &mut h);
+            assert_serialization_error(FanoutMessageHeader::deserialize(&frame(&h)));
         }
     }
 
-    /// Every strict prefix of a valid message must be rejected. This covers the
-    /// truncation points the hand-written `incomplete_*` tests miss — mid-string
-    /// bodies, a partial 8-byte fingerprint, and a 1-byte `required_features`.
+    /// Every strict prefix of a valid message must be rejected, wherever the cut
+    /// lands: the marker, the length, or the header. The header length is what
+    /// catches a cut inside it, so a bad prefix cannot decode as a shorter but
+    /// well-formed protobuf.
     #[test]
     fn test_deserialize_rejects_every_truncated_prefix() {
         let full = RawHeader {
@@ -915,20 +666,40 @@ mod tests {
         assert!(FanoutMessageHeader::deserialize(&full).is_ok());
     }
 
-    /// An unterminated varint must stop on the decoder's shift guard instead of
-    /// consuming the rest of the buffer or looping.
+    /// An unterminated varint must fail instead of consuming the rest of the
+    /// buffer or looping, in the framing length and in a header field.
     #[test]
     fn test_deserialize_rejects_unterminated_varint() {
-        for run in [10usize, 64, 4096] {
-            let mut buf = Vec::new();
-            write_marker(&mut buf);
-            write_u16_le(&mut buf, FANOUT_MESSAGE_VERSION);
-            // request_id: continuation bit set on every byte.
-            buf.extend_from_slice(&vec![0x80u8; run]);
-            buf.push(0x01);
+        for run in [10usize, 64, 4000] {
+            let mut in_length = FANOUT_MESSAGE_MARKER.to_le_bytes().to_vec();
+            in_length.extend_from_slice(&vec![0x80u8; run]);
+            in_length.push(0x01);
+            assert_serialization_error(FanoutMessageHeader::deserialize(&in_length));
 
-            assert_serialization_error(FanoutMessageHeader::deserialize(&buf));
+            let mut h = vec![0x08]; // 1: request_id, as a varint
+            h.extend_from_slice(&vec![0x80u8; run]);
+            h.push(0x01);
+            assert_serialization_error(FanoutMessageHeader::deserialize(&frame(&h)));
         }
+    }
+
+    /// Unknown groups nest, so skipping them recurses. Deep nesting must hit the
+    /// decoder's recursion limit rather than overflow the stack.
+    #[test]
+    fn test_deserialize_rejects_deeply_nested_unknown_groups() {
+        let mut h = Vec::new();
+        for _ in 0..1000 {
+            encode_key(99, WireType::StartGroup, &mut h);
+        }
+        assert_serialization_error(FanoutMessageHeader::deserialize(&frame(&h)));
+    }
+
+    /// A known field with the wrong wire type is corruption, not an unknown field.
+    #[test]
+    fn test_deserialize_rejects_wrong_wire_type() {
+        let mut h = Vec::new();
+        write_len_delimited(&mut h, 1, b"not a varint");
+        assert_serialization_error(FanoutMessageHeader::deserialize(&frame(&h)));
     }
 
     /// `db` is written from an `i32`; a value outside that range is malformed and
@@ -963,37 +734,26 @@ mod tests {
         }
     }
 
-    /// Only the exact current version is accepted — older and newer alike.
-    #[test]
-    fn test_deserialize_rejects_all_other_versions() {
-        for version in [0, FANOUT_MESSAGE_VERSION + 1, 0x00FF, u16::MAX] {
-            let buf = RawHeader {
-                version,
-                ..Default::default()
-            }
-            .encode();
-            assert_serialization_error(FanoutMessageHeader::deserialize(&buf));
-        }
-    }
-
     /// An empty user field decodes to `None`, which `FanoutContext` treats as
     /// "run without ACL enforcement". Pinning this makes the collapse explicit:
     /// a peer cannot smuggle a distinct zero-length ACL identity through, and
     /// conversely an empty name is never resolved via `ModuleUser::from_name`.
     #[test]
     fn test_deserialize_empty_user_collapses_to_none() {
-        let from_wire = RawHeader {
-            user: b"",
-            ..Default::default()
-        }
-        .encode();
+        let from_wire = RawHeader::default().encode();
         let (header, _) = FanoutMessageHeader::deserialize(&from_wire).unwrap();
+        assert_eq!(header.user, None);
+
+        // An explicitly encoded empty string decodes the same way.
+        let mut h = Vec::new();
+        uint64::encode(1, &1, &mut h);
+        write_len_delimited(&mut h, 4, b"");
+        let (header, _) = FanoutMessageHeader::deserialize(&frame(&h)).unwrap();
         assert_eq!(header.user, None);
 
         // Serializing `Some("")` produces the identical bytes.
         let mut round_trip = Vec::new();
         FanoutMessageHeader {
-            version: FANOUT_MESSAGE_VERSION,
             request_id: 1,
             db: 0,
             handler: "handler".to_string(),
@@ -1020,24 +780,6 @@ mod tests {
         assert_eq!(header.user.as_deref(), Some("alice\0evil"));
     }
 
-    /// An unsupported `required_features` bit must survive parsing so intake can
-    /// see it and reject the message. Dropping or masking it here would let the
-    /// request through as if it demanded nothing.
-    #[test]
-    fn test_unsupported_features_survive_parsing_for_intake() {
-        for required_features in [1u16, 0x8000, u16::MAX] {
-            let buf = RawHeader {
-                required_features,
-                ..Default::default()
-            }
-            .encode();
-
-            let msg = FanoutMessage::new(&buf).unwrap();
-            assert_eq!(msg.required_features, required_features);
-            assert!(has_unsupported_features(msg.required_features));
-        }
-    }
-
     proptest! {
         /// Totality: arbitrary bytes off the cluster bus must decode to `Ok` or
         /// `Err`, never panic. `deserialize` runs under an `extern "C"` callback,
@@ -1048,20 +790,18 @@ mod tests {
             let _ = FanoutMessage::new(&bytes);
         }
 
-        /// The same, but starting from a valid marker so the generator gets past
-        /// the cheap `skip_marker` rejection and actually exercises field decoding.
+        /// The same, but framed so the generator gets past the marker and length
+        /// checks and actually exercises field decoding.
         #[test]
-        fn arbitrary_bytes_after_valid_marker_never_panic(
-            tail in prop::collection::vec(any::<u8>(), 0..1024),
+        fn arbitrary_header_bytes_never_panic(
+            header in prop::collection::vec(any::<u8>(), 0..1024),
         ) {
-            let mut buf = FANOUT_MESSAGE_MARKER.to_le_bytes().to_vec();
-            buf.extend_from_slice(&tail);
-            let _ = FanoutMessageHeader::deserialize(&buf);
+            let _ = FanoutMessageHeader::deserialize(&frame(&header));
         }
 
         /// Single-byte corruption of a well-formed message: whatever survives
         /// parsing must still satisfy the parser's own invariants. Catches a cap
-        /// or version check that a flipped length/discriminant can slip past.
+        /// that a flipped length can slip past.
         #[test]
         fn corrupted_message_never_violates_invariants(
             index in any::<prop::sample::Index>(),
@@ -1082,7 +822,6 @@ mod tests {
 
             match FanoutMessageHeader::deserialize(&buf) {
                 Ok((header, _)) => {
-                    prop_assert_eq!(header.version, FANOUT_MESSAGE_VERSION);
                     prop_assert!(header.handler.len() <= MAX_HANDLER_LEN);
                     prop_assert!(header.user.as_deref().map_or(0, str::len) <= MAX_USERNAME_LEN);
                     prop_assert!(header.user.as_deref() != Some(""));
@@ -1095,19 +834,19 @@ mod tests {
         /// rejection tests above cannot be passing by rejecting too much.
         /// `user` is generated non-empty because empty and `None` are the same
         /// on the wire (see `test_deserialize_empty_user_collapses_to_none`).
+        /// `request_id` is non-zero so the header can never encode to nothing.
         #[test]
         fn valid_headers_round_trip(
-            request_id in any::<u64>(),
+            request_id in 1..=u64::MAX,
             db in any::<i32>(),
             // Char counts, not byte counts: capped so that even all-4-byte
             // characters stay inside MAX_HANDLER_LEN / MAX_USERNAME_LEN.
             handler in "\\PC{0,32}",
             user in prop::option::of("\\PC{1,64}"),
             cluster_fingerprint in any::<u64>(),
-            required_features in any::<u16>(),
+            required_features in any::<u64>(),
         ) {
             let original = FanoutMessageHeader {
-                version: FANOUT_MESSAGE_VERSION,
                 request_id,
                 db,
                 handler,

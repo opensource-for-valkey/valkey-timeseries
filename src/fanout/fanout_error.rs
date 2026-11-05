@@ -1,5 +1,6 @@
-use crate::common::encoding::{try_read_byte_slice, write_byte_slice};
+use crate::commands::fanout_codec::EnvelopeError;
 use crate::error_consts;
+use prost::Message;
 use valkey_module::{ValkeyError, ValkeyResult};
 
 /// Fanout error. Designed mostly for compactness since it's sent over the wire.
@@ -219,35 +220,29 @@ impl FanoutError {
     }
 
     pub fn serialize(&self, buf: &mut Vec<u8>) {
-        buf.push(self.kind as u8);
-        write_byte_slice(buf, self.message.as_str().as_ref());
+        let wire = EnvelopeError {
+            kind: u64::from(self.kind as u8),
+            message: self.message.clone(),
+        };
+        buf.reserve(wire.encoded_len());
+        wire.encode_raw(buf);
     }
 
-    pub fn deserialize(buf: &[u8]) -> ValkeyResult<(Self, &[u8])> {
-        if buf.len() < 2 {
-            return Err(ValkeyError::Str("Buffer too small to contain Error"));
-        }
-
-        let kind = ErrorKind::try_from(buf[0])?;
-        let mut buf = &buf[1..];
-
-        let extra = try_read_byte_slice(&mut buf)
-            .map_err(|_| ValkeyError::Str("Failed to read Error extra"))?;
-
-        let extra = if !extra.is_empty() {
-            String::from_utf8(extra.to_vec())
-                .map_err(|_| ValkeyError::Str("Invalid UTF-8 in Error extra"))?
-        } else {
-            String::new()
-        };
-
-        Ok((
-            Self {
-                kind,
-                message: extra,
-            },
-            buf,
-        ))
+    /// Decodes an error reply. A kind this node does not know, from a newer peer,
+    /// is reported as an invalid message and keeps its text.
+    ///
+    /// An empty buffer is valid: it is what `InvalidMessage` with no text encodes to.
+    pub fn deserialize(buf: &[u8]) -> ValkeyResult<Self> {
+        let wire = EnvelopeError::decode(buf)
+            .map_err(|_| ValkeyError::Str("Failed to decode fanout error"))?;
+        let kind = u8::try_from(wire.kind)
+            .ok()
+            .and_then(|kind| ErrorKind::try_from(kind).ok())
+            .unwrap_or(ErrorKind::InvalidMessage);
+        Ok(Self {
+            kind,
+            message: wire.message,
+        })
     }
 }
 
@@ -402,6 +397,7 @@ impl From<ValkeyError> for FanoutError {
 mod tests {
     use super::*;
     use crate::error_consts;
+    use prost::encoding::{WireType, encode_key, encode_varint};
     use valkey_module::ValkeyError;
 
     #[test]
@@ -465,9 +461,7 @@ mod tests {
         let mut buf = Vec::new();
         original.serialize(&mut buf);
 
-        let (deserialized, remaining) = FanoutError::deserialize(&buf).unwrap();
-        assert_eq!(original, deserialized);
-        assert!(remaining.is_empty());
+        assert_eq!(original, FanoutError::deserialize(&buf).unwrap());
     }
 
     #[test]
@@ -479,9 +473,7 @@ mod tests {
         let mut buf = Vec::new();
         original.serialize(&mut buf);
 
-        let (deserialized, remaining) = FanoutError::deserialize(&buf).unwrap();
-        assert_eq!(original, deserialized);
-        assert!(remaining.is_empty());
+        assert_eq!(original, FanoutError::deserialize(&buf).unwrap());
     }
 
     #[test]
@@ -512,55 +504,65 @@ mod tests {
             let mut buf = Vec::new();
             original.serialize(&mut buf);
 
-            let (deserialized, remaining) = FanoutError::deserialize(&buf).unwrap();
-            assert_eq!(original, deserialized);
-            assert!(remaining.is_empty());
+            assert_eq!(original, FanoutError::deserialize(&buf).unwrap());
         }
     }
 
+    /// The kind with no text encodes to nothing, so an empty buffer is that error.
     #[test]
-    fn test_deserialize_with_remaining_data() {
-        let original = FanoutError::custom("test".to_string());
+    fn test_deserialize_empty_buffer() {
+        let original = FanoutError::invalid_message();
         let mut buf = Vec::new();
         original.serialize(&mut buf);
-        buf.extend_from_slice(b"extra data");
+        assert!(buf.is_empty());
+        assert_eq!(FanoutError::deserialize(&buf).unwrap(), original);
+    }
 
-        let (deserialized, remaining) = FanoutError::deserialize(&buf).unwrap();
-        assert_eq!(original, deserialized);
-        assert_eq!(remaining, b"extra data");
+    fn encode_raw_error(kind: u64, message: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_key(1, WireType::Varint, &mut buf);
+        encode_varint(kind, &mut buf);
+        encode_key(2, WireType::LengthDelimited, &mut buf);
+        encode_varint(message.len() as u64, &mut buf);
+        buf.extend_from_slice(message);
+        buf
+    }
+
+    /// A kind added by a newer peer reaches us as an invalid message with its text
+    /// intact. Values past a u8 must not truncate onto a known kind: 2^32 + 4 is
+    /// not `Permissions`.
+    #[test]
+    fn test_unknown_kind_keeps_message() {
+        for kind in [14, 151, 254, 256, (1 << 32) + 4, u64::MAX] {
+            let error = FanoutError::deserialize(&encode_raw_error(kind, b"text")).unwrap();
+            assert_eq!(error.kind, ErrorKind::InvalidMessage, "kind {kind}");
+            assert_eq!(error.message, "text");
+        }
+    }
+
+    /// A newer peer's extra fields are skipped.
+    #[test]
+    fn test_unknown_error_fields_are_ignored() {
+        let mut buf = encode_raw_error(ErrorKind::Busy as u64, b"text");
+        encode_key(50, WireType::Varint, &mut buf);
+        encode_varint(1, &mut buf);
+
+        let error = FanoutError::deserialize(&buf).unwrap();
+        assert_eq!(error.kind, ErrorKind::Busy);
+        assert_eq!(error.message, "text");
     }
 
     #[test]
-    fn test_deserialize_errors() {
-        // Buffer too small
-        let result = FanoutError::deserialize(&[]);
-        assert!(result.is_err());
-
-        let result = FanoutError::deserialize(&[0]);
-        assert!(result.is_err());
-
-        // Invalid error kind
-        let mut buf = vec![151]; // Invalid error kind
-        buf.push(0); // Empty message length
-        let result = FanoutError::deserialize(&buf);
-        assert!(result.is_err());
-
-        // Invalid UTF-8 in a message
-        let mut buf = vec![0]; // Valid error kind
-        buf.push(3); // Message length = 3
-        buf.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // Invalid UTF-8
-        let result = FanoutError::deserialize(&buf);
-        assert!(result.is_err());
+    fn test_deserialize_rejects_invalid_utf8_message() {
+        let buf = encode_raw_error(0, &[0xFF, 0xFE, 0xFD]);
+        assert!(FanoutError::deserialize(&buf).is_err());
     }
 
     #[test]
-    fn test_deserialize_buffer_too_small_for_message() {
-        let mut buf = vec![0]; // Valid error kind (Failed)
-        buf.push(10); // Message length = 10, but we won't provide 10 bytes
-        buf.extend_from_slice(b"short"); // Only 5 bytes
-
-        let result = FanoutError::deserialize(&buf);
-        assert!(result.is_err());
+    fn test_deserialize_rejects_truncated_message() {
+        let mut buf = encode_raw_error(0, b"short");
+        buf.truncate(buf.len() - 1);
+        assert!(FanoutError::deserialize(&buf).is_err());
     }
 
     #[test]
