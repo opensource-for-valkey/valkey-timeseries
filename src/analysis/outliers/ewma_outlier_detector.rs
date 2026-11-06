@@ -99,8 +99,14 @@ impl EwmaOutlierDetector {
             // The update form, not `alpha * value + (1 - alpha) * ewma`: at a small
             // alpha that form's rounding bias accumulates to hundreds of ULPs on a
             // constant series, whereas here a sample equal to the average moves it
-            // by exactly nothing.
-            ewma += self.alpha * (v - ewma);
+            // by exactly nothing. Finite readings can still overflow the difference, and
+            // an infinite average would turn NaN on the next step and never recover.
+            let step = v - ewma;
+            ewma = if step.is_finite() {
+                ewma + self.alpha * step
+            } else {
+                self.alpha * v + (1.0 - self.alpha) * ewma
+            };
 
             // Sigma scales the root rather than being squared inside it: `sigma * sigma`
             // underflows below ~1e-154 and overflows above ~1e154, whatever the
@@ -664,6 +670,26 @@ mod tests {
         let quiet = shifted_after_alternating(1e15, 0.5, 0.0);
         let d = EwmaOutlierDetector::from_series(&quiet, 0.3).unwrap();
         assert!(d.detect(&quiet).unwrap().anomalies.is_empty());
+    }
+
+    /// `v - ewma` can overflow on finite readings. The average must survive it, or every
+    /// later outlier goes unseen.
+    #[test]
+    fn an_overflowing_difference_does_not_poison_the_average() {
+        let alternating = |i: usize| if i.is_multiple_of(2) { 1.0 } else { -1.0 };
+        let mut ts: Vec<f64> = (0..200).map(alternating).collect();
+        ts.extend([1e308, -1e308, 100.0]);
+        ts.extend(std::iter::repeat_n(0.0, 50));
+        ts.push(1e6);
+        ts.extend(std::iter::repeat_n(0.0, 50));
+
+        let d = EwmaOutlierDetector::from_series(&ts, 1.0).unwrap();
+        let result = d.detect(&ts).unwrap();
+        let flagged: Vec<usize> = result.anomalies.iter().map(|a| a.index).collect();
+        // The 100 at 202 is absorbed: next to -1e308 it is below the rounding of the update.
+        // What matters is that the average recovers and finds the outlier at 253.
+        assert_eq!(flagged, vec![200, 201, 253]);
+        assert!(result.scores.iter().all(|s| s.is_finite()));
     }
 
     #[test]
