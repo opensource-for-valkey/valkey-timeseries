@@ -158,7 +158,7 @@ requests stay bounded.
 * `TS.OUTLIERS`: Identify outliers in a series based on a specified algorithm and parameters; without `METHOD` it runs
   `ZSCORE THRESHOLD 3.0`. Detections run on the main thread or on a background lane according to their estimated
   cost. The config `ts-outliers-max-samples` (default 1,000,000, minimum 1,000, changeable at runtime) refuses a
-  larger request before it decodes any sample. See [TS.OUTLIERS](commands/ts.outliers.md).
+  larger request before it reads the range. See [TS.OUTLIERS](commands/ts.outliers.md).
 
 ## Indexes
 

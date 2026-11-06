@@ -690,7 +690,7 @@ TS._DEBUG LIST_CONFIGS [VERBOSE]
 | `ts-num-threads`               | integer  | 8               | Number of worker threads for parallel query processing                                  |
 | `ts-fanout-command-timeout`    | duration | —               | Timeout (ms) for fanout (cluster scatter/gather) commands                               |
 | `ts-cluster-map-expiration-ms` | duration | —               | How long (ms) cluster slot-map entries are cached; `0` disables caching                 |
-| `ts-outliers-max-samples`      | integer  | 1000000         | Most samples one `TS.OUTLIERS` request may read, estimated before decoding (minimum 1000) |
+| `ts-outliers-max-samples`      | integer  | 1000000         | Most samples one `TS.OUTLIERS` request may read (minimum 1000) |
 | `ts-fanout-aggregation-pushdown` | boolean | `yes`          | Shard-side aggregation/reduce push-down for clustered MRANGE. Not needed for rolling upgrades (version skew is handled automatically); disable only as an emergency/diagnostic revert to the coordinator-side path |
 
 ### Examples

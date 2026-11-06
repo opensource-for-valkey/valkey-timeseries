@@ -501,8 +501,7 @@ pub fn index_build_max_memory() -> i64 {
 }
 
 /// The most samples one `TS.OUTLIERS` request may read (`ts-outliers-max-samples`). Checked
-/// once, before decoding, against an upper-bound estimate at chunk granularity, so a request
-/// already admitted is unaffected by lowering it.
+/// once, before the range is read, so a request already admitted is unaffected by lowering it.
 pub static OUTLIERS_MAX_SAMPLES: AtomicI64 = AtomicI64::new(OUTLIERS_MAX_SAMPLES_DEFAULT);
 
 pub fn outliers_max_samples() -> usize {
