@@ -49,6 +49,10 @@ fn bench_outliers(c: &mut Criterion) {
             method(AnomalyDetectionMethodOptions::ZScore(None)),
         ),
         (
+            "ewma_default",
+            method(AnomalyDetectionMethodOptions::Ewma(None)),
+        ),
+        (
             "mad_hd",
             method(AnomalyDetectionMethodOptions::Mad(MADAnomalyOptions {
                 estimator: AnomalyMADEstimator::HarrellDavis,
