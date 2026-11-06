@@ -187,6 +187,9 @@ impl Postings {
     /// How many of `postings`' ids a read may see: neither tombstoned nor hidden. For the readers
     /// that walk the term dictionary directly rather than through `Terms`.
     pub(in crate::series::index) fn visible_cardinality(&self, postings: &PostingsBitmap) -> u64 {
+        if self.stale_ids.is_empty() && self.hidden_ids.is_empty() {
+            return postings.cardinality();
+        }
         postings
             .cardinality()
             .saturating_sub(self.stale_ids.stale_count_in(postings))
@@ -289,6 +292,26 @@ mod tests {
         assert!(postings.get_label_names().contains("env"));
         assert!(postings.get_label_values("only_imported").is_empty());
         assert_eq!(postings.get_label_values("job"), ["local"]);
+    }
+
+    #[test]
+    fn tombstoned_series_are_masked_with_nothing_hidden() {
+        let mut postings = fixture();
+        postings.mark_id_as_stale(IMPORTED);
+        assert!(postings.hidden_ids.is_empty());
+        assert!(!postings.get_label_names().contains("only_imported"));
+        assert_eq!(postings.get_label_values("job"), ["local"]);
+        let prod = postings.label_index.get(&b"env=prod\0"[..]).unwrap();
+        assert_eq!(prod.cardinality(), 2, "the bitmap itself still carries it");
+        assert_eq!(postings.visible_cardinality(prod), 1);
+    }
+
+    #[test]
+    fn nothing_masked_counts_every_id() {
+        let postings = fixture();
+        let prod = postings.label_index.get(&b"env=prod\0"[..]).unwrap();
+        assert_eq!(postings.visible_cardinality(prod), 2);
+        assert!(postings.get_label_names().contains("only_imported"));
     }
 
     #[test]

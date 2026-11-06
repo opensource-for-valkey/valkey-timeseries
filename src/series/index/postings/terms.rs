@@ -93,6 +93,10 @@ impl<'a> Terms<'a> {
     /// Whether a read may see any id of `postings`.
     #[inline]
     fn has_visible(self, postings: &PostingsBitmap) -> bool {
+        // The usual case, and far cheaper: counting walks the list's containers.
+        if self.stale.is_empty() && self.hidden.is_empty() {
+            return !postings.is_empty();
+        }
         let cardinality = postings.cardinality();
         cardinality > self.stale.stale_count_in(postings) + self.hidden.count_in(postings)
     }
