@@ -2,6 +2,7 @@ use crate::common::logging::log_debug;
 use crate::common::metrics::task;
 use crate::is_shutting_down;
 use crate::series::index::TIMESERIES_INDEX;
+use crate::series::index::asm::retry_unscheduled_drains;
 use crate::series::index::persistence::is_loading_active;
 use crate::series::tasks::{
     optimize_indices_for_db, process_series_trim, remove_stale_series_ids_incremental,
@@ -92,7 +93,7 @@ impl SchedulePause {
 static TASK_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 static LOAD_PAUSE: SchedulePause = SchedulePause::new();
 
-static SCHEDULE: [ScheduledTask; 4] = [
+static SCHEDULE: [ScheduledTask; 5] = [
     ScheduledTask::new(process_series_trim, RETENTION_CLEANUP_INTERVAL),
     ScheduledTask::new(
         remove_stale_series_ids_incremental,
@@ -100,6 +101,8 @@ static SCHEDULE: [ScheduledTask; 4] = [
     ),
     ScheduledTask::new(optimize_indices_for_db, INDEX_OPTIMIZE_INTERVAL),
     ScheduledTask::new(trim_unused_dbs, DB_CLEANUP_INTERVAL),
+    // Normally a no-op: only has work after a slot-import drain failed to start its thread.
+    ScheduledTask::new(retry_unscheduled_drains, TOMBSTONE_CLEANUP_INTERVAL),
 ];
 
 fn monotonic_ms() -> u64 {

@@ -502,34 +502,57 @@ fn process_delayed_keys_for_db(db: i32, keys: Vec<Box<[u8]>>, run: &TaskRun<'_>)
     indexed - skipped
 }
 
-/// Indexes the keys queued during `job`, an import that has just completed.
-///
-/// There is no "already running" guard: each drain owns exactly its import's keys, so
-/// concurrent drains touch disjoint keys and skipping one would strand them.
-fn process_delayed_indexing(job: ImportJob) {
-    let mut pending: Vec<(i32, Vec<Box<[u8]>>)> = job
-        .pending
+/// The keys a drain indexes, per db, sorted by db.
+type DrainWork = Vec<(i32, Vec<Box<[u8]>>)>;
+
+/// Merges several pieces of drain work into one, keys concatenated per db in arrival order,
+/// dbs sorted, empty dbs dropped.
+fn merge_drain_work(parts: Vec<DrainWork>) -> DrainWork {
+    let mut by_db: std::collections::BTreeMap<i32, Vec<Box<[u8]>>> = Default::default();
+    for (db, keys) in parts.into_iter().flatten() {
+        by_db.entry(db).or_default().extend(keys);
+    }
+    by_db
         .into_iter()
         .filter(|(_, keys)| !keys.is_empty())
-        .collect();
-    pending.sort_unstable_by_key(|(db, _)| *db);
+        .collect()
+}
 
-    log_debug(format!(
-        "ASM delayed indexing drain scheduled: job={} dbs={} slot_ranges={}",
-        job_display(&job.name),
-        pending.len(),
-        job.slots.ranges_len()
-    ));
-    if pending.is_empty() {
+/// Drain work whose thread could not be started. Folded into the next drain that does start,
+/// and retried on the maintenance schedule ([`retry_unscheduled_drains`]), so an import whose
+/// completion coincided with thread exhaustion is published late rather than never.
+static UNSCHEDULED_DRAINS: Mutex<Vec<DrainWork>> = Mutex::new(Vec::new());
+
+fn stash_unscheduled_drain(work: DrainWork) {
+    lock(&UNSCHEDULED_DRAINS).push(work);
+}
+
+fn take_unscheduled_drains() -> Vec<DrainWork> {
+    std::mem::take(&mut *lock(&UNSCHEDULED_DRAINS))
+}
+
+/// Indexes `work` on its own thread; if the thread cannot be started, keeps `work` for a retry.
+///
+/// On its own thread rather than the pool because it takes the module lock (see
+/// `spawn_background`), and checks `is_shutting_down()` between dbs — an aborted drain leaves
+/// the remaining dbs' keys un-indexed, which is fine on shutdown (see
+/// `process_delayed_keys_for_db`) but must not happen otherwise.
+fn schedule_drain(work: DrainWork) {
+    let mut parts = take_unscheduled_drains();
+    parts.push(work);
+    let work = merge_drain_work(parts);
+    if work.is_empty() {
         return;
     }
-
-    // On its own thread rather than the pool because it takes the module lock (see
-    // `spawn_background`), and checks `is_shutting_down()` between dbs — an aborted drain
-    // leaves the remaining dbs' keys un-indexed, which is fine on shutdown (see
-    // `process_delayed_keys_for_db`) but must not happen otherwise.
-    crate::common::threads::spawn_task(&metrics::DRAIN, move |run| {
-        for (db, keys) in pending {
+    // The thread takes the work out of the slot when it starts; a failed spawn drops the
+    // closure without running it, so the work is still there for the caller to keep.
+    let slot = std::sync::Arc::new(Mutex::new(Some(work)));
+    let for_thread = std::sync::Arc::clone(&slot);
+    let spawned = crate::common::threads::spawn_task(&metrics::DRAIN, move |run| {
+        let Some(work) = lock(&for_thread).take() else {
+            return;
+        };
+        for (db, keys) in work {
             if run.check_shutdown() {
                 log_debug("ASM delayed indexing drain aborted by shutdown");
                 return;
@@ -544,6 +567,36 @@ fn process_delayed_indexing(job: ImportJob) {
         }
         log_debug("ASM delayed indexing drain finished");
     });
+    if !spawned && let Some(work) = lock(&slot).take() {
+        let keys: usize = work.iter().map(|(_, keys)| keys.len()).sum();
+        log_warning(format!(
+            "ASM delayed indexing drain could not start a thread; {keys} key(s) kept for a later retry"
+        ));
+        stash_unscheduled_drain(work);
+    }
+}
+
+/// Indexes the keys queued during `job`, an import that has just completed.
+///
+/// There is no "already running" guard: each drain owns exactly its import's keys, so
+/// concurrent drains touch disjoint keys and skipping one would strand them.
+fn process_delayed_indexing(job: ImportJob) {
+    let work = merge_drain_work(vec![job.pending.into_iter().collect()]);
+    log_debug(format!(
+        "ASM delayed indexing drain scheduled: job={} dbs={} slot_ranges={}",
+        job_display(&job.name),
+        work.len(),
+        job.slots.ranges_len()
+    ));
+    schedule_drain(work);
+}
+
+/// Maintenance hook: starts a drain for work an earlier drain could not start a thread for.
+pub(crate) fn retry_unscheduled_drains() {
+    if lock(&UNSCHEDULED_DRAINS).is_empty() {
+        return;
+    }
+    schedule_drain(Vec::new());
 }
 
 fn slot_migration_event_handler(event: AtomicSlotMigrationEvent, reported: SlotMigrationEvent) {
@@ -880,6 +933,40 @@ mod tests {
     }
 
     use serial_test::serial;
+
+    fn keys(names: &[&str]) -> Vec<Box<[u8]>> {
+        names.iter().map(|k| k.as_bytes().into()).collect()
+    }
+
+    #[test]
+    fn test_merging_drain_work_groups_keys_by_db_in_order() {
+        let merged = merge_drain_work(vec![
+            vec![(2, keys(&["b1"])), (1, keys(&["a1"]))],
+            vec![(1, keys(&["a2"])), (3, keys(&[]))],
+        ]);
+        assert_eq!(
+            merged,
+            vec![(1, keys(&["a1", "a2"])), (2, keys(&["b1"]))],
+            "sorted by db, keys concatenated in arrival order, empty dbs dropped"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_unscheduled_drain_work_is_kept_for_retry() {
+        // ASM-04: a drain whose thread could not start keeps its keys, and the next retry gets
+        // all of them at once.
+        assert!(take_unscheduled_drains().is_empty());
+        stash_unscheduled_drain(vec![(5, keys(&["{k}1"]))]);
+        stash_unscheduled_drain(vec![(5, keys(&["{k}2"])), (6, keys(&["{k}3"]))]);
+
+        let retried = merge_drain_work(take_unscheduled_drains());
+        assert_eq!(
+            retried,
+            vec![(5, keys(&["{k}1", "{k}2"])), (6, keys(&["{k}3"]))]
+        );
+        assert!(take_unscheduled_drains().is_empty(), "taken once");
+    }
 
     #[test]
     fn test_parse_single_range() {

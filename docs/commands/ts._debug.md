@@ -188,7 +188,9 @@ Atomic slot migration (Valkey 9.0+). One task, with the same lifecycle names as 
 So `asm_drain_started_total`, `asm_drain_completed_total`, `asm_drain_skipped_inflight_total`,
 `asm_drain_spawn_failures_total`, `asm_drain_running`, `asm_drain_duration_seconds` and
 `asm_drain_last_completed_timestamp_seconds`. Each drain owns the keys of exactly one import and
-is not suppressed by another in flight, so `asm_drain_running` can exceed one.
+is not suppressed by another in flight, so `asm_drain_running` can exceed one. A drain that
+could not start its thread (`asm_drain_spawn_failures_total`) keeps its keys: they are folded
+into the next drain that starts, or retried on the maintenance schedule every 20 s.
 
 | Work counter | Description |
 |--------------|-------------|
