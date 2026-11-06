@@ -875,6 +875,24 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_cleanup_during_an_import_keeps_a_db_holding_only_hidden_series() {
+        // The check `trim_unused_dbs` makes, limited to this db: running the task itself would
+        // drop the empty indexes of tests running alongside this one.
+        const DB: i32 = 78;
+        let shared = slots(&[b"{u}x"]);
+        start(job(b'u'), &shared);
+        get_db_index(DB).index_timeseries(&series(1, "only_series"), b"{u}1");
+
+        TIMESERIES_INDEX
+            .pin()
+            .retain(|db, index| *db != DB || !index.is_empty());
+
+        complete(job(b'u'), &shared);
+        assert_eq!(visible_values(DB), ["only_series"]);
+    }
+
+    #[test]
+    #[serial]
     fn test_a_series_indexed_after_its_import_completed_is_visible_at_once() {
         const DB: i32 = 81;
         let shared = slots(&[b"{r}x"]);

@@ -23,6 +23,11 @@ impl Postings {
         self.id_to_key.len() - self.hidden_ids.cardinality() as usize
     }
 
+    /// Whether the index holds no series at all, hidden ones included.
+    pub(in crate::series::index) fn holds_no_series(&self) -> bool {
+        self.id_to_key.is_empty()
+    }
+
     pub(in crate::series::index) fn has_id(&self, id: SeriesRef) -> bool {
         self.id_to_key.contains_key(&id)
     }

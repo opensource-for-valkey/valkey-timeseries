@@ -146,6 +146,26 @@ mod tests {
     }
 
     #[test]
+    fn test_an_index_holding_only_hidden_series_is_not_empty() {
+        // Periodic cleanup drops empty indexes: this one holds a whole import in progress.
+        let index = TimeSeriesIndex::new();
+        assert!(index.is_empty());
+        let imported = create_series_from_metric_name(r#"latency{region="imported"}"#);
+        index.index_timeseries(&imported, b"{imported}1");
+        index.get_postings_mut().hide_indexed_keys_in_slots(
+            &range_set_blaze::RangeSetBlaze::from_iter([crate::fanout::calculate_hash_slot(
+                b"{imported}1",
+            )]),
+        );
+
+        assert_eq!(index.count(), 0, "no read sees it");
+        assert!(!index.is_empty());
+
+        index.remove_timeseries_for_key(&imported, b"{imported}1");
+        assert!(index.is_empty(), "nothing is left to keep the index for");
+    }
+
+    #[test]
     fn test_stats_do_not_count_hidden_series() {
         let index = TimeSeriesIndex::new();
         let imported = create_series_from_metric_name(r#"latency{region="imported",env="qa"}"#);

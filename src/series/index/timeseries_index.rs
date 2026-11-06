@@ -629,8 +629,10 @@ impl TimeSeriesIndex {
         inner.label_index.len()
     }
 
+    /// Whether this index holds no series at all. Not `count() == 0`: an import in progress may
+    /// have hidden every series here, and dropping the index would lose them for good.
     pub fn is_empty(&self) -> bool {
-        self.count() == 0
+        read_lock(&self.inner).holds_no_series()
     }
 
     pub fn with_postings<F, R, STATE>(&self, state: &mut STATE, f: F) -> R
