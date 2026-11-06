@@ -1,4 +1,4 @@
-//! How much work a `TS.OUTLIERS` request is, before any sample is decoded.
+//! How much work a `TS.OUTLIERS` request is, before its samples are read.
 //!
 //! A rough cost in microseconds, used only to choose where the request runs. It is calculated
 //! from the method, its options and the seasonality, because those move the work by orders of

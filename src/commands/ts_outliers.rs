@@ -139,28 +139,37 @@ fn process_request(
     anomaly_direction: AnomalyDirection,
     output_format: OutputFormat,
 ) -> ValkeyResult {
-    // Everything that can refuse without the samples runs before the decode, which is the
+    // Everything that can refuse without the samples runs before the full decode, which is the
     // expensive part on the main thread: the sample cap, the RCF budget and, for the lane, its
     // queue place.
     let (samples, lane_slot) = {
         let series = get_timeseries(ctx, &key, Some(AclPermissions::ACCESS))?;
         let (start, end) = date_range.get_series_range(&series, None, false);
 
-        let estimate = series.estimated_sample_count_in_range(start, end);
         let limit = outliers_max_samples();
-        if estimate > limit {
+        let leaves_main_thread =
+            |samples| estimated_cost_micros(samples, &options) > INLINE_COST_BUDGET_MICROS;
+
+        // The estimate counts whole chunks at no cost and is never too low, so it settles a
+        // request it lets through. Only one it would refuse or move pays for the exact count.
+        let estimate = series.estimated_sample_count_in_range(start, end);
+        let sample_count = if estimate > limit || leaves_main_thread(estimate) {
+            series.sample_count_in_range(start, end)
+        } else {
+            estimate
+        };
+        if sample_count > limit {
             return Err(ValkeyError::String(format!(
-                "TSDB: outlier detection: range holds about {estimate} samples, limit is {limit}"
+                "TSDB: outlier detection: range holds {sample_count} samples, limit is {limit}"
             )));
         }
         validate_rcf_budget(&options)?;
 
         // A deny-blocking client (MULTI, a script, an `RM_Call` without the K flag) runs inline
         // whatever the cost: the server asserts on blocking one.
-        let lane_slot = (estimated_cost_micros(estimate, &options) > INLINE_COST_BUDGET_MICROS
-            && !is_blocking_denied(ctx))
-        .then(|| reserve_analysis_slot(ctx, "outlier detection"))
-        .transpose()?;
+        let lane_slot = (leaves_main_thread(sample_count) && !is_blocking_denied(ctx))
+            .then(|| reserve_analysis_slot(ctx, "outlier detection"))
+            .transpose()?;
 
         (series.get_range(start, end), lane_slot)
     };

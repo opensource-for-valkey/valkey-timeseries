@@ -46,6 +46,15 @@ def create_background_sized_series(client, key):
     pipe.execute()
 
 
+def create_dense_chunk_series(client, key):
+    """A series whose samples all sit in one chunk, more of them than the inline limit."""
+    client.execute_command('TS.CREATE', key, 'CHUNK_SIZE', 1048576)
+    create_background_sized_series(client, key)
+    info = client.execute_command('TS.INFO', key)
+    fields = dict(zip(info[::2], info[1::2]))
+    assert fields.get(b'chunkCount', fields.get('chunkCount')) == 1
+
+
 def convert_anomaly_entries(result: List[Any]) -> list[AnomalyEntry]:
     """Convert raw TS.OUTLIERS result to a list of AnomalyEntry."""
     entries = []
@@ -118,18 +127,33 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
         assert in_multi == expected
 
     def test_sample_cap_refuses_before_decoding(self):
-        """The cap is checked against an upper-bound estimate at chunk granularity: a narrow
-        range counts as every chunk it touches, so it is only tested well under the cap."""
+        """A range over the cap is refused, and the error reports what it actually holds."""
         key = 'test:outliers:cap'
         create_background_sized_series(self.client, key)
         self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 5000)
         try:
-            with pytest.raises(ResponseError, match='limit is 5000'):
+            with pytest.raises(ResponseError, match=f'holds {BACKGROUND_SAMPLE_COUNT} samples, limit is 5000'):
                 self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
             # a narrower range under the cap still works
             narrow = self.client.execute_command(
                 'TS.OUTLIERS', key, 1000, 1000 + 9 * 1000, 'METHOD', 'zscore')
             assert narrow is not None
+        finally:
+            self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000000)
+
+    def test_sample_cap_counts_only_the_samples_in_the_range(self):
+        """A narrow range inside a chunk holding more than the cap is not charged for the chunk."""
+        key = 'test:outliers:cap:dense'
+        create_dense_chunk_series(self.client, key)
+        self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000)
+        try:
+            narrow = self.client.execute_command(
+                'TS.OUTLIERS', key, 1000, 1000 + 99 * 1000, 'METHOD', 'zscore')
+            assert narrow is not None
+            # One sample past the cap is still refused, with the true count.
+            with pytest.raises(ResponseError, match='holds 1001 samples, limit is 1000'):
+                self.client.execute_command(
+                    'TS.OUTLIERS', key, 1000, 1000 + 1000 * 1000, 'METHOD', 'zscore')
         finally:
             self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000000)
 
@@ -1065,6 +1089,20 @@ class TestOutliersLaneFailureStillReplies(ValkeyTimeSeriesTestCaseDebugMode):
         with pytest.raises(ResponseError, match='internal error'):
             client.execute_command(
                 'TS.OUTLIERS', key, '-', '+', 'METHOD', 'rcf', 'NUM_TREES', 256, 'SAMPLE_SIZE', 4096)
+
+    def test_placement_counts_only_the_samples_in_the_range(self):
+        """A narrow range inside a chunk too long to run inline stays inline."""
+        client = self._client()
+        key = 'test:outliers:placement:dense'
+        create_dense_chunk_series(client, key)
+
+        # 100 cheap samples: the armed panic is not consumed.
+        client.execute_command('TS._DEBUG', 'PANIC_NEXT_ANALYSIS_JOB')
+        client.execute_command('TS.OUTLIERS', key, 1000, 1000 + 99 * 1000, 'METHOD', 'zscore')
+
+        # The whole chunk goes to the lane and consumes it.
+        with pytest.raises(ResponseError, match='internal error'):
+            client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
 
     def test_placement_follows_estimated_cost(self):
         client = self._client()

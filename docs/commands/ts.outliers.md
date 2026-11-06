@@ -587,11 +587,10 @@ Detect pattern-based anomalies using a sliding window:
 * **Sample limit:**
     * The config `ts-outliers-max-samples` (default 1,000,000, minimum 1,000, changeable at runtime with
       `CONFIG SET ts.ts-outliers-max-samples <n>`) limits the samples one request may read. A larger request is
-      refused before any sample is decoded, with
-      `TSDB: outlier detection: range holds about N samples, limit is M`. The limit also applies inside `MULTI`, a
+      refused before the range is read, with
+      `TSDB: outlier detection: range holds N samples, limit is M`. The limit also applies inside `MULTI`, a
       Lua script or a module call.
-    * The count is an upper-bound estimate at chunk granularity: every chunk the range touches counts in full, so a
-      narrow range can read as more samples than it holds.
+    * The count is exact, so a narrow range inside a large chunk counts only the samples it covers.
     * The limit is checked once, on submission. Lowering it does not cancel a detection already admitted.
 * **Performance tips:**
     * Use `DIRECTION` to filter results when only interested in one type of anomaly
