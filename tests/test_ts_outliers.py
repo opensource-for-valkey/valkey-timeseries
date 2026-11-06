@@ -1,4 +1,6 @@
 import math
+import select
+import socket
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Any
 
@@ -44,6 +46,13 @@ def create_background_sized_series(client, key):
         value = 50.0 if i == BACKGROUND_SAMPLE_COUNT // 2 else math.sin(i * 0.1)
         pipe.execute_command('TS.ADD', key, 1000 + i * 1000, value)
     pipe.execute()
+
+
+def resp_command(*args) -> bytes:
+    """The wire form of a command, for a connection that does not wait for its reply."""
+    parts = [str(arg).encode() for arg in args]
+    return b''.join([f'*{len(parts)}\r\n'.encode()]
+                    + [f'${len(part)}\r\n'.encode() + part + b'\r\n' for part in parts])
 
 
 def create_dense_chunk_series(client, key):
@@ -127,12 +136,12 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
         assert in_multi == expected
 
     def test_sample_cap_refuses_before_decoding(self):
-        """A range over the cap is refused, and the error reports what it actually holds."""
+        """A range over the cap is refused."""
         key = 'test:outliers:cap'
         create_background_sized_series(self.client, key)
         self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 5000)
         try:
-            with pytest.raises(ResponseError, match=f'holds {BACKGROUND_SAMPLE_COUNT} samples, limit is 5000'):
+            with pytest.raises(ResponseError, match='holds more than the limit of 5000 samples'):
                 self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
             # a narrower range under the cap still works
             narrow = self.client.execute_command(
@@ -150,8 +159,9 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
             narrow = self.client.execute_command(
                 'TS.OUTLIERS', key, 1000, 1000 + 99 * 1000, 'METHOD', 'zscore')
             assert narrow is not None
-            # One sample past the cap is still refused, with the true count.
-            with pytest.raises(ResponseError, match='holds 1001 samples, limit is 1000'):
+            # One sample past the cap is refused, so the cap is exact. A narrow range under it
+            # ran above.
+            with pytest.raises(ResponseError, match='holds more than the limit of 1000 samples'):
                 self.client.execute_command(
                     'TS.OUTLIERS', key, 1000, 1000 + 1000 * 1000, 'METHOD', 'zscore')
         finally:
@@ -167,7 +177,7 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
             tx.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
             [in_multi] = tx.execute(raise_on_error=False)
             assert isinstance(in_multi, ResponseError)
-            assert 'limit is 5000' in str(in_multi)
+            assert 'limit of 5000' in str(in_multi)
         finally:
             self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000000)
 
@@ -188,12 +198,50 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
                           or self.client.info('clients')['blocked_clients'] > 0)
             self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000)
             try:
-                with pytest.raises(ResponseError, match='limit is 1000'):
+                with pytest.raises(ResponseError, match='limit of 1000'):
                     self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
                 # Admitted before the change: it still gets its answer.
                 assert isinstance(queued.result(timeout=120), list)
             finally:
                 self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000000)
+
+    def test_a_full_lane_still_serves_a_narrow_range(self):
+        """A range whose chunks suggest the lane, but whose samples do not, runs inline when the
+        lane has no room, while a range that does need the lane is refused."""
+        key = 'test:outliers:lane:full'
+        create_dense_chunk_series(self.client, key)
+        slow_job = resp_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'esd', 'MAX_OUTLIERS', 1000)
+        fillers = []
+
+        def fill_lane_until_it_refuses():
+            # More than the queue holds. The first reply on these connections is a refusal, since
+            # an admitted job takes far longer to answer.
+            batch = [socket.create_connection((self.server.bind_ip, self.server.port))
+                     for _ in range(300)]
+            fillers.extend(batch)
+            for filler in batch:
+                filler.sendall(slow_job)
+            readable, _, _ = select.select(batch, [], [], 30)
+            assert any(b'too many queued' in filler.recv(200) for filler in readable)
+
+        def wide_is_refused_and_narrow_runs():
+            fill_lane_until_it_refuses()
+            # One read from the socket, so nothing frees a place between the two. A place freed
+            # just before them admits the wide range, which ends this attempt.
+            pipe = self.client.pipeline(transaction=False)
+            pipe.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
+            pipe.execute_command('TS.OUTLIERS', key, 1000, 1000 + 99 * 1000, 'METHOD', 'zscore')
+            wide, narrow = pipe.execute(raise_on_error=False)
+            if not (isinstance(wide, ResponseError) and 'too many queued' in str(wide)):
+                return False
+            assert isinstance(narrow, list), narrow
+            return True
+
+        try:
+            wait_for_true(wide_is_refused_and_narrow_runs)
+        finally:
+            for filler in fillers:
+                filler.close()
 
     def test_outliers_nonexistent_key(self):
         """Test outlier detection on non-existent key."""
@@ -1090,19 +1138,16 @@ class TestOutliersLaneFailureStillReplies(ValkeyTimeSeriesTestCaseDebugMode):
             client.execute_command(
                 'TS.OUTLIERS', key, '-', '+', 'METHOD', 'rcf', 'NUM_TREES', 256, 'SAMPLE_SIZE', 4096)
 
-    def test_placement_counts_only_the_samples_in_the_range(self):
-        """A narrow range inside a chunk too long to run inline stays inline."""
+    def test_placement_uses_chunk_lengths_while_the_lane_has_room(self):
+        """The chunk lengths decide while the lane has room: counting exactly would cost more
+        than the hand-off, so a narrow range inside a long chunk runs on the lane."""
         client = self._client()
         key = 'test:outliers:placement:dense'
         create_dense_chunk_series(client, key)
 
-        # 100 cheap samples: the armed panic is not consumed.
         client.execute_command('TS._DEBUG', 'PANIC_NEXT_ANALYSIS_JOB')
-        client.execute_command('TS.OUTLIERS', key, 1000, 1000 + 99 * 1000, 'METHOD', 'zscore')
-
-        # The whole chunk goes to the lane and consumes it.
         with pytest.raises(ResponseError, match='internal error'):
-            client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
+            client.execute_command('TS.OUTLIERS', key, 1000, 1000 + 99 * 1000, 'METHOD', 'zscore')
 
     def test_placement_follows_estimated_cost(self):
         client = self._client()

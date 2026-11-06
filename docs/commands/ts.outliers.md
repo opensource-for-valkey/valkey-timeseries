@@ -582,15 +582,19 @@ Detect pattern-based anomalies using a sliding window:
       worker threads (`ts-num-threads`, clamped to 2–8), so the server keeps serving other clients meanwhile.
     * The lane queues up to 256 detections. When it is full the command is refused at once with
       `TSDB: outlier detection: too many queued jobs (limit 256)`; retry later.
+    * The sample count here comes from chunk lengths, so a narrow range inside a large chunk can use the lane. When
+      the lane is full such a range runs on the main thread if it is cheap enough, found by decoding up to about
+      131,000 samples at no more than the ends of the range; a range that needs more than that is refused.
     * Inside `MULTI`, a Lua script or a module call the client cannot be blocked, so the detection runs inline on
       the main thread instead, whatever its cost.
 * **Sample limit:**
     * The config `ts-outliers-max-samples` (default 1,000,000, minimum 1,000, changeable at runtime with
       `CONFIG SET ts.ts-outliers-max-samples <n>`) limits the samples one request may read. A larger request is
       refused before the range is read, with
-      `TSDB: outlier detection: range holds N samples, limit is M`. The limit also applies inside `MULTI`, a
-      Lua script or a module call.
-    * The count is exact, so a narrow range inside a large chunk counts only the samples it covers.
+      `TSDB: outlier detection: range holds more than the limit of M samples`. The limit also applies inside `MULTI`,
+      a Lua script or a module call.
+    * The limit is exact, so a narrow range inside a large chunk counts only the samples it covers. When the lengths
+      of the chunks in the range cannot settle it, up to the two chunks at the ends of the range are decoded.
     * The limit is checked once, on submission. Lowering it does not cancel a detection already admitted.
 * **Performance tips:**
     * Use `DIRECTION` to filter results when only interested in one type of anomaly

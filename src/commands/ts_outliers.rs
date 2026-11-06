@@ -10,12 +10,12 @@ use crate::commands::outliers_cost::{INLINE_COST_BUDGET_MICROS, estimated_cost_m
 use crate::commands::{
     CommandArgIterator, CommandArgToken, parse_command_arg_token, parse_timestamp_range,
 };
-use crate::common::Sample;
 use crate::common::context::is_blocking_denied;
 use crate::common::hash::{IntMap, IntSet};
 use crate::common::replies::{ReplyContext, reply_with_counted_array, reply_with_sample};
+use crate::common::{Sample, Timestamp};
 use crate::config::outliers_max_samples;
-use crate::series::{TimestampRange, get_timeseries};
+use crate::series::{TimeSeries, TimestampRange, get_timeseries};
 use valkey_module::{
     AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
@@ -23,6 +23,11 @@ use valkey_module::{
 // Keep the RCF resource requirements bounded before they reach krcf. In
 // particular, krcf allocates storage proportional to sample_size * num_trees
 // and shingle_size increases the dimensionality of every point.
+/// Samples a request may decode to find out whether it can run inline on a full lane: about
+/// 1 ms, the inline budget, at the 5–9 ns per sample the compressed chunks decode at. A chunk
+/// of the default size stays well inside it.
+const BUSY_LANE_SCAN_BUDGET: usize = 1 << 17;
+
 const MAX_RCF_NUM_TREES: usize = 512;
 const MAX_RCF_SAMPLE_SIZE: usize = 4096;
 const MAX_RCF_SHINGLE_SIZE: usize = 128;
@@ -139,37 +144,50 @@ fn process_request(
     anomaly_direction: AnomalyDirection,
     output_format: OutputFormat,
 ) -> ValkeyResult {
-    // Everything that can refuse without the samples runs before the full decode, which is the
-    // expensive part on the main thread: the sample cap, the RCF budget and, for the lane, its
-    // queue place.
+    // Everything that can refuse without the samples runs before the read, which is the expensive
+    // part on the main thread: the RCF budget, the sample cap and, for the lane, its queue place.
     let (samples, lane_slot) = {
         let series = get_timeseries(ctx, &key, Some(AclPermissions::ACCESS))?;
         let (start, end) = date_range.get_series_range(&series, None, false);
+        validate_rcf_budget(&options)?;
 
         let limit = outliers_max_samples();
         let leaves_main_thread =
             |samples| estimated_cost_micros(samples, &options) > INLINE_COST_BUDGET_MICROS;
 
-        // The estimate counts whole chunks at no cost and is never too low, so it settles a
-        // request it lets through. Only one it would refuse or move pays for the exact count.
-        let estimate = series.estimated_sample_count_in_range(start, end);
-        let sample_count = if estimate > limit || leaves_main_thread(estimate) {
-            series.sample_count_in_range(start, end)
-        } else {
-            estimate
-        };
-        if sample_count > limit {
-            return Err(ValkeyError::String(format!(
-                "TSDB: outlier detection: range holds {sample_count} samples, limit is {limit}"
-            )));
+        // The chunk lengths usually settle both decisions. Counting exactly decodes the chunks at
+        // the ends of the range, so it is only for when they cannot.
+        let (mut at_least, mut at_most) = series.sample_count_bounds(start, end);
+        if at_most > limit {
+            // Stops just past the cap, but the cap is exact: this is the one unbudgeted scan.
+            let count = series
+                .count_samples_in_range(start, end, limit + 1, usize::MAX)
+                .unwrap_or(limit + 1);
+            if count > limit {
+                return Err(ValkeyError::String(format!(
+                    "TSDB: outlier detection: range holds more than the limit of {limit} samples"
+                )));
+            }
+            (at_least, at_most) = (count, count);
         }
-        validate_rcf_budget(&options)?;
 
         // A deny-blocking client (MULTI, a script, an `RM_Call` without the K flag) runs inline
         // whatever the cost: the server asserts on blocking one.
-        let lane_slot = (leaves_main_thread(sample_count) && !is_blocking_denied(ctx))
-            .then(|| reserve_analysis_slot(ctx, "outlier detection"))
-            .transpose()?;
+        let lane_slot = if leaves_main_thread(at_most) && !is_blocking_denied(ctx) {
+            match reserve_analysis_slot(ctx, "outlier detection") {
+                Ok(slot) => Some(slot),
+                // Only a full lane is worth a scan, to not refuse a range that would be cheap.
+                Err(_)
+                    if !leaves_main_thread(at_least)
+                        && fits_inline_on_busy_lane(&series, start, end, leaves_main_thread) =>
+                {
+                    None
+                }
+                Err(busy) => return Err(busy),
+            }
+        } else {
+            None
+        };
 
         (series.get_range(start, end), lane_slot)
     };
@@ -216,6 +234,20 @@ fn process_request(
             }
         }
     })
+}
+
+/// Whether a range the lane has no room for is cheap enough to run inline. Bounded, because a
+/// busy lane sees this repeatedly and most of those requests end in a refusal anyway: a range
+/// the scan cannot settle in budget is refused like any other.
+fn fits_inline_on_busy_lane(
+    series: &TimeSeries,
+    start: Timestamp,
+    end: Timestamp,
+    leaves_main_thread: impl Fn(usize) -> bool,
+) -> bool {
+    series
+        .count_samples_in_range(start, end, usize::MAX, BUSY_LANE_SCAN_BUDGET)
+        .is_some_and(|samples| !leaves_main_thread(samples))
 }
 
 fn parse_method_options(
@@ -1154,6 +1186,50 @@ fn reply_with_parameters(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::series::chunks::{ChunkOps, GorillaChunk, TimeSeriesChunk};
+
+    /// One chunk of `samples` constant values, the cheapest to hold and the slowest to scan.
+    fn one_chunk_series(samples: i64) -> TimeSeries {
+        let mut chunk = TimeSeriesChunk::Gorilla(GorillaChunk::with_max_size(1 << 20));
+        for i in 0..samples {
+            let sample = Sample {
+                timestamp: i * 1000,
+                value: 1.0,
+            };
+            chunk.add_sample(&sample).unwrap();
+        }
+        let mut series = TimeSeries::default();
+        series.chunks.push(chunk);
+        series.update_state_from_chunks();
+        series
+    }
+
+    #[test]
+    fn a_busy_lane_scan_keeps_a_cheap_range_and_refuses_the_rest() {
+        let series = one_chunk_series(10_000);
+        let over_5000 = |samples| samples > 5000;
+        // Narrow, wherever it sits in the chunk.
+        assert!(fits_inline_on_busy_lane(&series, 0, 99_000, over_5000));
+        assert!(fits_inline_on_busy_lane(
+            &series, 9_900_000, 9_999_000, over_5000
+        ));
+        // Too many samples for the main thread: still the lane's, which is full.
+        assert!(!fits_inline_on_busy_lane(&series, 0, 9_999_000, over_5000));
+    }
+
+    #[test]
+    fn a_busy_lane_scan_gives_up_at_its_budget() {
+        let samples = BUSY_LANE_SCAN_BUDGET as i64 + 10;
+        let series = one_chunk_series(samples);
+        let never = |_| false;
+        // In reach of the budget, then just past it.
+        let reachable = (BUSY_LANE_SCAN_BUDGET as i64 - 1) * 1000;
+        assert!(fits_inline_on_busy_lane(
+            &series, reachable, reachable, never
+        ));
+        let last = (samples - 1) * 1000;
+        assert!(!fits_inline_on_busy_lane(&series, last, last, never));
+    }
 
     #[test]
     fn validate_rcf_budget_rejects_max_combination() {
