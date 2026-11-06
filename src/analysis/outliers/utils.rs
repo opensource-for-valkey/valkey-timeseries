@@ -158,9 +158,7 @@ pub(super) fn fit_head_baseline(ts: &[f64]) -> (f64, f64) {
     let training_size = ((ts.len() as f64 * 0.5).min(100.0) as usize)
         .max(2)
         .min(ts.len());
-    let (center, scale) = fit_mean_std_dev(&ts[..training_size]);
-    // The floor is a backstop for a head that is constant but for rounding.
-    (center, snap_dust(scale, center))
+    fit_mean_std_dev(&ts[..training_size])
 }
 
 /// `0.0` when non-negative `evidence` is indistinguishable from rounding error in

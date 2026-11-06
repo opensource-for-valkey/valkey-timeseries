@@ -640,6 +640,32 @@ mod tests {
         }
     }
 
+    /// Half the series alternating around `center`, the rest shifted by `shift`.
+    fn shifted_after_alternating(center: f64, deviation: f64, shift: f64) -> Vec<f64> {
+        let mut ts: Vec<f64> = (0..100)
+            .map(|i| center + if i % 2 == 0 { deviation } else { -deviation })
+            .collect();
+        ts.extend(std::iter::repeat_n(center + shift, 100));
+        ts
+    }
+
+    /// A deviation of a few dozen ULPs of the target is still representable variance, so it
+    /// is a scale to test against rather than rounding error to discard.
+    #[test]
+    fn small_variance_on_a_large_target_is_kept() {
+        let ts = shifted_after_alternating(1e15, 0.5, 3.0);
+        let d = EwmaOutlierDetector::from_series(&ts, 0.3).unwrap();
+        assert!(d.sigma > 0.4, "sigma {}", d.sigma);
+        assert_eq!(
+            d.detect(&ts).unwrap().anomalies.first().map(|a| a.index),
+            Some(100)
+        );
+        // Inside the same limits, the same baseline flags nothing.
+        let quiet = shifted_after_alternating(1e15, 0.5, 0.0);
+        let d = EwmaOutlierDetector::from_series(&quiet, 0.3).unwrap();
+        assert!(d.detect(&quiet).unwrap().anomalies.is_empty());
+    }
+
     #[test]
     fn from_series_rejects_alpha_outside_the_half_open_unit_interval() {
         for alpha in [0.0, -1.0, 1.5, f64::NAN, f64::INFINITY] {

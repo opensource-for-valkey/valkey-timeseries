@@ -616,6 +616,30 @@ mod tests {
         }
     }
 
+    /// A deviation of a few dozen ULPs of the target is still representable variance, so it
+    /// is a scale to test against rather than rounding error to discard.
+    #[test]
+    fn small_variance_on_a_large_target_is_kept() {
+        let series = |shift: f64| -> Vec<f64> {
+            let mut ts: Vec<f64> = (0..100)
+                .map(|i| 1e15 + if i % 2 == 0 { 0.5 } else { -0.5 })
+                .collect();
+            ts.extend(std::iter::repeat_n(1e15 + shift, 100));
+            ts
+        };
+        let ts = series(3.0);
+        let (_, std_dev) = fit_head_baseline(&ts);
+        assert!(std_dev > 0.4, "std_dev {std_dev}");
+        let result = CusumOutlierDetector::from_series(&ts).detect(&ts).unwrap();
+        assert_eq!(result.anomalies.first().map(|a| a.index), Some(100));
+
+        let quiet = series(0.0);
+        let result = CusumOutlierDetector::from_series(&quiet)
+            .detect(&quiet)
+            .unwrap();
+        assert!(result.anomalies.is_empty());
+    }
+
     /// A collapsed chart reports zero-width limits, and the lower bound is `0.0`, not
     /// the `-0.0` that negating a zero produces.
     #[test]
