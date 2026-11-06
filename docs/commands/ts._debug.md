@@ -178,27 +178,24 @@ Metrics are grouped in sections; each name starts with its section.
 
 #### `asm`
 
-Atomic slot migration (Valkey 9.0+). Two tasks, each with the same lifecycle names as the tasks
-in [`task`](#task), prefixed `asm_` instead of `task_`:
+Atomic slot migration (Valkey 9.0+). One task, with the same lifecycle names as the tasks in
+[`task`](#task), prefixed `asm_` instead of `task_`:
 
 | Task | Node | Trigger |
 |------|------|---------|
 | `drain` | Importing | Index the keys deferred while a slot import ran, once it completes |
-| `post_migration_cleanup` | Exporting | Mark the exported series stale once their slots have left |
 
 So `asm_drain_started_total`, `asm_drain_completed_total`, `asm_drain_skipped_inflight_total`,
-`asm_drain_spawn_failures_total`, `asm_drain_running`,
-`asm_drain_duration_seconds` and `asm_drain_last_completed_timestamp_seconds`, and the same for
-`asm_post_migration_cleanup_*`. Concurrent drains take disjoint slots and are not suppressed, so
-`asm_drain_running` can exceed one.
+`asm_drain_spawn_failures_total`, `asm_drain_running`, `asm_drain_duration_seconds` and
+`asm_drain_last_completed_timestamp_seconds`. Each drain owns the keys of exactly one import and
+is not suppressed by another in flight, so `asm_drain_running` can exceed one.
 
 | Work counter | Description |
 |--------------|-------------|
 | `asm_drain_keys_indexed_total` | Deferred import keys successfully indexed, including batches completed before shutdown |
-| `asm_post_migration_cleanup_ids_marked_total` | Exported IDs marked stale during source cleanup |
 
-The cleanup then requests a full stale-ID sweep, which reports in `task` as
-`task_tombstone_full_sweep_*`.
+The exporting node has no task of its own: the server deletes the exported keys, and the type's
+`unlink` callback retires them from the index like any other deletion.
 
 The same metrics are in `INFO ts_asm`, each prefixed `ts_`, without the `debug-mode` gate, except
 the duration histograms. `INFO` counts since module start: `METRICS RESET` doesn't move it.
@@ -396,7 +393,6 @@ Maintenance work on this node. Select it with `TS._DEBUG METRICS task` or
 |------|---------|
 | `retention_trim` | Periodic retention trimming (10 s) |
 | `tombstone_sweep` | Periodic stale-ID (tombstone) cleanup (20 s) |
-| `tombstone_full_sweep` | Full stale-ID (tombstone) cleanup requested after an atomic slot migration; shares the periodic cleanup's single-flight guard, so it stays here rather than in `asm` |
 | `optimize_index` | Periodic postings optimization (60 s) |
 
 Periodic intervals (and the 300 s empty-database cleanup) are elapsed time, independent of `hz` and

@@ -3,7 +3,6 @@ use crate::common::metrics::task::{self as metrics, TaskRun};
 use crate::common::sync::lock;
 use crate::common::threads::{SingleFlight, spawn_task_single};
 use crate::series::index::{IndexKey, TIMESERIES_INDEX};
-use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 
 const STALE_ID_BATCH_SIZE: usize = 50;
@@ -71,34 +70,6 @@ fn remove_stale_series_internal(run: &TaskRun<'_>) {
 
     let new_cursor = process_db_until_done(db, cursor, run);
     set_stale_id_cleanup_cursor(db, new_cursor);
-}
-
-/// This function is intended to be called when we want to aggressively clean up all stale series,
-/// for instance after slot migrations on the source shard. It should be used with caution since it can
-/// be a long-running operation that can stall index writes.
-/// ## Note
-/// Must be called in a separate thread to avoid blocking the main thread
-pub(in crate::series) fn remove_all_stale_series_internal() {
-    let Some(_flight) = STALE_ID_CLEANUP.try_start() else {
-        metrics::TOMBSTONE_FULL_SWEEP
-            .skipped_inflight
-            .fetch_add(1, Ordering::Relaxed);
-        return;
-    };
-    let run = metrics::TOMBSTONE_FULL_SWEEP.start();
-
-    let index = TIMESERIES_INDEX.pin();
-    let mut dbs: Vec<i32> = index.keys().copied().collect();
-    dbs.sort_unstable();
-    drop(index);
-
-    for db in dbs {
-        process_db_until_done(db, None, &run);
-    }
-
-    let mut context = lock(&STALE_ID_CLEANUP_CONTEXT);
-    context.db = 0;
-    context.cursor = None;
 }
 
 pub(crate) fn remove_stale_series_ids_incremental() {

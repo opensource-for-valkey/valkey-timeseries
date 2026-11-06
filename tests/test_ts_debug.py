@@ -1050,8 +1050,8 @@ class TestDebugMetrics(ValkeyTimeSeriesTestCaseDebugMode):
                    'rdb_save_failures_total', 'rdb_saves_total']
     EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
                     'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_running']
-    TASKS = ['retention_trim', 'tombstone_sweep', 'tombstone_full_sweep', 'optimize_index']
-    ASM_TASKS = ['drain', 'post_migration_cleanup']
+    TASKS = ['retention_trim', 'tombstone_sweep', 'optimize_index']
+    ASM_TASKS = ['drain']
     TASK_FIELDS = ('started_total', 'completed_total', 'skipped_inflight_total',
                    'spawn_failures_total', 'running', 'duration_seconds',
                    'last_completed_timestamp_seconds')
@@ -1160,11 +1160,11 @@ class TestDebugMetrics(ValkeyTimeSeriesTestCaseDebugMode):
         assert 'fanout_errors_key_permissions_total' in errors
 
     def test_asm_section(self):
-        """Both ASM tasks carry the full task lifecycle under `asm_`, next to their work
-        counters. A standalone server never migrates slots, so everything is zero."""
+        """The ASM drain task carries the full task lifecycle under `asm_`, next to its work
+        counter. A standalone server never migrates slots, so everything is zero."""
         stats = self.debug_metrics('asm')
         expected = {f'asm_{task}_{suffix}' for task in self.ASM_TASKS for suffix in self.TASK_FIELDS}
-        expected |= {'asm_drain_keys_indexed_total', 'asm_post_migration_cleanup_ids_marked_total'}
+        expected |= {'asm_drain_keys_indexed_total'}
         assert set(stats) == expected
         for name, value in stats.items():
             if name in self.HISTOGRAMS:
@@ -1200,7 +1200,8 @@ class TestDebugMetrics(ValkeyTimeSeriesTestCaseDebugMode):
         assert 'task_tombstone_passes_completed_total' in stats
         assert 'task_tombstone_sweep_passes_completed_total' not in stats
         # No name from before the renames survives (`task_trim_unused_dbs_*` is not one).
-        retired = ('task_stale_ids', 'task_retention_sweep', 'task_retention_full_sweep')
+        retired = ('task_stale_ids', 'task_retention_sweep', 'task_retention_full_sweep',
+                   'task_tombstone_full_sweep')
         assert not any(name.startswith(retired) for name in stats)
         assert not any(name.startswith('task_trim_') and not name.startswith('task_trim_unused_dbs_')
                        for name in stats)

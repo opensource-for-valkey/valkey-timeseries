@@ -2,22 +2,27 @@
 //!
 //! Subscribes to the server's ASM events and keeps the secondary index consistent with them. On
 //! the destination, indexing of imported keys is deferred until their import completes (so reads
-//! never see phantom series of an import that may still abort); on the source, the index entries
-//! of exported slots are retired once the export completes.
+//! never see phantom series of an import that may still abort). On the source nothing extra is
+//! needed: the server deletes the exported keys through `unlink2`, which retires them from the
+//! index like any other deletion (see the `ExportCompleted` arm of the event handler).
+//!
+//! The import events fire on the target primary *and* on its replicas (the server propagates the
+//! migration's control commands down the replication stream), so a replica defers and drains
+//! exactly like its primary.
 use crate::common::context::{create_key_string, get_current_db, set_current_db};
 use crate::common::hash::BuildNoHashHasher;
-use crate::common::logging::{log_debug, log_notice, log_warning};
+use crate::common::logging::{log_debug, log_warning};
 use crate::common::metrics::asm as metrics;
 use crate::common::metrics::task::TaskRun;
 use crate::common::module_options::{HANDLE_ATOMIC_SLOT_MIGRATION, declare_module_options};
-use crate::common::sync::{lock, read_lock, write_lock};
+use crate::common::sync::{lock, write_lock};
 use crate::common::threads::LockGil;
 use crate::fanout::NUM_SLOTS;
 use crate::fanout::{is_clustered, mark_cluster_map_stale};
-use crate::series::index::{TIMESERIES_INDEX, get_db_index, index_loaded_series};
+use crate::series::TimeSeries;
+use crate::series::index::{get_db_index, index_loaded_series};
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
-use crate::series::tasks::{optimize_index_fully, remove_all_stale_series_internal};
-use crate::series::{SeriesRef, TimeSeries};
+use crate::series::tasks::optimize_index_fully;
 use range_set_blaze::RangeSetBlaze;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
@@ -541,122 +546,17 @@ fn process_delayed_indexing(job: ImportJob) {
     });
 }
 
-/// Retires from `db`'s index every series whose key hashes into `exported_slots`, and returns
-/// how many ids that marked stale.
-///
-/// By the time this runs the server has already deleted every exported key through the type's
-/// `unlink2` callback (see [`handle_post_migration_cleanup`]), so normally it finds nothing: it is
-/// a net for an id whose index entry drifted from its key and so escaped the key-checked
-/// retirement in `unlink2`. The scan walks `id_to_key` one window at a time under the read lock
-/// and marks each window's matches under the write lock, never holding both.
-fn remove_non_owned_keys(db: i32, exported_slots: &RangeSetBlaze<u16>) -> usize {
-    if exported_slots.is_empty() {
-        return 0;
-    }
-    let mut marked = 0usize;
-    let mut cursor: u64 = 0;
-    let mut batch: Vec<SeriesRef> = Vec::with_capacity(BATCH_SIZE);
-    loop {
-        // `batch` is empty at the top of every iteration: each window is flushed below.
-        let index = get_db_index(db);
-        let visited = {
-            let postings = read_lock(&index.inner);
-            let mut visited = 0usize;
-            for (id, key) in postings.id_to_key.range(cursor..).take(BATCH_SIZE) {
-                visited += 1;
-                cursor = *id + 1;
-                if exported_slots.contains(crate::fanout::calculate_hash_slot(key.as_ref())) {
-                    batch.push(*id);
-                }
-            }
-            visited
-        };
-        marked += index.mark_ids_as_stale(&batch);
-        batch.clear();
-        if visited < BATCH_SIZE {
-            break;
-        }
-    }
-    marked
-}
-
-/// Handles post-migration cleanup for the source shard by removing keys that are no longer owned after a successful migration.
-/// Once a migration succeeds and the cluster topology updates, the slots are no longer owned by the source shard.
-///
-/// ## Primary Source Shard Handling
-/// Valkey primaries automatically clean up unowned keys in the background, which calls standard engine deletion routines.
-/// We need to ensure that the timeseries index is also cleaned up accordingly by marking the relevant series as stale in the index,
-/// which will prevent them from being returned in queries and allow them to be cleaned up lazily over time as they are accessed,
-/// or when the index performs maintenance.
-/// The event triggering this is only received on the source primary shard.
-///
-/// ## Source Replica Handling
-/// Because the source replicas are completely blind to the export event state machine, we cannot rely on module events there.
-///
-/// These deletions are natively propagated down the replication stream as standard DEL or UNLINK commands to the source replicas. We handle these events already
-/// by subscribing to the Keyspace Notification hooks in `server_events` to handle the standard data eviction/deletion hooks.
-///
-/// In other words, we only need special handling for the source primary node.
-/// ## Possible Future Optimization
-/// Check if the source_slots covers all slots the current node is responsible for (or a full reshard) and if so, we can just clear
-/// the entire index instead.
-fn handle_post_migration_cleanup(source_slots: RangeSetBlaze<u16>) {
-    let slots_count = source_slots.len();
-    log_notice(format!(
-        "ASM post-migration cleanup scheduled: source_slots_count={slots_count}"
-    ));
-
-    // Spawn a background task so we don't block the main thread; this can take a while if there are
-    // a lot of keys to clean up. Off the pool: it takes the module lock (see `spawn_background`).
-    crate::common::threads::spawn_task(&metrics::POST_MIGRATION_CLEANUP, move |run| {
-        let index = TIMESERIES_INDEX.pin();
-        let mut dbs: Vec<i32> = index.keys().copied().collect();
-        dbs.sort_unstable();
-        let db_count = dbs.len();
-        drop(index);
-
-        log_notice(format!(
-            "ASM post-migration cleanup starting: db_count={db_count} slots_count={slots_count}"
-        ));
-
-        let mut deleted_count = 0usize;
-        let mut touched_dbs = Vec::new();
-        for db in dbs {
-            let deleted = remove_non_owned_keys(db, &source_slots);
-            metrics::POST_MIGRATION_CLEANUP_IDS_MARKED.fetch_add(deleted as u64, Ordering::Relaxed);
-            if deleted > 0 {
-                touched_dbs.push(db);
-                deleted_count += deleted;
-            }
-        }
-
-        if deleted_count > 0 {
-            remove_all_stale_series_internal();
-            // Masking the exported ids out leaves the surviving posting lists sparse.
-            for db in touched_dbs {
-                if run.check_shutdown() {
-                    break;
-                }
-                optimize_index_fully(db);
-                // `optimize_index_fully` stops early on shutdown without aborting this run; check
-                // again so a pass cut short on the last db isn't recorded as completed.
-                if run.check_shutdown() {
-                    break;
-                }
-            }
-        }
-
-        log_notice(format!(
-            "ASM post-migration cleanup finished: deleted_count={deleted_count} db_count={db_count} slots_count={slots_count}"
-        ));
-    });
-}
-
 fn slot_migration_event_handler(event: AtomicSlotMigrationEvent, reported: SlotMigrationEvent) {
     let SlotMigrationEvent { job, slots } = reported;
     match event {
         AtomicSlotMigrationEvent::ExportCompleted => {
-            handle_post_migration_cleanup(slots);
+            // Nothing to do for the index. The server deletes every exported key on the source
+            // (`delKeysInSlot`, run on the main thread as part of the same ownership change that
+            // completes the export) through the type's `unlink2` callback, which retires each
+            // series from the index key-checked, and the same deletions reach the source's
+            // replicas as replicated DELs. A scan that marked every id in the exported slots
+            // stale used to run here as well; it never found anything `unlink2` had not already
+            // retired, and it could retire a series the slot brought *back* before the scan ran.
         }
         AtomicSlotMigrationEvent::ImportStarted => {
             start_import(job, slots);
@@ -979,80 +879,7 @@ mod tests {
         assert!(parse_event_payload(p.ptr()).is_none());
     }
 
-    use crate::series::index::{clear_timeseries_index, next_timeseries_id};
     use serial_test::serial;
-
-    fn index_series(db: i32, key: &str) -> SeriesRef {
-        let mut ts = TimeSeries::new();
-        ts.id = next_timeseries_id();
-        ts.labels = r#"metric{l="v"}"#.parse().unwrap();
-        get_db_index(db).index_timeseries(&ts, key.as_bytes());
-        ts.id
-    }
-
-    /// `count` owned and `count` exported series, interleaved in id order so that exported
-    /// matches are sparser than `BATCH_SIZE` within a scan window.
-    fn populate_interleaved(db: i32, count: usize) -> (Vec<SeriesRef>, Vec<SeriesRef>) {
-        clear_timeseries_index(db);
-        let mut owned = Vec::with_capacity(count);
-        let mut exported = Vec::with_capacity(count);
-        for i in 0..count {
-            owned.push(index_series(db, &format!("{{own}}:{i}")));
-            exported.push(index_series(db, &format!("{{exp}}:{i}")));
-        }
-        (owned, exported)
-    }
-
-    fn indexed_ids(db: i32) -> Vec<SeriesRef> {
-        let index = get_db_index(db);
-        let postings = read_lock(&index.inner);
-        postings.id_to_key.keys().copied().collect()
-    }
-
-    #[test]
-    #[serial]
-    fn test_cleanup_retires_exactly_the_exported_slots_across_windows() {
-        const DB: i32 = 93;
-        // More than one BATCH_SIZE of exported ids, so the scan both fills a batch mid-window
-        // and advances past windows that hold fewer matches than a batch.
-        let (owned, exported) = populate_interleaved(DB, 600);
-        let exported_slots = slots(&[b"{exp}:0"]);
-        assert!(!exported_slots.contains(slot_of(b"{own}:0")));
-
-        let marked = remove_non_owned_keys(DB, &exported_slots);
-
-        assert_eq!(marked, exported.len());
-        assert_eq!(
-            indexed_ids(DB),
-            owned,
-            "only the owned ids keep their key mapping"
-        );
-        let index = get_db_index(DB);
-        let postings = read_lock(&index.inner);
-        for id in &exported {
-            assert!(!postings.has_id(*id), "exported id {id} still has postings");
-        }
-        for id in &owned {
-            assert!(postings.has_id(*id), "owned id {id} lost its postings");
-        }
-        drop(postings);
-        clear_timeseries_index(DB);
-    }
-
-    #[test]
-    #[serial]
-    fn test_cleanup_with_no_exported_slot_touches_nothing() {
-        const DB: i32 = 94;
-        let (mut owned, exported) = populate_interleaved(DB, 10);
-        owned.extend(exported);
-        owned.sort_unstable();
-
-        let marked = remove_non_owned_keys(DB, &RangeSetBlaze::new());
-
-        assert_eq!(marked, 0);
-        assert_eq!(indexed_ids(DB), owned);
-        clear_timeseries_index(DB);
-    }
 
     #[test]
     fn test_parse_single_range() {
