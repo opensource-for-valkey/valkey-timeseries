@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use itertools::Itertools;
 use welch_sde::{Build, SpectralDensity};
 
-use super::MAX_SEASONALITY_PERIODS;
+use super::{MAX_SEASONALITY_PERIODS, overflow_safe_scale};
 
 /// Default number of cycles of data assumed when establishing FFT window sizes.
 const DEFAULT_MIN_FFT_CYCLES: f64 = 3.0;
@@ -45,6 +45,19 @@ impl Builder {
 
 fn default_max_period(data: &[f64]) -> u32 {
     (data.len() as f64 / DEFAULT_MIN_FFT_CYCLES).min(DEFAULT_MAX_FFT_PERIOD) as u32
+}
+
+/// The samples as welch-sde needs them: zero-mean, and small enough to transform.
+///
+/// A large mean leaks DC power into the low frequencies (long periods), where it can outrank a
+/// real cycle. Huge samples are scaled down first, because the mean's sum, the differences from
+/// it and the squared magnitudes inside the transform can each overflow on finite input. Only
+/// the relative powers matter for peak picking, and a power of two scales samples exactly, so
+/// the detected periods do not change.
+fn centered_samples(data: &[f64]) -> Vec<f64> {
+    let scale = overflow_safe_scale(data);
+    let mean = data.iter().map(|x| x * scale).sum::<f64>() / data.len() as f64;
+    data.iter().map(|x| x * scale - mean).collect()
 }
 
 /// A periodogram of a time series.
@@ -156,10 +169,7 @@ impl Detector {
 
         let n_segments = (data_len as f64 / n_per_segment as f64).ceil() as usize;
 
-        // welch-sde assumes a zero-mean signal. A large mean leaks DC power into the low
-        // frequencies (long periods), where it can outrank a real cycle.
-        let mean = data.iter().sum::<f64>() / data_len as f64;
-        let centered: Vec<f64> = data.iter().map(|x| x - mean).collect();
+        let centered = centered_samples(data);
 
         let welch: SpectralDensity<'_, f64> = SpectralDensity::builder(&centered, frequency)
             .n_segment(n_segments)
@@ -300,6 +310,48 @@ mod test {
             })
             .collect();
         assert_eq!(Detector::default().detect(&series)[0], 24);
+    }
+
+    /// The smoke pattern, each sample multiplied by the exact power of two `2^exp`.
+    fn scaled_cycle(exp: i32) -> Vec<f64> {
+        let factor = 2f64.powi(exp);
+        (0..256)
+            .map(|i| [0.1, 0.3, 0.8, 0.5][i % 4] * factor)
+            .collect()
+    }
+
+    fn assert_same_detection(data: &[f64], expected: &[u32], label: &str) {
+        let detector = Detector::default();
+        let periodogram = detector.periodogram(data);
+        assert!(!periodogram.powers.is_empty(), "{label}: no powers");
+        assert!(
+            periodogram.powers.iter().all(|p| p.is_finite()),
+            "{label}: non-finite power in {:?}",
+            periodogram.powers
+        );
+        assert_eq!(detector.detect(data), expected, "{label}");
+    }
+
+    #[test]
+    fn huge_finite_samples_detect_like_ordinary_ones() {
+        let expected = Detector::default().detect(&scaled_cycle(0));
+        assert_eq!(expected[0], 4);
+        // 2^1023 overflows the sum behind the mean; 2^600 survives the mean but overflows the
+        // squared magnitudes inside the transform.
+        for exp in [400, 460, 512, 600, 1000, 1023] {
+            assert_same_detection(&scaled_cycle(exp), &expected, &format!("2^{exp}"));
+        }
+    }
+
+    #[test]
+    fn opposed_extremes_do_not_overflow_centering() {
+        // The mean sits next to -MAX, so MAX minus the mean exceeds the f64 range.
+        let data: Vec<f64> = (0..256)
+            .map(|i| if i % 16 == 0 { f64::MAX } else { -f64::MAX })
+            .collect();
+        let powers = Detector::default().periodogram(&data).powers;
+        assert!(!powers.is_empty());
+        assert!(powers.iter().all(|p| p.is_finite()), "{powers:?}");
     }
 
     #[test]

@@ -50,6 +50,19 @@ pub fn seasonally_adjust(
         return Ok(ts.to_vec());
     }
 
+    // Both decompositions scale linearly, so this only keeps their arithmetic inside the f64
+    // range; the remainder comes back in the units of the series.
+    let scale = overflow_safe_scale(ts);
+    if scale == 1.0 {
+        return decompose(ts, periods);
+    }
+    let scaled: Vec<f64> = ts.iter().map(|x| x * scale).collect();
+    let mut remainder = decompose(&scaled, periods)?;
+    remainder.iter_mut().for_each(|x| *x /= scale);
+    Ok(remainder)
+}
+
+fn decompose(ts: &[f64], periods: Vec<usize>) -> TimeSeriesAnalysisResult<Vec<f64>> {
     if periods.len() == 1 {
         Stl::new(periods[0])
             .robust()
@@ -66,6 +79,19 @@ pub fn seasonally_adjust(
             .ok_or_else(|| {
                 TimeSeriesAnalysisError::DecompositionError("MSTL decomposition failed".to_string())
             })
+    }
+}
+
+/// The factor that brings huge samples back into a range where sums, differences and squares
+/// cannot overflow: once any magnitude exceeds 2^400, the power of two that puts the peak near 1,
+/// otherwise 1. A power of two scales exactly, and ordinary series are left alone. Scaling to the
+/// peak rather than by a fixed factor keeps samples clear of the absolute tolerances in STL.
+fn overflow_safe_scale(data: &[f64]) -> f64 {
+    let peak = data.iter().fold(0.0_f64, |peak, x| peak.max(x.abs()));
+    if peak.is_finite() && peak > 2f64.powi(400) {
+        2f64.powi(-(peak.log2().floor() as i32))
+    } else {
+        1.0
     }
 }
 
@@ -121,6 +147,35 @@ mod tests {
             too_short,
             TimeSeriesAnalysisError::InvalidParameter { .. }
         ));
+    }
+
+    #[test]
+    fn huge_series_decompose_like_ordinary_ones() {
+        let cycle = |exp: i32| -> Vec<f64> {
+            let factor = 2f64.powi(exp);
+            (0..256)
+                .map(|i| [0.1, 0.3, 0.8, 0.5][i % 4] * factor)
+                .collect()
+        };
+        for seasonality in [
+            Seasonality::Auto,
+            Seasonality::Periods(vec![4]),
+            Seasonality::Periods(vec![4, 8]),
+        ] {
+            let expected = seasonally_adjust(&cycle(0), &seasonality).unwrap();
+            for exp in [512, 1000, 1023] {
+                let factor = 2f64.powi(exp);
+                let adjusted = seasonally_adjust(&cycle(exp), &seasonality).unwrap();
+                for (got, want) in adjusted.iter().zip(&expected) {
+                    assert!(got.is_finite(), "{seasonality:?} 2^{exp}");
+                    assert!(
+                        (got / factor - want).abs() < 1e-9,
+                        "{seasonality:?} 2^{exp}: {} vs {want}",
+                        got / factor
+                    );
+                }
+            }
+        }
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
