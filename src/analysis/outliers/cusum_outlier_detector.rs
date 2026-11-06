@@ -1,6 +1,7 @@
-use super::utils::{normalize_evidence, normalize_value};
+use super::utils::{
+    detect_own_departures, fit_head_baseline, normalize_evidence, usable_fence_distance,
+};
 use crate::analysis::TimeSeriesAnalysisResult;
-use crate::analysis::math::calculate_mean_std_dev;
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo,
 };
@@ -53,15 +54,26 @@ impl CusumOutlierDetector {
 
     #[cfg(test)]
     pub fn from_series(ts: &[f64]) -> Self {
-        let (target, std_dev) = fit_baseline(ts);
+        let (target, std_dev) = fit_head_baseline(ts);
         Self::with_params(target, std_dev)
     }
 
+    /// The decision interval in raw units, under the one degenerate-scale rule:
+    /// positive when the baseline supports a standardized cusum, `0.0` when its
+    /// scale has collapsed, `NaN` when the fit is unusable.
+    #[inline]
+    fn decision_distance(&self) -> f64 {
+        if self.target.is_finite() {
+            usable_fence_distance(self.target, self.h * self.std_dev)
+        } else {
+            f64::NAN
+        }
+    }
+
     /// True when the fitted baseline supports a meaningful standardized cusum.
-    /// A constant (or degenerate) baseline has no scale to measure shifts against.
     #[inline]
     fn has_valid_scale(&self) -> bool {
-        self.std_dev.is_finite() && self.std_dev > f64::EPSILON && self.target.is_finite()
+        self.decision_distance() > 0.0
     }
 
     pub fn detect(&self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
@@ -71,12 +83,17 @@ impl CusumOutlierDetector {
         // decision interval is used directly as the threshold.
         let threshold = self.h;
 
-        // Without a usable scale every point standardizes to infinity or NaN;
-        // report a flat, anomaly-free result rather than propagating that.
         if !self.has_valid_scale() {
+            // An unusable fit has nothing to test against; a collapsed one has
+            // zero-width limits.
+            let (scores, anomalies) = if self.decision_distance() == 0.0 {
+                detect_own_departures(ts, self.target)
+            } else {
+                (vec![0.0; n], Vec::new())
+            };
             return Ok(AnomalyResult {
-                scores: vec![0.0; n],
-                anomalies: Vec::new(),
+                scores,
+                anomalies,
                 threshold,
                 method: AnomalyMethod::Cusum,
                 method_info: Some(self.method_info()),
@@ -90,8 +107,13 @@ impl CusumOutlierDetector {
         let mut cusum_neg = 0.0;
 
         for (index, &v) in ts.iter().enumerate() {
-            let value = normalize_value(v);
-            let deviation = (value - self.target) / self.std_dev;
+            // A missing reading is not an observation: both arms keep their value,
+            // so the gap neither relieves nor adds to a drift under way.
+            if v.is_nan() {
+                scores.push(0.0);
+                continue;
+            }
+            let deviation = (v - self.target) / self.std_dev;
             cusum_pos = f64::max(0.0, cusum_pos + deviation - self.k);
             cusum_neg = f64::max(0.0, cusum_neg - deviation - self.k);
 
@@ -133,17 +155,13 @@ impl CusumOutlierDetector {
     /// they stay on the same scale as the `center_line` reported alongside them.
     fn method_info(&self) -> MethodInfo {
         let limit = self.h * self.std_dev;
+        // Not `-limit`: negating a collapsed limit would report `-0`.
+        let lower = if limit == 0.0 { 0.0 } else { -limit };
         MethodInfo::Spc {
-            control_limits: (-limit, limit),
+            control_limits: (lower, limit),
             center_line: self.target,
         }
     }
-}
-
-/// Fit the baseline mean and standard deviation from the head of the series.
-fn fit_baseline(ts: &[f64]) -> (f64, f64) {
-    let training_size = (ts.len() as f64 * 0.5).min(100.0) as usize;
-    calculate_mean_std_dev(&ts[0..training_size])
 }
 
 /// CUSUM implements only [`AnomalyDetector`], not [`PointDetector`]. Its whole
@@ -158,7 +176,7 @@ impl AnomalyDetector for CusumOutlierDetector {
     fn train(&mut self, data: &[f64]) -> TimeSeriesAnalysisResult<()> {
         // `k` and `h` are in sigmas and so remain valid across any rescaling of
         // the baseline; only the baseline itself is refitted here.
-        let (target, std_dev) = fit_baseline(data);
+        let (target, std_dev) = fit_head_baseline(data);
         self.target = target;
         self.std_dev = std_dev;
         self.is_trained = true;
@@ -303,9 +321,35 @@ mod tests {
 
         let anomaly_result = detector.detect(&ts).unwrap();
 
-        // All scores should be zero when std_dev is invalid
-        for score in &anomaly_result.scores {
-            assert_eq!(*score, 0.0);
+        // A zero-variance head collapses the limits to zero width, so only the
+        // two samples that depart from it are flagged, each in its own direction.
+        let signals: Vec<(usize, AnomalySignal)> = anomaly_result
+            .anomalies
+            .iter()
+            .map(|a| (a.index, a.signal))
+            .collect();
+        assert_eq!(
+            signals,
+            vec![(5, AnomalySignal::Negative), (6, AnomalySignal::Positive)]
+        );
+        for (i, score) in anomaly_result.scores.iter().enumerate() {
+            let expected = if i == 5 || i == 6 { 1.0 } else { 0.0 };
+            assert_eq!(*score, expected, "score[{i}]");
+        }
+    }
+
+    /// Overflow in the fitted scale is not a collapse: there is no boundary at
+    /// all, so nothing is flagged.
+    #[test]
+    fn test_detect_with_unusable_scale_flags_nothing() {
+        for detector in [
+            CusumOutlierDetector::with_params(5.0, f64::INFINITY),
+            CusumOutlierDetector::with_params(f64::INFINITY, 1.0),
+            CusumOutlierDetector::with_params(f64::NAN, 1.0),
+        ] {
+            let result = detector.detect(&[5.0, 50.0, 500.0]).unwrap();
+            assert!(result.anomalies.is_empty());
+            assert_eq!(result.scores, vec![0.0; 3]);
         }
     }
 
@@ -318,6 +362,53 @@ mod tests {
 
         // Should handle NaN values gracefully
         assert_eq!(anomaly_result.scores.len(), 3);
+    }
+
+    /// A missing reading is not an observation: both arms keep the value they had,
+    /// so the gap neither relieves nor adds to a drift under way. Scores and flags
+    /// after the gap are those of the series with the gap removed.
+    #[test]
+    fn test_nan_leaves_the_accumulators_untouched() {
+        let detector = CusumOutlierDetector::with_params(0.0, 1.0);
+        let shifted = vec![1.5; 12];
+        let mut with_gap = shifted.clone();
+        with_gap.insert(4, f64::NAN);
+
+        let clean = detector.detect(&shifted).unwrap();
+        let gapped = detector.detect(&with_gap).unwrap();
+
+        assert!(
+            !clean.anomalies.is_empty(),
+            "the drift must reach the limit"
+        );
+        let mut expected_scores = clean.scores.clone();
+        expected_scores.insert(4, 0.0);
+        assert_eq!(gapped.scores, expected_scores);
+
+        let place = |index: usize| if index < 4 { index } else { index + 1 };
+        let expected_flags: Vec<_> = clean
+            .anomalies
+            .iter()
+            .map(|a| (place(a.index), a.signal, a.score))
+            .collect();
+        let flags: Vec<_> = gapped
+            .anomalies
+            .iter()
+            .map(|a| (a.index, a.signal, a.score))
+            .collect();
+        assert_eq!(flags, expected_flags);
+        assert!(gapped.anomalies.iter().all(|a| a.index != 4));
+    }
+
+    /// Zero-width limits take the same view of a gap: nothing to score, nothing to flag.
+    #[test]
+    fn test_nan_is_not_a_departure_when_the_scale_has_collapsed() {
+        let detector = CusumOutlierDetector::with_params(5.0, 0.0);
+
+        let result = detector.detect(&[5.0, f64::NAN, 5.0]).unwrap();
+
+        assert_eq!(result.scores, vec![0.0; 3]);
+        assert!(result.anomalies.is_empty());
     }
 
     #[test]
@@ -491,5 +582,105 @@ mod tests {
         } else {
             panic!("Expected Spc method info");
         }
+    }
+
+    /// A constant head has an exact answer: its own value, with no scale. The computed
+    /// mean of such a head is a few ULPs off, which the dust floor would hide in the
+    /// scale but not in the target.
+    #[test]
+    fn fit_baseline_of_a_constant_head_is_exact() {
+        for value in [0.1, 1.0 / 3.0, 1e-3, 123_456.789, -7.7] {
+            let mut ts = vec![value; 100];
+            ts.extend((0..100).map(|i| value + (i as f64 * 0.1).sin()));
+            assert_eq!(fit_head_baseline(&ts), (value, 0.0), "value {value}");
+        }
+    }
+
+    /// A head without two finite observations has no baseline to depart from, so later
+    /// readings are not judged against the 0.0 an empty mean falls back to.
+    #[test]
+    fn head_without_two_finite_observations_is_unusable() {
+        let heads: [&[f64]; 5] = [
+            &[],
+            &[f64::NAN, f64::NAN],
+            &[f64::INFINITY, f64::INFINITY],
+            &[f64::NEG_INFINITY, f64::INFINITY],
+            &[5.0, f64::NAN],
+        ];
+        for head in heads {
+            let mut d = CusumOutlierDetector::default();
+            d.train(head).unwrap();
+            let result = CusumOutlierDetector::detect(&d, &[5.0, 50.0, -500.0]).unwrap();
+            assert!(result.anomalies.is_empty(), "{head:?}");
+            assert_eq!(result.scores, vec![0.0; 3], "{head:?}");
+        }
+    }
+
+    /// A deviation of a few dozen ULPs of the target is still representable variance, so it
+    /// is a scale to test against rather than rounding error to discard.
+    #[test]
+    fn small_variance_on_a_large_target_is_kept() {
+        let series = |shift: f64| -> Vec<f64> {
+            let mut ts: Vec<f64> = (0..100)
+                .map(|i| 1e15 + if i % 2 == 0 { 0.5 } else { -0.5 })
+                .collect();
+            ts.extend(std::iter::repeat_n(1e15 + shift, 100));
+            ts
+        };
+        let ts = series(3.0);
+        let (_, std_dev) = fit_head_baseline(&ts);
+        assert!(std_dev > 0.4, "std_dev {std_dev}");
+        let result = CusumOutlierDetector::from_series(&ts).detect(&ts).unwrap();
+        assert_eq!(result.anomalies.first().map(|a| a.index), Some(100));
+
+        let quiet = series(0.0);
+        let result = CusumOutlierDetector::from_series(&quiet)
+            .detect(&quiet)
+            .unwrap();
+        assert!(result.anomalies.is_empty());
+    }
+
+    /// A collapsed chart reports zero-width limits, and the lower bound is `0.0`, not
+    /// the `-0.0` that negating a zero produces.
+    #[test]
+    fn collapsed_method_info_reports_unsigned_zero_limits() {
+        let result = CusumOutlierDetector::with_params(5.0, 0.0)
+            .detect(&[5.0, 5.0])
+            .unwrap();
+        let Some(MethodInfo::Spc {
+            control_limits,
+            center_line,
+        }) = result.method_info
+        else {
+            panic!("Expected Spc method info");
+        };
+        assert_eq!(center_line, 5.0);
+        assert_eq!(control_limits, (0.0, 0.0));
+        assert!(
+            control_limits.0.is_sign_positive(),
+            "lower limit is {:?}",
+            control_limits.0
+        );
+    }
+
+    /// Each arm decays by `k` sigma per sample, so a lone spike of `s` sigma keeps
+    /// flagging for about `2 * (s - h)` of the samples after it. The docs say so.
+    #[test]
+    fn a_lone_spike_keeps_flagging_while_the_arm_decays() {
+        let detector = CusumOutlierDetector::with_params(0.0, 1.0);
+        let mut ts = vec![0.0; 200];
+        ts[100] = 30.0;
+
+        let flagged: Vec<usize> = detector
+            .detect(&ts)
+            .unwrap()
+            .anomalies
+            .iter()
+            .map(|a| a.index)
+            .collect();
+
+        // The arm is 29.5 after the spike and loses 0.5 per sample; it is above h = 5
+        // for the 48 samples that follow.
+        assert_eq!(flagged, (100..=148).collect::<Vec<_>>());
     }
 }

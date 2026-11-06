@@ -1,11 +1,12 @@
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetectionMethodOptions, AnomalyDirection, AnomalyMethod, AnomalyOptions,
-    AnomalyResult, ESDOutlierOptions, EWMA_DEFAULT_ALPHA, EsdEstimator, MADAnomalyOptions,
-    MethodInfo, RCF_DEFAULT_NUM_TREES, RCF_DEFAULT_SAMPLE_SIZE, RCFOptions, RCFThreshold,
-    SmoothedZScoreOptions, detect_anomalies,
+    AnomalyResult, ESD_MAX_ITERATIONS, ESDOutlierOptions, EWMA_DEFAULT_ALPHA, EsdEstimator,
+    MADAnomalyOptions, MethodInfo, RCF_DEFAULT_NUM_TREES, RCF_DEFAULT_SAMPLE_SIZE,
+    RCF_MIN_SAMPLE_SIZE, RCFOptions, RCFThreshold, SmoothedZScoreOptions, detect_anomalies,
 };
-use crate::analysis::seasonality::Seasonality;
-use crate::commands::analysis_runner::run_on_analysis_lane;
+use crate::analysis::seasonality::{MAX_SEASONALITY_PERIODS, MIN_SEASONALITY_PERIOD, Seasonality};
+use crate::commands::analysis_runner::{reserve_analysis_slot, run_reserved_on_analysis_lane};
+use crate::commands::outliers_cost::{INLINE_COST_BUDGET_MICROS, estimated_cost_micros};
 use crate::commands::{
     CommandArgIterator, CommandArgToken, parse_command_arg_token, parse_timestamp_range,
 };
@@ -13,12 +14,11 @@ use crate::common::Sample;
 use crate::common::context::is_blocking_denied;
 use crate::common::hash::{IntMap, IntSet};
 use crate::common::replies::{ReplyContext, reply_with_counted_array, reply_with_sample};
+use crate::config::outliers_max_samples;
 use crate::series::{TimestampRange, get_timeseries};
 use valkey_module::{
     AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
-
-const MAX_SEASONALITY_PERIODS: usize = 4;
 
 // Keep the RCF resource requirements bounded before they reach krcf. In
 // particular, krcf allocates storage proportional to sample_size * num_trees
@@ -55,7 +55,7 @@ enum ZScoreType {
 
 acl_categories!(TS_OUTLIERS, "ts.outliers", "read timeseries");
 /// TS.OUTLIERS key fromTimestamp toTimestamp
-///     METHOD <method> [method-specific-options]
+///     [METHOD <method> [method-specific-options]]
 ///     [OUTPUT <full|simple|cleaned>]
 ///     [DIRECTION <positive|negative|both>]
 ///     [SEASONALITY <period1> [period2] ...]
@@ -63,9 +63,9 @@ acl_categories!(TS_OUTLIERS, "ts.outliers", "read timeseries");
     name: "ts.outliers",
     flags: [ReadOnly],
     summary: "Detect outlier samples in a time series over a timestamp range.",
-    complexity: "O(N) where N is the number of samples in the requested range.",
+    complexity: "O(N log N) for the fence-based methods; ESD O(N log N*MAX_OUTLIERS) (CLASSIC O(N*MAX_OUTLIERS)), RCF O(N*NUM_TREES*log(SAMPLE_SIZE)), multi-period SEASONALITY O(N^2).",
     since: "1.0.0",
-    arity: -6,
+    arity: -4,
     key_spec: [{
         flags: [ReadOnly, Access],
         begin_search: Index({ index: 1 }),
@@ -73,7 +73,7 @@ acl_categories!(TS_OUTLIERS, "ts.outliers", "read timeseries");
     }]
 })]
 pub fn ts_outliers_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
-    if args.len() < 6 {
+    if args.len() < 4 {
         return Err(ValkeyError::WrongArity);
     }
 
@@ -139,17 +139,45 @@ fn process_request(
     anomaly_direction: AnomalyDirection,
     output_format: OutputFormat,
 ) -> ValkeyResult {
-    let samples = {
+    // Everything that can refuse without the samples runs before the full decode, which is the
+    // expensive part on the main thread: the sample cap, the RCF budget and, for the lane, its
+    // queue place.
+    let (samples, lane_slot) = {
         let series = get_timeseries(ctx, &key, Some(AclPermissions::ACCESS))?;
         let (start, end) = date_range.get_series_range(&series, None, false);
-        series.get_range(start, end)
+
+        let limit = outliers_max_samples();
+        let leaves_main_thread =
+            |samples| estimated_cost_micros(samples, &options) > INLINE_COST_BUDGET_MICROS;
+
+        // The estimate counts whole chunks at no cost and is never too low, so it settles a
+        // request it lets through. Only one it would refuse or move pays for the exact count.
+        let estimate = series.estimated_sample_count_in_range(start, end);
+        let sample_count = if estimate > limit || leaves_main_thread(estimate) {
+            series.sample_count_in_range(start, end)
+        } else {
+            estimate
+        };
+        if sample_count > limit {
+            return Err(ValkeyError::String(format!(
+                "TSDB: outlier detection: range holds {sample_count} samples, limit is {limit}"
+            )));
+        }
+        validate_rcf_budget(&options)?;
+
+        // A deny-blocking client (MULTI, a script, an `RM_Call` without the K flag) runs inline
+        // whatever the cost: the server asserts on blocking one.
+        let lane_slot = (leaves_main_thread(sample_count) && !is_blocking_denied(ctx))
+            .then(|| reserve_analysis_slot(ctx, "outlier detection"))
+            .transpose()?;
+
+        (series.get_range(start, end), lane_slot)
     };
 
-    validate_rcf_options(&options, samples.len())?;
+    // Detection leaves NaN and infinities out, so the shingle must fit the finite samples.
+    validate_rcf_shingle_size(&options, finite_sample_count(&samples))?;
 
-    // Inline when a deny-blocking client (MULTI, a script, an `RM_Call` without the K flag)
-    // could not be blocked anyway: the server asserts on blocking one.
-    if !should_run_in_background(samples.len(), options.method()) || is_blocking_denied(ctx) {
+    let Some(lane_slot) = lane_slot else {
         let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
         let reply_ctx = ReplyContext::new(ctx.ctx);
         return match detect_anomalies(&values, &options) {
@@ -165,9 +193,9 @@ fn process_request(
                 &options,
             ),
         };
-    }
+    };
 
-    run_on_analysis_lane(ctx, "outlier detection", move |thread_ctx| {
+    run_reserved_on_analysis_lane(ctx, lane_slot, move |thread_ctx| {
         let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
         match detect_anomalies(&values, &options) {
             Err(err) => {
@@ -188,21 +216,6 @@ fn process_request(
             }
         }
     })
-}
-
-const SPAWN_THRESHOLD_SAMPLES: usize = 1000;
-
-fn is_cpu_intensive(method: AnomalyMethod) -> bool {
-    matches!(method, AnomalyMethod::RandomCutForest | AnomalyMethod::Esd)
-}
-
-/// Just a naive heuristic to decide whether to spawn a background thread for anomaly detection
-/// based on the number of samples and method complexity.
-fn should_run_in_background(samples: usize, method: AnomalyMethod) -> bool {
-    match is_cpu_intensive(method) {
-        true => samples > SPAWN_THRESHOLD_SAMPLES,
-        false => samples > 5_000, // For lightweight methods, we can allow more samples before spawning
-    }
 }
 
 fn parse_method_options(
@@ -251,6 +264,11 @@ fn parse_seasonality(args: &mut CommandArgIterator) -> ValkeyResult<Seasonality>
     if periods.is_empty() || periods.len() > MAX_SEASONALITY_PERIODS {
         return Err(ValkeyError::Str("TSDB: invalid SEASONALITY periods"));
     }
+    if periods.iter().any(|&p| p < MIN_SEASONALITY_PERIOD) {
+        return Err(ValkeyError::Str(
+            "TSDB: SEASONALITY periods must be integers >= 2",
+        ));
+    }
     // periods should be unique and sorted
     periods.sort_unstable();
     if !periods.windows(2).all(|w| w[0] != w[1]) {
@@ -284,7 +302,7 @@ fn parse_ewma_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOpti
         let slice = arg.as_slice();
         if slice.len() == 5 && slice.eq_ignore_ascii_case(b"alpha") {
             args.next(); // consume ALPHA
-            Some(parse_single_value(args, "ALPHA")?)
+            Some(parse_half_open_unit_value(args, "ALPHA")?)
         } else {
             None
         }
@@ -351,7 +369,7 @@ fn parse_zscore_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOp
                 influence = Some(parse_unit_interval_value(args, "INFLUENCE")?);
             },
             "LAG" => {
-                lag = Some(parse_positive_value(args, "LAG")? as usize);
+                lag = Some(parse_bounded_integer(args, "LAG", 1, usize::MAX)?);
             },
             _ => {
                 return Err(ValkeyError::String(format!("TSDB: unknown zscore option {arg}")));
@@ -411,7 +429,7 @@ fn parse_smoothed_zscore_options(args: &mut CommandArgIterator) -> ValkeyResult<
                 smoothed_options.influence = parse_unit_interval_value(args, "INFLUENCE")?;
             },
             "LAG" => {
-                smoothed_options.lag = parse_positive_value(args, "LAG")? as usize;
+                smoothed_options.lag = parse_bounded_integer(args, "LAG", 1, usize::MAX)?;
             },
             _ => {
                 return Err(ValkeyError::String(format!("TSDB: unknown smoothed zscore option {arg}")));
@@ -520,7 +538,7 @@ fn parse_rcf_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
                 rcf_options.sample_size = Some(parse_bounded_integer(
                     args,
                     "SAMPLE_SIZE",
-                    2,
+                    RCF_MIN_SAMPLE_SIZE,
                     MAX_RCF_SAMPLE_SIZE,
                 )?);
             },
@@ -546,7 +564,7 @@ fn parse_rcf_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
                 );
             },
             "DECAY" => {
-                rcf_options.time_decay = Some(parse_single_value(args, "DECAY")?);
+                rcf_options.time_decay = Some(parse_unit_interval_value(args, "DECAY")?);
             },
             "SHINGLE_SIZE" => {
                 rcf_options.shingle_size = Some(parse_bounded_integer(
@@ -557,7 +575,12 @@ fn parse_rcf_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
                 )?);
             },
             "OUTPUT_AFTER" => {
-                rcf_options.output_after = Some(parse_positive_value(args, "OUTPUT_AFTER")? as usize);
+                rcf_options.output_after = Some(parse_bounded_integer(
+                    args,
+                    "OUTPUT_AFTER",
+                    1,
+                    usize::MAX,
+                )?);
             },
             _ => {
                 return Err(ValkeyError::String(format!("TSDB: unknown RCF option {arg}")));
@@ -599,7 +622,12 @@ fn parse_esd_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
                 esd_options.estimator = EsdEstimator::Classic;
             },
             "MAX_OUTLIERS" => {
-                esd_options.max_outliers = Some(parse_positive_value(args, "MAX_OUTLIERS")? as usize);
+                esd_options.max_outliers = Some(parse_bounded_integer(
+                    args,
+                    "MAX_OUTLIERS",
+                    1,
+                    ESD_MAX_ITERATIONS,
+                )?);
             },
             _ => {
                 return Err(ValkeyError::String(format!("TSDB: unknown ESD option {arg}")));
@@ -650,18 +678,34 @@ fn parse_bounded_integer(
     Ok(value as usize)
 }
 
-fn validate_rcf_options(options: &AnomalyOptions, sample_count: usize) -> ValkeyResult<()> {
+/// The samples detection will actually see: NaN and infinities are left out of the analysis.
+fn finite_sample_count(samples: &[Sample]) -> usize {
+    samples.iter().filter(|s| s.value.is_finite()).count()
+}
+
+fn validate_rcf_shingle_size(
+    options: &AnomalyOptions,
+    finite_sample_count: usize,
+) -> ValkeyResult<()> {
     let AnomalyDetectionMethodOptions::Rcf(rcf_options) = &options.options else {
         return Ok(());
     };
 
     if let Some(shingle_size) = rcf_options.shingle_size
-        && shingle_size > sample_count
+        && shingle_size > finite_sample_count
     {
         return Err(ValkeyError::String(format!(
-            "TSDB: SHINGLE_SIZE ({shingle_size}) cannot exceed the number of samples ({sample_count})"
+            "TSDB: SHINGLE_SIZE ({shingle_size}) cannot exceed the number of finite samples ({finite_sample_count})"
         )));
     }
+
+    Ok(())
+}
+
+fn validate_rcf_budget(options: &AnomalyOptions) -> ValkeyResult<()> {
+    let AnomalyDetectionMethodOptions::Rcf(rcf_options) = &options.options else {
+        return Ok(());
+    };
 
     let num_trees = rcf_options.num_trees.unwrap_or(RCF_DEFAULT_NUM_TREES);
     let sample_size = rcf_options.sample_size.unwrap_or(RCF_DEFAULT_SAMPLE_SIZE);
@@ -706,7 +750,7 @@ fn parse_positive_value(iter: &mut CommandArgIterator, option_name: &str) -> Val
 /// an invalid quantile probability in the ESD detector.
 fn parse_esd_alpha(iter: &mut CommandArgIterator) -> ValkeyResult<f64> {
     let value = parse_finite_value(iter, "ALPHA")?;
-    if !(0.0..1.0).contains(&value) {
+    if !(value > 0.0 && value < 1.0) {
         return Err(ValkeyError::Str(
             "TSDB: ALPHA must be greater than 0 and less than 1",
         ));
@@ -723,6 +767,22 @@ fn parse_finite_value(iter: &mut CommandArgIterator, option_name: &str) -> Valke
     if !value.is_finite() {
         return Err(ValkeyError::String(format!(
             "TSDB: {option_name} must be finite"
+        )));
+    }
+    Ok(value)
+}
+
+/// A smoothing weight in `(0, 1]`, such as the EWMA `ALPHA`. Zero is excluded
+/// because the average would never move; one is the "no smoothing" limit, so it
+/// is valid. Rejects NaN and infinities along with the out-of-range values.
+fn parse_half_open_unit_value(
+    iter: &mut CommandArgIterator,
+    option_name: &str,
+) -> ValkeyResult<f64> {
+    let value = parse_single_value(iter, option_name)?;
+    if !(value > 0.0 && value <= 1.0) {
+        return Err(ValkeyError::String(format!(
+            "TSDB: {option_name} must be greater than 0 and at most 1"
         )));
     }
     Ok(value)
@@ -1096,7 +1156,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_rcf_options_rejects_max_combination() {
+    fn validate_rcf_budget_rejects_max_combination() {
         let options = AnomalyOptions {
             options: AnomalyDetectionMethodOptions::Rcf(RCFOptions {
                 num_trees: Some(MAX_RCF_NUM_TREES),
@@ -1107,7 +1167,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = validate_rcf_options(&options, MAX_RCF_SAMPLE_SIZE)
+        let err = validate_rcf_budget(&options)
             .expect_err("maximum NUM_TREES/SAMPLE_SIZE/SHINGLE_SIZE combination must be rejected");
         assert!(
             err.to_string().contains("combined"),
@@ -1115,14 +1175,60 @@ mod tests {
         );
     }
 
+    fn rcf_options_with_shingle(shingle_size: usize) -> AnomalyOptions {
+        AnomalyOptions {
+            options: AnomalyDetectionMethodOptions::Rcf(RCFOptions {
+                shingle_size: Some(shingle_size),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn validate_rcf_options_accepts_default_combination() {
+    fn finite_sample_count_skips_nan_and_infinities() {
+        let values = [1.0, f64::NAN, 2.0, f64::INFINITY, f64::NEG_INFINITY, 3.0];
+        let samples: Vec<Sample> = values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| Sample::new(i as i64, v))
+            .collect();
+        assert_eq!(finite_sample_count(&samples), 3);
+    }
+
+    #[test]
+    fn validate_rcf_shingle_size_is_bounded_by_the_finite_samples() {
+        let options = rcf_options_with_shingle(12);
+
+        let err = validate_rcf_shingle_size(&options, 10)
+            .expect_err("a shingle larger than the finite samples must be rejected");
+        assert!(
+            err.to_string()
+                .contains("SHINGLE_SIZE (12) cannot exceed the number of finite samples (10)"),
+            "unexpected error message: {err}"
+        );
+
+        validate_rcf_shingle_size(&options, 12).expect("a shingle equal to the count is valid");
+        validate_rcf_shingle_size(&options, 15).expect("a shingle below the count is valid");
+    }
+
+    #[test]
+    fn validate_rcf_shingle_size_ignores_other_methods() {
+        let options = AnomalyOptions {
+            options: AnomalyDetectionMethodOptions::Cusum,
+            ..Default::default()
+        };
+        validate_rcf_shingle_size(&options, 0).expect("only RCF has a shingle size");
+    }
+
+    #[test]
+    fn validate_rcf_budget_accepts_default_combination() {
         let options = AnomalyOptions {
             options: AnomalyDetectionMethodOptions::Rcf(RCFOptions::default()),
             ..Default::default()
         };
 
-        validate_rcf_options(&options, RCF_DEFAULT_SAMPLE_SIZE)
+        validate_rcf_budget(&options)
             .expect("default RCF option combination must be within the budget");
     }
 }

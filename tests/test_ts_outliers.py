@@ -1,10 +1,11 @@
 import math
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Any
 
 import pytest
 from valkey import ResponseError, StrictValkey
 
-from outlier_result import AnomalyEntry, TSOutliersFullResult, TSOutliersCleanedResult
+from outlier_result import AnomalyEntry, AnomalyMethod, TSOutliersFullResult, TSOutliersCleanedResult
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase, ValkeyTimeSeriesTestCaseDebugMode
 from valkeytestframework.conftest import resource_port_tracker
 from valkeytestframework.util.waiters import *
@@ -33,6 +34,8 @@ def create_series_with_outliers(client, key, start_time=1000):
 # Above the inline limit for lightweight methods, so the detection runs on the analysis lane.
 BACKGROUND_SAMPLE_COUNT = 6000
 
+MAX_SAMPLES_CONFIG = 'ts.ts-outliers-max-samples'
+
 
 def create_background_sized_series(client, key):
     """A series large enough for the analysis lane, with one clear outlier in the middle."""
@@ -41,6 +44,15 @@ def create_background_sized_series(client, key):
         value = 50.0 if i == BACKGROUND_SAMPLE_COUNT // 2 else math.sin(i * 0.1)
         pipe.execute_command('TS.ADD', key, 1000 + i * 1000, value)
     pipe.execute()
+
+
+def create_dense_chunk_series(client, key):
+    """A series whose samples all sit in one chunk, more of them than the inline limit."""
+    client.execute_command('TS.CREATE', key, 'CHUNK_SIZE', 1048576)
+    create_background_sized_series(client, key)
+    info = client.execute_command('TS.INFO', key)
+    fields = dict(zip(info[::2], info[1::2]))
+    assert fields.get(b'chunkCount', fields.get('chunkCount')) == 1
 
 
 def convert_anomaly_entries(result: List[Any]) -> list[AnomalyEntry]:
@@ -78,6 +90,28 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
 
         assert len(TSOutliersFullResult.parse(result).samples) == 3
 
+    def test_outliers_without_method_defaults_to_zscore(self):
+        key = 'test:outliers:default_method'
+        create_series_with_outliers(self.client, key)
+        plain = self.client.execute_command('TS.OUTLIERS', key, '-', '+')
+        explicit = self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore', 'THRESHOLD', 3.0)
+        assert plain == explicit
+
+        # FULL output carries every score and the method name, so a different default would show.
+        plain_full = self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'OUTPUT', 'full')
+        explicit_full = self.client.execute_command(
+            'TS.OUTLIERS', key, '-', '+', 'OUTPUT', 'full', 'METHOD', 'zscore', 'THRESHOLD', 3.0)
+        assert plain_full == explicit_full
+        assert TSOutliersFullResult.parse(plain_full).method == AnomalyMethod.ZSCORE
+
+    def test_auto_seasonality_with_a_gap_is_documented_as_compressed(self):
+        """Review Focus 1: a NaN gap closes up before decomposition; the reply must still have one entry per sample."""
+        key = 'test:outliers:seasonality:gap'
+        for i in range(96):
+            self.client.execute_command('TS.ADD', key, 1000 + i * 1000, 'nan' if i == 40 else math.sin(i * math.tau / 24))
+        res = TSOutliersFullResult.parse(self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'OUTPUT', 'full', 'METHOD', 'zscore', 'SEASONALITY', 'auto'))
+        assert len(res.samples) == 96 and math.isnan(res.samples[40].score)
+
     def test_background_detection_runs_inline_inside_multi(self):
         """A detection large enough for the analysis lane cannot block a client inside
         MULTI, so it runs inline there, with the same answer."""
@@ -92,6 +126,75 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
         [in_multi] = tx.execute()
         assert in_multi == expected
 
+    def test_sample_cap_refuses_before_decoding(self):
+        """A range over the cap is refused, and the error reports what it actually holds."""
+        key = 'test:outliers:cap'
+        create_background_sized_series(self.client, key)
+        self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 5000)
+        try:
+            with pytest.raises(ResponseError, match=f'holds {BACKGROUND_SAMPLE_COUNT} samples, limit is 5000'):
+                self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
+            # a narrower range under the cap still works
+            narrow = self.client.execute_command(
+                'TS.OUTLIERS', key, 1000, 1000 + 9 * 1000, 'METHOD', 'zscore')
+            assert narrow is not None
+        finally:
+            self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000000)
+
+    def test_sample_cap_counts_only_the_samples_in_the_range(self):
+        """A narrow range inside a chunk holding more than the cap is not charged for the chunk."""
+        key = 'test:outliers:cap:dense'
+        create_dense_chunk_series(self.client, key)
+        self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000)
+        try:
+            narrow = self.client.execute_command(
+                'TS.OUTLIERS', key, 1000, 1000 + 99 * 1000, 'METHOD', 'zscore')
+            assert narrow is not None
+            # One sample past the cap is still refused, with the true count.
+            with pytest.raises(ResponseError, match='holds 1001 samples, limit is 1000'):
+                self.client.execute_command(
+                    'TS.OUTLIERS', key, 1000, 1000 + 1000 * 1000, 'METHOD', 'zscore')
+        finally:
+            self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000000)
+
+    def test_sample_cap_applies_inside_multi(self):
+        """A client that cannot block runs inline whatever the cost, but not whatever the size."""
+        key = 'test:outliers:cap:multi'
+        create_background_sized_series(self.client, key)
+        self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 5000)
+        try:
+            tx = self.client.pipeline(transaction=True)
+            tx.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
+            [in_multi] = tx.execute(raise_on_error=False)
+            assert isinstance(in_multi, ResponseError)
+            assert 'limit is 5000' in str(in_multi)
+        finally:
+            self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000000)
+
+    def test_lowering_the_cap_does_not_cancel_a_queued_job(self):
+        """Admission is checked once, at submission."""
+        key = 'test:outliers:cap:queued'
+        create_background_sized_series(self.client, key)
+        other = StrictValkey(host=self.server.bind_ip, port=self.server.port, socket_timeout=120)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            # The long job blocks `other`, so it gets its own thread. Wait until the server has
+            # admitted it. If it finishes before the cap is lowered the test still passes, with
+            # less to say; no wait can rule that out.
+            queued = pool.submit(
+                other.execute_command,
+                'TS.OUTLIERS', key, '-', '+', 'METHOD', 'esd', 'MAX_OUTLIERS', 1000)
+            wait_for_true(lambda: queued.done()
+                          or self.client.info('clients')['blocked_clients'] > 0)
+            self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000)
+            try:
+                with pytest.raises(ResponseError, match='limit is 1000'):
+                    self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
+                # Admitted before the change: it still gets its answer.
+                assert isinstance(queued.result(timeout=120), list)
+            finally:
+                self.client.execute_command('CONFIG', 'SET', MAX_SAMPLES_CONFIG, 1000000)
+
     def test_outliers_nonexistent_key(self):
         """Test outlier detection on non-existent key."""
         with pytest.raises(ResponseError, match="the key does not exist"):
@@ -104,6 +207,54 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
                 'TS.OUTLIERS', 'test:outliers:esd:alpha', '-', '+',
                 'METHOD', 'esd', 'ALPHA', 13,
             )
+
+    def test_option_validation_rejects_out_of_range_values(self):
+        """EWMA/ESD alpha, integer options and RCF decay are validated at parse time."""
+        key = 'test:outliers:validation'
+        create_normal_series(self.client, key, count=50)
+        bad = [
+            ('METHOD', 'ewma', 'ALPHA', 0), ('METHOD', 'ewma', 'ALPHA', 2), ('METHOD', 'ewma', 'ALPHA', 'nan'),
+            ('METHOD', 'esd', 'ALPHA', 0),
+            ('METHOD', 'smoothed-zscore', 'LAG', 3.9),
+            ('METHOD', 'zscore', 'SMOOTHED', 'LAG', 3.9),
+            ('METHOD', 'esd', 'MAX_OUTLIERS', 2.5),
+            ('METHOD', 'rcf', 'OUTPUT_AFTER', 0), ('METHOD', 'rcf', 'OUTPUT_AFTER', 2.5),
+            ('METHOD', 'rcf', 'DECAY', -1), ('METHOD', 'rcf', 'DECAY', 5), ('METHOD', 'rcf', 'DECAY', 'nan'),
+        ]
+        for args in bad:
+            with pytest.raises(ResponseError):
+                self.client.execute_command('TS.OUTLIERS', key, '-', '+', *args)
+
+    def test_esd_max_outliers_above_the_cap_is_refused_at_parse_time(self):
+        """The documented 1..1000 range is enforced by the parser, before a lane slot or the decode."""
+        key = 'test:outliers:validation:max_outliers'
+        create_normal_series(self.client, key, count=50)
+        for value in (0, 1001, 18446744073709551615):
+            with pytest.raises(ResponseError, match="MAX_OUTLIERS must be between 1 and 1000"):
+                self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'esd', 'MAX_OUTLIERS', value)
+
+    def test_option_validation_accepts_boundary_values(self):
+        """The closed ends of the documented ranges are valid."""
+        key = 'test:outliers:validation:bounds'
+        create_normal_series(self.client, key, count=50)
+        good = [
+            ('METHOD', 'ewma', 'ALPHA', 1),
+            ('METHOD', 'rcf', 'DECAY', 0),
+            ('METHOD', 'rcf', 'DECAY', 1),
+        ]
+        for args in good:
+            self.client.execute_command('TS.OUTLIERS', key, '-', '+', *args)
+
+    def test_huge_lag_is_an_error_not_a_panic(self):
+        """A LAG beyond any series length reports the shortfall; it must not overflow."""
+        key = 'test:outliers:validation:lag'
+        create_normal_series(self.client, key, count=50)
+        with pytest.raises(ResponseError, match="insufficient samples"):
+            self.client.execute_command(
+                'TS.OUTLIERS', key, '-', '+',
+                'METHOD', 'smoothed-zscore', 'LAG', 18446744073709551615,
+            )
+        assert self.client.ping()
 
     def test_method_spc_cusum_negative_spike(self):
         """Test SPC CUSUM control chart method negative spike."""
@@ -144,6 +295,38 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
         positive_count = sum(1 for entry in outliers if entry.signal == 1)
         assert positive_count >= 4
 
+
+    def test_spc_baseline_is_fitted_on_the_first_hundred_samples(self):
+        """CUSUM and EWMA fit target and sigma on the first min(n/2, 100) samples (documented).
+
+        A constant head fits a zero sigma, so the limits have no width and every later sample
+        that differs from it is reported. There is no whole-series fallback.
+        """
+        head = 100
+        values = [50.0] * head + [50.0 + math.sin(i * 0.1) for i in range(1, 201)]
+        first_after_head = 1000 + head * 1000
+
+        for method in ('cusum', 'ewma'):
+            key = f'test:outliers:spc_baseline:{method}'
+            pipe = self.client.pipeline(transaction=False)
+            for i, val in enumerate(values):
+                pipe.execute_command('TS.ADD', key, 1000 + i * 1000, val)
+            pipe.execute()
+
+            result = TSOutliersFullResult.parse(self.client.execute_command(
+                'TS.OUTLIERS', key, '-', '+', 'OUTPUT', 'full', 'METHOD', method))
+
+            flagged = result.anomalies()
+            assert len(flagged) > 150, f"{method}: {len(flagged)} flagged"
+            assert all(s.timestamp >= first_after_head for s in flagged), f"{method}: flagged inside the head"
+
+            info = result.method_info
+            assert info is not None, method
+            assert info.center_line == 50.0, method
+            low, high = info.control_limits
+            assert high - low == 0.0, f"{method}: limits {info.control_limits} have width"
+            # CUSUM reports its limits as offsets from the center: collapsed, that is 0, never -0.
+            assert math.copysign(1.0, low) > 0, f"{method}: lower limit {low!r}"
 
     def test_invalid_method(self):
         """Test with an invalid method name."""
@@ -303,6 +486,18 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
         assert len(anomalies) == 1
         assert anomalies[0].signal == 1  # Positive anomaly
         assert anomalies[0].value == 5.0
+
+    def test_smoothed_zscore_short_series_is_an_error(self):
+        """A series no longer than LAG has nothing to classify: error, not an empty reply."""
+        key = 'test:outliers:method:smoothed:short'
+
+        for i, val in enumerate([1.0, 1.0, 1.0, 1.0, 1.0, 500.0, 1.0, 1.0]):
+            self.client.execute_command('TS.ADD', key, 1000 + i * 1000, val)
+
+        with pytest.raises(ResponseError, match='Need at least 11 observations, got 8'):
+            self.client.execute_command(
+                'TS.OUTLIERS', key, '-', '+', 'METHOD', 'smoothed-zscore', 'LAG', 10
+            )
 
     def test_method_mad(self):
         """Test Median Absolute Deviation (Mad) detection"""
@@ -475,6 +670,20 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
 
         assert len(result) == 0
 
+    def test_cleaned_output_after_a_step(self):
+        """A constant baseline must not blind CUSUM: the baseline stays, the shifted tail goes."""
+        key = 'test:outliers:cleaned:after_step'
+        for i in range(100):
+            self.client.execute_command('TS.ADD', key, 1000 + i, 5.0)
+        for i in range(100):
+            self.client.execute_command('TS.ADD', key, 1100 + i, 50.0)
+
+        res = self.client.execute_command(
+            'TS.OUTLIERS', key, '-', '+', 'METHOD', 'cusum', 'OUTPUT', 'cleaned'
+        )
+
+        assert TSOutliersCleanedResult.parse(res).sample_count() == 100
+
     def test_format_cleaned(self):
         """Test OUTPUT cleaned returns only samples with directed anomalies removed."""
         key = 'test:outliers:format:cleaned'
@@ -573,6 +782,13 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
         assert -30.0 not in sample_values_neg
         assert 50.0 in sample_values_neg  # Positive anomaly should remain
         assert len(samples_neg) == len(data) - 1
+
+    def test_seasonality_rejects_degenerate_and_oversized_periods(self):
+        key = 'test:outliers:seasonality:bad_periods'
+        create_normal_series(self.client, key, count=50)
+        for period in (0, 1, 2**63, 26):
+            with pytest.raises(ResponseError):
+                self.client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore', 'SEASONALITY', period)
 
     def test_daily_seasonality_with_spike(self):
         """Test detection on a daily seasonal pattern with an anomalous spike."""
@@ -858,3 +1074,47 @@ class TestOutliersLaneFailureStillReplies(ValkeyTimeSeriesTestCaseDebugMode):
         result = client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
         assert any(entry.value == 50.0 for entry in convert_anomaly_entries(result))
         assert self.server.is_alive()
+
+    def test_short_range_placement_counts_the_forest(self):
+        client = self._client()
+        key = 'test:outliers:placement:forest'
+        for ts, value in enumerate([1.0, 2.0, 3.0], start=1):
+            client.execute_command('TS.ADD', key, ts, value)
+
+        # Three samples through the default forest stay inline: the armed panic is not consumed.
+        client.execute_command('TS._DEBUG', 'PANIC_NEXT_ANALYSIS_JOB')
+        client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'rcf')
+
+        # The same three samples through a large forest go to the lane and consume it.
+        with pytest.raises(ResponseError, match='internal error'):
+            client.execute_command(
+                'TS.OUTLIERS', key, '-', '+', 'METHOD', 'rcf', 'NUM_TREES', 256, 'SAMPLE_SIZE', 4096)
+
+    def test_placement_counts_only_the_samples_in_the_range(self):
+        """A narrow range inside a chunk too long to run inline stays inline."""
+        client = self._client()
+        key = 'test:outliers:placement:dense'
+        create_dense_chunk_series(client, key)
+
+        # 100 cheap samples: the armed panic is not consumed.
+        client.execute_command('TS._DEBUG', 'PANIC_NEXT_ANALYSIS_JOB')
+        client.execute_command('TS.OUTLIERS', key, 1000, 1000 + 99 * 1000, 'METHOD', 'zscore')
+
+        # The whole chunk goes to the lane and consumes it.
+        with pytest.raises(ResponseError, match='internal error'):
+            client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
+
+    def test_placement_follows_estimated_cost(self):
+        client = self._client()
+        key = 'test:outliers:placement'
+        create_normal_series(client, key, count=2000)
+
+        # 2,000 cheap samples stay inline: the armed panic is not consumed.
+        client.execute_command('TS._DEBUG', 'PANIC_NEXT_ANALYSIS_JOB')
+        client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore')
+
+        # The same range with two seasonal periods goes to the lane and consumes it.
+        with pytest.raises(ResponseError, match='internal error'):
+            client.execute_command('TS.OUTLIERS', key, '-', '+', 'METHOD', 'zscore', 'SEASONALITY', 24, 168)
+        wait_for_true(lambda: self.server.verify_string_in_logfile(
+            'job panicked: TS._DEBUG PANIC_NEXT_ANALYSIS_JOB'))

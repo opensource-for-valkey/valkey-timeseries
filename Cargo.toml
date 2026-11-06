@@ -101,6 +101,10 @@ harness = false
 name = "postings"
 harness = false
 
+[[bench]]
+name = "outliers"
+harness = false
+
 [[bin]]
 name = "compression_report"
 path = "tools/compression_report.rs"

@@ -1482,6 +1482,89 @@ mod tests {
     }
 
     #[test]
+    fn estimated_sample_count_counts_whole_chunks_the_range_touches() {
+        let mut series = TimeSeries::default();
+        // Four chunks of five samples: 1000..=5000, 6000..=10000, ...
+        for chunk_index in 0..4 {
+            let mut chunk = create_chunk(None);
+            for i in 1..=5 {
+                let sample = Sample {
+                    timestamp: (chunk_index * 5 + i) * 1000,
+                    value: 1.0,
+                };
+                chunk.add_sample(&sample).unwrap();
+            }
+            series.chunks.push(chunk);
+        }
+        series.update_state_from_chunks();
+
+        let estimate = |start, end| series.estimated_sample_count_in_range(start, end);
+        assert_eq!(estimate(1000, 20000), 20);
+        // One sample still counts as its whole chunk.
+        assert_eq!(estimate(7000, 7000), 5);
+        // Never below what the range actually reads.
+        for (start, end) in [(1000, 20000), (3000, 12000), (5000, 6000), (7000, 7000)] {
+            assert!(estimate(start, end) >= series.get_range(start, end).len());
+        }
+        // Outside the series, or reversed.
+        assert_eq!(estimate(21000, 30000), 0);
+        assert_eq!(estimate(0, 500), 0);
+        assert_eq!(estimate(8000, 7000), 0);
+    }
+
+    #[test]
+    fn sample_count_matches_what_get_range_returns() {
+        let chunks: [fn() -> TimeSeriesChunk; 3] = [
+            || TimeSeriesChunk::Gorilla(GorillaChunk::with_max_size(1024)),
+            || TimeSeriesChunk::Chimp(Default::default()),
+            || TimeSeriesChunk::Uncompressed(Default::default()),
+        ];
+        for new_chunk in chunks {
+            let mut series = TimeSeries::default();
+            // Four chunks of five samples: 1000..=5000, 6000..=10000, ...
+            for chunk_index in 0..4 {
+                let mut chunk = new_chunk();
+                for i in 1..=5 {
+                    let sample = Sample {
+                        timestamp: (chunk_index * 5 + i) * 1000,
+                        value: 1.0,
+                    };
+                    chunk.add_sample(&sample).unwrap();
+                }
+                series.chunks.push(chunk);
+            }
+            series.update_state_from_chunks();
+
+            let count = |start, end| series.sample_count_in_range(start, end);
+            // One sample inside a chunk is one sample, however long the chunk.
+            assert_eq!(count(7000, 7000), 1);
+            assert_eq!(count(1000, 20000), 20);
+            // Between samples, between chunks, outside the series, and reversed.
+            assert_eq!(count(7001, 7999), 0);
+            assert_eq!(count(5001, 5999), 0);
+            assert_eq!(count(21000, 30000), 0);
+            assert_eq!(count(8000, 7000), 0);
+            for start in (0..=21000).step_by(500) {
+                for end in (start..=21000).step_by(500) {
+                    assert_eq!(
+                        count(start, end),
+                        series.get_range(start, end).len(),
+                        "{start}..={end}"
+                    );
+                }
+            }
+
+            // A retention window hides the older samples from both.
+            series.retention = Duration::from_millis(4500);
+            assert_eq!(
+                series.sample_count_in_range(0, 20000),
+                series.get_range(0, 20000).len()
+            );
+            assert_eq!(series.sample_count_in_range(0, 20000), 5);
+        }
+    }
+
+    #[test]
     fn test_get_range_across_multiple_chunks() {
         let mut time_series = TimeSeries::default();
 

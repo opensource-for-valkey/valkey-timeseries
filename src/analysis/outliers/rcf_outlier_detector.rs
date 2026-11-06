@@ -1,5 +1,5 @@
 use super::utils::normalize_evidence;
-use crate::analysis::math::{calculate_mean, calculate_mean_std_dev, quantile};
+use crate::analysis::math::{calculate_mean_std_dev, quantile};
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal,
 };
@@ -10,6 +10,7 @@ use crate::config::num_threads;
 use krcf::{RandomCutForest, RandomCutForestOptions};
 #[cfg(test)]
 use orx_parallel::{Par, ParResult};
+#[cfg(test)]
 use valkey_module::logging::log_warning;
 use valkey_module::{ValkeyError, ValkeyResult};
 
@@ -76,14 +77,18 @@ pub struct RCFOptions {
     pub time_decay: Option<f64>,
     /// The size of the shingle (number of consecutive data points combined into a single point).
     pub shingle_size: Option<usize>,
-    /// Number of initial points to treat as a warmup window.
+    /// Number of initial points to treat as a warmup window. Unset means
+    /// `1 + sample_size / 4`, krcf's own default; see
+    /// [`RCFOptions::effective_output_after`].
     ///
-    /// Two effects:
-    /// 1. krcf will not emit meaningful scores from its internal `update()` path for
-    ///    the first `output_after` calls.
+    /// Three effects:
+    /// 1. krcf scores `0.0` for the first `output_after` points (`shingle_size - 1`
+    ///    more with a shingle, which only counts once it is full).
     /// 2. [`RcfOutlierDetector::detect`] suppresses anomaly flagging for indices
     ///    `0..output_after`, eliminating false positives that arise while the forest
     ///    is still learning the data distribution.
+    /// 3. The forest's leading zeros are left out of the cutoff in both threshold
+    ///    modes (see [`RCFOptions::first_scored_index`]), so they cannot shape it.
     pub output_after: Option<usize>,
     /// Whether to enable parallel execution for RCF operations.
     pub parallel_enabled: Option<bool>,
@@ -91,6 +96,9 @@ pub struct RCFOptions {
 
 pub const RCF_DEFAULT_NUM_TREES: usize = 100;
 pub const RCF_DEFAULT_SAMPLE_SIZE: usize = 256;
+/// The smallest `SAMPLE_SIZE` the forest can run. With two or more trees krcf fails
+/// partway through the series at 2 ("no more indices left in interval manager").
+pub const RCF_MIN_SAMPLE_SIZE: usize = 3;
 
 impl Default for RCFOptions {
     fn default() -> Self {
@@ -118,6 +126,26 @@ impl RCFOptions {
             output_after: overrides.output_after,
             parallel_enabled: overrides.parallel_enabled,
         }
+    }
+
+    /// The warmup length the detector and the forest both use.
+    ///
+    /// An explicit `output_after` wins. Otherwise it is krcf's own default,
+    /// `1 + sample_size / 4`, so that the module and the forest count the same warmup.
+    pub fn effective_output_after(&self) -> usize {
+        self.output_after
+            .unwrap_or_else(|| 1 + self.sample_size.unwrap_or(RCF_DEFAULT_SAMPLE_SIZE) / 4)
+    }
+
+    /// The index of the first point the forest scores above `0.0`, and so where the
+    /// cutoff fit starts.
+    ///
+    /// With internal shingling the forest only counts an update once the shingle is
+    /// full, so its run of `0.0` scores is `shingle_size - 1` points longer than
+    /// `output_after`.
+    pub fn first_scored_index(&self) -> usize {
+        self.effective_output_after()
+            .saturating_add(self.shingle_size.unwrap_or(1).saturating_sub(1))
     }
 
     /// Heuristic: decide whether to enable parallel execution for RCF operations.
@@ -176,7 +204,10 @@ impl From<RCFOptions> for RandomCutForestOptions {
             sample_size: options.sample_size,
             lambda: options.time_decay,
             shingle_size: options.shingle_size.unwrap_or(1),
-            output_after: options.output_after,
+            // The same value the detector suppresses flagging on. The forest's run of
+            // `0.0` scores is `shingle_size - 1` points longer when it shingles; the
+            // cutoff fit starts after that (`first_scored_index`).
+            output_after: Some(options.effective_output_after()),
             parallel_execution_enabled,
             internal_shingling,
             // Fixed so the same query over the same data scores the same way every time.
@@ -198,15 +229,19 @@ pub struct RcfOutlierDetector {
     forest: RandomCutForest,
     /// The anomaly score threshold above which a point is considered an outlier.
     threshold: Option<RCFThreshold>,
-    /// Number of leading points whose scores are excluded from anomaly detection.
-    /// Mirrors [`RCFOptions::output_after`].  Zero means no warmup suppression.
+    /// Number of leading points that are scored but never flagged. Mirrors
+    /// [`RCFOptions::effective_output_after`].  Zero means no warmup suppression.
     output_after: usize,
+    /// Index of the first point the forest scores above `0.0`: where the cutoff fit
+    /// starts. Mirrors [`RCFOptions::first_scored_index`].
+    fit_start: usize,
 }
 
 impl RcfOutlierDetector {
     pub fn new(options: RCFOptions) -> ValkeyResult<Self> {
         // Capture output_after before options is consumed by the From impl.
-        let output_after = options.output_after.unwrap_or(0);
+        let output_after = options.effective_output_after();
+        let fit_start = options.first_scored_index();
         let threshold = options.threshold;
         let rcf_options: RandomCutForestOptions = options.into();
         let forest = RandomCutForest::new(rcf_options)
@@ -216,6 +251,7 @@ impl RcfOutlierDetector {
             forest,
             threshold,
             output_after,
+            fit_start,
         })
     }
 
@@ -240,6 +276,7 @@ impl RcfOutlierDetector {
     }
 
     /// Like [`score`], but returns an error instead of logging + `NaN`.
+    #[cfg(test)]
     pub fn try_score(&self, value: f64) -> ValkeyResult<f64> {
         self.forest
             .score(&[value as f32])
@@ -288,11 +325,12 @@ impl RcfOutlierDetector {
     /// The method supports two thresholding strategies via [`RCFThreshold`]:
     ///
     /// 1. **StdDev (Default)**: Uses the Z-score of the RCF anomaly scores. A point is
-    ///    flagged if its score is `threshold` standard deviations above the mean of all
-    ///    scores in the batch.
+    ///    flagged if its score is `threshold` standard deviations above the mean of the
+    ///    batch's scores after the warmup.
     ///
     /// 2. **Contamination**: A non-parametric method that flags the top `contamination`
-    ///    proportion of points with the highest RCF scores (e.g., 0.01 flags the top 1%).
+    ///    proportion of points with the highest RCF scores after the warmup (e.g., 0.01
+    ///    flags the top 1%).
     ///
     /// # Score consistency
     ///
@@ -305,17 +343,27 @@ impl RcfOutlierDetector {
     /// # Direction
     ///
     /// RCF is a symmetric detector.  The [`AnomalySignal`] direction is derived by
-    /// comparing each anomalous value to the mean of the full input slice:
-    /// - value ≥ mean → [`AnomalySignal::Positive`]
-    /// - value < mean → [`AnomalySignal::Negative`]
+    /// comparing each anomalous value to the median of the full input slice, so that
+    /// one extreme value cannot change which side of normal the others fall on:
+    /// - value ≥ median → [`AnomalySignal::Positive`]
+    /// - value < median → [`AnomalySignal::Negative`]
     ///
     /// # State
     ///
     /// Points with index `< output_after` are scored and recorded in
     /// `AnomalyResult::scores` (preserving one score per input point), but are
-    /// **never classified as anomalies**.  This suppresses false positives that occur
+    /// **never classified as anomalies**.  The forest's leading zero scores, which with
+    /// a shingle run `shingle_size - 1` points past `output_after`, take no part in
+    /// fitting the cutoff in either mode.  This suppresses false positives that occur
     /// while the forest is still learning the data distribution.  Set `output_after`
-    /// in [`RCFOptions`] to control the size of the warmup window.
+    /// in [`RCFOptions`] to control the size of the warmup window; unset, it is
+    /// `1 + sample_size / 4`.
+    ///
+    /// # Precision
+    ///
+    /// The forest stores `f32`, so each value is centred on the series median in `f64`
+    /// before the cast; otherwise a large level would round the spread away. A value
+    /// that is still beyond `f32` after centring is an error.
     ///
     /// This method mutates `self.forest`.  For repeatable results always start from
     /// a fresh [`RcfOutlierDetector`]; `detect_anomalies_rcf` guarantees this by
@@ -333,30 +381,37 @@ impl RcfOutlierDetector {
             });
         }
 
+        // Direction, below, still reads the original values.
+        let centre = series_centre(ts);
+
         // Online pattern: score each point *before* updating the model so that the
         // anomaly score reflects the distribution seen *up to but not including*
         // the current point.
         let mut scores = Vec::with_capacity(ts.len());
 
         for &value in ts {
-            let raw = self.try_score(value).map_err(|e| {
-                let msg = format!("Failed to score RCF point: {e:?}");
-                log_warning(&msg);
-                TimeSeriesAnalysisError::AnomalyDetectionError(
-                    "failed to compute RCF score".to_string(),
-                )
+            let point = [centre_to_f32(value, centre)?];
+
+            let raw = self.forest.score(&point).map_err(|e| {
+                TimeSeriesAnalysisError::AnomalyDetectionError(format!(
+                    "failed to compute RCF score: {e}"
+                ))
             })?;
             scores.push(raw);
 
-            if let Err(e) = self.forest.update(&[value as f32]) {
-                log_warning(format!("Failed to update RCF with value {value}: {e:?}"));
-            }
+            // A failed update leaves the forest out of step with the series, so every
+            // later score would be against the wrong model. Report it.
+            self.forest.update(&point).map_err(|e| {
+                TimeSeriesAnalysisError::AnomalyDetectionError(format!("failed to update RCF: {e}"))
+            })?;
         }
 
         match threshold {
-            RCFThreshold::StdDev(threshold) => Ok(self.detect_with_zscores(ts, scores, threshold)),
+            RCFThreshold::StdDev(threshold) => {
+                Ok(self.detect_with_zscores(ts, centre, scores, threshold))
+            }
             RCFThreshold::Contamination(contamination) => {
-                Ok(self.detect_with_contamination(ts, scores, contamination))
+                Ok(self.detect_with_contamination(ts, centre, scores, contamination))
             }
         }
     }
@@ -374,6 +429,7 @@ impl RcfOutlierDetector {
     fn assemble(
         &self,
         values: &[f64],
+        centre: f64,
         raw_scores: &[f64],
         evidence: impl Fn(f64) -> f64,
         boundary: f64,
@@ -384,8 +440,9 @@ impl RcfOutlierDetector {
         // unrelated units, so the reported direction depended on whether the
         // series happened to live on the same numeric scale as the forest's
         // internal statistic.
-        let value_mean = calculate_mean(values);
-
+        //
+        // `centre` is the median: a mean dragged upward by one extreme value reports an
+        // ordinary spike as a dip, and `DIRECTION POSITIVE` then drops it.
         let mut scores = Vec::with_capacity(raw_scores.len());
         let mut anomalies: Vec<Anomaly> = Vec::with_capacity(4);
 
@@ -404,7 +461,7 @@ impl RcfOutlierDetector {
             }
 
             if score > 0.5 {
-                let signal = if value >= value_mean {
+                let signal = if value >= centre {
                     AnomalySignal::Positive
                 } else {
                     AnomalySignal::Negative
@@ -437,16 +494,32 @@ impl RcfOutlierDetector {
     fn detect_with_zscores(
         &mut self,
         values: &[f64],
+        centre: f64,
         raw_scores: Vec<f64>,
         threshold: f64,
     ) -> AnomalyResult {
-        let (mean, std_dev) = calculate_mean_std_dev(&raw_scores);
+        // The forest scores `0.0` until `fit_start`. Fitting the cutoff on those would let
+        // the warmup shape it, so only the scores the forest actually produced take
+        // part. (Contamination mode slices the same way.)
+        let start = self.fit_start.min(raw_scores.len());
+        let usable_scores = &raw_scores[start..];
+
+        // A spread needs at least two scores. Without them `(0, 0)` is what the fit
+        // returns, a cutoff collapsed onto zero that would flag every positive score.
+        // An unusable boundary scores every point 0.0, and the warmup flags nothing.
+        let (mean, boundary) = if usable_scores.len() < 2 {
+            (0.0, f64::NAN)
+        } else {
+            let (mean, std_dev) = calculate_mean_std_dev(usable_scores);
+            (mean, threshold * std_dev)
+        };
 
         self.assemble(
             values,
+            centre,
             &raw_scores,
             |raw| raw - mean,
-            threshold * std_dev,
+            boundary,
             threshold,
         )
     }
@@ -459,10 +532,11 @@ impl RcfOutlierDetector {
     fn detect_with_contamination(
         &self,
         values: &[f64],
+        centre: f64,
         raw_scores: Vec<f64>,
         contamination: f64,
     ) -> AnomalyResult {
-        let start = self.output_after.min(raw_scores.len());
+        let start = self.fit_start.min(raw_scores.len());
         let usable_scores = &raw_scores[start..];
 
         // Keep contamination in a safe open interval for quantile selection.
@@ -477,8 +551,45 @@ impl RcfOutlierDetector {
             quantile(usable_scores, 1.0 - contamination)
         };
 
-        self.assemble(values, &raw_scores, |raw| raw, boundary, contamination)
+        self.assemble(
+            values,
+            centre,
+            &raw_scores,
+            |raw| raw,
+            boundary,
+            contamination,
+        )
     }
+}
+
+/// The series median: what each value is centred on before the `f32` cast, and the
+/// reference for an anomaly's direction.
+///
+/// `f32` keeps 24 bits of mantissa, so a level far from zero takes the whole spread with
+/// it unless it is removed in `f64` first. It has to be the median and not the mean,
+/// because the values that matter are the ordinary ones: a single `1e12` among values
+/// near 100 moves the mean to about `2.49e9`, where `f32` steps are 256 apart and every
+/// ordinary value rounds to the same point.
+///
+/// Non-finite values are ignored. If the series is split evenly between levels too far
+/// apart for one `f32` scale, the spread within them is lost whatever the offset.
+fn series_centre(ts: &[f64]) -> f64 {
+    quantile(ts, 0.5)
+}
+
+/// `value - offset` as the `f32` the forest stores.
+///
+/// The subtraction happens in `f64`. A centred value only fails to fit when the series
+/// itself spans more than `f32` can hold; the forest would take the infinity as a
+/// point, so refuse it here instead.
+fn centre_to_f32(value: f64, offset: f64) -> TimeSeriesAnalysisResult<f32> {
+    let centred = (value - offset) as f32;
+    if centred.is_finite() {
+        return Ok(centred);
+    }
+    Err(TimeSeriesAnalysisError::AnomalyDetectionError(format!(
+        "RCF cannot represent {value} as a 32-bit float after centring on {offset}"
+    )))
 }
 
 /// RCF implements only [`AnomalyDetector`], not [`PointDetector`]. Under a
@@ -899,15 +1010,15 @@ mod tests {
         }
     }
 
-    /// A value clearly above the series mean must receive `Positive` signal;
+    /// A value clearly above the series median must receive `Positive` signal;
     /// a value clearly below must receive `Negative` signal.
     #[test]
-    fn detect_assigns_direction_relative_to_mean() {
-        // Build a series with mean ≈ 0.  High and low anomalies are symmetric.
+    fn detect_assigns_direction_relative_to_median() {
+        // Build a series with median 0.  High and low anomalies are symmetric.
         let n = 60usize;
         let mut ts: Vec<f64> = (0..n).map(|_| 0.0).collect();
-        ts[20] = 80.0; // well above mean → Positive
-        ts[40] = -80.0; // well below mean → Negative
+        ts[20] = 80.0; // well above median → Positive
+        ts[40] = -80.0; // well below median → Negative
 
         let mut detector = RcfOutlierDetector::new(RCFOptions {
             num_trees: Some(60),
@@ -927,14 +1038,14 @@ mod tests {
                 assert_eq!(
                     anomaly.signal,
                     AnomalySignal::Positive,
-                    "value {} above mean should be Positive",
+                    "value {} above median should be Positive",
                     anomaly.value
                 );
             } else if anomaly.value < 0.0 {
                 assert_eq!(
                     anomaly.signal,
                     AnomalySignal::Negative,
-                    "value {} below mean should be Negative",
+                    "value {} below median should be Negative",
                     anomaly.value
                 );
             }
@@ -949,7 +1060,7 @@ mod tests {
     /// whether the series happened to live near the forest's own numeric range.
     /// Raw RCF scores sit around 1-4; a series near 10,000 therefore has every
     /// value above that mean, and every anomaly was reported `Positive`,
-    /// including the dips. `detect_assigns_direction_relative_to_mean` above
+    /// including the dips. `detect_assigns_direction_relative_to_median` above
     /// cannot catch this: it builds a series centered on zero, where the two
     /// scales happen to agree.
     #[test]
@@ -978,14 +1089,14 @@ mod tests {
             assert_eq!(
                 dip.unwrap().signal,
                 AnomalySignal::Negative,
-                "{threshold:?}: a value far *below* the series mean must be Negative"
+                "{threshold:?}: a value far *below* the series median must be Negative"
             );
 
             if let Some(spike) = result.anomalies.iter().find(|a| a.index == 60) {
                 assert_eq!(
                     spike.signal,
                     AnomalySignal::Positive,
-                    "{threshold:?}: a value far above the series mean must be Positive"
+                    "{threshold:?}: a value far above the series median must be Positive"
                 );
             }
         }
@@ -1168,6 +1279,303 @@ mod tests {
             result.anomalies.len() <= 15,
             "Should not detect too many anomalies, got {}",
             result.anomalies.len()
+        );
+    }
+
+    /// The forest stores `f32`, which has 24 bits of mantissa: near 1e12 consecutive
+    /// integers are 65,536 apart, so a spike of 100 on top of a 1e12 level was rounded
+    /// away before the forest saw it. Values are centred in `f64` first.
+    #[test]
+    fn large_offset_does_not_erase_the_spike() {
+        let base: Vec<f64> = (0..120).map(|i| (i % 2) as f64).collect();
+        for offset in [0.0, 1e12] {
+            let mut ts: Vec<f64> = base.iter().map(|v| v + offset).collect();
+            ts[60] += 100.0;
+            let mut d = RcfOutlierDetector::new(RCFOptions {
+                threshold: Some(RCFThreshold::StdDev(3.0)),
+                output_after: Some(20),
+                ..Default::default()
+            })
+            .unwrap();
+            let r = d.detect(&ts).unwrap();
+            assert!(r.anomalies.iter().any(|a| a.index == 60), "offset {offset}");
+        }
+    }
+
+    /// `RCF_MIN_SAMPLE_SIZE` is where the forest starts working, not a guess. Below it
+    /// krcf runs out of interval-manager indices once there are two trees, so this uses
+    /// varied data: flat data only hits the limit at larger tree counts. If a krcf
+    /// upgrade lifts the limit the second half fails: lower the minimum then.
+    #[test]
+    fn minimum_sample_size_is_the_smallest_the_forest_can_run() {
+        let ts: Vec<f64> = (0..120).map(|i| ((i * 7) % 11) as f64).collect();
+        let detect = |sample_size, num_trees| {
+            RcfOutlierDetector::new(RCFOptions {
+                num_trees: Some(num_trees),
+                sample_size: Some(sample_size),
+                ..Default::default()
+            })
+            .unwrap()
+            .detect(&ts)
+        };
+        for num_trees in [1, 2, 3, 100] {
+            assert!(
+                detect(RCF_MIN_SAMPLE_SIZE, num_trees).is_ok(),
+                "{num_trees} trees"
+            );
+        }
+        let err = detect(RCF_MIN_SAMPLE_SIZE - 1, 2).unwrap_err().to_string();
+        assert!(err.contains("no more indices"), "{err}");
+        // krcf's error text, not its Debug form, reaches the client.
+        assert!(!err.contains("InvalidArgument"), "{err}");
+    }
+
+    /// One extreme value must not cost the rest of the series its precision. Centring on
+    /// the mean let a final `1e12` drag the offset to about `2.49e9`, where `f32` steps
+    /// are 256 apart: `100` and `150` rounded to the same point, so the earlier spike
+    /// scored 0 and vanished.
+    #[test]
+    fn one_extreme_value_does_not_erase_an_earlier_spike() {
+        let mut ts = vec![100.0f64; 400];
+        ts[200] = 150.0;
+        ts[399] = 1e12;
+
+        for threshold in [RCFThreshold::StdDev(3.0), RCFThreshold::Contamination(0.01)] {
+            let mut detector = RcfOutlierDetector::new(RCFOptions {
+                threshold: Some(threshold),
+                ..Default::default()
+            })
+            .unwrap();
+            let result = detector.detect(&ts).unwrap();
+            let spike = result.anomalies.iter().find(|a| a.index == 200);
+            let spike = spike.unwrap_or_else(|| {
+                panic!(
+                    "{threshold:?}: spike at 200 lost; score {}, flagged {:?}",
+                    result.scores[200],
+                    result.anomalies.iter().map(|a| a.index).collect::<Vec<_>>()
+                )
+            });
+            // The same extreme value must not flip the direction either: against the mean,
+            // 150 read as below a series whose every other point is 100.
+            assert_eq!(spike.signal, AnomalySignal::Positive, "{threshold:?}");
+        }
+    }
+
+    /// Under the default options a smooth series flags nothing in the warmup and next to
+    /// nothing after it. It passes with or without the warmup zeros in the cutoff fit, so
+    /// it says nothing about that fit: `cutoffs_are_fitted_on_the_scores_after_the_warmup`
+    /// does.
+    #[test]
+    fn smooth_series_has_no_false_positives_under_the_default_warmup() {
+        let ts: Vec<f64> = (0..300).map(|i| 10.0 + (i as f64 * 0.1).sin()).collect();
+        let mut d = RcfOutlierDetector::new(RCFOptions::default()).unwrap(); // output_after None -> 65
+        let r = d.detect(&ts).unwrap();
+        assert!(r.anomalies.iter().all(|a| a.index >= 65));
+        assert!(
+            r.anomalies.len() <= 3,
+            "{} flagged on a smooth series",
+            r.anomalies.len()
+        );
+    }
+
+    /// A warmup of `usize::MAX` plus a shingle must not overflow the index sum: the
+    /// fit start saturates, and `detect` clamps it to the series length.
+    #[test]
+    fn first_scored_index_saturates() {
+        let options = RCFOptions {
+            output_after: Some(usize::MAX),
+            shingle_size: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(options.first_scored_index(), usize::MAX);
+    }
+
+    /// With `OUTPUT_AFTER` unset the module and the forest must agree on the warmup, or
+    /// the module fits its cutoff on the forest's zeros. krcf's own default is
+    /// `1 + sample_size / 4`.
+    #[test]
+    fn default_warmup_follows_sample_size() {
+        assert_eq!(RCFOptions::default().effective_output_after(), 65);
+        let small = RCFOptions {
+            sample_size: Some(64),
+            ..Default::default()
+        };
+        assert_eq!(small.effective_output_after(), 17);
+        let explicit = RCFOptions {
+            output_after: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(explicit.effective_output_after(), 7);
+        let unset_size = RCFOptions {
+            sample_size: None,
+            ..Default::default()
+        };
+        assert_eq!(unset_size.effective_output_after(), 65);
+
+        let detector = RcfOutlierDetector::new(small).unwrap();
+        assert_eq!(detector.output_after, 17);
+        let options: RandomCutForestOptions = small.into();
+        assert_eq!(options.output_after, Some(17));
+    }
+
+    /// The raw forest scores `detect` sees for `ts`: the same centring, the same
+    /// score-then-update order, from a fresh forest.
+    fn replay_raw_scores(options: RCFOptions, ts: &[f64]) -> Vec<f64> {
+        let mut detector = RcfOutlierDetector::new(options).unwrap();
+        let centre = series_centre(ts);
+        ts.iter()
+            .map(|&v| {
+                let point = [(v - centre) as f32];
+                let score = detector.forest.score(&point).unwrap();
+                detector.forest.update(&point).unwrap();
+                score
+            })
+            .collect()
+    }
+
+    /// The forest answers `0.0` until it has seen `output_after` points, and with a
+    /// shingle it only counts a point once the shingle is full, so the first non-zero
+    /// score sits `shingle_size - 1` points later. That index is where the cutoff fit
+    /// has to start.
+    #[test]
+    fn module_and_forest_agree_on_the_warmup_boundary() {
+        let ts: Vec<f64> = (0..120).map(|i| 5.0 + ((i * 7) % 11) as f64).collect();
+        for shingle_size in [None, Some(1), Some(4), Some(8)] {
+            let options = RCFOptions {
+                sample_size: Some(64),
+                shingle_size,
+                ..Default::default()
+            };
+            let start = options.first_scored_index();
+            let raw = replay_raw_scores(options, &ts);
+            let first_nonzero = raw.iter().position(|&s| s > 0.0);
+            assert_eq!(first_nonzero, Some(start), "shingle_size {shingle_size:?}");
+        }
+    }
+
+    /// The cutoff is fitted on the scores the forest produced, not on its leading zeros
+    /// as well. The zeros inflate the spread, so a fit that includes them puts the
+    /// cutoff higher and hides points the forest scored as unusual. The leading zeros
+    /// include the `shingle_size - 1` points a shingle needs to fill.
+    #[test]
+    fn cutoffs_are_fitted_on_the_scores_after_the_warmup() {
+        let ts: Vec<f64> = (0..200).map(|i| 10.0 + (i as f64 * 0.1).sin()).collect();
+        for shingle_size in [None, Some(4), Some(8)] {
+            // StdDev: mean + 3 sd of the fitted scores.
+            let options = RCFOptions {
+                sample_size: Some(64),
+                shingle_size,
+                threshold: Some(RCFThreshold::StdDev(3.0)),
+                ..Default::default()
+            };
+            let start = options.first_scored_index();
+            let raw = replay_raw_scores(options, &ts);
+            let cutoff = |scores: &[f64]| {
+                let (mean, std_dev) = calculate_mean_std_dev(scores);
+                mean + 3.0 * std_dev
+            };
+            check_cutoff_fit(options, &ts, &raw, start, cutoff, "StdDev", shingle_size);
+
+            // Contamination: the 1 - c quantile of the fitted scores.
+            let options = RCFOptions {
+                threshold: Some(RCFThreshold::Contamination(0.1)),
+                ..options
+            };
+            let cutoff = |scores: &[f64]| quantile(scores, 0.9);
+            check_cutoff_fit(
+                options,
+                &ts,
+                &raw,
+                start,
+                cutoff,
+                "Contamination",
+                shingle_size,
+            );
+        }
+    }
+
+    /// `detect` must flag exactly the fitted-scores verdict, and the all-scores fit must
+    /// disagree about some point, or this cannot tell the two fits apart.
+    fn check_cutoff_fit(
+        options: RCFOptions,
+        ts: &[f64],
+        raw: &[f64],
+        start: usize,
+        cutoff: impl Fn(&[f64]) -> f64,
+        mode: &str,
+        shingle_size: Option<usize>,
+    ) {
+        let label = format!("{mode}, shingle_size {shingle_size:?}");
+        let fitted = cutoff(&raw[start..]);
+        let with_zeros = cutoff(raw);
+        assert!(
+            raw[start..]
+                .iter()
+                .any(|&r| (r > fitted) != (r > with_zeros)),
+            "{label}: no score falls between the cutoffs {fitted} and {with_zeros}"
+        );
+
+        let result = RcfOutlierDetector::new(options)
+            .unwrap()
+            .detect(ts)
+            .unwrap();
+        for (index, &r) in raw.iter().enumerate().skip(start) {
+            assert_eq!(
+                result.scores[index] > 0.5,
+                r > fitted,
+                "{label}: index {index}"
+            );
+        }
+    }
+
+    /// When the whole input falls in the warmup there is no score distribution to take a
+    /// cutoff from. A `(0, 0)` fit would collapse the cutoff onto zero and flag the lot.
+    #[test]
+    fn stddev_with_no_usable_scores_flags_nothing() {
+        let ts: Vec<f64> = (0..40).map(|i| (i % 5) as f64).collect();
+        for output_after in [40, 1000] {
+            let mut d = RcfOutlierDetector::new(RCFOptions {
+                threshold: Some(RCFThreshold::StdDev(3.0)),
+                output_after: Some(output_after),
+                ..Default::default()
+            })
+            .unwrap();
+            let r = d.detect(&ts).unwrap();
+            assert_eq!(r.scores.len(), ts.len());
+            assert!(r.anomalies.is_empty(), "output_after {output_after}");
+            assert!(
+                r.scores.iter().all(|&s| s == 0.0),
+                "output_after {output_after}"
+            );
+        }
+    }
+
+    /// A single usable score has no spread to measure either.
+    #[test]
+    fn stddev_with_a_single_usable_score_flags_nothing() {
+        let ts: Vec<f64> = (0..40).map(|i| (i % 5) as f64).collect();
+        let mut d = RcfOutlierDetector::new(RCFOptions {
+            threshold: Some(RCFThreshold::StdDev(3.0)),
+            output_after: Some(39),
+            ..Default::default()
+        })
+        .unwrap();
+        let r = d.detect(&ts).unwrap();
+        assert!(r.anomalies.is_empty());
+        assert!(r.scores.iter().all(|&s| s == 0.0));
+    }
+
+    /// A value that centres to something beyond `f32` must be refused, not handed to the
+    /// forest as an infinity.
+    #[test]
+    fn centred_value_beyond_f32_is_an_error() {
+        let mut ts = vec![0.0f64; 40];
+        ts[10] = 1e300;
+        let mut d = RcfOutlierDetector::new(RCFOptions::default()).unwrap();
+        let err = d.detect(&ts).unwrap_err();
+        assert!(
+            matches!(err, TimeSeriesAnalysisError::AnomalyDetectionError(_)),
+            "{err:?}"
         );
     }
 

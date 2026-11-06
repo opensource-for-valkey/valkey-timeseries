@@ -1,5 +1,6 @@
-use super::utils::{deviation_and_fence_distance, normalize_evidence, normalize_value};
+use super::utils::{deviation_and_fence_distance, normalize_evidence};
 use crate::analysis::TimeSeriesAnalysisResult;
+use crate::analysis::math::quantile_sorted;
 use crate::analysis::outliers::{
     AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo, PointDetector,
     detect_pointwise,
@@ -21,16 +22,14 @@ pub struct IQROutlierDetector {
 
 impl IQROutlierDetector {
     pub fn new(ts: &[f64], threshold: f64) -> Self {
-        let n = ts.len();
-
-        // Calculate quartiles
-        let mut sorted_values: Vec<f64> = ts.iter().map(|&x| normalize_value(x)).collect();
+        // A missing reading is left out of the quartiles rather than counted as a zero.
+        let mut sorted_values: Vec<f64> = ts.iter().copied().filter(|x| !x.is_nan()).collect();
         sorted_values.sort_by(|&a, &b| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal));
 
-        let q1_idx = n / 4;
-        let q3_idx = 3 * n / 4;
-        let q1 = sorted_values[q1_idx];
-        let q3 = sorted_values[q3_idx];
+        // Hyndman & Fan type 7: interpolated between the order statistics either
+        // side of the quantile, not the sample at a floored index.
+        let q1 = quantile_sorted(&sorted_values, 0.25);
+        let q3 = quantile_sorted(&sorted_values, 0.75);
         let iqr = q3 - q1;
 
         let lower_fence = q1 - threshold * iqr;
@@ -136,6 +135,24 @@ mod tests {
 
         assert_eq!(detector.classify(detector.center), AnomalySignal::None);
         assert_eq!(detector.score(detector.center), 0.0);
+    }
+
+    /// A missing reading is left out of the quartiles, not counted as a zero: the
+    /// fit over a series with gaps is the fit over the series without them.
+    #[test]
+    fn nan_samples_are_left_out_of_the_fit() {
+        let values: Vec<f64> = (0..24).map(|i| 40.0 + (i % 6) as f64).collect();
+        let mut with_gaps = values.clone();
+        with_gaps.insert(3, f64::NAN);
+        with_gaps.insert(17, f64::NAN);
+        with_gaps.push(f64::NAN);
+
+        let clean = IQROutlierDetector::new(&values, IQR_DEFAULT_THRESHOLD);
+        let gapped = IQROutlierDetector::new(&with_gaps, IQR_DEFAULT_THRESHOLD);
+
+        assert_eq!(gapped.lower_fence, clean.lower_fence);
+        assert_eq!(gapped.upper_fence, clean.upper_fence);
+        assert_eq!(gapped.center, clean.center);
     }
 
     #[test]
@@ -296,6 +313,22 @@ mod tests {
             result.anomalies[1].value, 5.0,
             "Should detect 5.0 as low outlier"
         );
+    }
+
+    #[test]
+    fn quartiles_follow_hyndman_fan_type_7() {
+        let v: Vec<f64> = (1..=10).map(|i| i as f64).collect();
+        let d = IQROutlierDetector::new(&v, 1.5);
+        let Some(MethodInfo::Fenced {
+            lower_fence,
+            upper_fence,
+            ..
+        }) = d.model_info()
+        else {
+            panic!()
+        };
+        assert!((lower_fence - (3.25 - 1.5 * 4.5)).abs() < 1e-12);
+        assert!((upper_fence - (7.75 + 1.5 * 4.5)).abs() < 1e-12);
     }
 
     #[test]

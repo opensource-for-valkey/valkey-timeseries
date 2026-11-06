@@ -6,7 +6,7 @@ Detect outliers in a time series.
 
 ```
 TS.OUTLIERS key fromTimestamp toTimestamp
-  METHOD method [method-options]
+  [METHOD method [method-options]]
   [OUTPUT <FULL | SIMPLE | CLEANED>]
   [DIRECTION <POSITIVE | NEGATIVE | BOTH>]
   [SEASONALITY period1 [period2 [period3 [period4]]]]
@@ -73,12 +73,18 @@ seasonal components based on the provided periods and perform detection on the r
 SEASONALITY [AUTO | period1 ...]
 ```
 
-* `AUTO` - Automatically detects the dominant seasonality period using periodograms. Suitable for data with unknown or
-  complex seasonal patterns.
+* `AUTO` - Automatically detects up to four seasonal periods, strongest first, using periodograms. Suitable for data
+  with unknown or complex seasonal patterns.
 * For a single period: Uses STL (Seasonal-Trend decomposition using LOESS)
 * For multiple periods: Uses MSTL (Multiple Seasonal-Trend decomposition using LOESS)
-* Periods must be unique positive integers
+* Periods must be unique integers ≥ 2 and ≤ half the number of finite samples in the range.
 * Requires at least `2 × max(period)` data points
+* Non-finite samples are removed before decomposition, so a gap shifts every later sample's phase; fill gaps upstream
+  if phase matters.
+
+**Caveat:** on a series that is flat apart from a spike, the decomposition leaves numeric noise in the residuals, so the
+robust methods (those built on the median, the MAD or quartiles) can flag many samples. Prefer running such a series
+without `SEASONALITY`.
 
 **Example:** `SEASONALITY 24 168` adjusts for daily (24 hours) and weekly (168 hours) patterns in hourly data.
 </details>
@@ -86,7 +92,8 @@ SEASONALITY [AUTO | period1 ...]
 <details open>
 <summary><code>METHOD</code></summary>
 
-Specifies the outlier detection algorithm. **Required**. The following methods are supported:
+Specifies the outlier detection algorithm. Optional: without it the command runs `METHOD ZSCORE THRESHOLD 3.0`. The
+following methods are supported:
 
 #### CUSUM
 
@@ -97,6 +104,15 @@ METHOD CUSUM
 ```
 
 Detects shifts in the mean by accumulating deviations from the target. No additional options.
+
+The target and the standard deviation are fitted on the first `min(n/2, 100)` samples (`n` counts the finite samples in
+the range); everything after is tested against that baseline. A constant head fits a zero standard deviation and so
+gives zero-width limits: every later sample that differs from it is reported.
+
+Every sample while an arm stays above `h` is reported; a sustained shift reports the whole shifted tail. An arm also
+decays by `k = 0.5` sigma per sample once the series is back on target, so a lone spike of `s` sigma keeps flagging for
+about `2 × (s − 5)` of the samples after it (`h` is 5 sigma; roughly `2s` for a large spike): one spike on a flat or
+very regular series can report a long trailing run. CUSUM is a change detector, not a point-outlier detector.
 
 ---
 
@@ -112,8 +128,9 @@ METHOD ESD [ALPHA alpha] [MAX_OUTLIERS max] [HYBRID | CLASSIC]
 
 * `ALPHA` - Significance level for the test, in the range `(0, 1)`. Default: `0.05`. Lower values are more conservative
   and report fewer outliers.
-* `MAX_OUTLIERS` - Upper bound on how many outliers to search for. Must be less than half the number of samples in the
-  range. Default: `n/2`.
+* `MAX_OUTLIERS` - Upper bound on how many outliers to search for. Must be a positive integer, less than half the
+  number of finite samples in the range, and at most `1000`. Default: `min(n/2, 100)`, where `n` is the number of
+  finite samples in the range; pass a larger value explicitly if you expect more than 100 outliers.
 * `HYBRID` - Studentize against the median and a normal-consistent MAD. **Default.** Robust: the reference point barely
   moves as outliers are removed.
 * `CLASSIC` - Studentize against the mean and sample standard deviation, as in Rosner's original procedure. Both are
@@ -146,7 +163,11 @@ METHOD EWMA [ALPHA alpha]
 
 **Options:**
 
-* `ALPHA` - Smoothing factor (0 < alpha ≤ 1). Default: `0.3`. Higher values give more weight to recent observations.
+* `ALPHA` - Smoothing factor, in the range `(0, 1]`. Default: `0.3`. Higher values give more weight to recent observations.
+
+The target and sigma are fitted on the first `min(n/2, 100)` samples (`n` counts the finite samples in the range);
+everything after is tested against that baseline. A constant head fits a zero sigma and so gives zero-width limits:
+every later sample that differs from it is reported.
 
 ---
 
@@ -162,6 +183,9 @@ METHOD IQR [THRESHOLD k]
 
 * `THRESHOLD` - IQR multiplier for fence boundaries. Default: `1.5`. Values beyond `Q1 - k×IQR` or `Q3 + k×IQR` are
   outliers.
+
+Q1 and Q3 are the 25th and 75th percentiles, linearly interpolated between neighbouring samples (Hyndman and Fan
+type 7, the default of R and NumPy).
 
 ---
 
@@ -208,10 +232,14 @@ METHOD SMOOTHED-ZSCORE [THRESHOLD threshold] [LAG lag] [INFLUENCE influence]
 
 **Options:**
 
-* `THRESHOLD` - Z-score threshold. Default: `3.0`
-* `LAG` - Window size for moving average. Default: `5`
+* `THRESHOLD` - Z-score threshold. Default: `3.5`
+* `LAG` - Window size for moving average. Must be a positive integer. Default: `10`
 * `INFLUENCE` - Weight of anomalies in calculations (0-1). Default: `0.5`. Lower values reduce the anomaly's impact on
-  subsequent detection.
+  subsequent detection; `0` freezes the baseline against flagged samples, which suits stationary data but flags most of
+  a series whose level drifts.
+
+The first `LAG` samples only seed the moving window and are never flagged. Requires at least `LAG + 1` finite samples;
+a shorter series is an error rather than an empty result.
 
 ---
 
@@ -262,16 +290,21 @@ METHOD RCF [NUM_TREES trees]
 **Options:**
 
 * `NUM_TREES` - Number of trees in forest. Default: `100`. Must be an integer from `1` to `512`.
-* `SAMPLE_SIZE` - Sample size per tree. Default: `256`. Must be an integer from `2` to `4096`.
-* `THRESHOLD` - Anomaly score threshold in standard deviations. Default: `3.0`
-* `CONTAMINATION` - The amount of contamination in the data set, i.e., the proportion of outliers in the data set.
-* `SHINGLE_SIZE` - Sliding window size. Default: `1`. Must be an integer from `1` to `128` and no larger than the number of samples in the query range. Use values > 1 for contextual anomalies.
-* `OUTPUT_AFTER` - Warmup period (samples). Default: `32`
-* `DECAY` - Time decay factor (0-1). Default: `0.1`. Controls how quickly old data is forgotten.
+* `SAMPLE_SIZE` - Sample size per tree. Default: `256`. Must be an integer from `3` to `4096`.
+* `THRESHOLD` - Anomaly score threshold in standard deviations above the mean of the forest scores. Default: `3.0`
+* `CONTAMINATION` - The amount of contamination in the data set, i.e., the proportion of outliers in the data set. From above `0` up to `0.5`.
+* `SHINGLE_SIZE` - Sliding window size. Default: `1`. Must be an integer from `1` to `128` and no larger than the number of *finite* samples in the query range: `NaN` and infinite samples are left out of the analysis, so they do not count. Use values > 1 for contextual anomalies.
+* `OUTPUT_AFTER` - Warmup period (samples). Must be a positive integer. Default: `1 + SAMPLE_SIZE / 4` (`65` for the default sample size). Values below that default can flag the forest's learning curve, including on flat data.
+* `DECAY` - Time decay factor, from `0` to `1`. Default: `0.1 / SAMPLE_SIZE`. Controls how quickly old data is forgotten.
 
-Either `THRESHOLD` or `CONTAMINATION` must be specified to determine the cutoff for anomaly scores. `THRESHOLD` sets a
-fixed score
-threshold, while `CONTAMINATION` determines the threshold based on the expected proportion of anomalies in the data.
+`THRESHOLD` and `CONTAMINATION` are alternative ways to set the cutoff for anomaly scores; if both are given, the later one applies. `THRESHOLD`
+places the cutoff a number of standard deviations above the mean of the forest scores, while `CONTAMINATION` places it
+at the quantile that leaves the expected proportion of anomalies above it. When neither is given, `THRESHOLD 3.0`
+applies.
+
+The first `OUTPUT_AFTER` samples are the warmup: the forest has not learned the data yet, so those samples are scored
+but never flagged. The forest scores `0.0` through the warmup, and with `SHINGLE_SIZE` above `1` for `SHINGLE_SIZE - 1`
+samples more while the shingle fills; those zero scores take no part in fitting the cutoff in either mode.
 
 The forest is built with a fixed random seed, so the same query over the same data always returns the same scores.
 
@@ -283,7 +316,8 @@ Returns anomaly information based on the `OUTPUT` format:
 
 #### SIMPLE format
 
-**Array reply:** Each anomaly as `[timestamp, value, signal, score]`
+**Array reply:** Each anomaly as `[timestamp, value, signal, score]`. The signal comes before the score here, the
+reverse of the `samples` tuples in the `FULL` format.
 
 * `timestamp` - Sample timestamp (integer)
 * `value` - Sample value (float)
@@ -297,7 +331,8 @@ Returns anomaly information based on the `OUTPUT` format:
 
 * `method` - Detection method name (string)
 * `direction` - Detection direction: `positive`, `negative`, or `both` (string)
-* `samples` - Array of sample tuples: `[[timestamp, value, score, signal], ...]`
+* `samples` - Array of sample tuples: `[[timestamp, value, score, signal], ...]`. The score comes before the signal
+  here, the reverse of the `SIMPLE` format's `[timestamp, value, signal, score]`.
     * `timestamp` - Sample timestamp (integer)
     * `value` - Original sample value (double)
     * `score` - Calculated anomaly score (0.0-1.0). `score > 0.5` for the samples the method flagged, `score <= 0.5` for
@@ -308,7 +343,8 @@ Returns anomaly information based on the `OUTPUT` format:
 * `method_info` - Algorithm-specific metadata (map, if available):
     * For the fence-based methods (ZSCORE, MODIFIED-ZSCORE, MAD, DOUBLE-MAD, IQR): `lower_fence`, `upper_fence`, and
       `center_line` where the method defines one
-    * For SPC methods (CUSUM, EWMA): `control_limits`, `center_line`
+    * For SPC methods (CUSUM, EWMA): `control_limits`, `center_line`. EWMA reports the steady-state limits; the first
+      few positions use tighter limits that converge to these.
     * Omitted for ESD, RCF, and SMOOTHED-ZSCORE, which fit no fences or control limits
 
 #### CLEANED format
@@ -327,14 +363,16 @@ as an anomaly.
 
 This makes `score > 0.5` a valid anomaly test without knowing which method produced the number or what threshold it was
 given, and makes scores comparable across methods. `0.0` and `1.0` are asymptotic — a score approaches `1.0` as evidence
-grows, but only degenerate or non-finite input reaches it exactly:
+grows, but only degenerate input reaches it exactly. Non-finite samples are never scored at all; see
+[Notes](#notes).
 
-* An infinite sample value is maximally anomalous: score `1.0`, and flagged.
-* A `NaN` sample scores `0.0` and is never flagged — a missing reading is not evidence of an anomaly.
-* When a method's fitted scale collapses to zero (a robust estimator on a series that is more than half constant), the
-  outcome depends on the method: `MAD`, `DOUBLE-MAD`, and `IQR` treat the collapsed fence as zero-width, so any deviation
-  at all scores `1.0` and is flagged; `ZSCORE`, `MODIFIED-ZSCORE`, `CUSUM`, and `EWMA` treat a collapsed scale as having
-  no boundary to test against, so every sample scores `0.0` and stays unflagged.
+When a method's fitted scale collapses (it is zero, or so small relative to the center that it is lost to rounding),
+all of `MAD`, `DOUBLE-MAD`, `IQR`, `ZSCORE`, `MODIFIED-ZSCORE`, `CUSUM`, and `EWMA` treat the limits as zero-width: any
+departure from the center scores `1.0` and is flagged. The test is relative to the center, so a series gets the same
+verdict whatever unit it is stored in. `ZSCORE`, `MODIFIED-ZSCORE`, `CUSUM`, and `EWMA` do not count departures that
+are only floating-point rounding error; `MAD`, `DOUBLE-MAD`, and `IQR` make no such allowance. A collapsed `CUSUM` or
+`EWMA` has no sigma to accumulate or smooth in, so it tests each sample on its own departure: a lone spike flags that
+sample and not the clean samples after it.
 
 The `THRESHOLD` echoed back in `parameters` stays on the **method's own** scale — standard deviations for `ZSCORE`, `k`
 for `MAD`, the decision interval for `CUSUM`, a fraction for `CONTAMINATION`. It is not on the score scale, and under
@@ -346,14 +384,12 @@ actually tested. Scores are comparable across methods only when computed over th
 
 ## Complexity
 
-O(N × M) where:
+N is the number of samples in the range.
 
-* N = number of samples in the range
-* M = method complexity factor (varies by algorithm)
-
-**Additional complexity for SEASONALITY:**
-
-* O(N × P × I) where P = number of periods, I = decomposition iterations (default: 2)
+* Fence-based methods: O(N log N)
+* ESD: O(N log N × MAX_OUTLIERS) with `HYBRID`, which re-sorts at each step; O(N × MAX_OUTLIERS) with `CLASSIC`
+* RCF: O(N × NUM_TREES × log(SAMPLE_SIZE))
+* Multi-period `SEASONALITY`: O(N²)
 
 ## Examples
 
@@ -399,7 +435,7 @@ Get detailed analysis with metadata for API request spikes:
 ```valkey-cli
 127.0.0.1:6379> TS.OUTLIERS requests:api - + OUTPUT FULL DIRECTION POSITIVE METHOD IQR THRESHOLD 1.5
 1) "method"
-2) "InterquartileRange"
+2) "iqr"
 3) "direction"
 4) "positive"
 5) "samples"
@@ -420,6 +456,8 @@ Get detailed analysis with metadata for API request spikes:
     2) "-50.3"
     3) "upper_fence"
     4) "250.7"
+    5) "center_line"
+    6) "100.2"
 ```
 
 </details>
@@ -520,9 +558,10 @@ Detect pattern-based anomalies using a sliding window:
 * **Minimum data requirements:**
     * At least 3 data points required for analysis (not counting NaN or infinite values)
     * For `SEASONALITY`: requires at least `2 × max(period)` samples
+    * For `SMOOTHED-ZSCORE`: requires at least `LAG + 1` finite samples
 * **Seasonality constraints:**
     * Maximum 4 periods allowed
-    * Periods must be unique positive integers
+    * Periods must be unique integers ≥ 2 and ≤ half the number of finite samples
     * Automatically sorted in ascending order
 * **Score normalization:**
     * All anomaly scores normalized to [0.0, 1.0] range
@@ -534,20 +573,33 @@ Detect pattern-based anomalies using a sliding window:
       scored. In `FULL` output they appear with a `nan` score and a `0` signal.
 * **Timestamp preservation:**
     * Output timestamps match original series timestamps
-* **Large ranges run in the background:**
-    * Above 1,000 samples for `rcf` and `esd`, or 5,000 samples for the other methods, the detection runs on the
-      analysis lane, a small pool of worker threads (`ts-num-threads`, clamped to 2–8), so the server keeps serving
-      other clients meanwhile.
+* **Expensive detections run in the background:**
+    * Where a detection runs depends on its estimated cost, which the sample count, the method, its options and
+      `SEASONALITY` all raise. The lightest methods with no seasonality stay on the main thread up to about 5,000
+      samples. With default options `esd` leaves it from about 500 samples and `rcf` from about 7, or from the fewest
+      samples detection accepts when `NUM_TREES` and `SAMPLE_SIZE` are large, since building the forest is part of
+      the cost; two-period seasonality leaves it from about 150. Past that point the detection runs on the analysis lane, a small pool of
+      worker threads (`ts-num-threads`, clamped to 2–8), so the server keeps serving other clients meanwhile.
     * The lane queues up to 256 detections. When it is full the command is refused at once with
       `TSDB: outlier detection: too many queued jobs (limit 256)`; retry later.
     * Inside `MULTI`, a Lua script or a module call the client cannot be blocked, so the detection runs inline on
-      the main thread instead, whatever its size.
+      the main thread instead, whatever its cost.
+* **Sample limit:**
+    * The config `ts-outliers-max-samples` (default 1,000,000, minimum 1,000, changeable at runtime with
+      `CONFIG SET ts.ts-outliers-max-samples <n>`) limits the samples one request may read. A larger request is
+      refused before the range is read, with
+      `TSDB: outlier detection: range holds N samples, limit is M`. The limit also applies inside `MULTI`, a
+      Lua script or a module call.
+    * The count is exact, so a narrow range inside a large chunk counts only the samples it covers.
+    * The limit is checked once, on submission. Lowering it does not cancel a detection already admitted.
 * **Performance tips:**
     * Use `DIRECTION` to filter results when only interested in one type of anomaly
     * Single seasonality periods are faster than multiple
     * RCF is more computationally expensive but better for complex patterns
-    * ESD re-tests the sample after each removal, so its cost scales with `MAX_OUTLIERS`; lower that bound if you only
-      care about the few most extreme samples
+    * ESD re-tests the sample after each removal, so its cost grows with `MAX_OUTLIERS` times the number of samples,
+      and times their logarithm with `HYBRID`
+      (`MAX_OUTLIERS` defaults to `min(n/2, 100)` and is capped at `1000`); lower that bound if you only care about the
+      few most extreme samples
 
 ## See also
 

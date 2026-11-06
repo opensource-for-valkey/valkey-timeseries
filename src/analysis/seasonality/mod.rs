@@ -4,9 +4,10 @@ pub mod stl;
 #[cfg(test)]
 pub mod test_data;
 
+use crate::analysis::math::is_constant;
 use crate::analysis::seasonality::mstl::Mstl;
 use crate::analysis::seasonality::stl::Stl;
-use crate::analysis::{TimeSeriesAnalysisError, TimeSeriesAnalysisResult};
+use crate::analysis::{INSUFFICIENT_DATA_ERROR, TimeSeriesAnalysisError, TimeSeriesAnalysisResult};
 pub use periodogram::Detector as PeriodogramDetector;
 
 #[derive(Clone, Debug)]
@@ -14,6 +15,12 @@ pub enum Seasonality {
     Auto,
     Periods(Vec<usize>),
 }
+
+/// Maximum number of seasonal periods accepted by `SEASONALITY`.
+pub const MAX_SEASONALITY_PERIODS: usize = 4;
+
+/// Smallest meaningful seasonal period: a period of 0 or 1 has no cycle to remove.
+pub const MIN_SEASONALITY_PERIOD: usize = 2;
 
 /// Seasonal adjustment using (M)Stl decomposition
 pub fn seasonally_adjust(
@@ -23,7 +30,8 @@ pub fn seasonally_adjust(
     let mut periods = match seasonality {
         Seasonality::Periods(periods) => periods.clone(),
         Seasonality::Auto => {
-            // use periodogram to detect periods
+            // use periodogram to detect periods; `detect` already caps the list at
+            // MAX_SEASONALITY_PERIODS, strongest first
             let detector = PeriodogramDetector::default();
             detector.detect(ts).iter().map(|&x| x as usize).collect()
         }
@@ -34,12 +42,28 @@ pub fn seasonally_adjust(
     }
 
     periods.sort_unstable();
+    validate_periods(&periods, ts.len())?;
 
-    let n = ts.len();
+    // Nothing to remove, and decomposing would only leave rounding noise that
+    // detectors then read as signal.
+    if is_constant(ts) {
+        return Ok(ts.to_vec());
+    }
+
+    // Both decompositions scale linearly, so this only keeps their arithmetic inside the f64
+    // range; the remainder comes back in the units of the series.
+    let scale = overflow_safe_scale(ts);
+    if scale == 1.0 {
+        return decompose(ts, periods);
+    }
+    let scaled: Vec<f64> = ts.iter().map(|x| x * scale).collect();
+    let mut remainder = decompose(&scaled, periods)?;
+    remainder.iter_mut().for_each(|x| *x /= scale);
+    Ok(remainder)
+}
+
+fn decompose(ts: &[f64], periods: Vec<usize>) -> TimeSeriesAnalysisResult<Vec<f64>> {
     if periods.len() == 1 {
-        let required = 2 * periods[0];
-        validate_insufficient_data::<Vec<f64>>(required, n)?;
-
         Stl::new(periods[0])
             .robust()
             .decompose(ts)
@@ -48,11 +72,7 @@ pub fn seasonally_adjust(
                 TimeSeriesAnalysisError::DecompositionError("STL decomposition failed".to_string())
             })
     } else {
-        let max_period = periods[periods.len() - 1];
-        let required = 2 * max_period;
-        validate_insufficient_data::<Vec<f64>>(required, n)?;
-
-        Mstl::new(periods.to_vec())
+        Mstl::new(periods)
             .robust()
             .decompose(ts)
             .map(|res| res.remainder)
@@ -62,18 +82,43 @@ pub fn seasonally_adjust(
     }
 }
 
-fn validate_insufficient_data<T: Default>(
-    required: usize,
-    actual: usize,
-) -> TimeSeriesAnalysisResult<T> {
-    if actual >= required {
-        return Ok(T::default());
+/// The factor that brings huge samples back into a range where sums, differences and squares
+/// cannot overflow: once any magnitude exceeds 2^400, the power of two that puts the peak near 1,
+/// otherwise 1. A power of two scales exactly, and ordinary series are left alone. Scaling to the
+/// peak rather than by a fixed factor keeps samples clear of the absolute tolerances in STL.
+fn overflow_safe_scale(data: &[f64]) -> f64 {
+    let peak = data.iter().fold(0.0_f64, |peak, x| peak.max(x.abs()));
+    if peak.is_finite() && peak > 2f64.powi(400) {
+        2f64.powi(-(peak.log2().floor() as i32))
+    } else {
+        1.0
     }
-    Err(TimeSeriesAnalysisError::InsufficientData {
-        message: "TSDB: insufficient samples for anomaly detection".to_string(),
-        required,
-        actual,
-    })
+}
+
+/// Checks every period against a series of `n` samples before any arithmetic or allocation
+/// depends on it. A period must be at least [`MIN_SEASONALITY_PERIOD`] and the series must
+/// hold at least two full cycles of it. `2 * period` saturates at `usize::MAX`, so an
+/// oversized period reports `required: usize::MAX` instead of wrapping.
+pub fn validate_periods(periods: &[usize], n: usize) -> TimeSeriesAnalysisResult<()> {
+    for &period in periods {
+        if period < MIN_SEASONALITY_PERIOD {
+            return Err(TimeSeriesAnalysisError::InvalidParameter {
+                name: "period".to_string(),
+                message: format!(
+                    "seasonal periods must be at least {MIN_SEASONALITY_PERIOD}, got {period}"
+                ),
+            });
+        }
+        let required = period.saturating_mul(2);
+        if n < required {
+            return Err(TimeSeriesAnalysisError::InsufficientData {
+                message: INSUFFICIENT_DATA_ERROR.to_string(),
+                required,
+                actual: n,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -81,6 +126,57 @@ mod tests {
     use super::*;
     use crate::analysis::TimeSeriesAnalysisError;
     use crate::analysis::seasonality::test_data::SEASON_SEVEN;
+
+    #[test]
+    fn constant_series_is_returned_undecomposed() {
+        let values = vec![0.1; 100];
+        for periods in [vec![24], vec![7, 24]] {
+            let adjusted = seasonally_adjust(&values, &Seasonality::Periods(periods)).unwrap();
+            assert_eq!(adjusted, values);
+        }
+    }
+
+    #[test]
+    fn constant_series_still_has_its_periods_validated() {
+        let values = vec![5.0; 10];
+        let too_long = seasonally_adjust(&values, &Seasonality::Periods(vec![24])).unwrap_err();
+        assert_insufficient_data(&too_long, 48, 10);
+
+        let too_short = seasonally_adjust(&values, &Seasonality::Periods(vec![1])).unwrap_err();
+        assert!(matches!(
+            too_short,
+            TimeSeriesAnalysisError::InvalidParameter { .. }
+        ));
+    }
+
+    #[test]
+    fn huge_series_decompose_like_ordinary_ones() {
+        let cycle = |exp: i32| -> Vec<f64> {
+            let factor = 2f64.powi(exp);
+            (0..256)
+                .map(|i| [0.1, 0.3, 0.8, 0.5][i % 4] * factor)
+                .collect()
+        };
+        for seasonality in [
+            Seasonality::Auto,
+            Seasonality::Periods(vec![4]),
+            Seasonality::Periods(vec![4, 8]),
+        ] {
+            let expected = seasonally_adjust(&cycle(0), &seasonality).unwrap();
+            for exp in [512, 1000, 1023] {
+                let factor = 2f64.powi(exp);
+                let adjusted = seasonally_adjust(&cycle(exp), &seasonality).unwrap();
+                for (got, want) in adjusted.iter().zip(&expected) {
+                    assert!(got.is_finite(), "{seasonality:?} 2^{exp}");
+                    assert!(
+                        (got / factor - want).abs() < 1e-9,
+                        "{seasonality:?} 2^{exp}: {} vs {want}",
+                        got / factor
+                    );
+                }
+            }
+        }
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -226,5 +322,46 @@ mod tests {
         let result = seasonally_adjust(&data, &Seasonality::Auto).unwrap();
 
         assert_eq!(result, data);
+    }
+
+    // ── period validation ────────────────────────────────────────────────────
+
+    #[test]
+    fn oversized_period_is_rejected_not_hung() {
+        let err = seasonally_adjust(&[1.0, 2.0, 1.0], &Seasonality::Periods(vec![1usize << 63]))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TimeSeriesAnalysisError::InsufficientData {
+                required: usize::MAX,
+                actual: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn periods_below_two_are_rejected() {
+        for p in [0usize, 1] {
+            let err =
+                seasonally_adjust(&vec![1.0; 50], &Seasonality::Periods(vec![p])).unwrap_err();
+            assert!(
+                matches!(err, TimeSeriesAnalysisError::InvalidParameter { ref name, .. } if name == "period"),
+                "{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn period_above_half_the_series_is_rejected() {
+        let err = seasonally_adjust(&vec![1.0; 50], &Seasonality::Periods(vec![26])).unwrap_err();
+        assert!(matches!(
+            err,
+            TimeSeriesAnalysisError::InsufficientData {
+                required: 52,
+                actual: 50,
+                ..
+            }
+        ));
     }
 }

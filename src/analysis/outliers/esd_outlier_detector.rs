@@ -6,6 +6,15 @@ use crate::analysis::outliers::{
 use crate::analysis::{TimeSeriesAnalysisError, TimeSeriesAnalysisResult};
 use statrs::distribution::{ContinuousCDF, StudentsT};
 
+/// How many outliers ESD searches for when `max_outliers` is not given, upper-bounded
+/// by `n / 2`. Each step re-fits and re-sorts the sample, so an `n / 2` default made the
+/// cost quadratic in the sample size.
+pub const ESD_DEFAULT_MAX_OUTLIERS: usize = 100;
+
+/// The largest explicit `max_outliers` ESD accepts. Bounds the number of step-down
+/// iterations, and with it the cost of one detection.
+pub const ESD_MAX_ITERATIONS: usize = 1_000;
+
 /// Which location/scale pair the studentized statistic is built from.
 ///
 /// The distinction is the one the literature draws between Rosner's generalized
@@ -55,7 +64,8 @@ pub struct ESDOutlierOptions {
     pub alpha: f64,
     /// Location/scale pair backing the test statistic.
     pub estimator: EsdEstimator,
-    /// Maximum number of outliers to detect. Must be < n/2.
+    /// Maximum number of outliers to detect. Must be < n/2 and at most [`ESD_MAX_ITERATIONS`].
+    /// If None, uses n/2, capped at [`ESD_DEFAULT_MAX_OUTLIERS`].
     pub max_outliers: Option<usize>,
 }
 
@@ -79,7 +89,8 @@ pub struct ESDOutlierDetector {
     alpha: f64,
     /// Location/scale pair backing the test statistic.
     estimator: EsdEstimator,
-    /// Maximum number of outliers to detect. Must be < n/2. If None, uses len(data)/2.
+    /// Maximum number of outliers to detect. Must be < n/2 and at most [`ESD_MAX_ITERATIONS`].
+    /// If None, uses n/2, capped at [`ESD_DEFAULT_MAX_OUTLIERS`].
     max_outliers: Option<usize>,
 }
 
@@ -117,6 +128,15 @@ impl AnomalyDetector for ESDOutlierDetector {
     }
 }
 
+/// The number of step-down iterations ESD runs on `n` observations: `explicit` when given,
+/// otherwise `n / 2` capped at [`ESD_DEFAULT_MAX_OUTLIERS`].
+///
+/// This is the single statement of the bound. It does not validate `explicit` — that stays in
+/// [`detect_anomalies_esd`] — so a caller predicting cost must pass a value that already passed it.
+pub(crate) fn effective_max_outliers(n: usize, explicit: Option<usize>) -> usize {
+    explicit.unwrap_or_else(|| (n / 2).min(ESD_DEFAULT_MAX_OUTLIERS))
+}
+
 fn detect_anomalies_esd(
     data: &[f64],
     alpha: f64,
@@ -126,19 +146,26 @@ fn detect_anomalies_esd(
     let n = data.len();
 
     // Parameter check: max_outliers
-    let max_outliers = match max_outliers {
-        Some(m) if m >= n / 2 => {
-            let message =
-                format!("max_outliers must be less than n/2. Got max_outliers = {m} and n = {n}",);
-            let err = TimeSeriesAnalysisError::InvalidParameter {
-                name: "max_outliers".to_string(),
-                message,
-            };
-            return Err(err);
+    let rejection = max_outliers.and_then(|m| {
+        if m >= n / 2 {
+            Some(format!(
+                "max_outliers must be less than n/2. Got max_outliers = {m} and n = {n}"
+            ))
+        } else if m > ESD_MAX_ITERATIONS {
+            Some(format!(
+                "max_outliers must be at most {ESD_MAX_ITERATIONS}. Got max_outliers = {m}"
+            ))
+        } else {
+            None
         }
-        Some(m) => m,
-        None => n / 2,
-    };
+    });
+    if let Some(message) = rejection {
+        return Err(TimeSeriesAnalysisError::InvalidParameter {
+            name: "max_outliers".to_string(),
+            message,
+        });
+    }
+    let max_outliers = effective_max_outliers(n, max_outliers);
 
     // Perform ESD test
     let (anomalies, scores) = esd_test(data, alpha, estimator, max_outliers)?;
@@ -182,7 +209,7 @@ impl Candidate {
 /// - `data`: slice of f64 values (original data)
 /// - `alpha`: significance level (default 0.05)
 /// - `estimator`: location/scale pair backing the statistic — see [`EsdEstimator`]
-/// - `max_outliers`: optional maximum number of outliers to search for. If None, uses len(data)/2.
+/// - `max_out`: the number of step-down iterations to run, already resolved by [`effective_max_outliers`]
 ///
 /// Returns a `TimeSeriesAnalysisResult<(Vec<Anomaly>, Vec<f64>)>` pair where `anomalies` contains
 /// detailed `Anomaly` structs (signal direction, original value/index, normalized score) and `scores`
@@ -196,7 +223,7 @@ fn esd_test(
     // This is normally enforced by the command parser, but ESD is also used
     // through the analysis API. Keeping the invariant here prevents invalid
     // quantiles from reaching `statrs`, which asserts its CDF input range.
-    if !alpha.is_finite() || !(0.0..1.0).contains(&alpha) {
+    if !(alpha > 0.0 && alpha < 1.0) {
         return Err(TimeSeriesAnalysisError::InvalidParameter {
             name: "alpha".to_string(),
             message: format!("alpha must be in the range (0, 1), got {alpha}"),
@@ -205,8 +232,10 @@ fn esd_test(
 
     let n_total = data.len();
 
-    // masked representation: Some(value) for active, None for masked
-    let mut masked: Vec<Option<f64>> = data.iter().cloned().map(Some).collect();
+    // The observations still under test, as (original index, value). Each step removes
+    // the chosen point with `swap_remove`, so the order of this vector is arbitrary and
+    // nothing here may depend on it.
+    let mut active: Vec<(usize, f64)> = data.iter().copied().enumerate().collect();
     let mut candidates: Vec<Candidate> = Vec::new();
 
     // per-observation scores (original ordering)
@@ -216,22 +245,20 @@ fn esd_test(
     let mut last_lambda: Option<f64> = None;
 
     for _ in 0..max_out {
-        // count non-masked
-        let n_non_masked = masked.iter().filter(|v| v.is_some()).count();
-        if n_non_masked < 3 {
+        if active.len() < 3 {
             // need at least 3 to compute t with df = n - 2 > 0
             break;
         }
 
-        let current_vals = active_points(&masked);
-        let Some((loc, _scale)) = loc_and_scale(&current_vals, estimator) else {
+        // One fit per step: the statistic is studentized against this same loc/scale.
+        let Some((loc, scale)) = loc_and_scale(&active, estimator) else {
             break;
         };
 
-        let (test_stat, test_idx) = calc_test_statistic(&current_vals, estimator);
+        let (test_stat, test_pos) = calc_test_statistic(&active, loc, scale);
 
-        // compute critical value using the current non-masked count
-        let n = n_non_masked as f64;
+        // compute critical value using the current active count
+        let n = active.len() as f64;
         let df = n - 2.0;
         if df <= 0.0 {
             break;
@@ -257,7 +284,7 @@ fn esd_test(
         // remember latest lambda
         last_lambda = Some(critical_value);
 
-        let value = data[test_idx];
+        let (test_idx, value) = active[test_pos];
         let signal = if value > loc {
             AnomalySignal::Positive
         } else {
@@ -272,8 +299,7 @@ fn esd_test(
             lambda: critical_value,
         });
 
-        // mask that index (in original indexing)
-        masked[test_idx] = None;
+        active.swap_remove(test_pos);
     }
 
     // Rosner's step-down rule: find the largest k whose statistic beats its own
@@ -331,51 +357,34 @@ fn esd_test(
     // largest surviving statistic puts the most extreme of them exactly on 0.5
     // and the rest below, which keeps them ranked instead of clamping them into
     // a tie.
-    score_active_points(
-        &active_points(&masked),
-        estimator,
-        last_lambda.unwrap_or(0.0),
-        &mut scores,
-    );
+    score_active_points(&active, estimator, last_lambda.unwrap_or(0.0), &mut scores);
 
     Ok((anomalies, scores))
 }
 
-/// Calculate the test statistic and index for the (masked) data.
-/// Returns (test_statistic, index_in_original_array)
-fn calc_test_statistic(values: &[(usize, f64)], estimator: EsdEstimator) -> (f64, usize) {
-    // If empty, return 0,0
-    if values.is_empty() {
-        return (0.0, 0);
-    }
-
-    let Some((loc, scale)) = loc_and_scale(values, estimator) else {
-        return (0.0f64, 0);
-    };
-
-    // Prevent division by zero; if scale is zero, return 0 statistic at index of maximum deviation
-    // find index with maximum absolute deviation
-    let (max_idx, max_dev) = values
-        .iter()
-        .map(|(i, x)| (*i, (x - loc).abs()))
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .unwrap();
-
-    if scale == 0.0 || scale.is_nan() {
-        return (0.0f64, max_idx);
-    }
-
-    let test_stat = max_dev / scale;
-    (test_stat, max_idx)
-}
-
-/// Collect the active observations from the masked representation.
-fn active_points(masked: &[Option<f64>]) -> Vec<(usize, f64)> {
-    masked
+/// The studentized statistic of the most extreme observation in `values`, against a `loc`/`scale`
+/// the caller has already fitted — fitting here would repeat the step's most expensive work.
+///
+/// Returns `(test_statistic, position_in_values)`; the position, not the original index, is what
+/// the caller needs to remove the point. Ties in deviation go to the highest original index, so
+/// the answer does not depend on the order of `values`. A zero or NaN scale yields a zero
+/// statistic, to avoid dividing by it, still at the most extreme point.
+fn calc_test_statistic(values: &[(usize, f64)], loc: f64, scale: f64) -> (f64, usize) {
+    let Some((pos, max_dev)) = values
         .iter()
         .enumerate()
-        .filter_map(|(i, v)| v.map(|x| (i, x)))
-        .collect()
+        .map(|(pos, &(idx, x))| (pos, idx, (x - loc).abs()))
+        .max_by(|a, b| a.2.total_cmp(&b.2).then(a.1.cmp(&b.1)))
+        .map(|(pos, _, dev)| (pos, dev))
+    else {
+        return (0.0, 0);
+    };
+
+    if scale == 0.0 || scale.is_nan() {
+        return (0.0, pos);
+    }
+
+    (max_dev / scale, pos)
 }
 
 /// Compute the location and scale used by the ESD detector.
@@ -462,14 +471,44 @@ fn median_values(values: &[(usize, f64)]) -> f64 {
 mod tests {
     use super::*;
 
+    /// The active observations as the step-down loop holds them: `(original index, value)`.
+    fn points(data: &[f64]) -> Vec<(usize, f64)> {
+        data.iter().copied().enumerate().collect()
+    }
+
     #[test]
     fn test_calc_test_statistic_median_mad() {
         // simple data with an outlier at index 4
         let data = [1.0, 1.1, 0.9, 1.05, 10.0];
-        let values = active_points(&data.iter().cloned().map(Some).collect::<Vec<_>>());
-        let (stat, idx) = calc_test_statistic(&values, EsdEstimator::Hybrid);
-        assert_eq!(idx, 4);
+        let values = points(&data);
+        let (loc, scale) = loc_and_scale(&values, EsdEstimator::Hybrid).unwrap();
+        let (stat, pos) = calc_test_statistic(&values, loc, scale);
+        assert_eq!(pos, 4);
         assert!(stat > 0.0);
+        assert_eq!(stat, (10.0 - loc).abs() / scale);
+    }
+
+    /// The statistic is studentized against the `loc`/`scale` it is handed, so the caller
+    /// fits once per step. A zero scale yields a zero statistic at the most extreme point.
+    #[test]
+    fn calc_test_statistic_uses_the_given_fit_and_survives_a_zero_scale() {
+        let values = points(&[1.0, 1.0, 4.0, 1.0]);
+        assert_eq!(calc_test_statistic(&values, 1.0, 1.5), (2.0, 2));
+        assert_eq!(calc_test_statistic(&values, 1.0, 0.0), (0.0, 2));
+        assert_eq!(calc_test_statistic(&[], 1.0, 1.0), (0.0, 0));
+    }
+
+    /// The loop removes points with `swap_remove`, which reorders the active set, so the
+    /// tie-break must not depend on slice order: equal deviations go to the highest
+    /// original index, as they did when the active set was always in index order.
+    #[test]
+    fn ties_resolve_to_the_highest_original_index_whatever_the_slice_order() {
+        // 8 has been swapped in ahead of 1; both sit 4.0 from the location.
+        let values = [(8, 5.0), (1, 5.0), (2, 1.0), (3, 1.0), (4, 1.0)];
+        assert_eq!(calc_test_statistic(&values, 1.0, 2.0), (2.0, 0));
+
+        let reversed = [(4, 1.0), (3, 1.0), (2, 1.0), (1, 5.0), (8, 5.0)];
+        assert_eq!(calc_test_statistic(&reversed, 1.0, 2.0), (2.0, 4));
     }
 
     /// `Hybrid` must studentize against median/MAD and `Classic` against
@@ -480,7 +519,7 @@ mod tests {
     #[test]
     fn estimator_selects_the_documented_location_and_scale() {
         let data = [-20.0, 1.0, 1.1, 0.9, 1.05, 1.2];
-        let values = active_points(&data.iter().cloned().map(Some).collect::<Vec<_>>());
+        let values = points(&data);
 
         let (hybrid_loc, _) = loc_and_scale(&values, EsdEstimator::Hybrid).unwrap();
         let (classic_loc, classic_scale) = loc_and_scale(&values, EsdEstimator::Classic).unwrap();
@@ -565,6 +604,14 @@ mod tests {
         assert!(matches!(
             err,
             TimeSeriesAnalysisError::InvalidParameter { ref name, .. } if name == "alpha"
+        ));
+    }
+
+    #[test]
+    fn alpha_zero_is_rejected() {
+        assert!(matches!(
+            detect_anomalies_esd(&[1.0, 2.0, 3.0, 9.0], 0.0, EsdEstimator::Hybrid, Some(1)),
+            Err(TimeSeriesAnalysisError::InvalidParameter { ref name, .. }) if name == "alpha"
         ));
     }
 
@@ -699,5 +746,82 @@ mod tests {
         assert!(indices.contains(&53)); // 6.01
         assert!(indices.contains(&52)); // 5.42
         assert!(indices.contains(&51)); // 5.34
+    }
+
+    #[test]
+    fn default_max_outliers_is_capped() {
+        let v: Vec<f64> = (0..5000).map(|i| (i % 7) as f64).collect();
+        let r = detect_anomalies_esd(&v, 0.05, EsdEstimator::Hybrid, None).unwrap();
+        assert_eq!(r.threshold, ESD_DEFAULT_MAX_OUTLIERS as f64);
+    }
+
+    #[test]
+    fn explicit_max_outliers_above_the_iteration_cap_is_rejected() {
+        let v: Vec<f64> = (0..5000).map(|i| (i % 7) as f64).collect();
+        assert!(
+            detect_anomalies_esd(&v, 0.05, EsdEstimator::Hybrid, Some(ESD_MAX_ITERATIONS + 1))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn smallest_legal_bound_terminates() {
+        let r = detect_anomalies_esd(
+            &[1.0, 1.1, 0.9, 1.05, 1.0, 10.0],
+            0.05,
+            EsdEstimator::Classic,
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(
+            r.anomalies.iter().map(|a| a.index).collect::<Vec<_>>(),
+            vec![5]
+        );
+    }
+
+    #[test]
+    fn explicit_max_outliers_at_the_iteration_cap_is_accepted() {
+        // n / 2 = 1001, so the cap, not the sample size, is the binding bound.
+        let v: Vec<f64> = (0..2002).map(|i| (i % 7) as f64).collect();
+        let r = detect_anomalies_esd(&v, 0.05, EsdEstimator::Classic, Some(ESD_MAX_ITERATIONS))
+            .unwrap();
+        assert_eq!(r.threshold, ESD_MAX_ITERATIONS as f64);
+    }
+
+    #[test]
+    fn explicit_max_outliers_must_stay_below_half_the_sample() {
+        let v = [1.0, 1.1, 0.9, 1.05, 1.0, 1.2, 0.95, 1.0, 1.1, 10.0];
+        assert!(matches!(
+            detect_anomalies_esd(&v, 0.05, EsdEstimator::Classic, Some(5)),
+            Err(TimeSeriesAnalysisError::InvalidParameter { ref name, .. }) if name == "max_outliers"
+        ));
+        assert!(detect_anomalies_esd(&v, 0.05, EsdEstimator::Classic, Some(4)).is_ok());
+    }
+
+    #[test]
+    fn iteration_cap_rejection_names_max_outliers() {
+        let v: Vec<f64> = (0..5000).map(|i| (i % 7) as f64).collect();
+        assert!(matches!(
+            detect_anomalies_esd(&v, 0.05, EsdEstimator::Classic, Some(ESD_MAX_ITERATIONS + 1)),
+            Err(TimeSeriesAnalysisError::InvalidParameter { ref name, .. }) if name == "max_outliers"
+        ));
+    }
+
+    /// One rule for the bound, shared with anything that needs to predict ESD's cost.
+    #[test]
+    fn effective_max_outliers_is_the_one_rule() {
+        // An explicit bound is taken as given; validating it is the caller's job.
+        assert_eq!(effective_max_outliers(5000, Some(7)), 7);
+        assert_eq!(effective_max_outliers(4, Some(1_000)), 1_000);
+        // Otherwise n / 2, capped.
+        assert_eq!(effective_max_outliers(0, None), 0);
+        assert_eq!(effective_max_outliers(10, None), 5);
+        assert_eq!(effective_max_outliers(199, None), 99);
+        assert_eq!(effective_max_outliers(200, None), ESD_DEFAULT_MAX_OUTLIERS);
+        assert_eq!(effective_max_outliers(201, None), ESD_DEFAULT_MAX_OUTLIERS);
+        assert_eq!(
+            effective_max_outliers(1_000_000, None),
+            ESD_DEFAULT_MAX_OUTLIERS
+        );
     }
 }

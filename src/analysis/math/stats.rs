@@ -8,6 +8,11 @@ fn sum_and_count_finite(data: &[f64]) -> (f64, usize) {
     })
 }
 
+/// True when every sample is exactly equal. A NaN compares unequal, so it is never constant.
+pub fn is_constant(data: &[f64]) -> bool {
+    data.windows(2).all(|w| w[0] == w[1])
+}
+
 /// Utility function to calculate mean and standard deviation of a slice of f64 values.
 pub fn calculate_mean_std_dev(data: &[f64]) -> (f64, f64) {
     let n = data.len();

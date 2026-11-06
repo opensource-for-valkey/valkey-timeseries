@@ -124,7 +124,10 @@ class TestRCFOutlierDetector(ValkeyTimeSeriesTestCaseBase):
         data = [42.0] * 200
         _add(self.client, key, 1_000, data)
 
-        raw = _rcf_cmd(self.client, key)
+        # 65 = 1 + SAMPLE_SIZE / 4, the warmup the forest itself needs. A shorter one lets
+        # the first scores after it, still on the forest's learning curve, stand out from
+        # the steady ones now that the warmup zeros no longer widen the cutoff.
+        raw = _rcf_cmd(self.client, key, "OUTPUT_AFTER", 65)
         anomalies = _parse_anomalies(raw)
 
         assert len(anomalies) == 0, f"expected no anomalies, got {anomalies}"
@@ -135,7 +138,8 @@ class TestRCFOutlierDetector(ValkeyTimeSeriesTestCaseBase):
         data = [10.0 + 0.5 * math.sin(i * 0.1) for i in range(200)]
         _add(self.client, key, 1_000, data)
 
-        raw = _rcf_cmd(self.client, key)
+        # 65 = 1 + SAMPLE_SIZE / 4; see the flat-data test above.
+        raw = _rcf_cmd(self.client, key, "OUTPUT_AFTER", 65)
         anomalies = _parse_anomalies(raw)
 
         # A gentle sine with amplitude 0.5 around 10 should not trigger
@@ -487,6 +491,20 @@ class TestRCFOutlierDetector(ValkeyTimeSeriesTestCaseBase):
             )
             assert raw is not None
 
+    def test_rcf_smallest_sample_size_runs(self):
+        """The documented minimum works on varied data, where the forest needs its samples."""
+        key = "rcf:options:smallest_sample_size"
+        _add(self.client, key, 1_000, [float((i * 7) % 11) for i in range(120)])
+
+        for num_trees in (1, 2, 50):
+            raw = self.client.execute_command(
+                "TS.OUTLIERS", key, "-", "+",
+                "METHOD", "rcf",
+                "NUM_TREES", num_trees,
+                "SAMPLE_SIZE", 3,
+            )
+            assert raw is not None
+
     def test_rcf_option_threshold_sensitivity(self):
         """Lowering THRESHOLD finds at least as many anomalies as a higher threshold."""
         key = "rcf:options:threshold_sensitivity"
@@ -583,10 +601,11 @@ class TestRCFOutlierDetector(ValkeyTimeSeriesTestCaseBase):
             ("NUM_TREES", 513, "must be between"),
             ("SAMPLE_SIZE", "1e300", "invalid integer value"),
             ("SAMPLE_SIZE", 1, "must be between"),
+            ("SAMPLE_SIZE", 2, "SAMPLE_SIZE must be between 3 and 4096"),
             ("SAMPLE_SIZE", 4097, "must be between"),
             ("SHINGLE_SIZE", 1.5, "invalid integer value"),
             ("SHINGLE_SIZE", 129, "must be between"),
-            ("SHINGLE_SIZE", 11, "cannot exceed the number of samples"),
+            ("SHINGLE_SIZE", 11, "cannot exceed the number of finite samples"),
         )
 
         for option, value, message in invalid_options:
@@ -596,6 +615,28 @@ class TestRCFOutlierDetector(ValkeyTimeSeriesTestCaseBase):
                     "METHOD", "rcf",
                     option, value,
                 )
+
+    def test_rcf_shingle_is_validated_against_finite_samples(self):
+        """SHINGLE_SIZE is bounded by the finite samples: NaN readings are left out of the analysis."""
+        key = "rcf:options:shingle_finite"
+        _add(self.client, key, 1_000, [10.0 + (i % 3) for i in range(10)])
+        for i in range(10, 15):
+            self.client.execute_command("TS.ADD", key, 1_000 + i * 1_000, "nan")
+
+        # 15 samples in the range, 10 of them finite
+        with pytest.raises(ResponseError, match="cannot exceed the number of finite samples"):
+            self.client.execute_command(
+                "TS.OUTLIERS", key, "-", "+",
+                "METHOD", "rcf",
+                "SHINGLE_SIZE", 12,
+            )
+
+        # The finite count itself is still a valid shingle size
+        self.client.execute_command(
+            "TS.OUTLIERS", key, "-", "+",
+            "METHOD", "rcf",
+            "SHINGLE_SIZE", 10,
+        )
 
     def test_rcf_option_decay(self):
         """DECAY option is accepted and the detector adapts to shifting data."""
@@ -802,15 +843,18 @@ class TestRCFOutlierDetector(ValkeyTimeSeriesTestCaseBase):
                 "METHOD", "rcf",
             )
 
-    def test_rcf_missing_method_raises_wrong_arity(self):
-        """Omitting METHOD entirely causes a wrong-arity or missing-argument error."""
-        key = "rcf:error:no_method"
+    def test_rcf_omitted_method_defaults_to_zscore(self):
+        """Omitting METHOD runs the default ZSCORE THRESHOLD 3.0, not the forest."""
+        key = "rcf:options:no_method"
         data = _baseline_with_spikes(n_baseline=120, spike_indices=[60], spike=500.0)
         _add(self.client, key, 1_000, data)
 
-        with pytest.raises(Exception):
-            # Too few args; the command requires at least key, from, to, and METHOD
-            self.client.execute_command("TS.OUTLIERS", key, "-", "+")
+        plain = self.client.execute_command("TS.OUTLIERS", key, "-", "+")
+        explicit = self.client.execute_command(
+            "TS.OUTLIERS", key, "-", "+", "METHOD", "zscore", "THRESHOLD", 3.0,
+        )
+        assert plain == explicit
+        assert plain, "the spike must be reported"
 
     # ── score properties ──────────────────────────────────────────────────────
 

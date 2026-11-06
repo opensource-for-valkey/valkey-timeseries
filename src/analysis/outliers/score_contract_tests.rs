@@ -17,10 +17,12 @@
 //! would hide real disagreements elsewhere.
 
 use super::{
-    AnomalyDetectionMethodOptions, AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal,
-    Detector, MADAnomalyOptions, RCFOptions, RCFThreshold, SmoothedZScoreOptions,
+    AnomalyDetectionMethodOptions, AnomalyDetector, AnomalyMethod, AnomalyOptions, AnomalyResult,
+    AnomalySignal, Detector, MADAnomalyOptions, RCFOptions, RCFThreshold, SmoothedZScoreOptions,
+    detect_anomalies,
 };
 use crate::analysis::outliers::esd_outlier_detector::ESDOutlierOptions;
+use crate::analysis::seasonality::Seasonality;
 
 /// Warmup length shared by the RCF cases, so the carve-out and the options
 /// cannot drift apart.
@@ -462,12 +464,10 @@ fn infinities_are_maximal_and_nan_is_never_flagged() {
 
     // And through the batch path, where `detect_pointwise` skips NaN outright.
     //
-    // Scoped to the pointwise detectors. The sequential ones still substitute
-    // `0.0` for a missing reading and let the substitute enter their running
-    // statistic, so an EWMA or CUSUM baseline is dragged toward zero by a gap in
-    // the data — a separate defect, tracked as out of scope for the score
-    // contract because it concerns what NaN contributes to a *fitted baseline*,
-    // not how it is scored.
+    // Scoped to the pointwise detectors, which can be fitted on the fixture
+    // as given. EWMA and CUSUM fit their baseline from the head of the series, so
+    // a NaN there leaves no baseline to score against; that they keep their
+    // running state across a NaN later in the series is pinned by their own tests.
     for case in method_cases() {
         let mut values = baseline(64);
         values[7] = f64::NAN;
@@ -801,6 +801,274 @@ fn reported_fences_agree_with_the_score_scale() {
             point.score(lower_fence + width * 0.01) < 0.5,
             "{}: just inside the lower fence must read as normal",
             case.name
+        );
+    }
+}
+
+/// The methods whose verdict is a fixed fence around a fitted center.
+fn fenced_cases() -> Vec<MethodCase> {
+    const FENCED: [&str; 5] = ["zscore", "modified-zscore", "mad", "double-mad", "iqr"];
+    method_cases()
+        .into_iter()
+        .filter(|case| FENCED.contains(&case.name))
+        .collect()
+}
+
+fn detect(values: &[f64], options: AnomalyDetectionMethodOptions) -> AnomalyResult {
+    detect_anomalies(
+        values,
+        &AnomalyOptions {
+            seasonality: None,
+            options,
+        },
+    )
+    .unwrap()
+}
+
+/// 40 varied samples with a spike at index 30, all multiplied by `scale`.
+fn flagged(case: &MethodCase, scale: f64) -> Vec<usize> {
+    let mut values: Vec<f64> = (0..40).map(|i| 1.0 + (i % 5) as f64 * 0.1).collect();
+    values[30] = 5.0;
+    let values: Vec<f64> = values.iter().map(|v| v * scale).collect();
+
+    let mut indices: Vec<usize> = detect(&values, case.options.clone())
+        .anomalies
+        .iter()
+        .map(|a| a.index)
+        .collect();
+    indices.sort_unstable();
+    indices
+}
+
+/// A scale cutoff in absolute units makes the verdict depend on the unit the
+/// data is stored in: the same series in kilo-units and in nano-units has to
+/// flag the same samples.
+#[test]
+fn spike_is_found_at_every_scale() {
+    for case in fenced_cases() {
+        let base = flagged(&case, 1.0);
+        assert!(
+            base.contains(&30),
+            "{}: spike missed at unit scale",
+            case.name
+        );
+        for scale in [1e-12, 1e-6, 1e6, 1e12] {
+            assert_eq!(
+                flagged(&case, scale),
+                base,
+                "{} at scale {scale}",
+                case.name
+            );
+        }
+    }
+}
+
+#[test]
+fn constant_baseline_then_step_is_flagged_by_the_spc_methods() {
+    let mut values = vec![5.0; 100];
+    values.extend(vec![50.0; 100]);
+
+    for options in [
+        AnomalyDetectionMethodOptions::Cusum,
+        AnomalyDetectionMethodOptions::Ewma(None),
+    ] {
+        let name = format!("{:?}", options.method());
+        let result = detect(&values, options);
+        assert!(
+            result.anomalies.iter().all(|a| a.index >= 100),
+            "{name}: the constant baseline must stay unflagged"
+        );
+        assert!(
+            result.anomalies.iter().any(|a| a.index == 100),
+            "{name}: the step must be flagged where it happens"
+        );
+        assert_eq!(result.scores[100], 1.0, "{name}");
+    }
+}
+
+#[test]
+fn constant_series_still_flags_nothing() {
+    let values = vec![5.0; 200];
+    for options in [
+        AnomalyDetectionMethodOptions::Cusum,
+        AnomalyDetectionMethodOptions::Ewma(None),
+        AnomalyDetectionMethodOptions::ZScore(None),
+        AnomalyDetectionMethodOptions::ModifiedZScore(None),
+    ] {
+        let name = format!("{:?}", options.method());
+        let result = detect(&values, options);
+        assert!(
+            result.anomalies.is_empty(),
+            "{name}: {:?}",
+            result.anomalies
+        );
+        assert!(result.scores.iter().all(|&s| s == 0.0), "{name}");
+    }
+}
+
+/// The mean of a constant series that binary cannot represent is off by a few
+/// ULPs, so its fitted standard deviation is dust rather than zero, and so is
+/// every deviation. Rounding is not evidence: not at any magnitude, length, or
+/// smoothing factor.
+#[test]
+fn constant_series_with_rounding_in_its_mean_flags_nothing() {
+    let levels = [
+        0.1,
+        -0.1,
+        0.3,
+        0.7,
+        1.1,
+        3.3,
+        1.306_144_243_935_541_7,
+        1.487_179_793_630_006_4,
+        1234.567,
+        1e6 + 0.1,
+        1e-12 * 0.1,
+        1e15 / 3.0,
+    ];
+    for level in levels {
+        for n in [3, 4, 7, 50, 200, 201, 1000, 20_000] {
+            let values = vec![level; n];
+            for options in [
+                AnomalyDetectionMethodOptions::Cusum,
+                AnomalyDetectionMethodOptions::Ewma(Some(0.0001)),
+                AnomalyDetectionMethodOptions::Ewma(Some(0.001)),
+                AnomalyDetectionMethodOptions::Ewma(Some(0.05)),
+                AnomalyDetectionMethodOptions::Ewma(Some(0.3)),
+                AnomalyDetectionMethodOptions::Ewma(Some(1.0)),
+                AnomalyDetectionMethodOptions::ZScore(None),
+                AnomalyDetectionMethodOptions::ZScore(Some(0.5)),
+                AnomalyDetectionMethodOptions::ModifiedZScore(None),
+            ] {
+                let label = format!("{options:?} on {n} x {level}");
+                let result = detect(&values, options);
+                assert!(
+                    result.anomalies.is_empty(),
+                    "{label}: {:?}",
+                    result.anomalies
+                );
+            }
+        }
+    }
+}
+
+/// Decomposing a constant series leaves a remainder of pure rounding noise, and
+/// with no spread but that noise every method would read it as signal.
+#[test]
+fn constant_series_with_seasonality_flags_nothing() {
+    let mut methods: Vec<AnomalyDetectionMethodOptions> = fenced_cases()
+        .into_iter()
+        .map(|case| case.options)
+        .collect();
+    methods.push(AnomalyDetectionMethodOptions::Cusum);
+    methods.push(AnomalyDetectionMethodOptions::Ewma(None));
+
+    for level in [5.0, 0.1] {
+        let values = vec![level; 400];
+        for options in &methods {
+            let result = detect_anomalies(
+                &values,
+                &AnomalyOptions {
+                    seasonality: Some(Seasonality::Periods(vec![24])),
+                    options: options.clone(),
+                },
+            )
+            .unwrap();
+            assert!(
+                result.anomalies.is_empty(),
+                "{options:?} on 400 x {level} flagged {} samples",
+                result.anomalies.len()
+            );
+        }
+    }
+}
+
+/// With a collapsed baseline neither SPC method has a sigma to work in. CUSUM has
+/// no slack to bleed an arm off with, so accumulating would flag the whole tail
+/// after one spike, and a decaying EWMA would stay outside zero-width limits long
+/// after the spike has passed. Each sample answers for its own departure instead,
+/// in the direction it departs.
+#[test]
+fn collapsed_spc_methods_flag_only_the_samples_that_depart() {
+    let mut values = vec![5.0; 200];
+    values[150] = 500.0;
+    values[170] = -500.0;
+
+    for options in [
+        AnomalyDetectionMethodOptions::Cusum,
+        AnomalyDetectionMethodOptions::Ewma(Some(0.05)),
+        AnomalyDetectionMethodOptions::Ewma(Some(0.3)),
+    ] {
+        let name = format!("{options:?}");
+        let result = detect(&values, options);
+
+        let signals: Vec<(usize, AnomalySignal)> = result
+            .anomalies
+            .iter()
+            .map(|a| (a.index, a.signal))
+            .collect();
+        assert_eq!(
+            signals,
+            vec![
+                (150, AnomalySignal::Positive),
+                (170, AnomalySignal::Negative)
+            ],
+            "{name}"
+        );
+        assert_eq!(result.scores[150], 1.0, "{name}");
+        assert_eq!(result.scores[151], 0.0, "{name}");
+    }
+}
+
+#[test]
+fn collapsed_ewma_flags_a_spike_and_nothing_after_it() {
+    let mut values = vec![5.0; 200];
+    values[150] = 500.0;
+
+    let result = detect(&values, AnomalyDetectionMethodOptions::Ewma(Some(0.3)));
+
+    let indices: Vec<usize> = result.anomalies.iter().map(|a| a.index).collect();
+    assert_eq!(indices, vec![150]);
+}
+
+/// A tiny standard deviation around a tiny center is a real scale. An absolute
+/// cutoff on it would call this baseline collapsed and flag every sample.
+#[test]
+fn spc_methods_keep_a_tiny_scale_around_a_tiny_center() {
+    let scale = 1e-20;
+    let mut values: Vec<f64> = (0..200).map(|i| (10.0 + noise(i)) * scale).collect();
+    values[150] = 500.0 * scale;
+
+    for options in [
+        AnomalyDetectionMethodOptions::Cusum,
+        AnomalyDetectionMethodOptions::Ewma(None),
+    ] {
+        let name = format!("{:?}", options.method());
+        let result = detect(&values, options.clone());
+        let unit: Vec<f64> = values.iter().map(|v| v / scale).collect();
+        let at_unit_scale = detect(&unit, options);
+
+        let indices = |r: &AnomalyResult| r.anomalies.iter().map(|a| a.index).collect::<Vec<_>>();
+        assert_eq!(indices(&result), indices(&at_unit_scale), "{name}");
+        assert!(result.anomalies.iter().all(|a| a.index >= 150), "{name}");
+    }
+}
+
+/// The baseline is fitted on at least two samples. One sample fits a zero scale
+/// by construction, which would read as a collapsed baseline on any short series.
+#[test]
+fn three_varied_samples_are_not_all_flagged_by_the_spc_methods() {
+    let values = [1.0, 2.0, 3.0];
+    for options in [
+        AnomalyDetectionMethodOptions::Cusum,
+        AnomalyDetectionMethodOptions::Ewma(None),
+    ] {
+        let name = format!("{:?}", options.method());
+        let result = detect(&values, options);
+        assert!(
+            result.anomalies.len() < values.len(),
+            "{name}: {:?}",
+            result.anomalies
         );
     }
 }
