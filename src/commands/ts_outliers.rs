@@ -63,7 +63,7 @@ acl_categories!(TS_OUTLIERS, "ts.outliers", "read timeseries");
     name: "ts.outliers",
     flags: [ReadOnly],
     summary: "Detect outlier samples in a time series over a timestamp range.",
-    complexity: "O(N log N) for the fence-based methods; ESD O(N*MAX_OUTLIERS), RCF O(N*NUM_TREES*log(SAMPLE_SIZE)), multi-period SEASONALITY O(N^2).",
+    complexity: "O(N log N) for the fence-based methods; ESD O(N log N*MAX_OUTLIERS) (CLASSIC O(N*MAX_OUTLIERS)), RCF O(N*NUM_TREES*log(SAMPLE_SIZE)), multi-period SEASONALITY O(N^2).",
     since: "1.0.0",
     arity: -4,
     key_spec: [{
