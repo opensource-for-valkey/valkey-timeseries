@@ -17,7 +17,7 @@ import threading
 import time
 import pytest
 from valkey import ResponseError, Valkey, ValkeyCluster
-from common import CompactionRule, parse_info_response
+from common import CompactionRule, LabelSearchResponse, parse_info_response
 from valkeytestframework.util.waiters import wait_for_true, WaitTimeout
 from valkeytestframework.conftest import resource_port_tracker
 from valkey_timeseries_test_case import (
@@ -1017,6 +1017,54 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
             assert target_client.execute_command("TS.RANGE", via_add, "-", "+") == [[1000, b"43"]]
             assert target_client.execute_command("TS.RANGE", copy_dst, "-", "+") == [[500, b"7"]]
             assert target_client.execute_command("TS.RANGE", rename_to, "-", "+") == []
+        finally:
+            self._cancel_migrations_quietly(source_client)
+            source_client.execute_command("DEBUG", "SLOTMIGRATION", "PREVENT-PAUSE", 0)
+
+    def test_filtered_label_names_do_not_count_hidden_series(self):
+        """A filtered TS.LABELNAMES reports a name's database-wide cardinality, which must leave
+        out series the node hides while their slot is importing, as the unfiltered search does."""
+        source_client = self.new_client_for_primary(0)
+        self._skip_if_asm_not_supported(source_client)
+        target_client = self.new_client_for_primary(1)
+        observer = self.new_client_for_primary(2)
+
+        source_tag = self._find_hash_tag_for_shard(source_client, "asm_names_src", shard_index=0)
+        target_tag = self._find_hash_tag_for_shard(source_client, "asm_names_dst", shard_index=1)
+        migrating = f"ts:{{{source_tag}}}:migrating"
+        source_client.execute_command(
+            "TS.CREATE", migrating, "LABELS", "hidden_probe", "migrating", "probe_group", "yes"
+        )
+        target_client.execute_command(
+            "TS.CREATE", f"ts:{{{target_tag}}}:local", "LABELS", "hidden_probe", "local", "probe_group", "yes"
+        )
+        slot = self._get_key_slot(source_client, migrating)
+
+        def cardinality(*selection):
+            reply = observer.execute_command(
+                "TS.LABELNAMES", "SEARCH", "hidden_probe", "INCLUDE_METADATA", *selection
+            )
+            matched = [
+                row for row in LabelSearchResponse.parse(reply).results
+                if row.value in (b"hidden_probe", "hidden_probe")
+            ]
+            assert len(matched) == 1, reply
+            return matched[0].cardinality
+
+        source_client.execute_command("DEBUG", "SLOTMIGRATION", "PREVENT-PAUSE", 1)
+        try:
+            self._migrate_slot_range(source_client, self._get_node_id(target_client), slot, slot)
+            wait_for_true(
+                lambda: "waiting-to-pause" in
+                        [self._migration_state(m) for m in self._get_slot_migrations(source_client)],
+                timeout=20,
+            )
+            # One series on the source, one on the target; the target also hides the migrating one.
+            assert cardinality() == 2
+            assert cardinality("FILTER", "probe_group=yes") == 2
+
+            source_client.execute_command("DEBUG", "SLOTMIGRATION", "PREVENT-PAUSE", 0)
+            self._wait_for_no_migrations(source_client)
         finally:
             self._cancel_migrations_quietly(source_client)
             source_client.execute_command("DEBUG", "SLOTMIGRATION", "PREVENT-PAUSE", 0)

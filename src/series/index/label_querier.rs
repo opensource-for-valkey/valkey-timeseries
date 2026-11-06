@@ -997,7 +997,7 @@ where
     }
 }
 
-/// The sum of the cardinalities of `name`'s values, read at most `entries_per_hold` entries
+/// The sum of the visible cardinalities of `name`'s values, read at most `entries_per_hold` entries
 /// per hold of the postings read lock: a high-cardinality name has a million entries.
 fn label_cardinality_in_holds(
     index: &TimeSeriesIndex,
@@ -1021,7 +1021,7 @@ fn label_cardinality_in_holds(
             .label_index
             .range::<[u8], _>((lower, Bound::Excluded(past.as_slice())))
         {
-            total += map.cardinality();
+            total += postings.visible_cardinality(map);
             read += 1;
             if read == entries_per_hold {
                 stopped_at = Some(key.as_ref().to_vec());
@@ -2665,6 +2665,21 @@ mod tests {
                     .results
                     .is_empty()
             );
+        }
+    }
+
+    #[test]
+    fn label_cardinality_of_a_filtered_search_leaves_out_hidden_series() {
+        // The filtered path reports this figure, and drops a name when it is zero.
+        let index = index_with_hidden_series();
+        for entries_per_hold in [1, 2, usize::MAX] {
+            for (name, expected) in [("job", 1), ("env", 1), ("only_imported", 0)] {
+                assert_eq!(
+                    label_cardinality_in_holds(&index, name, entries_per_hold),
+                    expected,
+                    "{name}, {entries_per_hold} per hold"
+                );
+            }
         }
     }
 
