@@ -198,6 +198,16 @@ impl Postings {
             .saturating_sub(self.hidden_ids.count_in(postings))
     }
 
+    /// The ids of `postings` a read may see now, for a set resolved under an earlier lock hold.
+    /// Stays borrowed when nothing is masked.
+    pub(in crate::series::index) fn visible_subset<'a>(
+        &self,
+        postings: &'a PostingsBitmap,
+    ) -> Cow<'a, PostingsBitmap> {
+        self.hidden_ids
+            .mask_cow(self.stale_ids.mask_cow(Cow::Borrowed(postings)))
+    }
+
     /// Stops hiding `id`, whose directory entry must still be in place. Returns whether it was.
     pub(super) fn forget_hidden(&mut self, id: SeriesRef) -> bool {
         if !self.hidden_ids.contains(id) {
