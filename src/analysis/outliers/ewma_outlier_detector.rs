@@ -74,10 +74,24 @@ impl EwmaOutlierDetector {
         self.multiplier * (self.sigma * (self.alpha / (2.0 - self.alpha)).sqrt())
     }
 
-    /// True when the fitted sigma leaves the control limits with zero width.
+    /// The standard deviation of the average after `observed` samples, given
+    /// `log_keep = ln(1 - alpha)`: `sigma * sqrt(alpha / (2 - alpha) * (1 - (1 - alpha)^(2n)))`.
+    ///
+    /// `ln_1p` and `exp_m1` because `1 - alpha` rounds to 1 below about 1e-16, which would
+    /// zero the limit whatever the sigma. Each factor has its own root so their product does
+    /// not underflow: sigma would otherwise be squared below ~1e-154 and overflow above
+    /// ~1e154, and a small alpha enters both of the other two.
+    fn transient_std(&self, log_keep: f64, observed: i32) -> f64 {
+        let settling = -(2.0 * f64::from(observed) * log_keep).exp_m1();
+        self.sigma * (self.alpha / (2.0 - self.alpha)).sqrt() * settling.sqrt()
+    }
+
+    /// True when the fitted sigma itself is lost in the target. Measured before alpha narrows
+    /// it: a small alpha shrinks the limits and the average's reach alike, so that chart
+    /// still has a scale and only the samples that move the average are departures.
     fn is_collapsed(&self) -> bool {
         self.target.is_finite()
-            && usable_fence_distance(self.target, self.steady_state_half_width()) == 0.0
+            && usable_fence_distance(self.target, self.multiplier * self.sigma) == 0.0
     }
 
     fn detect_smoothed(&self, ts: &[f64]) -> (Vec<f64>, Vec<Anomaly>) {
@@ -89,6 +103,7 @@ impl EwmaOutlierDetector {
         // leaves the average alone and the control limits where they were, rather
         // than widening them for a sample that never informed the average.
         let mut observed: i32 = 0;
+        let log_keep = (-self.alpha).ln_1p();
 
         for (i, &v) in ts.iter().enumerate() {
             if v.is_nan() {
@@ -108,12 +123,7 @@ impl EwmaOutlierDetector {
                 self.alpha * v + (1.0 - self.alpha) * ewma
             };
 
-            // Sigma scales the root rather than being squared inside it: `sigma * sigma`
-            // underflows below ~1e-154 and overflows above ~1e154, whatever the
-            // limit it describes.
-            let ewma_std = self.sigma
-                * (self.alpha / (2.0 - self.alpha) * (1.0 - (1.0 - self.alpha).powi(2 * observed)))
-                    .sqrt();
+            let ewma_std = self.transient_std(log_keep, observed);
 
             // The smoothed average's departure from target is the evidence; the
             // control limit that departure is tested against is the boundary.
@@ -690,6 +700,49 @@ mod tests {
         // What matters is that the average recovers and finds the outlier at 253.
         assert_eq!(flagged, vec![200, 201, 253]);
         assert!(result.scores.iter().all(|s| s.is_finite()));
+    }
+
+    /// Below about 1e-16 `1 - alpha` rounds to 1, which used to zero the control limits and
+    /// flag half of an unremarkable series. A real sigma keeps a chart from collapsing, and
+    /// an average that small an alpha cannot move stays inside its limits.
+    #[test]
+    fn a_tiny_alpha_does_not_collapse_the_limits() {
+        for alpha in [1e-16, 1e-17, 1e-20, 1e-40, 1e-100, 1e-160, 1e-200, 1e-300] {
+            for center in [0.0, 5.0, 1e-3, -1e6] {
+                let ts = shifted_after_alternating(center, 1.0, 0.0);
+                let d = EwmaOutlierDetector::from_series(&ts, alpha).unwrap();
+                let result = d.detect(&ts).unwrap();
+                assert!(
+                    result.anomalies.is_empty(),
+                    "alpha {alpha:e} center {center}: {} flagged",
+                    result.anomalies.len()
+                );
+            }
+        }
+    }
+
+    /// The closed form of the limit at each step, against the recurrence it solves.
+    #[test]
+    fn the_transient_limit_matches_its_recurrence() {
+        for alpha in [1.0, 0.9, 0.3, 1e-3, 1e-8] {
+            let (mut variance, sigma, multiplier) = (0.0, 2.0, 3.0);
+            let d = EwmaOutlierDetector {
+                alpha,
+                target: 0.0,
+                sigma,
+                multiplier,
+            };
+            let log_keep = (-alpha).ln_1p();
+            for observed in 1..=200 {
+                variance = (1.0 - alpha) * (1.0 - alpha) * variance + alpha * alpha;
+                let want = sigma * f64::sqrt(variance);
+                let got = d.transient_std(log_keep, observed);
+                assert!(
+                    ((got - want) / want).abs() < 1e-9,
+                    "{alpha} {observed}: {got} vs {want}"
+                );
+            }
+        }
     }
 
     #[test]
