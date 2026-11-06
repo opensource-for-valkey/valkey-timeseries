@@ -6,13 +6,12 @@
 //! of exported slots are retired once the export completes.
 use crate::common::context::{create_key_string, get_current_db, set_current_db};
 use crate::common::hash::BuildNoHashHasher;
-use crate::common::logging::{log_debug, log_notice};
+use crate::common::logging::{log_debug, log_notice, log_warning};
 use crate::common::metrics::asm as metrics;
 use crate::common::metrics::task::TaskRun;
 use crate::common::module_options::{HANDLE_ATOMIC_SLOT_MIGRATION, declare_module_options};
 use crate::common::sync::{lock, read_lock, write_lock};
 use crate::common::threads::LockGil;
-#[cfg(test)]
 use crate::fanout::NUM_SLOTS;
 use crate::fanout::{is_clustered, mark_cluster_map_stale};
 use crate::series::index::{TIMESERIES_INDEX, get_db_index, index_loaded_series};
@@ -156,26 +155,65 @@ struct ValkeyModuleAtomicSlotMigrationInfoV1 {
     num_slot_ranges: u32, // Number of slot ranges in the array.
 }
 
-impl ValkeyModuleAtomicSlotMigrationInfoV1 {
-    fn convert_slot_ranges(&self) -> RangeSetBlaze<u16> {
-        let mut ranges = RangeSetBlaze::new();
-        self.extend_slot_ranges(&mut ranges);
-        ranges
-    }
+/// The payload layout this module understands (`VALKEYMODULE_ATOMICSLOTMIGRATION_INFO_VERSION`).
+const ASM_INFO_VERSION: u64 = 1;
 
-    fn extend_slot_ranges(&self, dest: &mut RangeSetBlaze<u16>) {
-        for i in 0..self.num_slot_ranges {
-            unsafe {
-                let range = *self.slot_ranges.add(i as usize);
-                let start = range.start as u16;
-                let end = range.end as u16;
-                dest.extend(start..=end);
+/// Interprets the raw payload of an ASM server event as the set of slots it names.
+///
+/// The bindings do not describe this struct, so the layout above is transcribed from
+/// `valkeymodule.h` by hand and nothing checks it at compile time. Every field is therefore
+/// validated before it is trusted: a null payload, a version this module was not written
+/// against, a null or implausibly long range array, and any range outside `0..NUM_SLOTS` are
+/// rejected with a warning rather than reinterpreted (a `c_int` cast straight to `u16` would
+/// silently wrap). A bad range is skipped; an event that names no usable slot is dropped, so an
+/// `ImportStarted` the module cannot interpret defers nothing rather than registering a slot
+/// set a later event might not be able to remove.
+fn parse_event_payload(data: *mut c_void) -> Option<RangeSetBlaze<u16>> {
+    if data.is_null() {
+        log_warning("ASM event carried no payload; ignoring it");
+        return None;
+    }
+    // SAFETY: the server hands every ASM event a `ValkeyModuleAtomicSlotMigrationInfo` that
+    // outlives the callback; the null check above is the only precondition we can verify.
+    let info = unsafe { &*(data as *const ValkeyModuleAtomicSlotMigrationInfoV1) };
+    if info.version != ASM_INFO_VERSION {
+        log_warning(format!(
+            "ASM event payload version {} is not the supported version {ASM_INFO_VERSION}; ignoring the event",
+            info.version
+        ));
+        return None;
+    }
+    let count = info.num_slot_ranges as usize;
+    if count == 0 || count > NUM_SLOTS as usize {
+        log_warning(format!(
+            "ASM event names {count} slot ranges, which is not a plausible count; ignoring the event"
+        ));
+        return None;
+    }
+    if info.slot_ranges.is_null() {
+        log_warning("ASM event has a null slot range array; ignoring the event");
+        return None;
+    }
+    // SAFETY: non-null and `count` entries long by the checks above and the server's contract.
+    let ranges = unsafe { std::slice::from_raw_parts(info.slot_ranges, count) };
+    let mut slots = RangeSetBlaze::new();
+    for range in ranges {
+        match (u16::try_from(range.start), u16::try_from(range.end)) {
+            (Ok(start), Ok(end)) if start <= end && end < NUM_SLOTS => {
+                slots.ranges_insert(start..=end);
             }
+            _ => log_warning(format!(
+                "ASM event names slot range {}-{}, outside 0..{NUM_SLOTS}; skipping it",
+                range.start, range.end
+            )),
         }
     }
+    if slots.is_empty() {
+        log_warning("ASM event named no usable slot; ignoring the event");
+        return None;
+    }
+    Some(slots)
 }
-
-type ValkeyModuleAtomicSlotMigrationInfo = ValkeyModuleAtomicSlotMigrationInfoV1;
 
 unsafe extern "C" fn on_atomic_slot_migration_event(
     _ctx: *mut raw::RedisModuleCtx,
@@ -184,8 +222,9 @@ unsafe extern "C" fn on_atomic_slot_migration_event(
     data: *mut c_void,
 ) {
     fn raise_event(event: AtomicSlotMigrationEvent, data: *mut c_void) {
-        let info = unsafe { &*(data as *const ValkeyModuleAtomicSlotMigrationInfo) };
-        slot_migration_event_handler(event, info.convert_slot_ranges());
+        if let Some(slots) = parse_event_payload(data) {
+            slot_migration_event_handler(event, slots);
+        }
     }
 
     match sub_event {
@@ -686,6 +725,102 @@ mod tests {
 
         remove_importing_slots(&second);
         assert!(!is_key_in_slot_import(b"{b}1"));
+    }
+
+    /// A synthetic event payload, laid out exactly as the server fills it in.
+    struct Payload {
+        ranges: Vec<ValkeyModuleSlotRange>,
+        info: ValkeyModuleAtomicSlotMigrationInfoV1,
+    }
+
+    impl Payload {
+        fn new(version: u64, ranges: &[(c_int, c_int)]) -> Self {
+            let mut ranges: Vec<ValkeyModuleSlotRange> = ranges
+                .iter()
+                .map(|&(start, end)| ValkeyModuleSlotRange { start, end })
+                .collect();
+            let info = ValkeyModuleAtomicSlotMigrationInfoV1 {
+                version,
+                job_name: [0; VALKEYMODULE_NODE_ID_LEN + 1],
+                slot_ranges: ranges.as_mut_ptr(),
+                num_slot_ranges: ranges.len() as u32,
+            };
+            Payload { ranges, info }
+        }
+
+        fn ptr(&self) -> *mut c_void {
+            &self.info as *const _ as *mut c_void
+        }
+    }
+
+    #[test]
+    fn test_payload_valid_ranges_are_parsed() {
+        let p = Payload::new(1, &[(0, 100), (200, 300), (16383, 16383)]);
+        let slots = parse_event_payload(p.ptr()).expect("valid payload");
+        assert_eq!(slots.ranges_len(), 3);
+        assert!(slots.contains(0) && slots.contains(100) && slots.contains(16383));
+        assert!(!slots.contains(101) && !slots.contains(199));
+        assert_eq!(slots.len(), 101 + 101 + 1);
+    }
+
+    #[test]
+    fn test_payload_overlapping_and_unsorted_ranges_merge() {
+        let p = Payload::new(1, &[(50, 60), (10, 55), (7, 7)]);
+        let slots = parse_event_payload(p.ptr()).expect("valid payload");
+        assert_eq!(slots.ranges_len(), 2);
+        assert_eq!(slots.len(), 51 + 1);
+        let _ = &p.ranges;
+    }
+
+    #[test]
+    fn test_payload_null_is_rejected() {
+        assert!(parse_event_payload(std::ptr::null_mut()).is_none());
+    }
+
+    #[test]
+    fn test_payload_unknown_version_is_rejected() {
+        let p = Payload::new(2, &[(0, 10)]);
+        assert!(parse_event_payload(p.ptr()).is_none());
+    }
+
+    #[test]
+    fn test_payload_null_ranges_with_nonzero_count_is_rejected() {
+        let mut p = Payload::new(1, &[(0, 10)]);
+        p.info.slot_ranges = std::ptr::null_mut();
+        assert!(parse_event_payload(p.ptr()).is_none());
+    }
+
+    #[test]
+    fn test_payload_implausible_range_count_is_rejected() {
+        let mut p = Payload::new(1, &[(0, 10)]);
+        p.info.num_slot_ranges = u32::MAX;
+        assert!(parse_event_payload(p.ptr()).is_none());
+    }
+
+    #[test]
+    fn test_payload_empty_range_list_is_rejected() {
+        // Every event names at least one slot; an empty list has no meaning for any handler.
+        let p = Payload::new(1, &[]);
+        assert!(parse_event_payload(p.ptr()).is_none());
+    }
+
+    #[test]
+    fn test_payload_bad_ranges_are_skipped_not_wrapped() {
+        // Inverted, negative and out-of-range bounds are each dropped; the good range survives.
+        let p = Payload::new(
+            1,
+            &[(20, 10), (-1, 5), (16380, 16384), (-70000, 3), (100, 110)],
+        );
+        let slots = parse_event_payload(p.ptr()).expect("one good range");
+        assert_eq!(slots.ranges_len(), 1);
+        assert_eq!(slots.len(), 11);
+        assert!(slots.contains(100) && slots.contains(110));
+    }
+
+    #[test]
+    fn test_payload_with_only_bad_ranges_is_rejected() {
+        let p = Payload::new(1, &[(20, 10), (16384, 16385)]);
+        assert!(parse_event_payload(p.ptr()).is_none());
     }
 
     #[test]

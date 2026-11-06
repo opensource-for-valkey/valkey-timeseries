@@ -32,7 +32,6 @@ pub use fanout_error::*;
 pub use utils::*;
 pub(crate) use workers::request_lane_stats;
 
-#[cfg(test)]
 pub(crate) use cluster_map::NUM_SLOTS;
 pub use cluster_map::{ClusterMap, ClusterNodesSource, FanoutTarget, NodeInfo};
 #[cfg(test)]
