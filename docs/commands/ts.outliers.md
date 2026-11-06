@@ -387,7 +387,7 @@ actually tested. Scores are comparable across methods only when computed over th
 N is the number of samples in the range.
 
 * Fence-based methods: O(N log N)
-* ESD: O(N × MAX_OUTLIERS)
+* ESD: O(N log N × MAX_OUTLIERS) with `HYBRID`, which re-sorts at each step; O(N × MAX_OUTLIERS) with `CLASSIC`
 * RCF: O(N × NUM_TREES × log(SAMPLE_SIZE))
 * Multi-period `SEASONALITY`: O(N²)
 
@@ -596,7 +596,8 @@ Detect pattern-based anomalies using a sliding window:
     * Use `DIRECTION` to filter results when only interested in one type of anomaly
     * Single seasonality periods are faster than multiple
     * RCF is more computationally expensive but better for complex patterns
-    * ESD re-tests the sample after each removal, so its cost grows with `MAX_OUTLIERS` times the number of samples
+    * ESD re-tests the sample after each removal, so its cost grows with `MAX_OUTLIERS` times the number of samples,
+      and times their logarithm with `HYBRID`
       (`MAX_OUTLIERS` defaults to `min(n/2, 100)` and is capped at `1000`); lower that bound if you only care about the
       few most extreme samples
 
