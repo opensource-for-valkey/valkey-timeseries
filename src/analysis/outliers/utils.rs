@@ -1,3 +1,4 @@
+use crate::analysis::math::{calculate_mean_std_dev, is_constant};
 use crate::analysis::outliers::{Anomaly, AnomalySignal};
 
 /// Map `evidence` against a detection `boundary` onto `[0, 1]`, with `0.5` at the
@@ -128,6 +129,38 @@ pub(super) fn usable_fence_distance(center: f64, delta: f64) -> f64 {
     } else {
         delta
     }
+}
+
+/// The mean and standard deviation of `data`, or `NaN`s when fewer than two finite
+/// observations support a fit.
+///
+/// A mean over nothing falls back to `0.0` and one sample has a zero scale by construction,
+/// which together would read as a collapsed baseline at an arbitrary target and flag every
+/// later reading. `NaN` is the unusable state of [`usable_fence_distance`] instead: no
+/// boundary, nothing flagged.
+///
+/// A constant series has an exact answer. The computed mean is a few ULPs off, which makes
+/// the standard deviation that same rounding error rather than zero, and puts the mean
+/// beside the value it was fitted to.
+pub(super) fn fit_mean_std_dev(data: &[f64]) -> (f64, f64) {
+    if data.iter().filter(|x| x.is_finite()).take(2).count() < 2 {
+        return (f64::NAN, f64::NAN);
+    }
+    if is_constant(data) {
+        return (data[0], 0.0);
+    }
+    calculate_mean_std_dev(data)
+}
+
+/// The baseline of the SPC charts, fitted to the head of `ts`: half the series, at most 100
+/// samples and at least two, since one fits a zero scale by construction.
+pub(super) fn fit_head_baseline(ts: &[f64]) -> (f64, f64) {
+    let training_size = ((ts.len() as f64 * 0.5).min(100.0) as usize)
+        .max(2)
+        .min(ts.len());
+    let (center, scale) = fit_mean_std_dev(&ts[..training_size]);
+    // The floor is a backstop for a head that is constant but for rounding.
+    (center, snap_dust(scale, center))
 }
 
 /// `0.0` when non-negative `evidence` is indistinguishable from rounding error in
