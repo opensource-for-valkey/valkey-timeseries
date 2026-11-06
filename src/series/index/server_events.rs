@@ -58,7 +58,8 @@ fn __loading_event_handler(ctx: &Context, loading_event: LoadingSubevent) {
             // background for dbs that took the preload fast path instead.
             bulk_build::on_load_ended();
             // After the bulk build (so the keys it indexed can be hidden) and before the
-            // reconciliation sweep (which then defers them instead of re-indexing them).
+            // reconciliation sweep, so that whatever the sweep re-indexes is hidden by the
+            // now-registered import.
             reconcile_imports_after_load(ctx);
             on_loading_ended(load_keys_expired(ctx));
         }
