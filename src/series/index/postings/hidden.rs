@@ -116,6 +116,15 @@ impl HiddenSet {
         }
     }
 
+    /// [`HiddenSet::reveal`] for an id whose slot cannot be known, so every bucket is searched.
+    fn reveal_from_any_slot(&mut self, id: SeriesRef) {
+        self.ids.remove(id);
+        self.by_slot.retain(|_, ids| {
+            ids.remove(id);
+            !ids.is_empty()
+        });
+    }
+
     /// Removes and returns every id hidden under one of `slots`.
     fn take_slots(&mut self, slots: &RangeSetBlaze<u16>) -> PostingsBitmap {
         let mut taken = PostingsBitmap::new();
@@ -193,13 +202,15 @@ impl Postings {
             .mask_cow(self.stale_ids.mask_cow(Cow::Borrowed(postings)))
     }
 
-    /// Stops hiding `id`, whose directory entry must still be in place. Returns whether it was.
+    /// Stops hiding `id`. Returns whether it was hidden. Callers run this before removing the
+    /// directory entry, which names the slot; without one the id is still cleared, by searching.
     pub(super) fn forget_hidden(&mut self, id: SeriesRef) -> bool {
         if !self.hidden_ids.contains(id) {
             return false;
         }
-        if let Some(key) = self.id_to_key.get(&id) {
-            self.hidden_ids.reveal(id, calculate_hash_slot(key));
+        match self.id_to_key.get(&id) {
+            Some(key) => self.hidden_ids.reveal(id, calculate_hash_slot(key)),
+            None => self.hidden_ids.reveal_from_any_slot(id),
         }
         true
     }
@@ -365,6 +376,34 @@ mod tests {
         assert_eq!(postings.publish_hidden_in_slots(&importing()), 0);
         assert_eq!(ids(&postings.all_postings), [LOCAL]);
         assert!(!postings.get_label_names().contains("only_imported"));
+    }
+
+    #[test]
+    fn forgetting_a_hidden_id_with_no_directory_entry_still_clears_it() {
+        // Breaks the invariant on purpose: with no key there is no slot to look under.
+        let mut postings = hidden_fixture();
+        postings.id_to_key.remove(&IMPORTED);
+
+        assert!(postings.forget_hidden(IMPORTED));
+
+        assert_eq!(postings.hidden_ids, HiddenSet::default());
+        assert!(!postings.forget_hidden(IMPORTED), "already gone");
+    }
+
+    #[test]
+    fn forgetting_without_a_directory_entry_keeps_other_hidden_series() {
+        let mut postings = hidden_fixture();
+        let other = make_series(3, &[("job", "other")]);
+        postings.index_timeseries(&other, b"{imported}b");
+        postings.hide_indexed_keys_in_slots(&importing());
+        postings.id_to_key.remove(&IMPORTED);
+
+        assert!(postings.forget_hidden(IMPORTED));
+
+        assert!(!postings.hidden_ids.contains(IMPORTED));
+        assert!(postings.hidden_ids.contains(3));
+        assert_eq!(postings.publish_hidden_in_slots(&importing()), 1);
+        assert_eq!(postings.hidden_ids, HiddenSet::default());
     }
 
     #[test]
