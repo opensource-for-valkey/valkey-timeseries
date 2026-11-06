@@ -18,6 +18,7 @@ use crate::series::index::IndexKey;
 use crate::series::{SeriesRef, TimeSeries};
 use croaring::Bitmap64;
 use std::ops::{Bound, ControlFlow, Deref, DerefMut};
+use std::time::Duration;
 use valkey_module::{AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString};
 
 /// A read-only guard for accessing Postings data.
@@ -689,16 +690,25 @@ impl TimeSeriesIndex {
         inner.optimize_postings(start_prefix, count)
     }
 
-    /// Optimizes every posting list in one pass, taking the write lock for `batch_size` lists
-    /// at a time so queries and writes interleave. Returns `false` if `should_stop` ended the
-    /// pass early.
-    pub fn optimize_all(&self, batch_size: usize, should_stop: impl Fn() -> bool) -> bool {
+    /// Optimizes every posting list in one pass, taking the write lock for at most `hold_budget`
+    /// or `max_lists` lists at a time, whichever comes first, so queries and writes interleave.
+    /// Returns `false` if `should_stop` ended the pass early.
+    pub fn optimize_all(
+        &self,
+        max_lists: usize,
+        hold_budget: Duration,
+        should_stop: impl Fn() -> bool,
+    ) -> bool {
         let mut cursor = None;
         loop {
             if should_stop() {
                 return false;
             }
-            cursor = self.optimize_incremental(cursor, batch_size);
+            cursor = write_lock(&self.inner).optimize_postings_within(
+                cursor,
+                max_lists,
+                Some(hold_budget),
+            );
             if cursor.is_none() {
                 return true;
             }

@@ -6,10 +6,15 @@ use crate::is_shutting_down;
 use crate::series::index::{IndexKey, TIMESERIES_INDEX, get_db_index};
 use crate::series::tasks::utils::find_next_db;
 use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 const INDEX_OPTIMIZE_BATCH_SIZE: usize = 128;
-/// Lists per write-lock acquisition in a full pass ([`optimize_index_fully`]).
-const FULL_PASS_BATCH_SIZE: usize = 256;
+/// Most lists per write-lock acquisition in a full pass ([`optimize_index_fully`]): cheap lists
+/// reach this long before they reach the time budget.
+const FULL_PASS_MAX_LISTS: usize = 256;
+/// Longest a full pass holds the write lock before giving it back, except for the one list in
+/// progress. A main-thread index write waits on this lock with the GIL held.
+const FULL_PASS_HOLD_BUDGET: Duration = Duration::from_micros(250);
 
 #[derive(Default)]
 struct OptimizeContext {
@@ -61,7 +66,9 @@ pub(in crate::series) fn optimize_index_fully(db: i32) {
             .get(&db)
             .is_some_and(|current| std::ptr::eq(current, index))
     };
-    if index.optimize_all(FULL_PASS_BATCH_SIZE, || is_shutting_down() || replaced()) {
+    if index.optimize_all(FULL_PASS_MAX_LISTS, FULL_PASS_HOLD_BUDGET, || {
+        is_shutting_down() || replaced()
+    }) {
         log_debug(format!("Optimized every posting list of db {db}"));
     }
 }
