@@ -1,35 +1,34 @@
 //! Atomic slot migration (ASM, Valkey 9.0+) support.
 //!
 //! Subscribes to the server's ASM events and keeps the secondary index consistent with them. On
-//! the destination, indexing of imported keys is deferred until their import completes (so reads
-//! never see phantom series of an import that may still abort). On the source nothing extra is
-//! needed: the server deletes the exported keys through `unlink2`, which retires them from the
-//! index like any other deletion (see the `ExportCompleted` arm of the event handler).
+//! the destination, this module is the registry of imports in flight: imported series are indexed
+//! as they arrive, on whichever path brings them, but [`Postings::index_timeseries`] consults
+//! [`importing_slot`] and hides them from reads (see `postings::hidden`), so reads never see
+//! phantom series of an import that may still abort. Completion publishes them on the main thread,
+//! together with the ownership change. On the source nothing extra is needed: the server deletes
+//! the exported keys through `unlink2`, which retires them from the index like any other deletion
+//! (see the `ExportCompleted` arm of the event handler).
 //!
 //! The import events fire on the target primary *and* on its replicas (the server propagates the
-//! migration's control commands down the replication stream), so a replica defers and drains
+//! migration's control commands down the replication stream), so a replica hides and publishes
 //! exactly like its primary.
-use crate::common::context::{create_key_string, get_current_db, set_current_db};
-use crate::common::hash::BuildNoHashHasher;
+//!
+//! [`Postings::index_timeseries`]: crate::series::index::Postings::index_timeseries
 use crate::common::logging::{log_debug, log_notice, log_warning};
 use crate::common::metrics::asm as metrics;
-use crate::common::metrics::task::TaskRun;
 use crate::common::module_options::{HANDLE_ATOMIC_SLOT_MIGRATION, declare_module_options};
 use crate::common::sync::{lock, write_lock};
-use crate::common::threads::LockGil;
 use crate::fanout::NUM_SLOTS;
 use crate::fanout::{is_clustered, mark_cluster_map_stale};
-use crate::series::index::{TIMESERIES_INDEX, get_db_index, index_loaded_series};
-use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
+use crate::series::index::TIMESERIES_INDEX;
+use crate::series::index::postings::Postings;
 use crate::series::tasks::optimize_index_fully;
-use crate::series::{TimeSeries, try_get_timeseries_mut};
 use range_set_blaze::RangeSetBlaze;
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use valkey_module::redisvalue::ValkeyValueKey;
-use valkey_module::{Context, MODULE_CONTEXT, ValkeyValue, Version, raw};
+use valkey_module::{Context, ValkeyValue, Version, raw};
 
 const ASM_MINIMUM_VERSION: Version = Version {
     major: 9,
@@ -280,8 +279,6 @@ fn subscribe_to_atomic_slot_migration_events(ctx: &Context) {
     declare_module_options(ctx, HANDLE_ATOMIC_SLOT_MIGRATION);
 }
 
-const BATCH_SIZE: usize = 256;
-
 /// The server's identity for a migration job: `CLUSTER_NAMELEN` bytes, NUL-terminated in the
 /// event payload. Every event of one job carries the same name, on the target primary and on
 /// its replicas alike.
@@ -297,32 +294,30 @@ struct SlotMigrationEvent {
     slots: RangeSetBlaze<u16>,
 }
 
-/// An import in flight on this node.
-///
-/// Keys that arrive for it — restored by `TS._RESTORE`, loaded, or created, altered, renamed or
-/// copied by the replayed stream — are queued here instead of being indexed, so reads never see
-/// phantom series of an import that may still abort. Completion detaches the whole job, its
-/// registered slots and its queue, in one step on the main thread: a drain only ever indexes the
-/// keys of the import it was spawned for, even when the same slot is imported again before that
-/// drain runs, and an abort or completion that reports fewer slots than the start still clears
-/// the registration.
+/// An import in flight on this node: which slots hide their series until it finishes. Completion
+/// and abort detach the whole job in one step on the main thread, so an abort or completion that
+/// reports fewer slots than the start still clears the registration.
 struct ImportJob {
     name: JobName,
     slots: RangeSetBlaze<u16>,
-    /// Queued keys per db.
-    pending: HashMap<i32, Vec<Box<[u8]>>, BuildNoHashHasher<i32>>,
 }
 
-/// Every import in flight, in start order. Mutated only on the main thread (event handlers,
-/// command paths, flush handlers); a drain works on a detached job and never touches this.
+/// Every import in flight, in start order. Mutated only on the main thread, by the event handlers
+/// and the load-end reconciliation.
 static IMPORTS: Mutex<Vec<ImportJob>> = Mutex::new(Vec::new());
 
 /// Whether `IMPORTS` is non-empty. Maintained under its mutex, so it is only ever stale in the
-/// direction of "take the lock and look": [`is_key_in_slot_import`] runs on every series
-/// creation, restore and load, almost always with no import in flight.
+/// direction of "take the lock and look": [`importing_slot`] runs every time a series is indexed,
+/// almost always with no import in flight.
 static IMPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-static DELAYED_KEYS_COUNTER: AtomicUsize = AtomicUsize::new(0);
+// Unit tests index series on many threads at once, and only those of the thread that started an
+// import may see it: the rest would otherwise have a key hidden whenever its slot happened to
+// match.
+#[cfg(test)]
+thread_local! {
+    static IMPORTS_IN_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 fn with_imports<R>(f: impl FnOnce(&mut Vec<ImportJob>) -> R) -> R {
     let mut imports = lock(&IMPORTS);
@@ -331,58 +326,26 @@ fn with_imports<R>(f: impl FnOnce(&mut Vec<ImportJob>) -> R) -> R {
     result
 }
 
-/// FLUSHALL: every queued key is gone from the keyspace. The imports themselves stay
-/// registered; the server fails them and reports that as its own event.
-pub(super) fn clear_delayed_keys_map() {
-    with_imports(|imports| imports.iter_mut().for_each(|job| job.pending.clear()));
-}
-
-/// FLUSHDB: as [`clear_delayed_keys_map`], for one db.
-pub(super) fn clear_delayed_keys_in_db(db: i32) {
-    with_imports(|imports| {
-        for job in imports.iter_mut() {
-            job.pending.remove(&db);
-        }
-    });
-}
-
-/// Queues `key` for indexing when the import of its slot completes.
-///
-/// The caller has just checked [`is_key_in_slot_import`]; both run under the GIL, as do the
-/// event handlers that change the set of imports, so the owning import cannot have gone away
-/// in between.
-pub(crate) fn add_delayed_indexing_key(db: i32, key: &[u8]) {
-    let slot = crate::fanout::calculate_hash_slot(key);
-    with_imports(
-        |imports| match imports.iter_mut().find(|job| job.slots.contains(slot)) {
-            Some(job) => job.pending.entry(db).or_default().push(key.into()),
-            None => log_warning(format!(
-                "ASM: no import in flight owns slot {slot}; key {} in db {db} is left unindexed",
-                String::from_utf8_lossy(key)
-            )),
-        },
-    );
-
-    let count = DELAYED_KEYS_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-    // log every 100 queued keys to avoid excessive noise
-    if count.is_multiple_of(100) {
-        log_debug(format!(
-            "ASM queued delayed indexing keys: total_queued={count}, db={db}"
-        ));
+/// The slot of `key` if an import of it is in flight, in which case its series stays hidden from
+/// reads until that import completes.
+pub(in crate::series::index) fn importing_slot(key: &[u8]) -> Option<u16> {
+    #[cfg(test)]
+    if !IMPORTS_IN_SCOPE.get() {
+        return None;
     }
-}
-
-/// Whether `key` belongs to a slot being imported, in which case indexing it waits for that
-/// import to complete.
-pub(crate) fn is_key_in_slot_import(key: &[u8]) -> bool {
     if !IMPORT_ACTIVE.load(Ordering::Acquire) {
-        return false;
+        return None;
     }
     let slot = crate::fanout::calculate_hash_slot(key);
-    lock(&IMPORTS).iter().any(|job| job.slots.contains(slot))
+    lock(&IMPORTS)
+        .iter()
+        .any(|job| job.slots.contains(slot))
+        .then_some(slot)
 }
 
 fn start_import(job: JobName, slots: RangeSetBlaze<u16>) {
+    #[cfg(test)]
+    IMPORTS_IN_SCOPE.set(true);
     with_imports(|imports| {
         if let Some(existing) = imports.iter_mut().find(|j| j.name == job) {
             log_warning(format!(
@@ -392,16 +355,12 @@ fn start_import(job: JobName, slots: RangeSetBlaze<u16>) {
             existing.slots |= &slots;
             return;
         }
-        imports.push(ImportJob {
-            name: job,
-            slots,
-            pending: HashMap::default(),
-        });
+        imports.push(ImportJob { name: job, slots });
     });
 }
 
-/// Detaches the import `job`: its registered slots stop deferring, and its queue comes back to
-/// the caller. `reported` is what the completion or abort event named; a difference from the
+/// Detaches the import `job`: its registered slots stop hiding what is indexed from now on, and
+/// the job comes back to the caller. `reported` is what the completion or abort event named; a difference from the
 /// start is logged, but it is the registration that gets removed. `None` when the job was never
 /// registered here — an import restored from a snapshot, which fires no start event.
 fn finish_import(job: &JobName, reported: &RangeSetBlaze<u16>) -> Option<ImportJob> {
@@ -420,184 +379,59 @@ fn finish_import(job: &JobName, reported: &RangeSetBlaze<u16>) -> Option<ImportJ
     })
 }
 
-/// Indexes a batch of imported keys. Returns the number of keys that had no timeseries value at
-/// index time (already deleted, wrong type, or import aborted).
-fn index_timeseries_in_batch(db: i32, batch: &[Box<[u8]>]) -> usize {
-    let mut skipped = 0usize;
-
-    log_debug(format!(
-        "ASM indexing batch: db={}, batch_size={}",
-        db,
-        batch.len()
-    ));
-
-    let ctx = MODULE_CONTEXT.lock_gil();
-    let save_db = get_current_db(&ctx);
-    set_current_db(&ctx, db);
-
-    // Open every key *before* taking the postings write lock. Opening a key runs lazy
-    // expiry, which reaps an expired series through the `unlink` callback — and that takes
-    // the same write lock on this thread, so opening under the lock would hang the server
-    // with the GIL held (see `get_series_by_id`).
-    let opened: Vec<_> = batch
-        .iter()
-        .map(|key_name| {
-            let valkey_key = create_key_string(&ctx, key_name.as_ref());
-            let writeable_key = ctx.open_key_writable(&valkey_key);
-            (key_name, writeable_key)
-        })
-        .collect();
-
-    let index = get_db_index(db);
-    let mut postings = write_lock(&index.inner);
-
-    for (key_name, writeable_key) in opened.iter() {
-        let Ok(Some(series)) = writeable_key.get_value::<TimeSeries>(&VK_TIME_SERIES_TYPE) else {
-            skipped += 1;
-            continue;
-        };
-        series._db = Some(db);
-        // Imported ids come from another node's id space, so every imported series gets a
-        // fresh local id; a key queued twice has its first id retired, not duplicated.
-        index_loaded_series(&mut postings, series, key_name.as_ref());
-    }
-    drop(postings);
-    drop(opened);
-
-    set_current_db(&ctx, save_db);
-    skipped
+/// Runs `f` on the postings of every db, with the write lock held. Lock order: never with
+/// `IMPORTS` locked, since indexing takes that one under the postings lock.
+fn for_each_db_postings(mut f: impl FnMut(&mut Postings) -> u64) -> u64 {
+    let indexes = TIMESERIES_INDEX.pin();
+    indexes
+        .values()
+        .map(|index| f(&mut write_lock(&index.inner)))
+        .sum()
 }
 
-/// Indexes `keys`, queued for `db` during an import that has just completed. Returns how many
-/// were indexed.
-fn process_delayed_keys_for_db(db: i32, keys: Vec<Box<[u8]>>, run: &TaskRun<'_>) -> usize {
-    let total = keys.len();
-    let mut indexed = 0usize;
-    let mut skipped = 0usize;
-    for batch in keys.chunks(BATCH_SIZE) {
-        // Once detached from its import, a key is only indexed here — bailing out mid-drain
-        // leaves the remaining keys in this db un-indexed. That's acceptable on shutdown (the
-        // process is about to exit; a restart re-derives the index from the RDB/AOF), but not
-        // otherwise, so this only checks the shutdown flag, not e.g. a generic cancellation.
-        if run.check_shutdown() {
-            log_debug(format!(
-                "ASM delayed indexing for db={db} aborted by shutdown; {} of {total} key(s) left un-indexed",
-                total - indexed
-            ));
-            return 0;
+/// The import of `slots` completed: their series become visible, before the server resumes.
+fn publish_import(slots: &RangeSetBlaze<u16>) {
+    let mut dbs = Vec::new();
+    let mut published = 0;
+    for (db, index) in TIMESERIES_INDEX.pin().iter() {
+        let in_db = write_lock(&index.inner).publish_hidden_in_slots(slots);
+        if in_db > 0 {
+            dbs.push(*db);
+            published += in_db;
         }
-        indexed += batch.len();
-        let batch_skipped = index_timeseries_in_batch(db, batch);
-        skipped += batch_skipped;
-        metrics::DRAIN_KEYS_INDEXED
-            .fetch_add((batch.len() - batch_skipped) as u64, Ordering::Relaxed);
     }
-
-    if skipped > 0 {
-        // A skipped key had no timeseries value at drain time; this is terminal (retrying would
-        // never succeed), so we drop it rather than re-queueing it forever.
-        log_debug(format!(
-            "ASM delayed indexing dropped {skipped} key(s) with no series value in db={db}"
-        ));
-    }
-    indexed - skipped
+    metrics::KEYS_PUBLISHED.fetch_add(published, Ordering::Relaxed);
+    log_debug(format!(
+        "ASM import completed: {published} series published"
+    ));
+    optimize_after_import(dbs);
 }
 
-/// The keys a drain indexes, per db, sorted by db.
-type DrainWork = Vec<(i32, Vec<Box<[u8]>>)>;
-
-/// Merges several pieces of drain work into one, keys concatenated per db in arrival order,
-/// dbs sorted, empty dbs dropped.
-fn merge_drain_work(parts: Vec<DrainWork>) -> DrainWork {
-    let mut by_db: std::collections::BTreeMap<i32, Vec<Box<[u8]>>> = Default::default();
-    for (db, keys) in parts.into_iter().flatten() {
-        by_db.entry(db).or_default().extend(keys);
-    }
-    by_db
-        .into_iter()
-        .filter(|(_, keys)| !keys.is_empty())
-        .collect()
-}
-
-/// Drain work whose thread could not be started. Folded into the next drain that does start,
-/// and retried on the maintenance schedule ([`retry_unscheduled_drains`]), so an import whose
-/// completion coincided with thread exhaustion is published late rather than never.
-static UNSCHEDULED_DRAINS: Mutex<Vec<DrainWork>> = Mutex::new(Vec::new());
-
-fn stash_unscheduled_drain(work: DrainWork) {
-    lock(&UNSCHEDULED_DRAINS).push(work);
-}
-
-fn take_unscheduled_drains() -> Vec<DrainWork> {
-    std::mem::take(&mut *lock(&UNSCHEDULED_DRAINS))
-}
-
-/// Indexes `work` on its own thread; if the thread cannot be started, keeps `work` for a retry.
-///
-/// On its own thread rather than the pool because it takes the module lock (see
-/// `spawn_background`), and checks `is_shutting_down()` between dbs — an aborted drain leaves
-/// the remaining dbs' keys un-indexed, which is fine on shutdown (see
-/// `process_delayed_keys_for_db`) but must not happen otherwise.
-fn schedule_drain(work: DrainWork) {
-    let mut parts = take_unscheduled_drains();
-    parts.push(work);
-    let work = merge_drain_work(parts);
-    if work.is_empty() {
+/// The import added a slot's worth of series to the postings in one burst, which the periodic
+/// optimizer would take a long time to reach. On its own thread because it takes the postings
+/// write lock batch by batch; if the thread cannot start, the periodic optimizer gets there.
+fn optimize_after_import(dbs: Vec<i32>) {
+    if dbs.is_empty() {
         return;
     }
-    // The thread takes the work out of the slot when it starts; a failed spawn drops the
-    // closure without running it, so the work is still there for the caller to keep.
-    let slot = std::sync::Arc::new(Mutex::new(Some(work)));
-    let for_thread = std::sync::Arc::clone(&slot);
-    let spawned = crate::common::threads::spawn_task(&metrics::DRAIN, move |run| {
-        let Some(work) = lock(&for_thread).take() else {
-            return;
-        };
-        for (db, keys) in work {
+    crate::common::threads::spawn_task(&metrics::OPTIMIZE, move |run| {
+        for db in dbs {
             if run.check_shutdown() {
-                log_debug("ASM delayed indexing drain aborted by shutdown");
                 return;
             }
-            // The import added a slot's worth of series to the postings in one burst.
-            if process_delayed_keys_for_db(db, keys, run) > 0 {
-                optimize_index_fully(db);
-                if run.check_shutdown() {
-                    return;
-                }
-            }
+            optimize_index_fully(db);
         }
-        log_debug("ASM delayed indexing drain finished");
     });
-    if !spawned && let Some(work) = lock(&slot).take() {
-        let keys: usize = work.iter().map(|(_, keys)| keys.len()).sum();
+}
+
+/// The import of `slots` aborted, and the server has already deleted its keys.
+fn retire_import(slots: &RangeSetBlaze<u16>) {
+    let retired = for_each_db_postings(|postings| postings.retire_hidden_in_slots(slots));
+    if retired > 0 {
         log_warning(format!(
-            "ASM delayed indexing drain could not start a thread; {keys} key(s) kept for a later retry"
+            "ASM import aborted with {retired} series still hidden; the server's deletion did not reach them"
         ));
-        stash_unscheduled_drain(work);
     }
-}
-
-/// Indexes the keys queued during `job`, an import that has just completed.
-///
-/// There is no "already running" guard: each drain owns exactly its import's keys, so
-/// concurrent drains touch disjoint keys and skipping one would strand them.
-fn process_delayed_indexing(job: ImportJob) {
-    let work = merge_drain_work(vec![job.pending.into_iter().collect()]);
-    log_debug(format!(
-        "ASM delayed indexing drain scheduled: job={} dbs={} slot_ranges={}",
-        job_display(&job.name),
-        work.len(),
-        job.slots.ranges_len()
-    ));
-    schedule_drain(work);
-}
-
-/// Maintenance hook: starts a drain for work an earlier drain could not start a thread for.
-pub(crate) fn retry_unscheduled_drains() {
-    if lock(&UNSCHEDULED_DRAINS).is_empty() {
-        return;
-    }
-    schedule_drain(Vec::new());
 }
 
 fn slot_migration_event_handler(event: AtomicSlotMigrationEvent, reported: SlotMigrationEvent) {
@@ -616,25 +450,19 @@ fn slot_migration_event_handler(event: AtomicSlotMigrationEvent, reported: SlotM
             start_import(job, slots);
         }
         AtomicSlotMigrationEvent::ImportCompleted => match finish_import(&job, &slots) {
-            Some(done) => {
-                log_debug("ASM ImportCompleted received; triggering delayed indexing");
-                process_delayed_indexing(done);
-            }
+            Some(done) => publish_import(&done.slots),
             None => log_debug(format!(
-                "ASM import {} completed but was not registered here (restored from a snapshot?); nothing to drain",
+                "ASM import {} completed but was not registered here; nothing to publish",
                 job_display(&job)
             )),
         },
-        AtomicSlotMigrationEvent::ImportAborted => {
-            // The queued keys go with the job; the server has already removed the series.
-            let registered = finish_import(&job, &slots).is_some();
-            if !registered {
-                log_debug(format!(
-                    "ASM import {} aborted but was not registered here",
-                    job_display(&job)
-                ));
-            }
-        }
+        AtomicSlotMigrationEvent::ImportAborted => match finish_import(&job, &slots) {
+            Some(done) => retire_import(&done.slots),
+            None => log_debug(format!(
+                "ASM import {} aborted but was not registered here",
+                job_display(&job)
+            )),
+        },
         _ => {
             // no action needed for other events
         }
@@ -684,15 +512,6 @@ fn value_text(value: &ValkeyValue) -> Option<String> {
     }
 }
 
-fn value_bytes(value: &ValkeyValue) -> Option<Vec<u8>> {
-    match value {
-        ValkeyValue::SimpleString(s) | ValkeyValue::BulkString(s) => Some(s.as_bytes().to_vec()),
-        ValkeyValue::StringBuffer(b) => Some(b.clone()),
-        ValkeyValue::BulkValkeyString(s) => Some(s.as_slice().to_vec()),
-        _ => None,
-    }
-}
-
 fn key_text(key: &ValkeyValueKey) -> Option<String> {
     match key {
         ValkeyValueKey::Integer(i) => Some(i.to_string()),
@@ -730,10 +549,11 @@ fn reply_fields(entry: &ValkeyValue) -> Vec<(String, String)> {
 ///
 /// A node that loads an in-flight import from an RDB — a target primary restarting, or a
 /// target replica full-syncing from its primary mid-import — recreates the import job from the
-/// RDB's import record and keeps hiding the slots, but fires no `ImportStarted`. Every key of
-/// those slots was therefore indexed as it loaded. Ask the server which imports are in
-/// progress, register each one this module does not know, and move its keys from the index into
-/// its queue; the `SYNCSLOTS FINISH` that ends the import then drains them like any other.
+/// RDB's import record and keeps hiding the slots, but fires no `ImportStarted`, and whichever
+/// index the load built holds every key of those slots as visible. Ask the server which imports
+/// are in progress, register each one this module does not know, and hide its series; the
+/// `SYNCSLOTS FINISH` that ends the import then publishes them like any other. A known import is
+/// hidden again too: a preloaded index replaced the postings that were hiding its series.
 pub(super) fn reconcile_imports_after_load(ctx: &Context) {
     if !ASM_ENABLED.load(Ordering::Acquire) {
         return;
@@ -743,7 +563,7 @@ pub(super) fn reconcile_imports_after_load(ctx: &Context) {
         Ok(_) => return,
         Err(e) => {
             log_warning(format!(
-                "ASM: CLUSTER GETSLOTMIGRATIONS failed after load; imports restored from the snapshot (if any) are not deferred: {e}"
+                "ASM: CLUSTER GETSLOTMIGRATIONS failed after load; imports restored from the snapshot (if any) are not hidden: {e}"
             ));
             return;
         }
@@ -752,67 +572,16 @@ pub(super) fn reconcile_imports_after_load(ctx: &Context) {
         .iter()
         .filter_map(|entry| restored_import_from_fields(&reply_fields(entry)))
     {
-        let known = with_imports(|imports| imports.iter().any(|j| j.name == job));
-        if known {
-            continue;
+        if !with_imports(|imports| imports.iter().any(|j| j.name == job)) {
+            start_import(job, slots.clone());
         }
-        start_import(job, slots.clone());
-        let hidden = hide_keys_in_slots(ctx, &slots);
+        let hidden = for_each_db_postings(|postings| postings.hide_indexed_keys_in_slots(&slots));
         log_notice(format!(
-            "ASM import {} restored from snapshot: {} slot range(s) deferred, {hidden} loaded key(s) moved out of the index",
+            "ASM import {} restored from snapshot: {} slot range(s), {hidden} loaded series hidden",
             job_display(&job),
             slots.ranges_len()
         ));
     }
-}
-
-/// Moves every timeseries key in `slots`, in every db, out of the index and into the queue of
-/// the import that owns its slot. Returns how many keys were moved.
-fn hide_keys_in_slots(ctx: &Context, slots: &RangeSetBlaze<u16>) -> usize {
-    let mut dbs: Vec<i32> = TIMESERIES_INDEX.pin().keys().copied().collect();
-    if !dbs.contains(&0) {
-        dbs.push(0);
-    }
-    dbs.sort_unstable();
-    let save_db = get_current_db(ctx);
-    let mut hidden = 0usize;
-    for db in dbs {
-        set_current_db(ctx, db);
-        for slot in slots.iter() {
-            // Importing slots are hidden from SCAN but addressable by slot.
-            let keys: Vec<Vec<u8>> = match ctx.call(
-                "CLUSTER",
-                &["GETKEYSINSLOT", &slot.to_string(), "1000000000"],
-            ) {
-                Ok(ValkeyValue::Array(items)) => items.iter().filter_map(value_bytes).collect(),
-                Ok(_) => Vec::new(),
-                Err(e) => {
-                    log_warning(format!(
-                        "ASM: CLUSTER GETKEYSINSLOT {slot} failed after load: {e}"
-                    ));
-                    Vec::new()
-                }
-            };
-            for key in keys {
-                let valkey_key = create_key_string(ctx, &key);
-                let is_series = match try_get_timeseries_mut(ctx, &valkey_key, None) {
-                    // Key-checked: a no-op for a key the load left unindexed.
-                    Ok(Some(series)) => {
-                        get_db_index(db).remove_timeseries_for_key(&series, &key);
-                        true
-                    }
-                    _ => false,
-                };
-                if !is_series {
-                    continue;
-                }
-                add_delayed_indexing_key(db, &key);
-                hidden += 1;
-            }
-        }
-    }
-    set_current_db(ctx, save_db);
-    hidden
 }
 
 /// Set once the event handler is registered: this server can migrate slots atomically.
@@ -833,6 +602,11 @@ pub(super) fn register_asm_event_handler(ctx: &Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::labels::{Label, MetricName};
+    use crate::series::index::postings::BulkIndexEntry;
+    use crate::series::index::{IndexKey, get_db_index};
+    use crate::series::{SeriesRef, TimeSeries};
+    use serial_test::serial;
 
     fn slot_of(key: &[u8]) -> u16 {
         crate::fanout::calculate_hash_slot(key)
@@ -866,144 +640,233 @@ mod tests {
         );
     }
 
-    fn pending_keys(job: &ImportJob, db: i32) -> Vec<&[u8]> {
-        let mut keys: Vec<&[u8]> = job
-            .pending
-            .get(&db)
-            .map(|keys| keys.iter().map(|k| k.as_ref()).collect())
-            .unwrap_or_default();
-        keys.sort();
-        keys
+    fn complete(job: JobName, slots: &RangeSetBlaze<u16>) {
+        slot_migration_event_handler(
+            AtomicSlotMigrationEvent::ImportCompleted,
+            SlotMigrationEvent {
+                job,
+                slots: slots.clone(),
+            },
+        );
+    }
+
+    fn importing(key: &[u8]) -> bool {
+        importing_slot(key).is_some()
+    }
+
+    fn series(id: SeriesRef, label_value: &str) -> TimeSeries {
+        let mut series = TimeSeries::new();
+        series.id = id;
+        series.labels = MetricName::new(&[Label::new("asm_test", label_value)]);
+        series
+    }
+
+    /// The label values a read sees in `db`.
+    fn visible_values(db: i32) -> Vec<String> {
+        let index = get_db_index(db);
+        let mut values = index.get_label_values("asm_test");
+        values.sort();
+        values
     }
 
     #[test]
     #[serial]
-    fn test_overlapping_imports_are_tracked_per_job() {
-        // Two imports in flight: `{a}` keys belong to the first, `{b}` keys to the second.
+    fn test_a_series_indexed_during_its_import_appears_when_it_completes() {
+        const DB: i32 = 80;
+        let shared = slots(&[b"{p}x"]);
+        start(job(b'a'), &shared);
+
+        get_db_index(DB).index_timeseries(&series(1, "imported"), b"{p}1");
+        get_db_index(DB).index_timeseries(&series(2, "local"), b"{q}1");
+        assert_eq!(visible_values(DB), ["local"], "reads do not see the import");
+        assert_eq!(get_db_index(DB).count(), 1);
+
+        complete(job(b'a'), &shared);
+        assert_eq!(visible_values(DB), ["imported", "local"]);
+        assert_eq!(get_db_index(DB).count(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_series_indexed_after_its_import_completed_is_visible_at_once() {
+        const DB: i32 = 81;
+        let shared = slots(&[b"{r}x"]);
+        start(job(b'b'), &shared);
+        complete(job(b'b'), &shared);
+
+        get_db_index(DB).index_timeseries(&series(1, "after"), b"{r}1");
+        assert_eq!(visible_values(DB), ["after"]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_an_abort_leaves_nothing_behind() {
+        const DB: i32 = 82;
+        let shared = slots(&[b"{s}x"]);
+        start(job(b'c'), &shared);
+        let imported = series(1, "aborted");
+        get_db_index(DB).index_timeseries(&imported, b"{s}1");
+
+        abort(job(b'c'), &shared);
+        assert!(visible_values(DB).is_empty());
+        assert_eq!(get_db_index(DB).count(), 0);
+        assert!(!get_db_index(DB).has_id(1), "nothing can publish it later");
+    }
+
+    #[test]
+    #[serial]
+    fn test_overlapping_imports_publish_only_their_own_series() {
+        const DB: i32 = 83;
         let first = slots(&[b"{a}x"]);
         let second = slots(&[b"{b}x"]);
         assert_ne!(first, second);
-        const DB: i32 = 91;
 
         start(job(b'1'), &first);
         start(job(b'2'), &second);
-        assert!(is_key_in_slot_import(b"{a}1"));
-        assert!(is_key_in_slot_import(b"{b}1"));
-        assert!(
-            !is_key_in_slot_import(b"{c}1"),
-            "a key outside both imports is indexed now"
-        );
+        assert!(importing(b"{a}1"));
+        assert!(importing(b"{b}1"));
+        assert!(!importing(b"{c}1"), "a key outside both imports is visible");
+        get_db_index(DB).index_timeseries(&series(1, "first"), b"{a}1");
+        get_db_index(DB).index_timeseries(&series(2, "second"), b"{b}1");
 
-        add_delayed_indexing_key(DB, b"{a}1");
-        add_delayed_indexing_key(DB, b"{b}1");
-        add_delayed_indexing_key(DB, b"{b}2");
+        complete(job(b'1'), &first);
+        assert_eq!(visible_values(DB), ["first"]);
+        assert!(importing(b"{b}1"), "the second import is still in progress");
 
-        // Aborting the first drops its queued key only, and leaves the second import running.
-        abort(job(b'1'), &first);
-        assert!(!is_key_in_slot_import(b"{a}1"));
-        assert!(
-            is_key_in_slot_import(b"{b}1"),
-            "the second import is still in progress"
-        );
-        let done = finish_import(&job(b'2'), &second).expect("the second import is registered");
-        assert_eq!(pending_keys(&done, DB), vec![&b"{b}1"[..], &b"{b}2"[..]]);
-        assert!(!is_key_in_slot_import(b"{b}1"));
-        assert!(
-            finish_import(&job(b'1'), &first).is_none(),
-            "already aborted"
-        );
+        abort(job(b'2'), &second);
+        assert_eq!(visible_values(DB), ["first"]);
+        assert!(!importing(b"{b}1"));
     }
 
     #[test]
     #[serial]
-    fn test_a_completed_import_does_not_own_a_later_imports_keys() {
-        // ASM-03: the same slot is imported twice in a row. The first import's completion
-        // detaches exactly its own queue; a key queued for the second import afterwards belongs
-        // to the second import, even though both used the same slot.
+    fn test_the_same_slot_imported_twice_keeps_the_imports_apart() {
+        // ASM-03: publishing is synchronous, so nothing of the first import is left to mistake
+        // for the second one's.
+        const DB: i32 = 84;
         let shared = slots(&[b"{d}x"]);
-        const DB: i32 = 92;
-
         start(job(b'3'), &shared);
-        add_delayed_indexing_key(DB, b"{d}first");
-        let first = finish_import(&job(b'3'), &shared).expect("first import is registered");
-        assert!(
-            !is_key_in_slot_import(b"{d}x"),
-            "nothing is importing between the two"
-        );
+        get_db_index(DB).index_timeseries(&series(1, "first"), b"{d}first");
+        complete(job(b'3'), &shared);
+        assert!(!importing(b"{d}x"), "nothing is importing between the two");
 
         start(job(b'4'), &shared);
-        add_delayed_indexing_key(DB, b"{d}second");
-        assert_eq!(pending_keys(&first, DB), vec![&b"{d}first"[..]]);
+        get_db_index(DB).index_timeseries(&series(2, "second"), b"{d}second");
+        assert_eq!(visible_values(DB), ["first"]);
 
-        let second = finish_import(&job(b'4'), &shared).expect("second import is registered");
-        assert_eq!(pending_keys(&second, DB), vec![&b"{d}second"[..]]);
-        assert!(!is_key_in_slot_import(b"{d}x"));
+        complete(job(b'4'), &shared);
+        assert_eq!(visible_values(DB), ["first", "second"]);
     }
 
     #[test]
     #[serial]
-    fn test_finishing_removes_the_registered_slots_not_the_reported_ones() {
-        // ASM-07: a completion or abort that names fewer slots than its start must not leave
-        // the rest importing forever; the job's registration is what gets removed.
+    fn test_finishing_uses_the_registered_slots_not_the_reported_ones() {
+        // ASM-07: a completion that names fewer slots than its start must neither leave the rest
+        // importing forever nor strand their series.
+        const DB: i32 = 85;
         let registered = slots(&[b"{e}x", b"{f}x"]);
         let reported = slots(&[b"{e}x"]);
         assert_ne!(registered, reported);
 
         start(job(b'5'), &registered);
-        assert!(is_key_in_slot_import(b"{f}1"));
-        abort(job(b'5'), &reported);
-        assert!(!is_key_in_slot_import(b"{e}1"));
+        get_db_index(DB).index_timeseries(&series(1, "absent_from_report"), b"{f}1");
+        complete(job(b'5'), &reported);
         assert!(
-            !is_key_in_slot_import(b"{f}1"),
-            "slot of the start, absent from the abort"
+            !importing(b"{f}1"),
+            "slot of the start, absent from the report"
         );
+        assert_eq!(visible_values(DB), ["absent_from_report"]);
     }
 
     #[test]
     #[serial]
     fn test_unregistered_completion_leaves_other_imports_alone() {
-        // An import this node never saw start (restored from RDB, say) completes: nothing to
-        // drain, and an unrelated import in flight keeps its slots and keys.
+        // An import this node never saw start completes: an unrelated one keeps hiding.
+        const DB: i32 = 86;
         let running = slots(&[b"{g}x"]);
         let unknown = slots(&[b"{h}x"]);
-        const DB: i32 = 95;
-
         start(job(b'6'), &running);
-        add_delayed_indexing_key(DB, b"{g}1");
-        assert!(finish_import(&job(b'7'), &unknown).is_none());
-        assert!(is_key_in_slot_import(b"{g}1"));
-        let done = finish_import(&job(b'6'), &running).expect("registered");
-        assert_eq!(pending_keys(&done, DB), vec![&b"{g}1"[..]]);
+        get_db_index(DB).index_timeseries(&series(1, "running"), b"{g}1");
+
+        complete(job(b'7'), &unknown);
+        assert!(importing(b"{g}1"));
+        assert!(visible_values(DB).is_empty());
+
+        complete(job(b'6'), &running);
+        assert_eq!(visible_values(DB), ["running"]);
     }
 
     #[test]
     #[serial]
-    fn test_flushing_a_db_drops_only_that_dbs_queued_keys() {
-        let importing = slots(&[b"{i}x"]);
-        start(job(b'8'), &importing);
-        add_delayed_indexing_key(96, b"{i}1");
-        add_delayed_indexing_key(97, b"{i}2");
+    fn test_flushing_a_db_mid_import_forgets_only_that_dbs_series() {
+        let shared = slots(&[b"{i}x"]);
+        start(job(b'8'), &shared);
+        get_db_index(87).index_timeseries(&series(1, "flushed"), b"{i}1");
+        get_db_index(88).index_timeseries(&series(2, "kept"), b"{i}2");
 
-        clear_delayed_keys_in_db(96);
-        let done = finish_import(&job(b'8'), &importing).expect("registered");
-        assert!(pending_keys(&done, 96).is_empty());
-        assert_eq!(pending_keys(&done, 97), vec![&b"{i}2"[..]]);
+        crate::series::index::clear_timeseries_index(87);
+        complete(job(b'8'), &shared);
+        assert!(visible_values(87).is_empty());
+        assert_eq!(visible_values(88), ["kept"]);
     }
 
     #[test]
     #[serial]
-    fn test_flushing_everything_drops_every_queued_key_but_keeps_the_import() {
-        let importing = slots(&[b"{j}x"]);
-        start(job(b'9'), &importing);
-        add_delayed_indexing_key(98, b"{j}1");
+    fn test_a_replayed_label_change_stays_hidden() {
+        // `TS.ALTER … LABELS` re-indexes the series: one more path that must not reveal it.
+        const DB: i32 = 89;
+        let shared = slots(&[b"{j}x"]);
+        start(job(b'9'), &shared);
+        let before = series(1, "before");
+        get_db_index(DB).index_timeseries(&before, b"{j}1");
 
-        clear_delayed_keys_map();
-        assert!(
-            is_key_in_slot_import(b"{j}1"),
-            "the import itself is still running"
+        get_db_index(DB).remove_timeseries(&before);
+        get_db_index(DB).index_timeseries(&series(1, "after"), b"{j}1");
+        assert!(visible_values(DB).is_empty());
+
+        complete(job(b'9'), &shared);
+        assert_eq!(visible_values(DB), ["after"]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_bulk_build_hides_keys_of_an_import_in_flight() {
+        const DB: i32 = 90;
+        let shared = slots(&[b"{k}x"]);
+        start(job(b'0'), &shared);
+        let entry = |id: SeriesRef, key: &str, value: &str| BulkIndexEntry {
+            id,
+            key: key.as_bytes().into(),
+            label_keys: vec![IndexKey::for_label_value("asm_test", value)],
+        };
+        get_db_index(DB).get_postings_mut().bulk_index(vec![
+            entry(1, "{k}1", "imported"),
+            entry(2, "{l}1", "local"),
+        ]);
+        assert_eq!(visible_values(DB), ["local"]);
+
+        complete(job(b'0'), &shared);
+        assert_eq!(visible_values(DB), ["imported", "local"]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_restored_import_hides_the_series_the_load_indexed() {
+        // No start event: the load indexed these before the import was known.
+        const DB: i32 = 79;
+        get_db_index(DB).index_timeseries(&series(1, "loaded"), b"{m}1");
+        assert_eq!(visible_values(DB), ["loaded"]);
+
+        let shared = slots(&[b"{m}x"]);
+        start(job(b'x'), &shared);
+        assert_eq!(
+            for_each_db_postings(|postings| postings.hide_indexed_keys_in_slots(&shared)),
+            1
         );
-        let done = finish_import(&job(b'9'), &importing).expect("registered");
-        assert!(pending_keys(&done, 98).is_empty());
+        assert!(visible_values(DB).is_empty());
+
+        complete(job(b'x'), &shared);
+        assert_eq!(visible_values(DB), ["loaded"]);
     }
 
     /// A synthetic event payload, laid out exactly as the server fills it in.
@@ -1109,42 +972,6 @@ mod tests {
     fn test_payload_with_only_bad_ranges_is_rejected() {
         let p = Payload::new(1, &[(20, 10), (16384, 16385)]);
         assert!(parse_event_payload(p.ptr()).is_none());
-    }
-
-    use serial_test::serial;
-
-    fn keys(names: &[&str]) -> Vec<Box<[u8]>> {
-        names.iter().map(|k| k.as_bytes().into()).collect()
-    }
-
-    #[test]
-    fn test_merging_drain_work_groups_keys_by_db_in_order() {
-        let merged = merge_drain_work(vec![
-            vec![(2, keys(&["b1"])), (1, keys(&["a1"]))],
-            vec![(1, keys(&["a2"])), (3, keys(&[]))],
-        ]);
-        assert_eq!(
-            merged,
-            vec![(1, keys(&["a1", "a2"])), (2, keys(&["b1"]))],
-            "sorted by db, keys concatenated in arrival order, empty dbs dropped"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn test_unscheduled_drain_work_is_kept_for_retry() {
-        // ASM-04: a drain whose thread could not start keeps its keys, and the next retry gets
-        // all of them at once.
-        assert!(take_unscheduled_drains().is_empty());
-        stash_unscheduled_drain(vec![(5, keys(&["{k}1"]))]);
-        stash_unscheduled_drain(vec![(5, keys(&["{k}2"])), (6, keys(&["{k}3"]))]);
-
-        let retried = merge_drain_work(take_unscheduled_drains());
-        assert_eq!(
-            retried,
-            vec![(5, keys(&["{k}1", "{k}2"])), (6, keys(&["{k}3"]))]
-        );
-        assert!(take_unscheduled_drains().is_empty(), "taken once");
     }
 
     fn fields(pairs: &[(&str, &str)]) -> Vec<(String, String)> {

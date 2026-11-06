@@ -18,8 +18,9 @@ impl Postings {
         self.id_to_key.insert(id, key);
     }
 
+    /// How many series a read may see: the directory also holds hidden ones.
     pub fn count(&self) -> usize {
-        self.id_to_key.len()
+        self.id_to_key.len() - self.hidden_ids.cardinality() as usize
     }
 
     pub(in crate::series::index) fn has_id(&self, id: SeriesRef) -> bool {

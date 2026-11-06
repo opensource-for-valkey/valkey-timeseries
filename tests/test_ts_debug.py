@@ -1051,7 +1051,7 @@ class TestDebugMetrics(ValkeyTimeSeriesTestCaseDebugMode):
     EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
                     'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_running']
     TASKS = ['retention_trim', 'tombstone_sweep', 'optimize_index']
-    ASM_TASKS = ['drain']
+    ASM_TASKS = ['optimize']
     TASK_FIELDS = ('started_total', 'completed_total', 'skipped_inflight_total',
                    'spawn_failures_total', 'running', 'duration_seconds',
                    'last_completed_timestamp_seconds')
@@ -1160,11 +1160,11 @@ class TestDebugMetrics(ValkeyTimeSeriesTestCaseDebugMode):
         assert 'fanout_errors_key_permissions_total' in errors
 
     def test_asm_section(self):
-        """The ASM drain task carries the full task lifecycle under `asm_`, next to its work
+        """The ASM optimize task carries the full task lifecycle under `asm_`, next to its work
         counter. A standalone server never migrates slots, so everything is zero."""
         stats = self.debug_metrics('asm')
         expected = {f'asm_{task}_{suffix}' for task in self.ASM_TASKS for suffix in self.TASK_FIELDS}
-        expected |= {'asm_drain_keys_indexed_total'}
+        expected |= {'asm_keys_published_total'}
         assert set(stats) == expected
         for name, value in stats.items():
             if name in self.HISTOGRAMS:

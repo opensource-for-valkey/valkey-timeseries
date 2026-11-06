@@ -68,8 +68,9 @@ Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src
   - `chunks/`: three encodings — **Chimp** (default), **Gorilla**, **Uncompressed**
     (`DEFAULT_CHUNK_ENCODING` in `src/config.rs`). Storage encoding is a user choice; cluster *wire*
     encoding is a separate, internal policy (see Conventions below).
-  - `index/asm.rs` — atomic slot migration (ASM, Valkey 9.0+): event subscription, deferred
-    indexing mid-import, source-side index cleanup after export. During an ASM the source node's
+  - `index/asm.rs` — atomic slot migration (ASM, Valkey 9.0+): event subscription and the registry
+    of imports in flight. Imported series are indexed on arrival but hidden from reads
+    (`index/postings/hidden.rs`) until the import completes. During an ASM the source node's
     forked `aof_rewrite` child can't take the module GIL, so it serializes via `rdb_save` and emits
     the internal `TS._RESTORE key <blob>` command instead of `DUMP`/normal commands; the
     destination replays it like a replication feed (`src/commands/ts_restore.rs`).

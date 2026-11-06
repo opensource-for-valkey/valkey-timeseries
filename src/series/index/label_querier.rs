@@ -663,6 +663,15 @@ where
                 .range::<[u8], _>((start_bound, Bound::<&[u8]>::Unbounded))
             {
                 read_this_hold += 1;
+                let visible = postings.visible_cardinality(map) as usize;
+                if visible == 0 {
+                    // Only hidden or tombstoned series carry this entry: it does not exist yet.
+                    if read_this_hold >= entries_per_hold {
+                        set_resume_key(&mut resume_after, key.as_ref());
+                        continue 'hold;
+                    }
+                    continue;
+                }
                 let Some((key_name, _)) = key.split() else {
                     // Defensive: a malformed entry is passed over, never re-visited.
                     if read_this_hold >= entries_per_hold {
@@ -696,9 +705,9 @@ where
                         }
                         continue 'range;
                     }
-                    pending = Some((score, map.cardinality() as usize));
+                    pending = Some((score, visible));
                 } else if let Some((_, cardinality)) = pending.as_mut() {
-                    *cardinality += map.cardinality() as usize;
+                    *cardinality += visible;
                 }
 
                 if read_this_hold >= entries_per_hold {
@@ -805,6 +814,15 @@ fn get_label_names_desc_in_holds(
                 .rev()
             {
                 read_this_hold += 1;
+                let visible = postings.visible_cardinality(map) as usize;
+                if visible == 0 {
+                    // Only hidden or tombstoned series carry this entry: it does not exist yet.
+                    if read_this_hold >= entries_per_hold {
+                        set_resume_key(&mut resume_below, key.as_ref());
+                        continue 'hold;
+                    }
+                    continue;
+                }
                 let Some((key_name, _)) = key.split() else {
                     if read_this_hold >= entries_per_hold {
                         // Malformed entries still count toward the lock budget.
@@ -841,10 +859,10 @@ fn get_label_names_desc_in_holds(
                     current_result = Some(LabelSearchResult {
                         value: key_name.to_owned(),
                         score,
-                        cardinality: map.cardinality() as usize,
+                        cardinality: visible,
                     });
                 } else if let Some(active) = current_result.as_mut() {
-                    active.cardinality += map.cardinality() as usize;
+                    active.cardinality += visible;
                 }
 
                 if read_this_hold >= entries_per_hold {
@@ -873,7 +891,8 @@ fn get_label_names_desc_in_holds(
 /// The values of one label, in index order, read at most `entries_per_hold` entries per hold
 /// of the postings read lock.
 ///
-/// Under each hold `check` turns an entry into a result or rejects it, and the results are
+/// Under each hold `check` turns an entry and its visible series count, which is never zero, into a
+/// result or rejects it, and the results are
 /// buffered, owned, for after the lock is given back: nothing borrowed from the postings
 /// outlives a hold. A hold also ends once `results_per_hold` results are buffered, so a
 /// value-order read with `LIMIT n`, which needs only `n + 1`, scores no more entries than a
@@ -899,7 +918,7 @@ struct LabelValueScan<'a, F> {
 
 impl<'a, F> LabelValueScan<'a, F>
 where
-    F: FnMut(&IndexKey, &PostingsBitmap) -> Option<LabelSearchResult>,
+    F: FnMut(&IndexKey, usize) -> Option<LabelSearchResult>,
 {
     fn new(
         index: &'a TimeSeriesIndex,
@@ -945,7 +964,10 @@ where
         let mut stopped_at: Option<Vec<u8>> = None;
         for (key, map) in entries {
             read += 1;
-            if let Some(result) = (self.check)(key, map) {
+            let visible = postings.visible_cardinality(map) as usize;
+            if visible > 0
+                && let Some(result) = (self.check)(key, visible)
+            {
                 self.buffered.push_back(result);
             }
             if read == self.entries_per_hold || self.buffered.len() >= self.results_per_hold {
@@ -963,7 +985,7 @@ where
 
 impl<F> Iterator for LabelValueScan<'_, F>
 where
-    F: FnMut(&IndexKey, &PostingsBitmap) -> Option<LabelSearchResult>,
+    F: FnMut(&IndexKey, usize) -> Option<LabelSearchResult>,
 {
     type Item = LabelSearchResult;
 
@@ -1225,13 +1247,9 @@ fn collect_unscoped_label_values_in_holds(
 
     index.read_without_swap(|| {
         Ok(with_search_filter(hints, |filter| {
-            let check = |entry: &IndexKey, map: &PostingsBitmap| {
-                if map.is_empty() {
-                    return None;
-                }
+            let check = |entry: &IndexKey, cardinality: usize| {
                 let (_, value) = entry.split()?;
                 let (accepted, score) = filter.accept(value);
-                let cardinality = map.cardinality() as usize;
                 accepted.then(|| LabelSearchResult {
                     value: value.to_owned(),
                     score,
@@ -1496,9 +1514,36 @@ mod tests {
         iterate_label_names_asc_in_holds, label_cardinality_in_holds,
         label_search_exceeds_inline_budget,
     };
+    use crate::labels::{Label, MetricName};
+    use crate::series::TimeSeries;
     use crate::series::index::FuzzyAlgorithm;
     use crate::series::index::postings::Postings;
     use itertools::Itertools;
+
+    /// One series on each side of an import: `imported` will be hidden, `local` stays visible.
+    fn index_with_hidden_series() -> TimeSeriesIndex {
+        let series = |id, labels: &[(&str, &str)]| {
+            let mut series = TimeSeries::new();
+            series.id = id;
+            let labels: Vec<Label> = labels.iter().map(|(n, v)| Label::new(*n, *v)).collect();
+            series.labels = MetricName::new(&labels);
+            series
+        };
+        let imported = b"{imported}1".as_slice();
+        let mut postings = Postings::default();
+        postings.index_timeseries(
+            &series(
+                1,
+                &[("env", "imported"), ("job", "api"), ("only_imported", "x")],
+            ),
+            imported,
+        );
+        postings.index_timeseries(&series(2, &[("env", "local"), ("job", "api")]), b"{local}1");
+        postings.hide_indexed_keys_in_slots(&range_set_blaze::RangeSetBlaze::from_iter([
+            crate::fanout::calculate_hash_slot(imported),
+        ]));
+        index_of(postings)
+    }
 
     /// An index holding `postings`, for the collectors that take the index and lock it
     /// themselves.
@@ -2579,6 +2624,47 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn label_names_leave_out_what_only_hidden_series_carry() {
+        let index = index_with_hidden_series();
+        for order_by in all_orderings() {
+            let hints = SearchHints {
+                order_by,
+                ..Default::default()
+            };
+            let result = collect_unscoped_label_names(&index, &hints).unwrap();
+            let names: Vec<(&str, usize)> = result
+                .results
+                .iter()
+                .map(|r| (r.value.as_str(), r.cardinality))
+                .sorted()
+                .collect();
+            assert_eq!(names, [("env", 1), ("job", 1)], "{order_by:?}");
+        }
+    }
+
+    #[test]
+    fn label_values_leave_out_what_only_hidden_series_carry() {
+        let index = index_with_hidden_series();
+        for order_by in all_orderings() {
+            let hints = SearchHints {
+                order_by,
+                ..Default::default()
+            };
+            let env = collect_unscoped_label_values(&index, "env", &hints).unwrap();
+            assert_eq!(env.results.len(), 1, "{order_by:?}");
+            assert_eq!(env.results[0].value, "local");
+            let job = collect_unscoped_label_values(&index, "job", &hints).unwrap();
+            assert_eq!(job.results[0].cardinality, 1, "{order_by:?}");
+            assert!(
+                collect_unscoped_label_values(&index, "only_imported", &hints)
+                    .unwrap()
+                    .results
+                    .is_empty()
+            );
         }
     }
 

@@ -183,18 +183,18 @@ Atomic slot migration (Valkey 9.0+). One task, with the same lifecycle names as 
 
 | Task | Node | Trigger |
 |------|------|---------|
-| `drain` | Importing | Index the keys deferred while a slot import ran, once it completes |
+| `optimize` | Importing | Compact the posting lists a completed slot import grew |
 
-So `asm_drain_started_total`, `asm_drain_completed_total`, `asm_drain_skipped_inflight_total`,
-`asm_drain_spawn_failures_total`, `asm_drain_running`, `asm_drain_duration_seconds` and
-`asm_drain_last_completed_timestamp_seconds`. Each drain owns the keys of exactly one import and
-is not suppressed by another in flight, so `asm_drain_running` can exceed one. A drain that
-could not start its thread (`asm_drain_spawn_failures_total`) keeps its keys: they are folded
-into the next drain that starts, or retried on the maintenance schedule every 20 s.
+So `asm_optimize_started_total`, `asm_optimize_completed_total`,
+`asm_optimize_skipped_inflight_total`, `asm_optimize_spawn_failures_total`, `asm_optimize_running`,
+`asm_optimize_duration_seconds` and `asm_optimize_last_completed_timestamp_seconds`. The task only
+compacts: imported series are indexed as they arrive, hidden from reads, and published on the main
+thread when the import completes. If its thread cannot start, the periodic optimizer gets there
+later.
 
 | Work counter | Description |
 |--------------|-------------|
-| `asm_drain_keys_indexed_total` | Deferred import keys successfully indexed, including batches completed before shutdown |
+| `asm_keys_published_total` | Series hidden during a slot import and published when it completed |
 
 The exporting node has no task of its own: the server deletes the exported keys, and the type's
 `unlink` callback retires them from the index like any other deletion.

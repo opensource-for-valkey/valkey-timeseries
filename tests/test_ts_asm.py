@@ -27,8 +27,8 @@ from valkey_timeseries_test_case import (
 
 logger = logging.getLogger(__name__)
 
-# Ceiling for polling the async post-migration index catch-up (the background thread that drains
-# delayed-indexing keys after an ImportCompleted/ExportCompleted event). Polling returns as soon
+# Ceiling for polling the post-migration index state (a node reaches the completion or deletion
+# that updates its index some time after the job reports a terminal state). Polling returns as soon
 # as the condition is met, so this only bounds the failure case rather than adding to happy-path
 # runtime the way the fixed sleeps it replaces did.
 INDEX_CATCHUP_TIMEOUT = 15
@@ -236,7 +236,7 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
         logger.info(f"Migrating slot {slot} to node {target_node_id}")
         self._migrate_slot_range(source_client, target_node_id, slot, slot)
 
-        # Wait for migration to complete. Background index catch-up (delayed-indexing drain,
+        # Wait for migration to complete. Background index catch-up (publishing hidden series,
         # post-migration cleanup) continues asynchronously past this point; callers poll for it
         # via the _assert_*queryindex* / _assert_dbsize_zero helpers rather than sleeping here.
         self._wait_for_no_migrations(source_client, timeout=timeout)
@@ -448,7 +448,7 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
         expected_keys = set(k.encode() for k in keys)
 
-        # Poll: the primary's delayed-indexing drain and the replica's own index catch-up (driven
+        # Poll: the primary's publishing of hidden series and the replica's own index catch-up (driven
         # by the replicated writes) both continue asynchronously past the migration completing.
         self._poll_until(
             lambda: self._local_queryindex(target_primary_client, "migration=yes") == expected_keys
@@ -593,7 +593,7 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
             assert latest[0] == latest_ts, f"Wrong timestamp for {key}"
             assert 100.0 <= float(latest[1]) < 103.0, f"Wrong value for {key}"
 
-    def test_import_aborted_clears_delayed_keys(self):
+    def test_import_aborted_leaves_nothing_indexed(self):
         """Exercise ImportAborted and verify target index stays clean after abort."""
         cluster_client = self.new_cluster_client()
         source_client = self.new_client_for_primary(0)
@@ -624,10 +624,10 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
         self._wait_for_no_migrations(source_client, timeout=30)
         self._wait_for_no_migrations(target_client, timeout=30)
 
-        # ImportAborted path should clear delayed keys and keep the target's local index clean.
+        # ImportAborted should leave nothing hidden and keep the target's local index clean.
         # (A fanned-out TS.QUERYINDEX would still see the keys on the source, which correctly keeps
         # them after an aborted import, so we query the target's local index directly.) Polls
-        # internally for the abort's delayed-key cleanup to finish.
+        # internally for the abort's cleanup to finish.
         self._assert_local_queryindex_empty(target_client, f"tag={hash_tag}")
         self._assert_local_queryindex_empty(target_client, "migration=yes")
 
@@ -973,7 +973,7 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
                         [self._migration_state(m) for m in self._get_slot_migrations(source_client)],
                 timeout=20,
             )
-            # The snapshot's series are deferred on the target.
+            # The snapshot's series are hidden on the target.
             for selector in ("review=before", "review=renamed", "review=copied"):
                 assert self._local_queryindex(target_client, selector) == set(), selector
 

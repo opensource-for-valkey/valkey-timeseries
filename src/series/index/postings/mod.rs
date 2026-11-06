@@ -9,6 +9,7 @@
 //! * [`predicate`] — translating a single `LabelFilter` into a bitmap.
 //! * [`planner`] — boolean set algebra assembling filters and selectors into one bitmap.
 //! * [`stale`] — tombstoned ids: marking, masking them out of reads, incremental draining.
+//! * [`hidden`] — ids of series in a slot still being imported, masked out of reads until it completes.
 //! * [`maintenance`] — incremental bitmap compaction.
 //! * [`serialization`] — the wire format for one index body, container-agnostic.
 //!
@@ -17,6 +18,7 @@
 //! the lookup and planning primitives are deliberately confined to `postings`.
 
 mod directory;
+mod hidden;
 mod maintenance;
 mod mutation;
 mod planner;
@@ -28,6 +30,7 @@ mod terms;
 #[cfg(test)]
 mod test_support;
 
+pub(in crate::series::index) use hidden::HiddenSet;
 pub(crate) use mutation::BulkIndexEntry;
 pub(in crate::series::index) use stale::StaleSet;
 
@@ -60,10 +63,14 @@ pub struct Postings {
     /// happens when the index is inconsistent (value does not exist in the db but exists in the index)
     /// Keep track and cleanup from the index during a gc pass.
     pub(super) stale_ids: StaleSet,
+    /// Ids of series in a slot still being imported, masked out of every read until the import
+    /// completes. See [`hidden`].
+    pub(super) hidden_ids: HiddenSet,
     /// Set of all timeseries ids in the index. This is used to optimize queries that are subtractive.
     ///
-    /// Invariant: this set never contains stale ids — [`Postings::mark_ids_as_stale`] removes them
-    /// here as it marks them. Read paths may therefore use it without masking.
+    /// Invariant: this set never contains stale or hidden ids — [`Postings::mark_ids_as_stale`]
+    /// removes them here as it marks them, and hidden ids join it only when their import completes.
+    /// Read paths may therefore use it without masking.
     pub(crate) all_postings: PostingsBitmap,
 }
 
@@ -73,6 +80,7 @@ impl Default for Postings {
             label_index: PostingsIndex::new(),
             id_to_key: BTreeMap::new(),
             stale_ids: StaleSet::default(),
+            hidden_ids: HiddenSet::default(),
             all_postings: PostingsBitmap::default(),
         }
     }
@@ -84,6 +92,7 @@ impl Postings {
         self.label_index.clear();
         self.id_to_key.clear();
         self.stale_ids.clear();
+        self.hidden_ids.clear();
         self.all_postings.clear();
     }
 
@@ -93,6 +102,7 @@ impl Postings {
         std::mem::swap(&mut self.label_index, &mut other.label_index);
         std::mem::swap(&mut self.id_to_key, &mut other.id_to_key);
         std::mem::swap(&mut self.stale_ids, &mut other.stale_ids);
+        std::mem::swap(&mut self.hidden_ids, &mut other.hidden_ids);
         std::mem::swap(&mut self.all_postings, &mut other.all_postings);
     }
 }

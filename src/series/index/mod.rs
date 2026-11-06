@@ -191,12 +191,6 @@ fn with_series_for_indexing(
     index_fn: fn(&mut Postings, &mut TimeSeries, &[u8]),
 ) {
     let db = get_current_db(ctx);
-    // A key whose slot is being imported stays out of the index until the import completes,
-    // whichever path brought it here — the post-load repair scan included.
-    if asm::is_key_in_slot_import(key) {
-        asm::add_delayed_indexing_key(db, key);
-        return;
-    }
     let valkey_key = create_key_string(ctx, key);
     // Open the key before taking the index lock: opening runs lazy expiry, which can reach
     // the `unlink` callback and its write lock on this same thread.

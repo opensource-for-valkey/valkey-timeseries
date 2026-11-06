@@ -2,10 +2,7 @@
 //!
 use crate::common::context::{create_key_string, get_current_db, register_server_event_handler};
 use crate::common::sync::lock;
-use crate::series::index::asm::{
-    add_delayed_indexing_key, clear_delayed_keys_in_db, clear_delayed_keys_map,
-    is_key_in_slot_import, reconcile_imports_after_load, register_asm_event_handler,
-};
+use crate::series::index::asm::{reconcile_imports_after_load, register_asm_event_handler};
 use crate::series::index::bulk_build;
 use crate::series::index::persistence::{
     on_loading_ended, on_loading_failed, on_loading_started, should_skip_load_indexing,
@@ -24,10 +21,8 @@ use valkey_module::server_events::{
 use valkey_module::{Context, NotifyEvent, ValkeyResult, logging, raw};
 use valkey_module_macros::{loading_event_handler, persistence_event_handler};
 
-/// Logs persistence activity. Nothing here touches the ASM delayed-indexing queue: that queue
-/// belongs to a slot import on this node, and a save that fails (a BGSAVE out of disk, say)
-/// says nothing about the import. Clearing it on a failed save — as this did — left every
-/// imported series unindexed, invisible to MRANGE/MGET until a restart rebuilt the index.
+/// Logs persistence activity. Nothing here touches a slot import's state: a save that fails (a
+/// BGSAVE out of disk, say) says nothing about the import.
 #[persistence_event_handler]
 fn __persistence_event_handler(ctx: &Context, persistence_event: PersistenceSubevent) {
     match persistence_event {
@@ -112,28 +107,15 @@ fn handle_key_rename(ctx: &Context, old_key: &[u8], new_key: &[u8]) {
         return;
     };
     series.key = new_key.into();
-    if is_key_in_slot_import(new_key) {
-        // A replayed RENAME inside an importing slot: retire whatever the old key had (nothing,
-        // unless a replayed create indexed it) and keep the new key hidden until the import
-        // completes.
-        index.remove_timeseries_for_key(&series, old_key);
-        add_delayed_indexing_key(get_current_db(ctx), new_key);
-    } else {
-        index.reindex_timeseries(&series, old_key, new_key);
-    }
+    index.reindex_timeseries(&series, old_key, new_key);
     // Compaction partners link to each other by key.
     relink_renamed_series(ctx, &mut series, old_key);
 }
 
-/// Handle the "restore" event, which is triggered for each key restored from disk during server startup
-/// or slot migration. It collects the keys for later indexing if we're in the middle of an ASM slot import,
-/// otherwise it indexes them immediately.
+/// Handle the "restore" event, which is triggered for each key restored from disk during server
+/// startup or slot migration.
 fn handle_key_restore(ctx: &Context, key: &[u8]) {
     let db = get_current_db(ctx);
-    if is_key_in_slot_import(key) {
-        add_delayed_indexing_key(db, key);
-        return;
-    }
     // Fast path: during an RDB load whose index for this db was preloaded from the aux payload,
     // skip the per-key work entirely (string allocation, keyspace lookup, index lock).
     // `rdb_load` has already assigned `_db` and counted the series; post-load verification in
@@ -161,11 +143,6 @@ fn handle_key_copy(ctx: &Context, key: &[u8]) {
         return;
     };
     series._db = Some(db);
-    if is_key_in_slot_import(key) {
-        // A replayed COPY inside an importing slot stays hidden until the import completes.
-        add_delayed_indexing_key(db, key);
-        return;
-    }
     let index = get_db_index(db);
     let mut postings = index.get_postings_mut();
     index_loaded_series(&mut postings, &mut series, key);
@@ -264,10 +241,8 @@ unsafe extern "C" fn on_flush_event(
             // clear the delayed-keys map alone left the whole index dangling, every id pointing
             // at a key that no longer exists.
             clear_all_timeseries_indexes();
-            clear_delayed_keys_map();
         } else {
             clear_timeseries_index(fi.dbnum);
-            clear_delayed_keys_in_db(fi.dbnum);
         }
     };
 

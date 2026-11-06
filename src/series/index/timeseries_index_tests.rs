@@ -145,6 +145,32 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_do_not_count_hidden_series() {
+        let index = TimeSeriesIndex::new();
+        let imported = create_series_from_metric_name(r#"latency{region="imported",env="qa"}"#);
+        let local = create_series_from_metric_name(r#"latency{region="local",env="qa"}"#);
+        index.index_timeseries(&imported, b"{imported}1");
+        index.index_timeseries(&local, b"{local}1");
+        index.get_postings_mut().hide_indexed_keys_in_slots(
+            &range_set_blaze::RangeSetBlaze::from_iter([crate::fanout::calculate_hash_slot(
+                b"{imported}1",
+            )]),
+        );
+
+        let stats = index.stats("region", 10);
+        assert_eq!(stats.series_count, 1);
+        let by_region = stats.series_count_by_focus_label_value.unwrap();
+        assert_eq!(by_region.len(), 1, "{by_region:?}");
+        assert_eq!(by_region[0].name, "local");
+        let qa = stats
+            .series_count_by_label_value_pairs
+            .iter()
+            .find(|stat| stat.name == "env=qa")
+            .unwrap();
+        assert_eq!(qa.count, 1);
+    }
+
+    #[test]
     fn test_stats_empty_index() {
         let index = TimeSeriesIndex::new();
 

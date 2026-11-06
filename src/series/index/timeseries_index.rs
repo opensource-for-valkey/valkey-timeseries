@@ -736,18 +736,6 @@ impl<'a> BatchIterator<'a> {
         }
     }
 
-    #[inline]
-    fn adjusted_cardinality(inner: &Postings, bitmap: &PostingsBitmap, has_stale_ids: bool) -> u64 {
-        let mut count = bitmap.cardinality();
-        if has_stale_ids {
-            let stale_count = inner.stale_ids.stale_count_in(bitmap);
-            if stale_count > 0 {
-                count = count.saturating_sub(stale_count);
-            }
-        }
-        count
-    }
-
     fn next_batch<F>(&mut self, mut processor: F)
     where
         F: FnMut(&IndexKey, &PostingsBitmap, u64) -> ControlFlow<()>,
@@ -759,7 +747,6 @@ impl<'a> BatchIterator<'a> {
         let mut processed_in_batch = 0usize;
 
         let inner = read_lock(&self.index.inner);
-        let has_stale_ids = !inner.stale_ids.is_empty();
         let mut cursor: Option<&IndexKey> = None;
 
         // Resume from the cursor key using an ordered range rather than a prefix scan (a full key
@@ -782,7 +769,7 @@ impl<'a> BatchIterator<'a> {
 
             let cardinality = match self.matching {
                 Some(matching) => bitmap.and_cardinality(matching),
-                None => Self::adjusted_cardinality(&inner, bitmap, has_stale_ids),
+                None => inner.visible_cardinality(bitmap),
             };
             if cardinality > 0
                 && let ControlFlow::Break(_) = processor(key, bitmap, cardinality)

@@ -1,24 +1,25 @@
-//! `asm`: atomic slot migration (Valkey 9.0+). One task with the lifecycle metrics every task
-//! has (see [`super::task`]), plus how much work it did: on the importing node, `drain` indexes
-//! the keys deferred while the import ran. The exporting node needs no task of its own — the
-//! server deletes the exported keys through `unlink2`, which retires them from the index.
+//! `asm`: atomic slot migration (Valkey 9.0+). One task with the lifecycle metrics every task has
+//! (see [`super::task`]), plus how much work a completed import did. On the importing node, a
+//! completion publishes the import's hidden series on the main thread, then `optimize` compacts
+//! the posting lists the burst grew. The exporting node needs no task of its own: the server
+//! deletes the exported keys through `unlink2`, which retires them from the index.
 
 use super::task::{TaskMetrics, register_task};
 use metered::Registry;
 use metered::entry::counter;
 use std::sync::atomic::AtomicU64;
 
-/// Indexes the keys deferred during a slot import, once it completes.
-pub static DRAIN: TaskMetrics = TaskMetrics::new("drain", "ts-delayed-indexing");
+/// Optimizes the posting lists of the dbs a completed slot import published series into.
+pub static OPTIMIZE: TaskMetrics = TaskMetrics::new("optimize", "ts-asm-optimize");
 
-/// Deferred import keys indexed by `drain`, including batches finished before a shutdown abort.
-pub static DRAIN_KEYS_INDEXED: AtomicU64 = AtomicU64::new(0);
+/// Series made visible by the completion of the slot import that hid them.
+pub static KEYS_PUBLISHED: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn register(registry: &mut Registry<'static>) {
-    register_task(registry, &DRAIN);
+    register_task(registry, &OPTIMIZE);
     registry.register(
-        counter("drain_keys_indexed")
-            .source(&DRAIN_KEYS_INDEXED)
-            .help("Queued import keys successfully indexed, including progress before shutdown"),
+        counter("keys_published")
+            .source(&KEYS_PUBLISHED)
+            .help("Series hidden during a slot import and published when it completed"),
     );
 }

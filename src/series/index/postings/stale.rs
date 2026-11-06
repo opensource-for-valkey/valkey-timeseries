@@ -147,6 +147,11 @@ impl Postings {
     /// Returns how many of `ids` had a key mapping, i.e. were indexed until now; an id another
     /// path retired in the meantime is marked again harmlessly but not counted.
     pub(crate) fn mark_ids_as_stale(&mut self, ids: &[SeriesRef]) -> usize {
+        if !self.hidden_ids.is_empty() {
+            for &id in ids {
+                self.forget_hidden(id);
+            }
+        }
         let removed = ids
             .iter()
             .filter(|id| self.id_to_key.remove(id).is_some())

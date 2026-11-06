@@ -146,8 +146,9 @@ impl Postings {
                 }
                 // Proportional to the id range / 65536, not to the series count: one step.
                 WalkCursor::Bookkeeping => {
-                    memory.bookkeeping_bytes =
-                        bitmap_heap_size(&self.all_postings) + self.stale_ids.heap_size();
+                    memory.bookkeeping_bytes = bitmap_heap_size(&self.all_postings)
+                        + self.stale_ids.heap_size()
+                        + self.hidden_ids.heap_size();
                     WalkCursor::Done
                 }
                 WalkCursor::Done => return WalkCursor::Done,

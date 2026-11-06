@@ -1,16 +1,16 @@
 //! Term-dictionary lookups: resolving label keys and prefixes to posting bitmaps.
 //!
 //! [`Terms`] is the read side of the index, and the only thing the query layers above it
-//! ([`super::predicate`], [`super::planner`]) are handed. It carries three borrows — the term
-//! index, the tombstone set, and the live-id set — which is exactly what reading requires and
+//! ([`super::predicate`], [`super::planner`]) are handed. It carries four borrows — the term
+//! index, the tombstone set, the hidden set, and the live-id set — which is exactly what reading requires and
 //! nothing more: with no access to `id_to_key` and no `&mut`, a query cannot reach the id
 //! directory or mutate the index even by accident.
 //!
-//! Everything here reads `label_index` and therefore masks stale ids before returning; see
-//! [`super::stale`]. Results derived solely from [`Terms::all`] are exempt, since that set is
-//! stale-free by construction.
+//! Everything here reads `label_index` and therefore masks stale and hidden ids before returning;
+//! see [`super::stale`] and [`super::hidden`]. Results derived solely from [`Terms::all`] are
+//! exempt, since that set holds neither by construction.
 
-use super::{EMPTY_BITMAP, Postings, PostingsBitmap, PostingsIndex, StaleSet};
+use super::{EMPTY_BITMAP, HiddenSet, Postings, PostingsBitmap, PostingsIndex, StaleSet};
 use crate::labels::SeriesLabel;
 use crate::series::SeriesRef;
 use crate::series::index::key_buffer::KeyBuffer;
@@ -18,11 +18,12 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 
-/// A read-only view of the term dictionary. Cheap to copy — it is three references.
+/// A read-only view of the term dictionary. Cheap to copy — it is four references.
 #[derive(Clone, Copy)]
 pub(super) struct Terms<'a> {
     index: &'a PostingsIndex,
     stale: &'a StaleSet,
+    hidden: &'a HiddenSet,
     all: &'a PostingsBitmap,
 }
 
@@ -33,6 +34,7 @@ impl Postings {
         Terms {
             index: &self.label_index,
             stale: &self.stale_ids,
+            hidden: &self.hidden_ids,
             all: &self.all_postings,
         }
     }
@@ -68,23 +70,31 @@ impl Postings {
 }
 
 impl<'a> Terms<'a> {
-    /// Every id currently in the index. Stale-free by construction, so bitmaps derived from this
-    /// alone need no masking.
+    /// Every id a read may see. Free of stale and hidden ids by construction, so bitmaps derived
+    /// from this alone need no masking.
     #[inline]
     pub(super) fn all(self) -> &'a PostingsBitmap {
         self.all
     }
 
-    /// Drop stale ids from `postings`. See [`StaleSet::mask`].
+    /// Drop stale and hidden ids from `postings`. See [`StaleSet::mask`].
     #[inline]
     pub(super) fn mask(self, postings: &mut PostingsBitmap) {
         self.stale.mask(postings);
+        self.hidden.mask(postings);
     }
 
-    /// Drop stale ids from a `Cow`. See [`StaleSet::mask_cow`].
+    /// Drop stale and hidden ids from a `Cow`. See [`StaleSet::mask_cow`].
     #[inline]
     pub(super) fn mask_cow(self, postings: Cow<'a, PostingsBitmap>) -> Cow<'a, PostingsBitmap> {
-        self.stale.mask_cow(postings)
+        self.hidden.mask_cow(self.stale.mask_cow(postings))
+    }
+
+    /// Whether a read may see any id of `postings`.
+    #[inline]
+    fn has_visible(self, postings: &PostingsBitmap) -> bool {
+        let cardinality = postings.cardinality();
+        cardinality > self.stale.stale_count_in(postings) + self.hidden.count_in(postings)
     }
 
     /// Union of `bitmaps`, stale ids removed. Borrows when at most one of them is non-empty.
@@ -119,7 +129,7 @@ impl<'a> Terms<'a> {
     pub(super) fn get_label_names(self) -> BTreeSet<String> {
         let mut names: BTreeSet<String> = BTreeSet::new();
         for (key, map) in self.index.iter() {
-            if map.is_empty() {
+            if !self.has_visible(map) {
                 continue;
             }
             if let Some((name, _)) = key.split()
@@ -135,7 +145,7 @@ impl<'a> Terms<'a> {
         let prefix = KeyBuffer::for_prefix(label_name);
         let mut values = Vec::with_capacity(8);
         for (k, map) in self.index.prefix(prefix.as_bytes()) {
-            if !map.is_empty()
+            if self.has_visible(map)
                 && let Some((_key, value)) = k.split()
                 && !value.is_empty()
             {
@@ -283,7 +293,9 @@ impl<'a> Terms<'a> {
         // instead of intersecting.
         if smallest.cardinality() == 1 {
             let id = smallest.minimum()?;
-            let unique = !self.stale.contains(id) && rest.iter().all(|bmp| bmp.contains(id));
+            let unique = !self.stale.contains(id)
+                && !self.hidden.contains(id)
+                && rest.iter().all(|bmp| bmp.contains(id));
             return unique.then_some(id);
         }
 
