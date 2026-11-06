@@ -653,12 +653,13 @@ impl TimeSeriesIndex {
         inner.mark_id_as_stale(id);
     }
 
-    pub fn mark_ids_as_stale(&self, ids: &[SeriesRef]) {
+    /// Marks `ids` stale and returns how many of them were indexed until now.
+    pub fn mark_ids_as_stale(&self, ids: &[SeriesRef]) -> usize {
         if ids.is_empty() {
-            return;
+            return 0;
         }
         let mut inner = write_lock(&self.inner);
-        inner.mark_ids_as_stale(ids);
+        inner.mark_ids_as_stale(ids)
     }
 
     pub fn remove_stale_ids(&self) -> usize {
