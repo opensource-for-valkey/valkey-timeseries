@@ -98,7 +98,10 @@ impl HiddenSet {
                 .sum::<usize>()
     }
 
-    pub(super) fn hide(&mut self, id: SeriesRef, slot: u16) {
+    /// Hides `id`, evicting it from `visible` (`all_postings`), which is passed in so that no
+    /// caller can leave an id in both sets.
+    pub(super) fn hide(&mut self, id: SeriesRef, slot: u16, visible: &mut PostingsBitmap) {
+        visible.remove(id);
         self.ids.add(id);
         self.by_slot.entry(slot).or_default().add(id);
     }
@@ -147,8 +150,7 @@ impl Postings {
         for (&id, key) in &self.id_to_key {
             let slot = calculate_hash_slot(key);
             if slots.contains(slot) && !self.hidden_ids.contains(id) {
-                self.hidden_ids.hide(id, slot);
-                self.all_postings.remove(id);
+                self.hidden_ids.hide(id, slot, &mut self.all_postings);
                 hidden += 1;
             }
         }

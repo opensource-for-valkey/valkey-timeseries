@@ -96,7 +96,7 @@ impl Postings {
         for entry in &entries {
             self.forget_hidden(entry.id);
             match importing_slot(&entry.key) {
-                Some(slot) => self.hidden_ids.hide(entry.id, slot),
+                Some(slot) => self.hidden_ids.hide(entry.id, slot, &mut self.all_postings),
                 None => ids.push(entry.id),
             }
         }
@@ -165,10 +165,7 @@ impl Postings {
         // Every path that indexes a series comes through here, or through `bulk_index`: this is
         // what keeps an import in flight out of reads, whichever path brought the key.
         match importing_slot(key) {
-            Some(slot) => {
-                self.hidden_ids.hide(id, slot);
-                self.all_postings.remove(id);
-            }
+            Some(slot) => self.hidden_ids.hide(id, slot, &mut self.all_postings),
             None => self.all_postings.add(id),
         }
         self.set_timeseries_key(id, key);

@@ -1088,6 +1088,35 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_a_bulk_build_evicts_a_visible_series_it_hides() {
+        // `bulk_index` is documented as safe against a non-empty index, where the id may be
+        // visible already. An id must never be both visible and hidden.
+        const DB: i32 = 77;
+        let shared = slots(&[b"{v}x"]);
+        get_db_index(DB).index_timeseries(&series(1, "visible_first"), b"{v}1");
+
+        start(job(b'v'), &shared);
+        get_db_index(DB)
+            .get_postings_mut()
+            .bulk_index(vec![BulkIndexEntry {
+                id: 1,
+                key: b"{v}1".as_slice().into(),
+                label_keys: vec![IndexKey::for_label_value("asm_test", "visible_first")],
+            }]);
+
+        assert!(
+            !get_db_index(DB).get_postings().all_postings.contains(1),
+            "subtractive reads go through this set unmasked"
+        );
+        assert!(visible_values(DB).is_empty());
+
+        complete(job(b'v'), &shared);
+        assert_eq!(visible_values(DB), ["visible_first"]);
+        assert!(get_db_index(DB).get_postings().all_postings.contains(1));
+    }
+
+    #[test]
+    #[serial]
     fn test_a_restored_import_hides_the_series_the_load_indexed() {
         // No start event: the load indexed these before the import was known.
         const DB: i32 = 79;
