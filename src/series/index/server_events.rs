@@ -4,7 +4,7 @@ use crate::common::context::{create_key_string, get_current_db, register_server_
 use crate::common::sync::lock;
 use crate::series::index::asm::{
     add_delayed_indexing_key, clear_delayed_keys_in_db, clear_delayed_keys_map,
-    is_key_in_slot_import, register_asm_event_handler,
+    is_key_in_slot_import, reconcile_imports_after_load, register_asm_event_handler,
 };
 use crate::series::index::bulk_build;
 use crate::series::index::persistence::{
@@ -62,6 +62,9 @@ fn __loading_event_handler(ctx: &Context, loading_event: LoadingSubevent) {
             // before serving resumes); the aux-preload reconciliation sweep then runs in the
             // background for dbs that took the preload fast path instead.
             bulk_build::on_load_ended();
+            // After the bulk build (so the keys it indexed can be hidden) and before the
+            // reconciliation sweep (which then defers them instead of re-indexing them).
+            reconcile_imports_after_load(ctx);
             on_loading_ended(load_keys_expired(ctx));
         }
         LoadingSubevent::Failed => {

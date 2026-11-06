@@ -11,7 +11,7 @@
 //! exactly like its primary.
 use crate::common::context::{create_key_string, get_current_db, set_current_db};
 use crate::common::hash::BuildNoHashHasher;
-use crate::common::logging::{log_debug, log_warning};
+use crate::common::logging::{log_debug, log_notice, log_warning};
 use crate::common::metrics::asm as metrics;
 use crate::common::metrics::task::TaskRun;
 use crate::common::module_options::{HANDLE_ATOMIC_SLOT_MIGRATION, declare_module_options};
@@ -19,16 +19,17 @@ use crate::common::sync::{lock, write_lock};
 use crate::common::threads::LockGil;
 use crate::fanout::NUM_SLOTS;
 use crate::fanout::{is_clustered, mark_cluster_map_stale};
-use crate::series::TimeSeries;
-use crate::series::index::{get_db_index, index_loaded_series};
+use crate::series::index::{TIMESERIES_INDEX, get_db_index, index_loaded_series};
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
 use crate::series::tasks::optimize_index_fully;
+use crate::series::{TimeSeries, try_get_timeseries_mut};
 use range_set_blaze::RangeSetBlaze;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use valkey_module::{Context, MODULE_CONTEXT, Version, raw};
+use valkey_module::redisvalue::ValkeyValueKey;
+use valkey_module::{Context, MODULE_CONTEXT, ValkeyValue, Version, raw};
 
 const ASM_MINIMUM_VERSION: Version = Version {
     major: 9,
@@ -58,14 +59,14 @@ fn supports_atomic_slot_migration(ctx: &Context) -> bool {
     }
 }
 
-/// Parse a slot ranges string into a vector of inclusive ranges.
+/// Parse a slot ranges string into a vector of inclusive ranges (the `slot_ranges` field of
+/// `CLUSTER GETSLOTMIGRATIONS` is the space-separated form).
 ///
 /// Examples accepted:
 /// - "0-100"
 /// - "0-100 200-300"
 /// - "0-100,200-300"
 /// - "5" (single slot)
-#[cfg(test)]
 fn parse_slot_ranges(s: &str) -> Result<RangeSetBlaze<u16>, String> {
     let mut out = RangeSetBlaze::new();
     let trimmed = s.trim();
@@ -347,9 +348,9 @@ pub(super) fn clear_delayed_keys_in_db(db: i32) {
 
 /// Queues `key` for indexing when the import of its slot completes.
 ///
-/// The caller has just checked [`is_key_in_slot_import`]; both run on the main thread, as do
-/// the event handlers that change the set of imports, so the owning import cannot have gone
-/// away in between.
+/// The caller has just checked [`is_key_in_slot_import`]; both run under the GIL, as do the
+/// event handlers that change the set of imports, so the owning import cannot have gone away
+/// in between.
 pub(crate) fn add_delayed_indexing_key(db: i32, key: &[u8]) {
     let slot = crate::fanout::calculate_hash_slot(key);
     with_imports(
@@ -640,10 +641,188 @@ fn slot_migration_event_handler(event: AtomicSlotMigrationEvent, reported: SlotM
     }
 }
 
+/// Job states `CLUSTER GETSLOTMIGRATIONS` reports for a finished job.
+const TERMINAL_JOB_STATES: [&str; 3] = ["success", "failed", "cancelled"];
+
+/// Reads one `CLUSTER GETSLOTMIGRATIONS` entry, as (field, value) pairs, as an import still in
+/// progress: its job name and slots. `None` for exports, finished jobs and malformed entries.
+fn restored_import_from_fields(
+    fields: &[(String, String)],
+) -> Option<(JobName, RangeSetBlaze<u16>)> {
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+    if !field("operation")?.eq_ignore_ascii_case("IMPORT") {
+        return None;
+    }
+    let state = field("state")?;
+    if TERMINAL_JOB_STATES
+        .iter()
+        .any(|terminal| terminal.eq_ignore_ascii_case(state))
+    {
+        return None;
+    }
+    let name: JobName = field("name")?.as_bytes().try_into().ok()?;
+    let slots = parse_slot_ranges(field("slot_ranges")?).ok()?;
+    if slots.is_empty() {
+        return None;
+    }
+    Some((name, slots))
+}
+
+fn value_text(value: &ValkeyValue) -> Option<String> {
+    match value {
+        ValkeyValue::SimpleString(s) | ValkeyValue::BulkString(s) => Some(s.clone()),
+        ValkeyValue::SimpleStringStatic(s) => Some((*s).to_string()),
+        ValkeyValue::StringBuffer(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        ValkeyValue::BulkValkeyString(s) => Some(s.to_string_lossy()),
+        ValkeyValue::Integer(i) => Some(i.to_string()),
+        _ => None,
+    }
+}
+
+fn value_bytes(value: &ValkeyValue) -> Option<Vec<u8>> {
+    match value {
+        ValkeyValue::SimpleString(s) | ValkeyValue::BulkString(s) => Some(s.as_bytes().to_vec()),
+        ValkeyValue::StringBuffer(b) => Some(b.clone()),
+        ValkeyValue::BulkValkeyString(s) => Some(s.as_slice().to_vec()),
+        _ => None,
+    }
+}
+
+fn key_text(key: &ValkeyValueKey) -> Option<String> {
+    match key {
+        ValkeyValueKey::Integer(i) => Some(i.to_string()),
+        ValkeyValueKey::String(s) => Some(s.clone()),
+        ValkeyValueKey::BulkValkeyString(s) => Some(s.to_string_lossy()),
+        ValkeyValueKey::BulkString(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        ValkeyValueKey::Bool(_) => None,
+    }
+}
+
+/// The (field, value) pairs of one `CLUSTER GETSLOTMIGRATIONS` entry, whichever protocol shape
+/// the reply took.
+fn reply_fields(entry: &ValkeyValue) -> Vec<(String, String)> {
+    match entry {
+        ValkeyValue::Array(items) => items
+            .chunks(2)
+            .filter_map(|pair| match pair {
+                [k, v] => Some((value_text(k)?, value_text(v)?)),
+                _ => None,
+            })
+            .collect(),
+        ValkeyValue::Map(map) => map
+            .iter()
+            .filter_map(|(k, v)| Some((key_text(k)?, value_text(v)?)))
+            .collect(),
+        ValkeyValue::OrderedMap(map) => map
+            .iter()
+            .filter_map(|(k, v)| Some((key_text(k)?, value_text(v)?)))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Registers the imports the server restored from a snapshot, and hides their keys.
+///
+/// A node that loads an in-flight import from an RDB — a target primary restarting, or a
+/// target replica full-syncing from its primary mid-import — recreates the import job from the
+/// RDB's import record and keeps hiding the slots, but fires no `ImportStarted`. Every key of
+/// those slots was therefore indexed as it loaded. Ask the server which imports are in
+/// progress, register each one this module does not know, and move its keys from the index into
+/// its queue; the `SYNCSLOTS FINISH` that ends the import then drains them like any other.
+pub(super) fn reconcile_imports_after_load(ctx: &Context) {
+    if !ASM_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    let entries = match ctx.call("CLUSTER", &["GETSLOTMIGRATIONS"]) {
+        Ok(ValkeyValue::Array(entries)) => entries,
+        Ok(_) => return,
+        Err(e) => {
+            log_warning(format!(
+                "ASM: CLUSTER GETSLOTMIGRATIONS failed after load; imports restored from the snapshot (if any) are not deferred: {e}"
+            ));
+            return;
+        }
+    };
+    for (job, slots) in entries
+        .iter()
+        .filter_map(|entry| restored_import_from_fields(&reply_fields(entry)))
+    {
+        let known = with_imports(|imports| imports.iter().any(|j| j.name == job));
+        if known {
+            continue;
+        }
+        start_import(job, slots.clone());
+        let hidden = hide_keys_in_slots(ctx, &slots);
+        log_notice(format!(
+            "ASM import {} restored from snapshot: {} slot range(s) deferred, {hidden} loaded key(s) moved out of the index",
+            job_display(&job),
+            slots.ranges_len()
+        ));
+    }
+}
+
+/// Moves every timeseries key in `slots`, in every db, out of the index and into the queue of
+/// the import that owns its slot. Returns how many keys were moved.
+fn hide_keys_in_slots(ctx: &Context, slots: &RangeSetBlaze<u16>) -> usize {
+    let mut dbs: Vec<i32> = TIMESERIES_INDEX.pin().keys().copied().collect();
+    if !dbs.contains(&0) {
+        dbs.push(0);
+    }
+    dbs.sort_unstable();
+    let save_db = get_current_db(ctx);
+    let mut hidden = 0usize;
+    for db in dbs {
+        set_current_db(ctx, db);
+        for slot in slots.iter() {
+            // Importing slots are hidden from SCAN but addressable by slot.
+            let keys: Vec<Vec<u8>> = match ctx.call(
+                "CLUSTER",
+                &["GETKEYSINSLOT", &slot.to_string(), "1000000000"],
+            ) {
+                Ok(ValkeyValue::Array(items)) => items.iter().filter_map(value_bytes).collect(),
+                Ok(_) => Vec::new(),
+                Err(e) => {
+                    log_warning(format!(
+                        "ASM: CLUSTER GETKEYSINSLOT {slot} failed after load: {e}"
+                    ));
+                    Vec::new()
+                }
+            };
+            for key in keys {
+                let valkey_key = create_key_string(ctx, &key);
+                let is_series = match try_get_timeseries_mut(ctx, &valkey_key, None) {
+                    // Key-checked: a no-op for a key the load left unindexed.
+                    Ok(Some(series)) => {
+                        get_db_index(db).remove_timeseries_for_key(&series, &key);
+                        true
+                    }
+                    _ => false,
+                };
+                if !is_series {
+                    continue;
+                }
+                add_delayed_indexing_key(db, &key);
+                hidden += 1;
+            }
+        }
+    }
+    set_current_db(ctx, save_db);
+    hidden
+}
+
+/// Set once the event handler is registered: this server can migrate slots atomically.
+static ASM_ENABLED: AtomicBool = AtomicBool::new(false);
+
 pub(super) fn register_asm_event_handler(ctx: &Context) {
     if supports_atomic_slot_migration(ctx) {
         ctx.log_notice("Registering atomic slot migration event handler");
         subscribe_to_atomic_slot_migration_events(ctx);
+        ASM_ENABLED.store(true, Ordering::Release);
     } else {
         ctx.log_notice(
             "Atomic slot migration not supported, skipping registration of related event handler",
@@ -966,6 +1145,58 @@ mod tests {
             vec![(5, keys(&["{k}1", "{k}2"])), (6, keys(&["{k}3"]))]
         );
         assert!(take_unscheduled_drains().is_empty(), "taken once");
+    }
+
+    fn fields(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_in_progress_import_is_read_from_getslotmigrations_fields() {
+        let name = "0123456789abcdef0123456789abcdef01234567";
+        let parsed = restored_import_from_fields(&fields(&[
+            ("name", name),
+            ("operation", "IMPORT"),
+            ("slot_ranges", "10-20 30-30"),
+            ("state", "occurring-on-primary"),
+        ]))
+        .expect("an in-flight import");
+        assert_eq!(&parsed.0[..], name.as_bytes());
+        assert_eq!(parsed.1, RangeSetBlaze::from_iter([10..=20, 30..=30]));
+    }
+
+    #[test]
+    fn test_exports_finished_jobs_and_malformed_entries_are_not_restored() {
+        let name = "0123456789abcdef0123456789abcdef01234567";
+        let base = |op: &str, state: &str, ranges: &str, n: &str| {
+            fields(&[
+                ("name", n),
+                ("operation", op),
+                ("slot_ranges", ranges),
+                ("state", state),
+            ])
+        };
+        assert!(
+            restored_import_from_fields(&base("EXPORT", "snapshotting", "1-2", name)).is_none()
+        );
+        for state in ["success", "failed", "cancelled"] {
+            assert!(restored_import_from_fields(&base("IMPORT", state, "1-2", name)).is_none());
+        }
+        assert!(
+            restored_import_from_fields(&base("IMPORT", "occurring-on-primary", "20-10", name))
+                .is_none()
+        );
+        assert!(
+            restored_import_from_fields(&base("IMPORT", "occurring-on-primary", "1-2", "short"))
+                .is_none()
+        );
+        assert!(
+            restored_import_from_fields(&fields(&[("name", name), ("operation", "IMPORT")]))
+                .is_none()
+        );
     }
 
     #[test]

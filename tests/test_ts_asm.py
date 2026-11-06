@@ -1021,6 +1021,59 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
             self._cancel_migrations_quietly(source_client)
             source_client.execute_command("DEBUG", "SLOTMIGRATION", "PREVENT-PAUSE", 0)
 
+    def test_import_restored_from_snapshot_stays_hidden_on_replica(self):
+        """A node that loads an in-flight import from an RDB (here: the target's replica full-
+        syncing mid-import) gets no ImportStarted event from the server, so it must discover the
+        import itself and keep those keys out of its index until the import completes."""
+        source_client = self.new_client_for_primary(0)
+        self._skip_if_asm_not_supported(source_client)
+        target_rg = self.get_replication_group(1)
+        target_primary_client = target_rg.get_primary_connection()
+
+        hash_tag = self._find_hash_tag_for_shard(source_client, "asm_rdb", shard_index=0)
+        keys = [f"ts:{{{hash_tag}}}:s{i}" for i in range(20)]
+        for i, key in enumerate(keys):
+            source_client.execute_command("TS.CREATE", key, "LABELS", "rdb", "yes", "tag", hash_tag)
+            source_client.execute_command("TS.ADD", key, 1000, i)
+        slot = self._get_key_slot(source_client, keys[0])
+
+        source_client.execute_command("DEBUG", "SLOTMIGRATION", "PREVENT-PAUSE", 1)
+        try:
+            self._migrate_slot_range(source_client, self._get_node_id(target_primary_client), slot, slot)
+            wait_for_true(
+                lambda: "waiting-to-pause" in
+                        [self._migration_state(m) for m in self._get_slot_migrations(source_client)],
+                timeout=20,
+            )
+            assert self._local_queryindex(target_primary_client, f"tag={hash_tag}") == set()
+
+            # Restart the target's replica without its RDB: it full-syncs from the target
+            # primary, whose snapshot carries the importing keys and the import record.
+            replica = target_rg.replicas[0]
+            replica.server.restart(remove_rdb=True, remove_nodes_conf=False)
+            replica.client = replica.server.get_new_client()
+            target_rg.wait_for_replica_offset_to_sync_up(0)
+            target_replica_client = target_rg.get_replica_connection(0)
+            target_replica_client.execute_command("READONLY")
+            # The replica recreated the import job from the snapshot and hides its keys.
+            wait_for_true(lambda: target_replica_client.dbsize() == 0 and bool(
+                [m for m in self._get_slot_migrations(target_replica_client)
+                 if self._migration_state(m) not in self.TERMINAL_MIGRATION_STATES]),
+                          timeout=20)
+
+            assert self._local_queryindex(target_replica_client, f"tag={hash_tag}") == set(), (
+                "the replica indexed importing keys it loaded from the snapshot"
+            )
+
+            source_client.execute_command("DEBUG", "SLOTMIGRATION", "PREVENT-PAUSE", 0)
+            self._wait_for_no_migrations(source_client)
+            target_rg.wait_for_replica_offset_to_sync_up(0)
+            self._assert_local_queryindex_contains(target_primary_client, f"tag={hash_tag}", keys)
+            self._assert_local_queryindex_contains(target_replica_client, f"tag={hash_tag}", keys)
+        finally:
+            self._cancel_migrations_quietly(source_client)
+            source_client.execute_command("DEBUG", "SLOTMIGRATION", "PREVENT-PAUSE", 0)
+
     def _find_hash_tag_for_shard(self, client: Valkey, prefix: str, shard_index: int, max_attempts: int = 512) -> str:
         """Find a hash tag whose slot is owned by the requested shard."""
         for i in range(max_attempts):
