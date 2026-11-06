@@ -1,14 +1,21 @@
 use super::ts_mget_fanout_command::MGetFanoutCommand;
 use crate::commands::command_parser::{CommandArgToken, parse_hash_tags};
-use crate::commands::fanout_codec::MGetValue;
+use crate::commands::fanout_codec::{MGetValue, mget_value};
 use crate::commands::utils::reply_with_mget_values;
 use crate::commands::{parse_command_arg_token, parse_label_list, parse_series_selector_list};
+use crate::common::Sample;
+use crate::common::threads::GilSource;
 use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, is_clustered};
 use crate::labels::Label;
-use crate::series::index::with_matched_series;
+use crate::series::TimeSeries;
+use crate::series::index::{
+    DEFAULT_SERIES_BATCH_SIZE, SeriesCursor, SeriesSelection, for_each_planned_series,
+    read_planned, with_matched_series,
+};
 use crate::series::request_types::{MGetRequest, MGetSeriesData, MatchFilterOptions};
 use crate::series::{get_latest_compaction_sample, get_series_labels};
+use std::ops::ControlFlow;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString};
 
 acl_categories!(TS_MGET, "ts.mget", "read timeseries");
@@ -140,40 +147,19 @@ pub fn process_mget_request(
     ctx: &Context,
     options: MGetRequest,
 ) -> ValkeyResult<Vec<MGetSeriesData>> {
-    let with_labels = options.with_labels;
-    let selected_labels = &options.selected_labels;
     let mut series = Vec::with_capacity(8);
 
     let opts: MatchFilterOptions = options.filters.into();
+    let selected_labels = &options.selected_labels;
 
-    with_matched_series(ctx, &mut series, &opts, move |acc, series, series_key| {
-        let sample = if options.latest {
-            get_latest_compaction_sample(ctx, series).or(series.last_sample)
-        } else {
-            series.last_sample
-        };
-        // SELECTED_LABELS entries are positionally aligned with the request:
-        // a label missing from the series keeps its requested name with an
-        // empty value, so the reply can render [name, nil] like the reference.
-        let series_labels = get_series_labels(series, with_labels, selected_labels);
-        let labels = if selected_labels.is_empty() {
-            series_labels
-                .into_iter()
-                .map(|label| label.map(|x| Label::new(x.name, x.value)))
-                .collect()
-        } else {
-            series_labels
-                .into_iter()
-                .zip(selected_labels.iter())
-                .map(|(label, requested)| {
-                    Some(label.map_or_else(
-                        || Label::new(requested.as_str(), ""),
-                        |x| Label::new(x.name, x.value),
-                    ))
-                })
-                .collect()
-        };
-
+    with_matched_series(ctx, &mut series, &opts, |acc, series, series_key| {
+        let (sample, labels) = mget_series_fields(
+            ctx,
+            series,
+            options.latest,
+            options.with_labels,
+            selected_labels,
+        );
         acc.push(MGetSeriesData {
             sample,
             labels,
@@ -182,4 +168,79 @@ pub fn process_mget_request(
     })?;
 
     Ok(series)
+}
+
+/// A shard's share of a clustered TS.MGET, read in batches: the lock is given back between
+/// them, and the read stops there once `src`'s requester has given up. A fan-out has no
+/// atomicity across shards to preserve, unlike [`process_mget_request`] on a single node.
+pub fn read_mget_values<S: GilSource + ?Sized>(
+    src: &S,
+    options: MGetRequest,
+) -> ValkeyResult<Vec<MGetValue>> {
+    let opts: MatchFilterOptions = options.filters.into();
+    let selected_labels = &options.selected_labels;
+    let replan = || {
+        SeriesCursor::plan(
+            src.db(),
+            SeriesSelection::Matching(&opts.matchers),
+            opts.date_range,
+        )
+    };
+
+    read_planned(None, replan, |cursor| {
+        let mut values = Vec::with_capacity(8);
+        for_each_planned_series(
+            src,
+            cursor,
+            DEFAULT_SERIES_BATCH_SIZE,
+            |ctx, series, key| {
+                let (sample, labels) = mget_series_fields(
+                    ctx,
+                    &series,
+                    options.latest,
+                    options.with_labels,
+                    selected_labels,
+                );
+                values.push(mget_value(key.as_slice(), labels, sample));
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        Ok(values)
+    })
+}
+
+fn mget_series_fields(
+    ctx: &Context,
+    series: &TimeSeries,
+    latest: bool,
+    with_labels: bool,
+    selected_labels: &[String],
+) -> (Option<Sample>, Vec<Option<Label>>) {
+    let sample = if latest {
+        get_latest_compaction_sample(ctx, series).or(series.last_sample)
+    } else {
+        series.last_sample
+    };
+    // SELECTED_LABELS entries are positionally aligned with the request:
+    // a label missing from the series keeps its requested name with an
+    // empty value, so the reply can render [name, nil] like the reference.
+    let series_labels = get_series_labels(series, with_labels, selected_labels);
+    let labels = if selected_labels.is_empty() {
+        series_labels
+            .into_iter()
+            .map(|label| label.map(|x| Label::new(x.name, x.value)))
+            .collect()
+    } else {
+        series_labels
+            .into_iter()
+            .zip(selected_labels.iter())
+            .map(|(label, requested)| {
+                Some(label.map_or_else(
+                    || Label::new(requested.as_str(), ""),
+                    |x| Label::new(x.name, x.value),
+                ))
+            })
+            .collect()
+    };
+    (sample, labels)
 }

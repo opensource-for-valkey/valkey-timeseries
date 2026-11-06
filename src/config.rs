@@ -463,11 +463,6 @@ pub fn is_debug_mode_enabled() -> bool {
 /// (`ts-fanout-aggregation-pushdown`, default on). Consulted by the
 /// coordinator only; shards obey the request flag.
 ///
-/// This is NOT a mixed-version safety mechanism — the fanout compatibility
-/// handshake (self-describing responses + envelope feature gate, see
-/// `docs/fanout-compatibility-handshake.md`) makes version skew correct
-/// automatically, so no config action is needed across a rolling upgrade.
-///
 /// Its remaining purpose is an emergency/diagnostic escape hatch for the
 /// push-down code path itself: flipping it off at runtime routes every query
 /// back through the older coordinator-side aggregation path without a module

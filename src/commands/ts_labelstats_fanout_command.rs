@@ -7,7 +7,7 @@ use crate::commands::utils::get_multi_command_targets;
 use crate::common::acl::check_metadata_permissions;
 use crate::common::replies::ReplyContext;
 use crate::fanout::{
-    FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
+    FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutError, FanoutTarget, NodeInfo,
 };
 use crate::series::index::{
     PostingStat, PostingsBitmap, PostingsStats, StatsMaxHeap, deserialize_bitmap, get_db_index,
@@ -99,11 +99,17 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
-        // Handle the response from a remote target
-        self.state.series_count += resp.series_count as usize;
+        // Handle the response from a remote target. Decoded first, so that a response with an
+        // unreadable bitmap adds nothing.
+        let decode = |bitmap| {
+            deserialize_bitmap(bitmap).map_err(|e| FanoutError::serialization(e.to_string()))
+        };
+        let labels_bitmap = decode(&resp.labels_bitmap)?;
+        let label_value_pairs_bitmap = decode(&resp.label_value_pairs_bitmap)?;
 
-        self.state.labels_bitmap |= deserialize_bitmap(&resp.labels_bitmap);
-        self.state.label_value_pairs_bitmap |= deserialize_bitmap(&resp.label_value_pairs_bitmap);
+        self.state.series_count += resp.series_count as usize;
+        self.state.labels_bitmap |= labels_bitmap;
+        self.state.label_value_pairs_bitmap |= label_value_pairs_bitmap;
 
         collate_stats_values(
             &mut self.state.series_count_by_metric_name,
@@ -182,6 +188,72 @@ fn collate_stats_values(map: &mut AHashMap<String, PostingStat>, values: &[MPost
                     count: result.count,
                 },
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fanout::{ErrorKind, NodeRole, SocketAddress};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn target() -> NodeInfo {
+        NodeInfo {
+            id: Default::default(),
+            shard_id: Default::default(),
+            socket_address: SocketAddress {
+                port: 0,
+                primary_endpoint: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            },
+            role: NodeRole::Primary,
+            location: Default::default(),
+        }
+    }
+
+    fn response(labels: &[u64], pairs: &[u64]) -> StatsResponse {
+        StatsResponse {
+            series_count: 2,
+            labels_bitmap: serialize_bitmap(&PostingsBitmap::of(labels)),
+            label_value_pairs_bitmap: serialize_bitmap(&PostingsBitmap::of(pairs)),
+            ..Default::default()
+        }
+    }
+
+    /// A shard's label sets merge across responses, so the same label counts once.
+    #[test]
+    fn valid_bitmaps_merge() {
+        let mut command = LabelStatsFanoutCommand::default();
+
+        command
+            .on_response(response(&[1, 2], &[10]), &target())
+            .unwrap();
+        command
+            .on_response(response(&[2, 3], &[11]), &target())
+            .unwrap();
+
+        assert_eq!(command.state.series_count, 4);
+        assert_eq!(command.state.labels_bitmap.cardinality(), 3);
+        assert_eq!(command.state.label_value_pairs_bitmap.cardinality(), 2);
+    }
+
+    /// An unreadable bitmap fails the fan-out rather than undercounting the labels, and the
+    /// response leaves nothing behind, for either of its bitmaps.
+    #[test]
+    fn an_invalid_bitmap_is_an_error() {
+        let corrupt = vec![1, 0xFF, 0xFF];
+        let mut bad_labels = response(&[1], &[10]);
+        bad_labels.labels_bitmap = corrupt.clone();
+        let mut bad_pairs = response(&[1], &[10]);
+        bad_pairs.label_value_pairs_bitmap = corrupt;
+
+        for bad in [bad_labels, bad_pairs] {
+            let mut command = LabelStatsFanoutCommand::default();
+            let error = command.on_response(bad, &target()).unwrap_err();
+
+            assert_eq!(error.kind, ErrorKind::Serialization);
+            assert_eq!(command.state.series_count, 0);
+            assert_eq!(command.state.labels_bitmap.cardinality(), 0);
         }
     }
 }

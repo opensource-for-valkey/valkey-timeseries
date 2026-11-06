@@ -327,6 +327,54 @@ impl CompressionType {
         }
     }
 }
+/// Prefixes every message on the cluster bus. On the wire a message is a u32
+/// little-endian marker, the varint length of this header, this header, then the
+/// payload. The payload stays outside the protobuf so large replies are not
+/// copied.
+///
+/// A receiver ignores fields it does not know, so a new field's absent value must
+/// mean "today's behaviour". A change the receiver cannot safely ignore takes a
+/// required_features bit.
+///
+/// prost truncates varints to the declared width without an error, so integers
+/// whose value is checked after decoding are declared 64 bits wide: a 32-bit db
+/// would fold 2^32 onto database 0, and 32-bit features would drop a demanded bit.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EnvelopeHeader {
+    /// Matches a response to its request.
+    #[prost(uint64, tag = "1")]
+    pub request_id: u64,
+    /// Database for this request. Must fit an i32.
+    #[prost(sint64, tag = "2")]
+    pub db: i64,
+    /// Handler that processes the message. Empty on error replies.
+    #[prost(string, tag = "3")]
+    pub handler: ::prost::alloc::string::String,
+    /// ACL user for shard-side enforcement. Empty means no user context.
+    #[prost(string, tag = "4")]
+    pub user: ::prost::alloc::string::String,
+    /// Hash of the sender's cluster map. 0 disables the receiver's topology check.
+    #[prost(fixed64, tag = "5")]
+    pub cluster_fingerprint: u64,
+    /// Feature bits the receiver must understand to process this message.
+    #[prost(uint64, tag = "6")]
+    pub required_features: u64,
+    /// How long the requester waits for the answer, counted by the receiver from
+    /// arrival. 0 means no limit, as replies and errors send.
+    #[prost(uint64, tag = "7")]
+    pub time_budget_ms: u64,
+}
+/// The payload of a fanout error reply.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EnvelopeError {
+    /// An ErrorKind discriminant. Must fit a u8; receivers report kinds they do
+    /// not know as an invalid message, keeping the text.
+    #[prost(uint64, tag = "1")]
+    pub kind: u64,
+    /// Extra context. Empty means the kind's default text.
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FilterListValue {
     #[prost(string, repeated, tag = "1")]

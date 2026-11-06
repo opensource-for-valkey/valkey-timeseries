@@ -1,7 +1,9 @@
 use crate::common::acl::AclContextGuard;
 use crate::common::context::set_current_db;
 use crate::common::threads::{GilSource, LockGil};
-use std::sync::OnceLock;
+use crate::error_consts;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use valkey_module::{DetachedContext, MODULE_CONTEXT, Status, ValkeyError, ValkeyResult};
 
@@ -28,6 +30,8 @@ pub struct FanoutContext {
     ctx: &'static DetachedContext,
     /// When the requester stops waiting, if it said ([`Self::set_deadline`]).
     deadline: OnceLock<Instant>,
+    /// Set by the requester's cancel message, if this request can get one.
+    cancelled: OnceLock<Arc<AtomicBool>>,
 }
 
 impl FanoutContext {
@@ -42,6 +46,7 @@ impl FanoutContext {
             db,
             ctx: &MODULE_CONTEXT,
             deadline: OnceLock::new(),
+            cancelled: OnceLock::new(),
         }
     }
 
@@ -49,18 +54,48 @@ impl FanoutContext {
     /// keyspace for it stop between batches from then on ([`Self::expired`]). Only the
     /// first call counts.
     ///
-    /// Nothing on this branch sets one yet: the PromQL fan-out does, from its
-    /// request's time budget. Until then [`Self::expired`] is always false.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Set from the request's time budget for a cancellable operation
+    /// (`FanoutCommand::cancellable`), counted from when the request arrived; without
+    /// one, [`Self::expired`] is always false.
     pub fn set_deadline(&self, deadline: Instant) {
         let _ = self.deadline.set(deadline);
     }
 
-    /// Whether the requester has stopped waiting: its answer would arrive after it gave up.
-    pub fn expired(&self) -> bool {
-        self.deadline
+    /// The flag the requester's cancel message sets. Only the first call counts.
+    pub fn set_cancel_flag(&self, cancelled: Arc<AtomicBool>) {
+        let _ = self.cancelled.set(cancelled);
+    }
+
+    /// Whether the requester has said it stopped waiting.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
             .get()
-            .is_some_and(|deadline| Instant::now() >= *deadline)
+            .is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
+    }
+
+    /// Whether the requester has stopped waiting: it said so, or its answer would arrive after
+    /// it gave up.
+    pub fn expired(&self) -> bool {
+        self.is_cancelled()
+            || self
+                .deadline
+                .get()
+                .is_some_and(|deadline| Instant::now() >= *deadline)
+    }
+
+    /// [`Self::lock`] for a read that holds the lock throughout: fails with
+    /// [`FANOUT_REQUESTER_GAVE_UP`](error_consts::FANOUT_REQUESTER_GAVE_UP) instead of starting
+    /// a read nobody is waiting for, including when the wait for the lock used up the time.
+    pub fn lock_unexpired(&self) -> ValkeyResult<AclContextGuard> {
+        let gave_up = || Err(ValkeyError::Str(error_consts::FANOUT_REQUESTER_GAVE_UP));
+        if self.expired() {
+            return gave_up();
+        }
+        let guard = self.lock()?;
+        if self.expired() {
+            return gave_up();
+        }
+        Ok(guard)
     }
 
     /// The ACL user the request executes as, if enforcement applies.
@@ -141,6 +176,14 @@ mod tests {
         let past = FanoutContext::new(None, 0);
         past.set_deadline(Instant::now());
         assert!(past.expired());
+
+        let cancelled = FanoutContext::new(None, 0);
+        let flag = Arc::new(AtomicBool::new(false));
+        cancelled.set_cancel_flag(flag.clone());
+        assert!(!cancelled.expired(), "not cancelled yet");
+        flag.store(true, Ordering::Relaxed);
+        assert!(cancelled.is_cancelled());
+        assert!(cancelled.expired(), "a cancel needs no deadline");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use super::fanout_codec::generated::{MGetValue, MultiGetRequest, MultiGetResponse};
 use crate::commands::fanout_codec::filters::{deserialize_matchers_list, serialize_matchers_list};
-use crate::commands::process_mget_request;
+use crate::commands::read_mget_values;
 use crate::commands::utils::{get_multi_command_targets, reply_with_mget_values};
 use crate::common::logging::log_error;
 use crate::common::replies::ReplyContext;
@@ -52,15 +52,9 @@ impl FanoutClientCommand for MGetFanoutCommand {
             tags: vec![],
         };
 
-        // The per-series results carry the key as a `ValkeyString`, so convert
-        // them before releasing the lock.
-        let values: Vec<MGetValue> = {
-            let ctx = ctx.lock()?;
-            let results = process_mget_request(&ctx, mreq)?;
-            results.into_iter().map(|resp| resp.into()).collect()
-        };
-
-        Ok(MultiGetResponse { values })
+        Ok(MultiGetResponse {
+            values: read_mget_values(ctx, mreq)?,
+        })
     }
 
     fn generate_request(&self) -> MultiGetRequest {

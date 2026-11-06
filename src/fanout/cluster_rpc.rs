@@ -15,7 +15,7 @@ use crate::config::FANOUT_COMMAND_TIMEOUT;
 use crate::fanout::cluster_map::{CURRENT_NODE_ID, NodeId, NodeRole, SocketAddress};
 use crate::fanout::fanout_command::FanoutResponseCallback;
 use crate::fanout::fanout_context::FanoutContext;
-use crate::fanout::registry::{RequestHandlerCallback, get_fanout_request_handler};
+use crate::fanout::registry::{RegisteredOperation, get_fanout_request_handler};
 use crate::fanout::serialization::Serializable;
 use crate::fanout::workers::PEER_REQUEST_EXECUTOR;
 use crate::fanout::{
@@ -41,6 +41,9 @@ use valkey_module::{
 const FANOUT_REQUEST_MESSAGE: u8 = 0x01;
 const FANOUT_RESPONSE_MESSAGE: u8 = 0x02;
 const FANOUT_ERROR_MESSAGE: u8 = 0x03;
+/// The requester has stopped waiting for a request's answer. A node without a receiver for this
+/// type drops the message, and its share then ends at its time budget instead.
+const FANOUT_CANCEL_MESSAGE: u8 = 0x04;
 
 /// Default buffer size for serializing fanout request messages (header + small protobuf payload).
 const FANOUT_RPC_BUFFER_SIZE: usize = 512;
@@ -225,7 +228,19 @@ fn initial_request_id() -> u64 {
 /// - Two different nodes can safely use the same ID simultaneously for different requests
 ///
 fn generate_id() -> u64 {
-    REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+    next_id(&REQUEST_ID)
+}
+
+/// The counter's next value other than 0, which a seed or a wrap can land on. An error reply
+/// in db 0 carries nothing else in its header, and an empty header does not decode, so the
+/// requester would never see the error.
+fn next_id(counter: &AtomicU64) -> u64 {
+    loop {
+        let id = counter.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
 }
 
 /// The timeout timer's callback. Runs on the main thread inside
@@ -239,7 +254,7 @@ fn generate_id() -> u64 {
 /// with it; observed on the first fanout timeout of a large cluster range
 /// read). The server removes and frees the firing timer itself once this
 /// returns.
-fn on_request_timeout(_ctx: &Context, id: u64) {
+fn on_request_timeout(ctx: &Context, id: u64) {
     let map = INFLIGHT_REQUESTS.pin();
     if let Some(request) = map.get(&id) {
         // Timeout can race with responses; only one path should complete the request.
@@ -249,8 +264,39 @@ fn on_request_timeout(_ctx: &Context, id: u64) {
 
         metrics::FANOUT_RPC_TIMEOUTS.incr();
         request.deliver_timeout();
+        send_cancels(ctx, request);
 
         map.remove(&id);
+    }
+}
+
+/// Tells the targets yet to answer that nobody is waiting any more. A peer's time budget counts
+/// from when it reads the request, so a peer whose main thread stalled would otherwise give it a
+/// full budget after the requester has gone. This reaches it behind the request, on the same
+/// link. A lost message only leaves that budget in place, so a failed send is not an error.
+///
+/// A write always runs to the end on the shards that received it, so it gets no cancel.
+fn send_cancels(ctx: &Context, request: &InFlightRequest) {
+    if !get_fanout_request_handler(request.command).is_some_and(|op| op.cancellable) {
+        return;
+    }
+    let answered = lock(&request.responded);
+    for node in request.targets.iter() {
+        if node.is_local() || answered.contains(&node.id) {
+            continue;
+        }
+        let sent = send_message_internal(
+            ctx,
+            FANOUT_CANCEL_MESSAGE,
+            request.id,
+            0,
+            node.id.raw_ptr(),
+            "",
+            &[],
+        );
+        if sent == Status::Ok {
+            metrics::FANOUT_CANCELS_SENT.incr();
+        }
     }
 }
 
@@ -327,14 +373,19 @@ pub(super) fn send_cluster_request(
     let db = get_current_db(ctx);
     let user = caller_user_name(ctx);
 
+    let timeout = timeout.unwrap_or_else(get_cluster_command_timeout);
+
+    // The timeout travels as the request's time budget: a peer drops a request still
+    // queued past it instead of running it for a requester that has given up.
     let mut buf = get_pooled_buffer(FANOUT_RPC_BUFFER_SIZE);
     serialize_request_message(
         &mut buf,
         id,
         db,
         handler,
-        user.as_deref(),
+        user,
         cluster_fingerprint,
+        Some(timeout),
         request_buf,
     );
 
@@ -349,7 +400,6 @@ pub(super) fn send_cluster_request(
     }
 
     let node_count = remote_targets.len();
-    let timeout = timeout.unwrap_or_else(get_cluster_command_timeout);
     let timer_id = ctx.create_timer(timeout, on_request_timeout, id);
 
     let request = InFlightRequest {
@@ -401,7 +451,7 @@ fn send_message_internal(
     let mut dest = get_pooled_buffer(FANOUT_RPC_RESPONSE_BUFFER_SIZE);
     // Responses and errors don't carry a meaningful cluster-map fingerprint or
     // ACL user; the requester matches them by request id and reacts to the error kind.
-    serialize_request_message(&mut dest, request_id, db, handler, None, 0, buf);
+    serialize_request_message(&mut dest, request_id, db, handler, None, 0, None, buf);
     send_cluster_message(ctx, sender_id, msg_type, dest.as_slice())
 }
 
@@ -503,6 +553,20 @@ fn cluster_fingerprint_matches(ctx: &DetachedContext, expected: u64) -> bool {
         == expected
 }
 
+/// When a peer's request stops being worth running: `budget` after it `received` it, for an
+/// operation that may be abandoned (`FanoutCommand::cancellable`). `None` never expires — no
+/// budget, a write, or a budget past what `Instant` can represent.
+fn request_deadline(
+    operation: RegisteredOperation,
+    budget: Option<Duration>,
+    received: Instant,
+) -> Option<Instant> {
+    if !operation.cancellable {
+        return None;
+    }
+    received.checked_add(budget?)
+}
+
 /// Processes a valid request by executing the command and sending back the response.
 ///
 /// Runs on a worker thread. The GIL is taken twice here — to validate the
@@ -510,13 +574,35 @@ fn cluster_fingerprint_matches(ctx: &DetachedContext, expected: u64) -> bool {
 /// cluster-map check (for `CLUSTER NODES`) and the handler itself, for as long
 /// as its keyspace/index work needs (see `FanoutCommand::get_local_response`).
 /// Request decoding and response encoding to happen with the GIL released.
+///
+/// `received` is when the request arrived, before it waited in the lane's queue: its
+/// time budget counts from then.
 fn process_request_message(
     header: FanoutMessageHeader,
-    handler: RequestHandlerCallback,
+    operation: RegisteredOperation,
     request_buf: &[u8],
     sender_id: NodeId,
+    received: Instant,
+    registration: Option<PeerRequest>,
 ) {
     let request_id = header.request_id;
+
+    // The handler re-selects `db` and resolves `user` on every GIL acquisition
+    // (`FanoutContext::lock`); the context tells it which ones, and when to give up.
+    let fanout_ctx = FanoutContext::new(header.user, header.db);
+    if let Some(deadline) = request_deadline(operation, header.time_budget, received) {
+        fanout_ctx.set_deadline(deadline);
+    }
+    if let Some(registration) = &registration {
+        fanout_ctx.set_cancel_flag(registration.cancelled.clone());
+    }
+    if fanout_ctx.expired() {
+        // Cancelled, or past a deadline which, counted from arrival, is never earlier than the
+        // requester's. Either way the requester has already given up: any answer, an error
+        // included, would only be logged there as a reply to an unknown request.
+        metrics::FANOUT_DROPPED_EXPIRED.incr();
+        return;
+    }
 
     // Reject the request if the cluster topology changed between the requester
     // generating it and us receiving it. This runs on the worker thread (not the
@@ -543,11 +629,12 @@ fn process_request_message(
 
     let mut dest = get_pooled_buffer(FANOUT_RPC_RESPONSE_BUFFER_SIZE);
 
-    // The handler re-selects `db` and resolves `user` on every GIL acquisition
-    // (`FanoutContext::lock`); the context tells it which ones.
-    let fanout_ctx = FanoutContext::new(header.user, header.db);
-    match handler(&fanout_ctx, request_buf, &mut dest) {
+    match (operation.run)(&fanout_ctx, request_buf, &mut dest) {
         Ok(()) => {
+            if fanout_ctx.is_cancelled() {
+                metrics::FANOUT_ANSWERS_DISCARDED.incr();
+                return;
+            }
             metrics::FANOUT_SERVED_OK.incr();
             let ctx = MODULE_CONTEXT.lock_gil();
             if send_response_message(
@@ -564,6 +651,13 @@ fn process_request_message(
                 // send error ???
                 ctx.log_warning(&msg);
             }
+        }
+        // A handler times out only by abandoning its read at the deadline, which the requester
+        // has already passed, so as above there is no one to answer. Its own timer ends the
+        // fan-out: a reply could not beat that to the client, since the main thread runs both
+        // and unblocks clients only between commands.
+        Err(e) if e.kind == ErrorKind::Timeout => {
+            metrics::FANOUT_ABANDONED_EXPIRED.incr();
         }
         Err(e) => {
             metrics::FANOUT_SERVED_ERRORS.incr();
@@ -629,35 +723,41 @@ extern "C" fn on_request_received(
     len: u32,
 ) {
     let ctx = Context::new(ctx as *mut RedisModuleCtx);
-    let Some(mut message) = parse_fanout_message(&ctx, sender_id, payload, len) else {
+    let Some(FanoutMessage {
+        header,
+        buf: request_buf,
+    }) = parse_fanout_message(&ctx, sender_id, payload, len)
+    else {
         metrics::FANOUT_REJECTED_PARSE.incr();
         return;
     };
 
     // Feature gate: a newer peer may demand envelope features via the header;
     // reject explicitly (addressable, fast) rather than mis-process the
-    // request. See docs/fanout-compatibility-handshake.md.
-    if has_unsupported_features(message.required_features) {
+    // request. See docs/topics/fanout-compatibility-handshake.md.
+    if has_unsupported_features(header.required_features) {
         metrics::FANOUT_REJECTED_UNSUPPORTED_FEATURES.incr();
         let e = FanoutError::unsupported_features();
-        send_error_response(&ctx, message.request_id, message.db, sender_id, e);
+        send_error_response(&ctx, header.request_id, header.db, sender_id, e);
         let msg = format!(
             "Rejecting fanout request {} from node {}: unsupported required_features {:#06x}",
-            message.request_id,
+            header.request_id,
             NodeId::from_raw(sender_id),
-            message.required_features
+            header.required_features
         );
         ctx.log_warning(&msg);
         return;
     }
 
-    let Some(handler) = get_fanout_request_handler(&message.handler) else {
+    let received = Instant::now();
+
+    let Some(operation) = get_fanout_request_handler(&header.handler) else {
         metrics::FANOUT_REJECTED_NO_HANDLER.incr();
         let e = FanoutError::invalid_message();
-        send_error_response(&ctx, message.request_id, message.db, sender_id, e);
+        send_error_response(&ctx, header.request_id, header.db, sender_id, e);
         let msg = format!(
             "No handler registered for fanout operation '{}'",
-            message.handler
+            header.handler
         );
         ctx.log_warning(&msg);
         return;
@@ -666,25 +766,18 @@ extern "C" fn on_request_received(
     let sender = NodeId::from_raw(sender_id);
 
     let mut buf = get_pooled_buffer(len as usize);
-    buf.extend_from_slice(message.buf);
+    buf.extend_from_slice(request_buf);
 
-    let header = FanoutMessageHeader {
-        version: message.version,
-        required_features: message.required_features,
-        request_id: message.request_id,
-        db: message.db,
-        handler: std::mem::take(&mut message.handler),
-        user: message.user.take(),
-        cluster_fingerprint: message.cluster_fingerprint,
-    };
-
-    alloc_db_if_needed(&ctx, message.db);
+    alloc_db_if_needed(&ctx, header.db);
 
     let (request_id, db) = (header.request_id, header.db);
 
     // A blocking thread: the handler takes the GIL (R1 in `common::threads`).
+    let registration = operation
+        .cancellable
+        .then(|| PeerRequest::register(sender, request_id));
     let queued = PEER_REQUEST_EXECUTOR.try_spawn(move || {
-        process_request_message(header, handler, &buf, sender);
+        process_request_message(header, operation, &buf, sender, received, registration);
     });
     if queued.is_err() {
         metrics::FANOUT_REJECTED_BUSY.incr();
@@ -693,6 +786,56 @@ extern "C" fn on_request_received(
         let msg = format!("Rejecting fanout request {request_id} from node {sender}: workers busy");
         ctx.log_warning(&msg);
     }
+}
+
+/// Peer requests being served that their requester may cancel, by requester and request id.
+/// Request ids are only unique per requester.
+static PEER_REQUESTS: LazyLock<HashMap<(NodeId, u64), Arc<AtomicBool>>> =
+    LazyLock::new(HashMap::new);
+
+/// A peer request's entry in [`PEER_REQUESTS`], for as long as the request is queued or running.
+/// Dropping it removes the entry, so a request that never ran (the queue was full) leaves none.
+struct PeerRequest {
+    key: (NodeId, u64),
+    cancelled: Arc<AtomicBool>,
+}
+
+impl PeerRequest {
+    fn register(sender: NodeId, request_id: u64) -> Self {
+        let key = (sender, request_id);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        PEER_REQUESTS.pin().insert(key, cancelled.clone());
+        Self { key, cancelled }
+    }
+}
+
+impl Drop for PeerRequest {
+    fn drop(&mut self) {
+        PEER_REQUESTS.pin().remove(&self.key);
+    }
+}
+
+/// Marks a request as no longer wanted. A request that has finished has no entry, which is fine:
+/// its answer has gone already.
+fn cancel_peer_request(sender: NodeId, request_id: u64) {
+    if let Some(cancelled) = PEER_REQUESTS.pin().get(&(sender, request_id)) {
+        cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+extern "C" fn on_cancel_received(
+    ctx: *mut ValkeyModuleCtx,
+    sender_id: *const c_char,
+    _type: u8,
+    payload: *const c_uchar,
+    len: u32,
+) {
+    let ctx = Context::new(ctx as *mut RedisModuleCtx);
+    let Some(message) = parse_fanout_message(&ctx, sender_id, payload, len) else {
+        return;
+    };
+    metrics::FANOUT_CANCELS_RECEIVED.incr();
+    cancel_peer_request(NodeId::from_raw(sender_id), message.header.request_id);
 }
 
 /// Runs `f` against an in-flight request. `f` reports whether it delivered an answer that
@@ -732,12 +875,12 @@ extern "C" fn on_response_received(
         return;
     };
 
-    with_inflight_request(&ctx, message.request_id, |ctx, request| {
-        let _ = set_current_db(ctx, message.db);
+    with_inflight_request(&ctx, message.header.request_id, |ctx, request| {
+        let _ = set_current_db(ctx, message.header.db);
         // Feature gate: a newer peer's response may demand envelope features
         // (e.g., a payload encoding) we cannot decode; fail this node's slice
         // of the request instead of misinterpreting the payload.
-        if has_unsupported_features(message.required_features) {
+        if has_unsupported_features(message.header.required_features) {
             let err = FanoutError::unsupported_features();
             return request.handle_response(ctx, Err(err), sender_id);
         }
@@ -759,18 +902,18 @@ extern "C" fn on_error_received(
         return;
     };
 
-    with_inflight_request(&ctx, message.request_id, |ctx, request| {
-        let _ = set_current_db(ctx, message.db);
+    with_inflight_request(&ctx, message.header.request_id, |ctx, request| {
+        let _ = set_current_db(ctx, message.header.db);
 
         // Feature gate: mirror the response path — an error payload we cannot
         // decode per the demanded features still fails this node's slice.
-        if has_unsupported_features(message.required_features) {
+        if has_unsupported_features(message.header.required_features) {
             let err = FanoutError::unsupported_features();
             return request.handle_response(ctx, Err(err), sender_id);
         }
 
         match FanoutError::deserialize(message.buf) {
-            Ok((error, _)) => {
+            Ok(error) => {
                 // A peer rejected us because its view of the cluster topology
                 // differs from ours. Invalidate our local map so the next fanout
                 // rebuilds it before targeting nodes.
@@ -823,4 +966,218 @@ pub fn register_cluster_message_handlers(ctx: &Context) {
     register_message_receiver(ctx, FANOUT_REQUEST_MESSAGE, Some(on_request_received));
     register_message_receiver(ctx, FANOUT_RESPONSE_MESSAGE, Some(on_response_received));
     register_message_receiver(ctx, FANOUT_ERROR_MESSAGE, Some(on_error_received));
+    register_message_receiver(ctx, FANOUT_CANCEL_MESSAGE, Some(on_cancel_received));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error_consts;
+
+    fn never_called(_: &FanoutContext, _: &[u8], _: &mut Vec<u8>) -> FanoutResult {
+        panic!("an expired request must not reach its handler");
+    }
+
+    fn operation(cancellable: bool) -> RegisteredOperation {
+        RegisteredOperation {
+            run: never_called,
+            cancellable,
+        }
+    }
+
+    fn header(time_budget: Option<Duration>) -> FanoutMessageHeader {
+        FanoutMessageHeader {
+            request_id: 1,
+            db: 0,
+            handler: "mrange".to_string(),
+            user: None,
+            cluster_fingerprint: 0,
+            required_features: 0,
+            time_budget,
+        }
+    }
+
+    /// The deadline counts from arrival, only for an operation that may be abandoned, and
+    /// a budget no `Instant` can hold means none rather than a panic on the worker.
+    #[test]
+    fn request_deadline_counts_from_arrival_for_cancellable_operations() {
+        let received = Instant::now();
+        let budget = Duration::from_millis(250);
+
+        assert_eq!(
+            request_deadline(operation(true), Some(budget), received),
+            Some(received + budget)
+        );
+        assert_eq!(request_deadline(operation(true), None, received), None);
+        assert_eq!(
+            request_deadline(operation(false), Some(budget), received),
+            None,
+            "a write never expires"
+        );
+        assert_eq!(
+            request_deadline(operation(true), Some(Duration::MAX), received),
+            None
+        );
+    }
+
+    /// A cancellable request that waited out its budget in the queue is dropped before any
+    /// GIL is taken or reply sent: its handler never runs.
+    #[test]
+    fn an_expired_request_is_dropped_unrun() {
+        let before = metrics::FANOUT_DROPPED_EXPIRED.load(Ordering::Relaxed);
+
+        let received = Instant::now() - Duration::from_millis(50);
+        process_request_message(
+            header(Some(Duration::from_millis(10))),
+            operation(true),
+            &[],
+            NodeId::default(),
+            received,
+            None,
+        );
+
+        assert!(metrics::FANOUT_DROPPED_EXPIRED.load(Ordering::Relaxed) > before);
+    }
+
+    /// 0 is skipped whether the counter was seeded with it or wrapped onto it.
+    #[test]
+    fn request_ids_skip_zero() {
+        let seeded_with_zero = AtomicU64::new(0);
+        assert_eq!(next_id(&seeded_with_zero), 1);
+        assert_eq!(next_id(&seeded_with_zero), 2);
+
+        let about_to_wrap = AtomicU64::new(u64::MAX);
+        assert_eq!(next_id(&about_to_wrap), u64::MAX);
+        assert_eq!(next_id(&about_to_wrap), 1);
+    }
+
+    /// An error reply to the first id of a zero-seeded counter, in db 0, has no other field
+    /// set, so its id is all that keeps the header from being empty, which the decoder rejects.
+    #[test]
+    fn an_error_reply_to_a_generated_id_decodes() {
+        let id = next_id(&AtomicU64::new(0));
+        let mut buf = Vec::new();
+        serialize_request_message(&mut buf, id, 0, "", None, 0, None, &[]);
+
+        let message = FanoutMessage::new(&buf).unwrap();
+        assert_eq!(message.header.request_id, id);
+    }
+
+    /// `from_raw` reads a full node id, however short a string it is handed.
+    fn node_id(hex_digit: u8) -> NodeId {
+        NodeId::from_raw([hex_digit; 41].as_ptr().cast())
+    }
+
+    /// A cancel marks the request it names, from the requester that sent it, and nothing else:
+    /// request ids are only unique per requester.
+    #[test]
+    fn a_cancel_marks_only_the_request_it_names() {
+        let sender = node_id(b'a');
+        let other = node_id(b'b');
+        let request = PeerRequest::register(sender, 7);
+        let same_id_elsewhere = PeerRequest::register(other, 7);
+        let another_id = PeerRequest::register(sender, 8);
+
+        cancel_peer_request(sender, 7);
+
+        assert!(request.cancelled.load(Ordering::Relaxed));
+        assert!(!same_id_elsewhere.cancelled.load(Ordering::Relaxed));
+        assert!(!another_id.cancelled.load(Ordering::Relaxed));
+    }
+
+    /// A cancel can arrive after the answer has gone, and a finished request leaves no entry.
+    #[test]
+    fn a_finished_request_is_forgotten() {
+        let sender = node_id(b'c');
+        let request = PeerRequest::register(sender, 9);
+        assert!(PEER_REQUESTS.pin().contains_key(&(sender, 9)));
+
+        drop(request);
+
+        assert!(!PEER_REQUESTS.pin().contains_key(&(sender, 9)));
+        cancel_peer_request(sender, 9);
+    }
+
+    /// A request cancelled while it waited in the queue is dropped unrun, with its budget intact.
+    #[test]
+    fn a_cancelled_request_is_dropped_unrun() {
+        let before = metrics::FANOUT_DROPPED_EXPIRED.load(Ordering::Relaxed);
+        let sender = node_id(b'd');
+        let registration = PeerRequest::register(sender, 11);
+        cancel_peer_request(sender, 11);
+
+        process_request_message(
+            header(Some(Duration::from_secs(60))),
+            operation(true),
+            &[],
+            sender,
+            Instant::now(),
+            Some(registration),
+        );
+
+        assert!(metrics::FANOUT_DROPPED_EXPIRED.load(Ordering::Relaxed) > before);
+        assert!(!PEER_REQUESTS.pin().contains_key(&(sender, 11)));
+    }
+
+    fn cancelled_while_running(_: &FanoutContext, _: &[u8], _: &mut Vec<u8>) -> FanoutResult {
+        cancel_peer_request(node_id(b'e'), 1);
+        Ok(())
+    }
+
+    /// A read that finishes after its cancel has an answer nobody wants: it is not sent, which
+    /// would need the GIL here, and not counted as served.
+    #[test]
+    fn an_answer_finished_after_a_cancel_is_discarded() {
+        let discarded = metrics::FANOUT_ANSWERS_DISCARDED.load(Ordering::Relaxed);
+        let served = metrics::FANOUT_SERVED_OK.load(Ordering::Relaxed);
+        let sender = node_id(b'e');
+
+        process_request_message(
+            header(Some(Duration::from_secs(60))),
+            RegisteredOperation {
+                run: cancelled_while_running,
+                cancellable: true,
+            },
+            &[],
+            sender,
+            Instant::now(),
+            Some(PeerRequest::register(sender, 1)),
+        );
+
+        assert_eq!(
+            metrics::FANOUT_ANSWERS_DISCARDED.load(Ordering::Relaxed),
+            discarded + 1
+        );
+        assert_eq!(metrics::FANOUT_SERVED_OK.load(Ordering::Relaxed), served);
+    }
+
+    fn gives_up_mid_read(_: &FanoutContext, _: &[u8], _: &mut Vec<u8>) -> FanoutResult {
+        Err(ValkeyError::Str(error_consts::FANOUT_REQUESTER_GAVE_UP).into())
+    }
+
+    /// A read abandoned at its deadline is not a handler failure, and like a request dropped
+    /// from the queue it gets no reply: nothing here takes the GIL to send one.
+    #[test]
+    fn a_read_abandoned_at_its_deadline_is_counted_and_not_answered() {
+        let abandoned = metrics::FANOUT_ABANDONED_EXPIRED.load(Ordering::Relaxed);
+        let failed = metrics::FANOUT_SERVED_ERRORS.load(Ordering::Relaxed);
+
+        process_request_message(
+            header(Some(Duration::from_secs(60))),
+            RegisteredOperation {
+                run: gives_up_mid_read,
+                cancellable: true,
+            },
+            &[],
+            NodeId::default(),
+            Instant::now(),
+            None,
+        );
+
+        assert!(metrics::FANOUT_ABANDONED_EXPIRED.load(Ordering::Relaxed) > abandoned);
+        assert_eq!(
+            metrics::FANOUT_SERVED_ERRORS.load(Ordering::Relaxed),
+            failed
+        );
+    }
 }

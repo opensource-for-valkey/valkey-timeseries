@@ -1,0 +1,57 @@
+// Copyright 2024 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
+syntax = "proto3";
+
+package valkey_timeseries.fanout.v1;
+
+// Prefixes every message on the cluster bus. On the wire a message is a u32
+// little-endian marker, the varint length of this header, this header, then the
+// payload. The payload stays outside the protobuf so large replies are not
+// copied.
+//
+// A receiver ignores fields it does not know, so a new field's absent value must
+// mean "today's behaviour". A change the receiver cannot safely ignore takes a
+// required_features bit.
+//
+// prost truncates varints to the declared width without an error, so integers
+// whose value is checked after decoding are declared 64 bits wide: a 32-bit db
+// would fold 2^32 onto database 0, and 32-bit features would drop a demanded bit.
+message EnvelopeHeader {
+  // Matches a response to its request.
+  uint64 request_id = 1;
+  // Database for this request. Must fit an i32.
+  sint64 db = 2;
+  // Handler that processes the message. Empty on error replies.
+  string handler = 3;
+  // ACL user for shard-side enforcement. Empty means no user context.
+  string user = 4;
+  // Hash of the sender's cluster map. 0 disables the receiver's topology check.
+  fixed64 cluster_fingerprint = 5;
+  // Feature bits the receiver must understand to process this message.
+  uint64 required_features = 6;
+  // How long the requester waits for the answer, counted by the receiver from
+  // arrival. 0 means no limit, as replies and errors send.
+  uint64 time_budget_ms = 7;
+}
+
+// The payload of a fanout error reply.
+message EnvelopeError {
+  // An ErrorKind discriminant. Must fit a u8; receivers report kinds they do
+  // not know as an invalid message, keeping the text.
+  uint64 kind = 1;
+  // Extra context. Empty means the kind's default text.
+  string message = 2;
+}

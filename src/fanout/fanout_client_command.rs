@@ -30,6 +30,11 @@ pub trait FanoutClientCommand: Default + Send + 'static {
     /// [`FanoutCommand::get_local_response`] for the locking contract.
     fn get_local_response(ctx: &FanoutContext, req: Self::Request) -> ValkeyResult<Self::Response>;
 
+    /// See [`FanoutCommand::cancellable`]: `false` for a command that writes.
+    fn cancellable() -> bool {
+        true
+    }
+
     fn generate_request(&self) -> Self::Request;
 
     fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult;
@@ -99,6 +104,10 @@ impl<T: FanoutClientCommand> FanoutCommand for T {
 
     fn get_local_response(ctx: &FanoutContext, req: Self::Request) -> ValkeyResult<Self::Response> {
         T::get_local_response(ctx, req)
+    }
+
+    fn cancellable() -> bool {
+        T::cancellable()
     }
 
     /// Get the target nodes for the fanout operation, bound to the cluster-map

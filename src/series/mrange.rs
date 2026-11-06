@@ -18,6 +18,7 @@ use crate::series::request_types::{
 };
 use ahash::AHashMap;
 use orx_parallel::Par;
+use std::sync::atomic::{AtomicBool, Ordering};
 use valkey_module::{Context, ValkeyError, ValkeyResult};
 
 struct MRangeSeriesMeta<'a> {
@@ -71,6 +72,7 @@ pub(crate) fn process_mrange_group_partials(
     ctx: &Context,
     options: MRangeOptions,
     limit: Option<SampleLimit>,
+    expired: &(dyn Fn() -> bool + Sync),
 ) -> ValkeyResult<Vec<GroupPartialsResult>> {
     check_metadata_permissions(ctx)?;
 
@@ -117,10 +119,20 @@ pub(crate) fn process_mrange_group_partials(
         .filter(|a| a.is_multi())
         .map(|a| a.aggregations.len());
 
-    Ok(grouped
+    let deadline = ReadDeadline::new(expired);
+    let results = grouped
         .into_iter()
         .iter_into_par_rayon()
         .map(|(label_value, group_data)| {
+            if deadline.passed() {
+                return GroupPartialsResult {
+                    group_label_value: label_value,
+                    source_keys: Vec::new(),
+                    timestamps: Vec::new(),
+                    states: Vec::new(),
+                    column_count: 1,
+                };
+            }
             let mut source_keys: Vec<Vec<u8>> = group_data
                 .series
                 .iter()
@@ -179,14 +191,18 @@ pub(crate) fn process_mrange_group_partials(
                 column_count,
             }
         })
-        .collect())
+        .collect();
+    deadline.finish(results)
 }
 
+/// `expired` says whether a shard's requester has stopped waiting: the decode, which runs under
+/// the lock, stops between series once it has.
 pub(crate) fn process_mrange_query(
     ctx: &Context,
     options: MRangeOptions,
     clustered: bool,
     limit: Option<SampleLimit>,
+    expired: &(dyn Fn() -> bool + Sync),
 ) -> ValkeyResult<Vec<MRangeSeriesResult>> {
     if options.filters.is_empty() {
         return Err(ValkeyError::Str(error_consts::MISSING_FILTER));
@@ -212,7 +228,7 @@ pub(crate) fn process_mrange_query(
         })
         .collect();
 
-    process_mrange(series_metas, options, clustered, limit)
+    process_mrange(series_metas, options, clustered, limit, expired)
 }
 
 fn process_mrange(
@@ -220,6 +236,7 @@ fn process_mrange(
     options: MRangeOptions,
     is_clustered: bool,
     limit: Option<SampleLimit>,
+    expired: &(dyn Fn() -> bool + Sync),
 ) -> ValkeyResult<Vec<MRangeSeriesResult>> {
     let mut options = options;
     let mut metas = metas;
@@ -245,7 +262,9 @@ fn process_mrange(
         // already decided here and dropping it now only saves transfer. The
         // coordinator re-applies EXCLUDEEMPTY regardless, so a peer that ignores
         // the request flag still yields the same reply.
-        let mut items = handle_non_grouped(metas, options, true, limit);
+        let deadline = ReadDeadline::new(expired);
+        let items = handle_non_grouped(metas, options, true, limit, &deadline);
+        let mut items = deadline.finish(items)?;
         if exclude_empty {
             items.retain(|item| !item.data.is_empty());
         }
@@ -255,7 +274,7 @@ fn process_mrange(
     let mut items = if is_grouped {
         handle_grouping(metas, options)?
     } else {
-        handle_non_grouped(metas, options, false, None)
+        handle_non_grouped(metas, options, false, None, &ReadDeadline::new(&|| false))
     };
 
     // EXCLUDEEMPTY is rejected together with GROUPBY at parse time, so this only
@@ -297,6 +316,42 @@ fn create_iter<'a>(
     )
 }
 
+/// Stops a shard's decode once its requester has given up. Decoding runs on a pool, so each
+/// series or group asks before starting, what it returns is discarded, and [`Self::finish`]
+/// turns the whole read into the error. A read that got to the end is answered however late:
+/// only a read with work left is abandoned.
+struct ReadDeadline<'a> {
+    expired: &'a (dyn Fn() -> bool + Sync),
+    abandoned: AtomicBool,
+}
+
+impl<'a> ReadDeadline<'a> {
+    fn new(expired: &'a (dyn Fn() -> bool + Sync)) -> Self {
+        Self {
+            expired,
+            abandoned: AtomicBool::new(false),
+        }
+    }
+
+    fn passed(&self) -> bool {
+        if self.abandoned.load(Ordering::Relaxed) {
+            return true;
+        }
+        let passed = (self.expired)();
+        if passed {
+            self.abandoned.store(true, Ordering::Relaxed);
+        }
+        passed
+    }
+
+    fn finish<T>(&self, results: T) -> ValkeyResult<T> {
+        if self.abandoned.load(Ordering::Relaxed) {
+            return Err(ValkeyError::Str(error_consts::FANOUT_REQUESTER_GAVE_UP));
+        }
+        Ok(results)
+    }
+}
+
 pub(crate) fn sort_mrange_results(results: &mut [MRangeSeriesResult], is_grouped: bool) {
     if is_grouped {
         results.sort_by(|a, b| a.group_label_value.cmp(&b.group_label_value));
@@ -310,6 +365,7 @@ fn handle_non_grouped(
     options: MRangeOptions,
     clustered: bool,
     limit: Option<SampleLimit>,
+    deadline: &ReadDeadline<'_>,
 ) -> Vec<MRangeSeriesResult> {
     let is_multi = options
         .range
@@ -320,6 +376,9 @@ fn handle_non_grouped(
     metas
         .into_par_rayon()
         .map(|meta| {
+            if deadline.passed() {
+                return MRangeSeriesResult::default();
+            }
             // Multi-aggregation yields rows, which chunks cannot store. Under
             // aggregation push-down a shard produces these rows too; they ship
             // as per-column chunks (SeriesRangeResponse.columns), so the
@@ -711,6 +770,62 @@ mod tests {
     /// the *reported* payload rather than the stored series: a series whose only
     /// in-range sample is NaN still reports and is kept, while one emptied by
     /// FILTER_BY_VALUE is dropped just like one with no samples in the range.
+    fn one_series() -> TimeSeries {
+        let mut series = TimeSeries::new();
+        series.add(100, 1.0, None);
+        series
+    }
+
+    /// A shard's decode stops once its requester's deadline has passed, and says so instead of
+    /// answering with what it skipped.
+    #[test]
+    fn a_shard_decode_past_its_deadline_is_abandoned() {
+        let series = one_series();
+        let options = MRangeOptions {
+            range: RangeOptions::with_range(0, 500).unwrap(),
+            ..Default::default()
+        };
+
+        let result = process_mrange(vec![meta(&series, "s", None)], options, true, None, &|| {
+            true
+        });
+
+        match result {
+            Err(ValkeyError::Str(msg)) => assert_eq!(msg, error_consts::FANOUT_REQUESTER_GAVE_UP),
+            Err(other) => panic!("expected the requester-gave-up error, got {other:?}"),
+            Ok(_) => panic!("expected the requester-gave-up error, got results"),
+        }
+    }
+
+    #[test]
+    fn a_shard_decode_within_its_deadline_is_answered() {
+        let series = one_series();
+        let options = MRangeOptions {
+            range: RangeOptions::with_range(0, 500).unwrap(),
+            ..Default::default()
+        };
+
+        let results = process_mrange(vec![meta(&series, "s", None)], options, true, None, &|| {
+            false
+        })
+        .unwrap();
+
+        assert_eq!(keys_of(&results), vec!["s"]);
+    }
+
+    /// Time running out after the last series is not abandonment: the read is done.
+    #[test]
+    fn a_finished_read_is_answered_however_late() {
+        let deadline = ReadDeadline::new(&|| true);
+        assert!(deadline.finish(()).is_ok(), "nothing was skipped");
+        assert!(deadline.passed());
+        assert!(deadline.finish(()).is_err());
+
+        let none = ReadDeadline::new(&|| false);
+        assert!(!none.passed());
+        assert!(none.finish(()).is_ok());
+    }
+
     #[test]
     fn test_exclude_empty_drops_series_with_no_reported_samples() {
         let in_range = make_series(&[(100, 100.0), (400, 400.0)]);
@@ -731,11 +846,11 @@ mod tests {
         };
 
         // Default: every matched series is reported, empty payload included.
-        let results = process_mrange(metas(), options.clone(), false, None).unwrap();
+        let results = process_mrange(metas(), options.clone(), false, None, &|| false).unwrap();
         assert_eq!(keys_of(&results), vec!["n", "s", "u"]);
 
         options.exclude_empty = true;
-        let results = process_mrange(metas(), options.clone(), false, None).unwrap();
+        let results = process_mrange(metas(), options.clone(), false, None, &|| false).unwrap();
         assert_eq!(
             keys_of(&results),
             vec!["n", "s"],
@@ -743,12 +858,12 @@ mod tests {
         );
 
         // Shard side (clustered): same decision, made before the payload ships.
-        let results = process_mrange(metas(), options.clone(), true, None).unwrap();
+        let results = process_mrange(metas(), options.clone(), true, None, &|| false).unwrap();
         assert_eq!(keys_of(&results), vec!["n", "s"]);
 
         // A value filter that removes every sample makes a series empty too.
         options.range.value_filter = Some(crate::series::ValueFilter::new(0.0, 200.0).unwrap());
-        let results = process_mrange(metas(), options, false, None).unwrap();
+        let results = process_mrange(metas(), options, false, None, &|| false).unwrap();
         assert_eq!(
             keys_of(&results),
             vec!["s"],
@@ -771,7 +886,7 @@ mod tests {
         for is_reverse in [false, true] {
             options.is_reverse = is_reverse;
             let metas = vec![meta(&in_range, "s", None), meta(&out_of_range, "u", None)];
-            let results = process_mrange(metas, options.clone(), false, None).unwrap();
+            let results = process_mrange(metas, options.clone(), false, None, &|| false).unwrap();
             assert_eq!(keys_of(&results), vec!["s"], "reverse={is_reverse}");
             assert_eq!(rows_of(&results[0]).len(), 2);
         }
@@ -793,7 +908,8 @@ mod tests {
         let options = multi_options(100);
         let metas = vec![meta(&s1, "a", None), meta(&s2, "b", None)];
 
-        let mut results = handle_non_grouped(metas, options, false, None);
+        let mut results =
+            handle_non_grouped(metas, options, false, None, &ReadDeadline::new(&|| false));
         sort_mrange_results(&mut results, false);
 
         assert_eq!(results.len(), 2);

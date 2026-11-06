@@ -39,6 +39,8 @@ pub static FANOUT_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub static FANOUT_CLIENT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 /// RPCs whose timer fired with shares outstanding.
 pub static FANOUT_RPC_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+/// Cancel messages sent to shares still outstanding when an RPC's timer fired.
+pub static FANOUT_CANCELS_SENT: AtomicU64 = AtomicU64::new(0);
 /// Operations ended early by an error returned to the client as it is (a cluster-map mismatch,
 /// a permission denial, a busy shard).
 pub static FANOUT_ABORTS: AtomicU64 = AtomicU64::new(0);
@@ -101,6 +103,14 @@ pub static FANOUT_REJECTED_UNSUPPORTED_FEATURES: AtomicU64 = AtomicU64::new(0);
 pub static FANOUT_REJECTED_NO_HANDLER: AtomicU64 = AtomicU64::new(0);
 /// Peer requests refused because the fanout lane's queue was full.
 pub static FANOUT_REJECTED_BUSY: AtomicU64 = AtomicU64::new(0);
+/// Cancel messages received from requesters that stopped waiting.
+pub static FANOUT_CANCELS_RECEIVED: AtomicU64 = AtomicU64::new(0);
+/// Peer requests that were cancelled or waited in the queue past their time budget, dropped unrun.
+pub static FANOUT_DROPPED_EXPIRED: AtomicU64 = AtomicU64::new(0);
+/// Peer requests whose read was cancelled or ran past its time budget, stopped part-way, unanswered.
+pub static FANOUT_ABANDONED_EXPIRED: AtomicU64 = AtomicU64::new(0);
+/// Peer requests whose read finished after a cancel: the answer was discarded, not sent.
+pub static FANOUT_ANSWERS_DISCARDED: AtomicU64 = AtomicU64::new(0);
 /// Peer requests rejected because the sender's cluster map disagrees with ours.
 pub static FANOUT_REJECTED_CLUSTER_MAP_MISMATCH: AtomicU64 = AtomicU64::new(0);
 
@@ -194,6 +204,11 @@ static COUNTERS: &[(&str, &AtomicU64, &str)] = &[
         "Blocked fanout clients answered with the timeout error",
     ),
     (
+        "cancels_sent",
+        &FANOUT_CANCELS_SENT,
+        "Cancel messages sent to shares still outstanding when an RPC's timer fired",
+    ),
+    (
         "rpc_timeouts",
         &FANOUT_RPC_TIMEOUTS,
         "Fanout RPCs whose timer fired with remote shares outstanding",
@@ -277,6 +292,26 @@ static COUNTERS: &[(&str, &AtomicU64, &str)] = &[
         "rejected_busy",
         &FANOUT_REJECTED_BUSY,
         "Peer fanout requests rejected because the fanout lane's queue was full",
+    ),
+    (
+        "cancels_received",
+        &FANOUT_CANCELS_RECEIVED,
+        "Cancel messages received from requesters that stopped waiting",
+    ),
+    (
+        "dropped_expired",
+        &FANOUT_DROPPED_EXPIRED,
+        "Peer fanout requests dropped unrun because they were cancelled or waited in the queue past their time budget",
+    ),
+    (
+        "abandoned_expired",
+        &FANOUT_ABANDONED_EXPIRED,
+        "Peer fanout requests whose read was cancelled or ran past its time budget and stopped part-way, unanswered",
+    ),
+    (
+        "answers_discarded",
+        &FANOUT_ANSWERS_DISCARDED,
+        "Peer fanout requests whose read finished after a cancel, so the answer was discarded",
     ),
     (
         "rejected_cluster_map_mismatch",
