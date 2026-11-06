@@ -516,7 +516,8 @@ pub(crate) fn label_search_exceeds_inline_budget(
             if scanned == entries_budget {
                 return true;
             }
-            if !map.is_empty() {
+            // As the scan does: an entry no read can see is not a result, so it cannot end this.
+            if postings.visible_cardinality(map) > 0 {
                 live_entries += 1;
                 if stop_after == Some(live_entries) {
                     return false;
@@ -1717,6 +1718,58 @@ mod tests {
                 &hints,
                 2,
             ));
+        }
+    }
+
+    /// `region` values that no read can see, more of them than the budget used below.
+    fn postings_with_invisible_values(mask: impl FnOnce(&mut Postings, &[u64])) -> Postings {
+        let ids: Vec<u64> = (1..=6).collect();
+        let mut postings = Postings::default();
+        for &id in &ids {
+            postings.add_posting_for_label_value(id, "region", &format!("r{id}"));
+            postings
+                .id_to_key
+                .insert(id, format!("{{same}}{id}").into_bytes().into());
+        }
+        mask(&mut postings, &ids);
+        postings
+    }
+
+    #[test]
+    fn label_search_budget_does_not_count_invisible_entries_as_results() {
+        // The scan skips these, so stopping the probe at them would approve an inline search that
+        // must read past every one of them.
+        let tombstoned = postings_with_invisible_values(|postings, ids| {
+            postings.mark_ids_as_stale(ids);
+        });
+        let hidden = postings_with_invisible_values(|postings, _| {
+            postings.hide_indexed_keys_in_slots(&range_set_blaze::RangeSetBlaze::from_iter([
+                crate::fanout::calculate_hash_slot(b"{same}"),
+            ]));
+        });
+        for postings in [tombstoned, hidden] {
+            let index = index_of(postings);
+            for order_by in [
+                SearchResultOrdering::ValueAsc,
+                SearchResultOrdering::ValueDesc,
+            ] {
+                let hints = SearchHints {
+                    limit: 1,
+                    order_by,
+                    ..Default::default()
+                };
+                assert!(
+                    label_search_exceeds_inline_budget(
+                        &index,
+                        Some("region"),
+                        false,
+                        None,
+                        &hints,
+                        3,
+                    ),
+                    "{order_by:?}"
+                );
+            }
         }
     }
 
