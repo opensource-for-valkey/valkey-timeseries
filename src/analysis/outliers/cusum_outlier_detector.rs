@@ -1,6 +1,7 @@
-use super::utils::{detect_own_departures, normalize_evidence, snap_dust, usable_fence_distance};
+use super::utils::{
+    detect_own_departures, fit_head_baseline, normalize_evidence, usable_fence_distance,
+};
 use crate::analysis::TimeSeriesAnalysisResult;
-use crate::analysis::math::{calculate_mean_std_dev, is_constant};
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo,
 };
@@ -53,7 +54,7 @@ impl CusumOutlierDetector {
 
     #[cfg(test)]
     pub fn from_series(ts: &[f64]) -> Self {
-        let (target, std_dev) = fit_baseline(ts);
+        let (target, std_dev) = fit_head_baseline(ts);
         Self::with_params(target, std_dev)
     }
 
@@ -163,24 +164,6 @@ impl CusumOutlierDetector {
     }
 }
 
-/// Fit the baseline mean and standard deviation from the head of the series.
-fn fit_baseline(ts: &[f64]) -> (f64, f64) {
-    // At least two samples: one fits a zero scale by construction.
-    let training_size = ((ts.len() as f64 * 0.5).min(100.0) as usize)
-        .max(2)
-        .min(ts.len());
-    let head = &ts[0..training_size];
-    // A constant head has an exact answer. The computed mean is a few ULPs off, which
-    // makes the standard deviation that same rounding error rather than zero, and puts
-    // the target beside the value it was fitted to.
-    let (target, std_dev) = match head.first() {
-        Some(&first) if is_constant(head) => (first, 0.0),
-        _ => calculate_mean_std_dev(head),
-    };
-    // The floor stays as a backstop for a head that is constant but for rounding.
-    (target, snap_dust(std_dev, target))
-}
-
 /// CUSUM implements only [`AnomalyDetector`], not [`PointDetector`]. Its whole
 /// purpose is to accumulate small deviations until they add up, so a point is
 /// flagged because of the drift preceding it — a per-point test would answer a
@@ -193,7 +176,7 @@ impl AnomalyDetector for CusumOutlierDetector {
     fn train(&mut self, data: &[f64]) -> TimeSeriesAnalysisResult<()> {
         // `k` and `h` are in sigmas and so remain valid across any rescaling of
         // the baseline; only the baseline itself is refitted here.
-        let (target, std_dev) = fit_baseline(data);
+        let (target, std_dev) = fit_head_baseline(data);
         self.target = target;
         self.std_dev = std_dev;
         self.is_trained = true;
@@ -609,7 +592,27 @@ mod tests {
         for value in [0.1, 1.0 / 3.0, 1e-3, 123_456.789, -7.7] {
             let mut ts = vec![value; 100];
             ts.extend((0..100).map(|i| value + (i as f64 * 0.1).sin()));
-            assert_eq!(fit_baseline(&ts), (value, 0.0), "value {value}");
+            assert_eq!(fit_head_baseline(&ts), (value, 0.0), "value {value}");
+        }
+    }
+
+    /// A head without two finite observations has no baseline to depart from, so later
+    /// readings are not judged against the 0.0 an empty mean falls back to.
+    #[test]
+    fn head_without_two_finite_observations_is_unusable() {
+        let heads: [&[f64]; 5] = [
+            &[],
+            &[f64::NAN, f64::NAN],
+            &[f64::INFINITY, f64::INFINITY],
+            &[f64::NEG_INFINITY, f64::INFINITY],
+            &[5.0, f64::NAN],
+        ];
+        for head in heads {
+            let mut d = CusumOutlierDetector::default();
+            d.train(head).unwrap();
+            let result = CusumOutlierDetector::detect(&d, &[5.0, 50.0, -500.0]).unwrap();
+            assert!(result.anomalies.is_empty(), "{head:?}");
+            assert_eq!(result.scores, vec![0.0; 3], "{head:?}");
         }
     }
 

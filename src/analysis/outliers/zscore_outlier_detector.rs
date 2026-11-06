@@ -1,7 +1,7 @@
 use crate::analysis::TimeSeriesAnalysisResult;
-use crate::analysis::math::{calculate_mean_std_dev, is_constant};
 use crate::analysis::outliers::utils::{
-    deviation_and_fence_distance, normalize_evidence, snap_dust_if_collapsed, usable_fence_distance,
+    deviation_and_fence_distance, fit_mean_std_dev, normalize_evidence, snap_dust_if_collapsed,
+    usable_fence_distance,
 };
 use crate::analysis::outliers::{
     AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo, PointDetector,
@@ -83,13 +83,7 @@ impl AnomalyDetector for ZScoreOutlierDetector {
 
     fn train(&mut self, data: &[f64]) -> TimeSeriesAnalysisResult<()> {
         // maybe use welford here ?
-        // A constant series has an exact answer. The computed mean is off by rounding,
-        // which makes every deviation about one computed std dev, so any threshold
-        // below 1 would otherwise flag every sample.
-        let (mean, std_dev) = match data.first() {
-            Some(&first) if is_constant(data) => (first, 0.0),
-            _ => calculate_mean_std_dev(data),
-        };
+        let (mean, std_dev) = fit_mean_std_dev(data);
 
         // store computed stats
         self.mean = mean;
@@ -155,6 +149,25 @@ mod tests {
     /// point — including the mean itself — while still scoring it `0.0`, since
     /// `normalize_evidence` already treated the negative boundary as unusable.
     /// Both must now agree that there is nothing to be past.
+    /// Without two finite observations there is no baseline, so later readings are not
+    /// judged against the 0.0 an empty mean falls back to.
+    #[test]
+    fn fit_without_two_finite_observations_is_unusable() {
+        let fits: [&[f64]; 4] = [
+            &[],
+            &[f64::NAN, f64::NAN],
+            &[f64::INFINITY, f64::INFINITY],
+            &[5.0, f64::NAN],
+        ];
+        for data in fits {
+            let mut d = ZScoreOutlierDetector::new(3.0);
+            d.train(data).unwrap();
+            let result = ZScoreOutlierDetector::detect(&mut d, &[5.0, 50.0, -500.0]).unwrap();
+            assert!(result.anomalies.is_empty(), "{data:?}");
+            assert_eq!(result.scores, vec![0.0; 3], "{data:?}");
+        }
+    }
+
     #[test]
     fn negative_threshold_does_not_flag_the_mean() {
         let ts: Vec<f64> = (0..100).map(|i| (i as f64 / 10.0).sin()).collect();

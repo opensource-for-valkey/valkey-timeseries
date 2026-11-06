@@ -1,8 +1,7 @@
 use super::utils::{
-    detect_own_departures, normalize_evidence, snap_dust, snap_dust_if_collapsed,
+    detect_own_departures, fit_head_baseline, normalize_evidence, snap_dust_if_collapsed,
     usable_fence_distance,
 };
-use crate::analysis::math::{calculate_mean, calculate_std_dev, is_constant};
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo,
 };
@@ -38,24 +37,7 @@ impl EwmaOutlierDetector {
             });
         }
 
-        // At least two samples: one fits a zero scale by construction.
-        let training_size = ((ts.len() as f64 * 0.5).min(100.0) as usize)
-            .max(2)
-            .min(ts.len());
-        let training_data = &ts[0..training_size];
-
-        // A constant head has an exact answer. The computed mean is a few ULPs off, which
-        // makes the standard deviation that same rounding error rather than zero, and puts
-        // the target beside the value it was fitted to.
-        let (target, sigma) = match training_data.first() {
-            Some(&first) if is_constant(training_data) => (first, 0.0),
-            _ => (
-                calculate_mean(training_data),
-                calculate_std_dev(training_data),
-            ),
-        };
-        // The floor stays as a backstop for a head that is constant but for rounding.
-        let sigma = snap_dust(sigma, target);
+        let (target, sigma) = fit_head_baseline(ts);
         let multiplier = 3.0;
 
         Ok(EwmaOutlierDetector {
@@ -636,6 +618,25 @@ mod tests {
             ts.extend((0..100).map(|i| value + (i as f64 * 0.1).sin()));
             let d = EwmaOutlierDetector::from_series(&ts, EWMA_DEFAULT_ALPHA).unwrap();
             assert_eq!((d.target, d.sigma), (value, 0.0), "value {value}");
+        }
+    }
+
+    /// A head without two finite observations has no baseline to depart from, so later
+    /// readings are not judged against the 0.0 an empty mean falls back to.
+    #[test]
+    fn head_without_two_finite_observations_is_unusable() {
+        let heads: [&[f64]; 5] = [
+            &[],
+            &[f64::NAN, f64::NAN],
+            &[f64::INFINITY, f64::INFINITY],
+            &[f64::NEG_INFINITY, f64::INFINITY],
+            &[5.0, f64::NAN],
+        ];
+        for head in heads {
+            let d = EwmaOutlierDetector::from_series(head, 0.3).unwrap();
+            let result = d.detect(&[5.0, 50.0, -500.0]).unwrap();
+            assert!(result.anomalies.is_empty(), "{head:?}");
+            assert_eq!(result.scores, vec![0.0; 3], "{head:?}");
         }
     }
 
