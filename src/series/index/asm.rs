@@ -19,9 +19,10 @@ use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
 use crate::series::tasks::{optimize_index_fully, remove_all_stale_series_internal};
 use crate::series::{SeriesRef, TimeSeries};
 use range_set_blaze::RangeSetBlaze;
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex, RwLock};
 use valkey_module::{Context, MODULE_CONTEXT, Version, raw};
 
 const ASM_MINIMUM_VERSION: Version = Version {
@@ -168,7 +169,7 @@ const ASM_INFO_VERSION: u64 = 1;
 /// silently wrap). A bad range is skipped; an event that names no usable slot is dropped, so an
 /// `ImportStarted` the module cannot interpret defers nothing rather than registering a slot
 /// set a later event might not be able to remove.
-fn parse_event_payload(data: *mut c_void) -> Option<RangeSetBlaze<u16>> {
+fn parse_event_payload(data: *mut c_void) -> Option<SlotMigrationEvent> {
     if data.is_null() {
         log_warning("ASM event carried no payload; ignoring it");
         return None;
@@ -212,7 +213,11 @@ fn parse_event_payload(data: *mut c_void) -> Option<RangeSetBlaze<u16>> {
         log_warning("ASM event named no usable slot; ignoring the event");
         return None;
     }
-    Some(slots)
+    let mut job = [0u8; VALKEYMODULE_NODE_ID_LEN];
+    for (dst, src) in job.iter_mut().zip(info.job_name.iter()) {
+        *dst = *src as u8;
+    }
+    Some(SlotMigrationEvent { job, slots })
 }
 
 unsafe extern "C" fn on_atomic_slot_migration_event(
@@ -222,8 +227,8 @@ unsafe extern "C" fn on_atomic_slot_migration_event(
     data: *mut c_void,
 ) {
     fn raise_event(event: AtomicSlotMigrationEvent, data: *mut c_void) {
-        if let Some(slots) = parse_event_payload(data) {
-            slot_migration_event_handler(event, slots);
+        if let Some(reported) = parse_event_payload(data) {
+            slot_migration_event_handler(event, reported);
         }
     }
 
@@ -271,32 +276,86 @@ fn subscribe_to_atomic_slot_migration_events(ctx: &Context) {
 
 const BATCH_SIZE: usize = 256;
 
-/// Collects indexed keys that are pending indexing for each database. This is used during slot migrations
-/// to track keys that have been imported but not yet indexed, so we can ensure they are indexed after the migration completes.
-/// Doing this at the end of the migration process
-/// - to ensure that we have a complete view of all
-/// - avoids the complication of filtering out "phantom keys" in the read path during migration
-/// - indexes them efficiently in batches after the migration completes.
-type DelayedKeysMap = papaya::HashMap<i32, RwLock<Vec<Box<[u8]>>>, BuildNoHashHasher<i32>>;
+/// The server's identity for a migration job: `CLUSTER_NAMELEN` bytes, NUL-terminated in the
+/// event payload. Every event of one job carries the same name, on the target primary and on
+/// its replicas alike.
+type JobName = [u8; VALKEYMODULE_NODE_ID_LEN];
 
-static DELAYED_KEYS_MAP: LazyLock<DelayedKeysMap> = LazyLock::new(DelayedKeysMap::default);
+fn job_display(job: &JobName) -> String {
+    String::from_utf8_lossy(job).into_owned()
+}
+
+/// A slot migration event as the server reports it: which job, and which slots it covers.
+struct SlotMigrationEvent {
+    job: JobName,
+    slots: RangeSetBlaze<u16>,
+}
+
+/// An import in flight on this node.
+///
+/// Keys that arrive for it — restored by `TS._RESTORE`, loaded, or created, altered, renamed or
+/// copied by the replayed stream — are queued here instead of being indexed, so reads never see
+/// phantom series of an import that may still abort. Completion detaches the whole job, its
+/// registered slots and its queue, in one step on the main thread: a drain only ever indexes the
+/// keys of the import it was spawned for, even when the same slot is imported again before that
+/// drain runs, and an abort or completion that reports fewer slots than the start still clears
+/// the registration.
+struct ImportJob {
+    name: JobName,
+    slots: RangeSetBlaze<u16>,
+    /// Queued keys per db.
+    pending: HashMap<i32, Vec<Box<[u8]>>, BuildNoHashHasher<i32>>,
+}
+
+/// Every import in flight, in start order. Mutated only on the main thread (event handlers,
+/// command paths, flush handlers); a drain works on a detached job and never touches this.
+static IMPORTS: Mutex<Vec<ImportJob>> = Mutex::new(Vec::new());
+
+/// Whether `IMPORTS` is non-empty. Maintained under its mutex, so it is only ever stale in the
+/// direction of "take the lock and look": [`is_key_in_slot_import`] runs on every series
+/// creation, restore and load, almost always with no import in flight.
+static IMPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 static DELAYED_KEYS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+fn with_imports<R>(f: impl FnOnce(&mut Vec<ImportJob>) -> R) -> R {
+    let mut imports = lock(&IMPORTS);
+    let result = f(&mut imports);
+    IMPORT_ACTIVE.store(!imports.is_empty(), Ordering::Release);
+    result
+}
+
+/// FLUSHALL: every queued key is gone from the keyspace. The imports themselves stay
+/// registered; the server fails them and reports that as its own event.
 pub(super) fn clear_delayed_keys_map() {
-    DELAYED_KEYS_MAP.pin().clear();
+    with_imports(|imports| imports.iter_mut().for_each(|job| job.pending.clear()));
 }
 
+/// FLUSHDB: as [`clear_delayed_keys_map`], for one db.
 pub(super) fn clear_delayed_keys_in_db(db: i32) {
-    let pending_keys = DELAYED_KEYS_MAP.pin();
-    pending_keys.remove(&db);
+    with_imports(|imports| {
+        for job in imports.iter_mut() {
+            job.pending.remove(&db);
+        }
+    });
 }
 
+/// Queues `key` for indexing when the import of its slot completes.
+///
+/// The caller has just checked [`is_key_in_slot_import`]; both run on the main thread, as do
+/// the event handlers that change the set of imports, so the owning import cannot have gone
+/// away in between.
 pub(crate) fn add_delayed_indexing_key(db: i32, key: &[u8]) {
-    let pending_keys = DELAYED_KEYS_MAP.pin();
-
-    let converted_key = key.to_vec().into_boxed_slice();
-    write_lock(pending_keys.get_or_insert_with(db, || RwLock::new(Vec::with_capacity(64))))
-        .push(converted_key);
+    let slot = crate::fanout::calculate_hash_slot(key);
+    with_imports(
+        |imports| match imports.iter_mut().find(|job| job.slots.contains(slot)) {
+            Some(job) => job.pending.entry(db).or_default().push(key.into()),
+            None => log_warning(format!(
+                "ASM: no import in flight owns slot {slot}; key {} in db {db} is left unindexed",
+                String::from_utf8_lossy(key)
+            )),
+        },
+    );
 
     let count = DELAYED_KEYS_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
     // log every 100 queued keys to avoid excessive noise
@@ -305,6 +364,54 @@ pub(crate) fn add_delayed_indexing_key(db: i32, key: &[u8]) {
             "ASM queued delayed indexing keys: total_queued={count}, db={db}"
         ));
     }
+}
+
+/// Whether `key` belongs to a slot being imported, in which case indexing it waits for that
+/// import to complete.
+pub(crate) fn is_key_in_slot_import(key: &[u8]) -> bool {
+    if !IMPORT_ACTIVE.load(Ordering::Acquire) {
+        return false;
+    }
+    let slot = crate::fanout::calculate_hash_slot(key);
+    lock(&IMPORTS).iter().any(|job| job.slots.contains(slot))
+}
+
+fn start_import(job: JobName, slots: RangeSetBlaze<u16>) {
+    with_imports(|imports| {
+        if let Some(existing) = imports.iter_mut().find(|j| j.name == job) {
+            log_warning(format!(
+                "ASM import {} reported as started twice; merging its slot ranges",
+                job_display(&job)
+            ));
+            existing.slots |= &slots;
+            return;
+        }
+        imports.push(ImportJob {
+            name: job,
+            slots,
+            pending: HashMap::default(),
+        });
+    });
+}
+
+/// Detaches the import `job`: its registered slots stop deferring, and its queue comes back to
+/// the caller. `reported` is what the completion or abort event named; a difference from the
+/// start is logged, but it is the registration that gets removed. `None` when the job was never
+/// registered here — an import restored from a snapshot, which fires no start event.
+fn finish_import(job: &JobName, reported: &RangeSetBlaze<u16>) -> Option<ImportJob> {
+    with_imports(|imports| {
+        let position = imports.iter().position(|j| &j.name == job)?;
+        let done = imports.remove(position);
+        if done.slots != *reported {
+            log_warning(format!(
+                "ASM import {} finished with {} slot range(s) but started with {}; releasing the slots it started with",
+                job_display(job),
+                reported.ranges_len(),
+                done.slots.ranges_len()
+            ));
+        }
+        Some(done)
+    })
 }
 
 /// Indexes a batch of imported keys. Returns the number of keys that had no timeseries value at
@@ -355,40 +462,17 @@ fn index_timeseries_in_batch(db: i32, batch: &[Box<[u8]>]) -> usize {
     skipped
 }
 
-/// Removes and returns the keys queued for `db` whose hash slot is in `slots`, leaving every
-/// other queued key — another import's — where it is.
-fn take_delayed_keys_in_slots(db: i32, slots: &RangeSetBlaze<u16>) -> Vec<Box<[u8]>> {
-    let pending_keys = DELAYED_KEYS_MAP.pin();
-    let Some(lock) = pending_keys.get(&db) else {
-        return Vec::new();
-    };
-    // The entry itself stays (possibly empty) so a concurrent append cannot be lost.
-    let mut guard = write_lock(lock);
-    let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *guard)
-        .into_iter()
-        .partition(|key| slots.contains(crate::fanout::calculate_hash_slot(key)));
-    *guard = kept;
-    taken
-}
-
-/// Indexes the keys of `db` queued during the import of `slots`. Returns how many were indexed.
-fn process_delayed_keys_for_db(db: i32, slots: &RangeSetBlaze<u16>, run: &TaskRun<'_>) -> usize {
-    // Take ownership of this import's queued keys so we can index without holding the write
-    // lock. Keys of an import still in progress stay queued for its own completion.
-    let keys_vec = take_delayed_keys_in_slots(db, slots);
-
-    if keys_vec.is_empty() {
-        return 0;
-    }
-
-    let total = keys_vec.len();
+/// Indexes `keys`, queued for `db` during an import that has just completed. Returns how many
+/// were indexed.
+fn process_delayed_keys_for_db(db: i32, keys: Vec<Box<[u8]>>, run: &TaskRun<'_>) -> usize {
+    let total = keys.len();
     let mut indexed = 0usize;
     let mut skipped = 0usize;
-    for batch in keys_vec.chunks(BATCH_SIZE) {
-        // Once dequeued above, a key is only indexed here — bailing out mid-drain leaves the
-        // remaining keys in this db un-indexed. That's acceptable on shutdown (the process is
-        // about to exit; a restart re-derives the index from the RDB/AOF), but not otherwise, so
-        // this only checks the shutdown flag, not e.g. a generic cancellation.
+    for batch in keys.chunks(BATCH_SIZE) {
+        // Once detached from its import, a key is only indexed here — bailing out mid-drain
+        // leaves the remaining keys in this db un-indexed. That's acceptable on shutdown (the
+        // process is about to exit; a restart re-derives the index from the RDB/AOF), but not
+        // otherwise, so this only checks the shutdown flag, not e.g. a generic cancellation.
         if run.check_shutdown() {
             log_debug(format!(
                 "ASM delayed indexing for db={db} aborted by shutdown; {} of {total} key(s) left un-indexed",
@@ -413,34 +497,40 @@ fn process_delayed_keys_for_db(db: i32, slots: &RangeSetBlaze<u16>, run: &TaskRu
     indexed - skipped
 }
 
-/// Indexes the keys queued during the import of `slots`, which has just completed.
+/// Indexes the keys queued during `job`, an import that has just completed.
 ///
-/// There is no "already running" guard: a completion that found one drain in flight used to
-/// skip its own, and with each drain now taking only its own import's keys, that would strand
-/// them. Concurrent drains touch disjoint keys.
-fn process_delayed_indexing(slots: RangeSetBlaze<u16>) {
-    let pending_keys = DELAYED_KEYS_MAP.pin();
-    let mut dbs: Vec<i32> = pending_keys.keys().copied().collect();
-    dbs.sort_unstable();
+/// There is no "already running" guard: each drain owns exactly its import's keys, so
+/// concurrent drains touch disjoint keys and skipping one would strand them.
+fn process_delayed_indexing(job: ImportJob) {
+    let mut pending: Vec<(i32, Vec<Box<[u8]>>)> = job
+        .pending
+        .into_iter()
+        .filter(|(_, keys)| !keys.is_empty())
+        .collect();
+    pending.sort_unstable_by_key(|(db, _)| *db);
 
     log_debug(format!(
-        "ASM delayed indexing drain scheduled: dbs={}, slot_ranges={}",
-        dbs.len(),
-        slots.ranges_len()
+        "ASM delayed indexing drain scheduled: job={} dbs={} slot_ranges={}",
+        job_display(&job.name),
+        pending.len(),
+        job.slots.ranges_len()
     ));
+    if pending.is_empty() {
+        return;
+    }
 
     // On its own thread rather than the pool because it takes the module lock (see
     // `spawn_background`), and checks `is_shutting_down()` between dbs — an aborted drain
     // leaves the remaining dbs' keys un-indexed, which is fine on shutdown (see
     // `process_delayed_keys_for_db`) but must not happen otherwise.
     crate::common::threads::spawn_task(&metrics::DRAIN, move |run| {
-        for db in dbs {
+        for (db, keys) in pending {
             if run.check_shutdown() {
                 log_debug("ASM delayed indexing drain aborted by shutdown");
                 return;
             }
             // The import added a slot's worth of series to the postings in one burst.
-            if process_delayed_keys_for_db(db, &slots, run) > 0 {
+            if process_delayed_keys_for_db(db, keys, run) > 0 {
                 optimize_index_fully(db);
                 if run.check_shutdown() {
                     return;
@@ -562,67 +652,34 @@ fn handle_post_migration_cleanup(source_slots: RangeSetBlaze<u16>) {
     });
 }
 
-/// Slots this node is importing right now, across every in-flight atomic slot migration.
-///
-/// This used to be one flag for "an import is running". With imports overlapping, the first to
-/// complete cleared it and let the others' keys be indexed mid-import (phantom reads), and an
-/// abort dropped every import's queued keys. Keyed by slot, each import is handled on its own.
-static IMPORTING_SLOTS: LazyLock<Mutex<RangeSetBlaze<u16>>> =
-    LazyLock::new(|| Mutex::new(RangeSetBlaze::new()));
-
-/// Whether `IMPORTING_SLOTS` is non-empty. Maintained under its mutex, so it is only ever
-/// stale in the direction of "take the lock and look": the check below runs on every series
-/// creation, restore and load, and almost always with no import in flight.
-static IMPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-fn set_importing_slots(importing: &mut RangeSetBlaze<u16>, slots: RangeSetBlaze<u16>) {
-    *importing = slots;
-    IMPORT_ACTIVE.store(!importing.is_empty(), Ordering::Release);
-}
-
-/// Whether `key` belongs to a slot being imported, in which case indexing it waits for that
-/// import to complete.
-pub(crate) fn is_key_in_slot_import(key: &[u8]) -> bool {
-    if !IMPORT_ACTIVE.load(Ordering::Acquire) {
-        return false;
-    }
-    let importing = lock(&IMPORTING_SLOTS);
-    !importing.is_empty() && importing.contains(crate::fanout::calculate_hash_slot(key))
-}
-
-/// Drops the keys queued during an aborted import of `slots` (the series themselves are
-/// removed by the server).
-fn discard_delayed_keys_in_slots(slots: &RangeSetBlaze<u16>) {
-    let dbs: Vec<i32> = DELAYED_KEYS_MAP.pin().keys().copied().collect();
-    for db in dbs {
-        let _ = take_delayed_keys_in_slots(db, slots);
-    }
-}
-
-fn remove_importing_slots(slots: &RangeSetBlaze<u16>) {
-    let mut importing = lock(&IMPORTING_SLOTS);
-    let remaining = &*importing - slots;
-    set_importing_slots(&mut importing, remaining);
-}
-
-fn slot_migration_event_handler(event: AtomicSlotMigrationEvent, slots: RangeSetBlaze<u16>) {
+fn slot_migration_event_handler(event: AtomicSlotMigrationEvent, reported: SlotMigrationEvent) {
+    let SlotMigrationEvent { job, slots } = reported;
     match event {
         AtomicSlotMigrationEvent::ExportCompleted => {
             handle_post_migration_cleanup(slots);
         }
         AtomicSlotMigrationEvent::ImportStarted => {
-            let mut importing = lock(&IMPORTING_SLOTS);
-            let all = &*importing | &slots;
-            set_importing_slots(&mut importing, all);
+            start_import(job, slots);
         }
-        AtomicSlotMigrationEvent::ImportCompleted => {
-            remove_importing_slots(&slots);
-            log_debug("ASM ImportCompleted received; triggering delayed indexing");
-            process_delayed_indexing(slots);
-        }
+        AtomicSlotMigrationEvent::ImportCompleted => match finish_import(&job, &slots) {
+            Some(done) => {
+                log_debug("ASM ImportCompleted received; triggering delayed indexing");
+                process_delayed_indexing(done);
+            }
+            None => log_debug(format!(
+                "ASM import {} completed but was not registered here (restored from a snapshot?); nothing to drain",
+                job_display(&job)
+            )),
+        },
         AtomicSlotMigrationEvent::ImportAborted => {
-            remove_importing_slots(&slots);
-            discard_delayed_keys_in_slots(&slots);
+            // The queued keys go with the job; the server has already removed the series.
+            let registered = finish_import(&job, &slots).is_some();
+            if !registered {
+                log_debug(format!(
+                    "ASM import {} aborted but was not registered here",
+                    job_display(&job)
+                ));
+            }
         }
         _ => {
             // no action needed for other events
@@ -653,16 +710,51 @@ mod tests {
         keys.iter().map(|k| slot_of(k)).collect()
     }
 
+    fn job(tag: u8) -> JobName {
+        [tag; VALKEYMODULE_NODE_ID_LEN]
+    }
+
+    fn start(job: JobName, slots: &RangeSetBlaze<u16>) {
+        slot_migration_event_handler(
+            AtomicSlotMigrationEvent::ImportStarted,
+            SlotMigrationEvent {
+                job,
+                slots: slots.clone(),
+            },
+        );
+    }
+
+    fn abort(job: JobName, slots: &RangeSetBlaze<u16>) {
+        slot_migration_event_handler(
+            AtomicSlotMigrationEvent::ImportAborted,
+            SlotMigrationEvent {
+                job,
+                slots: slots.clone(),
+            },
+        );
+    }
+
+    fn pending_keys(job: &ImportJob, db: i32) -> Vec<&[u8]> {
+        let mut keys: Vec<&[u8]> = job
+            .pending
+            .get(&db)
+            .map(|keys| keys.iter().map(|k| k.as_ref()).collect())
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    }
+
     #[test]
-    fn test_overlapping_imports_are_tracked_per_slot() {
+    #[serial]
+    fn test_overlapping_imports_are_tracked_per_job() {
         // Two imports in flight: `{a}` keys belong to the first, `{b}` keys to the second.
         let first = slots(&[b"{a}x"]);
         let second = slots(&[b"{b}x"]);
         assert_ne!(first, second);
         const DB: i32 = 91;
 
-        slot_migration_event_handler(AtomicSlotMigrationEvent::ImportStarted, first.clone());
-        slot_migration_event_handler(AtomicSlotMigrationEvent::ImportStarted, second.clone());
+        start(job(b'1'), &first);
+        start(job(b'2'), &second);
         assert!(is_key_in_slot_import(b"{a}1"));
         assert!(is_key_in_slot_import(b"{b}1"));
         assert!(
@@ -675,20 +767,111 @@ mod tests {
         add_delayed_indexing_key(DB, b"{b}2");
 
         // Aborting the first drops its queued key only, and leaves the second import running.
-        slot_migration_event_handler(AtomicSlotMigrationEvent::ImportAborted, first.clone());
+        abort(job(b'1'), &first);
         assert!(!is_key_in_slot_import(b"{a}1"));
         assert!(
             is_key_in_slot_import(b"{b}1"),
             "the second import is still in progress"
         );
-        let remaining = take_delayed_keys_in_slots(DB, &second);
-        let mut remaining: Vec<&[u8]> = remaining.iter().map(|k| k.as_ref()).collect();
-        remaining.sort();
-        assert_eq!(remaining, vec![&b"{b}1"[..], &b"{b}2"[..]]);
-        assert!(take_delayed_keys_in_slots(DB, &first).is_empty());
-
-        remove_importing_slots(&second);
+        let done = finish_import(&job(b'2'), &second).expect("the second import is registered");
+        assert_eq!(pending_keys(&done, DB), vec![&b"{b}1"[..], &b"{b}2"[..]]);
         assert!(!is_key_in_slot_import(b"{b}1"));
+        assert!(
+            finish_import(&job(b'1'), &first).is_none(),
+            "already aborted"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_completed_import_does_not_own_a_later_imports_keys() {
+        // ASM-03: the same slot is imported twice in a row. The first import's completion
+        // detaches exactly its own queue; a key queued for the second import afterwards belongs
+        // to the second import, even though both used the same slot.
+        let shared = slots(&[b"{d}x"]);
+        const DB: i32 = 92;
+
+        start(job(b'3'), &shared);
+        add_delayed_indexing_key(DB, b"{d}first");
+        let first = finish_import(&job(b'3'), &shared).expect("first import is registered");
+        assert!(
+            !is_key_in_slot_import(b"{d}x"),
+            "nothing is importing between the two"
+        );
+
+        start(job(b'4'), &shared);
+        add_delayed_indexing_key(DB, b"{d}second");
+        assert_eq!(pending_keys(&first, DB), vec![&b"{d}first"[..]]);
+
+        let second = finish_import(&job(b'4'), &shared).expect("second import is registered");
+        assert_eq!(pending_keys(&second, DB), vec![&b"{d}second"[..]]);
+        assert!(!is_key_in_slot_import(b"{d}x"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_finishing_removes_the_registered_slots_not_the_reported_ones() {
+        // ASM-07: a completion or abort that names fewer slots than its start must not leave
+        // the rest importing forever; the job's registration is what gets removed.
+        let registered = slots(&[b"{e}x", b"{f}x"]);
+        let reported = slots(&[b"{e}x"]);
+        assert_ne!(registered, reported);
+
+        start(job(b'5'), &registered);
+        assert!(is_key_in_slot_import(b"{f}1"));
+        abort(job(b'5'), &reported);
+        assert!(!is_key_in_slot_import(b"{e}1"));
+        assert!(
+            !is_key_in_slot_import(b"{f}1"),
+            "slot of the start, absent from the abort"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_unregistered_completion_leaves_other_imports_alone() {
+        // An import this node never saw start (restored from RDB, say) completes: nothing to
+        // drain, and an unrelated import in flight keeps its slots and keys.
+        let running = slots(&[b"{g}x"]);
+        let unknown = slots(&[b"{h}x"]);
+        const DB: i32 = 95;
+
+        start(job(b'6'), &running);
+        add_delayed_indexing_key(DB, b"{g}1");
+        assert!(finish_import(&job(b'7'), &unknown).is_none());
+        assert!(is_key_in_slot_import(b"{g}1"));
+        let done = finish_import(&job(b'6'), &running).expect("registered");
+        assert_eq!(pending_keys(&done, DB), vec![&b"{g}1"[..]]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_flushing_a_db_drops_only_that_dbs_queued_keys() {
+        let importing = slots(&[b"{i}x"]);
+        start(job(b'8'), &importing);
+        add_delayed_indexing_key(96, b"{i}1");
+        add_delayed_indexing_key(97, b"{i}2");
+
+        clear_delayed_keys_in_db(96);
+        let done = finish_import(&job(b'8'), &importing).expect("registered");
+        assert!(pending_keys(&done, 96).is_empty());
+        assert_eq!(pending_keys(&done, 97), vec![&b"{i}2"[..]]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_flushing_everything_drops_every_queued_key_but_keeps_the_import() {
+        let importing = slots(&[b"{j}x"]);
+        start(job(b'9'), &importing);
+        add_delayed_indexing_key(98, b"{j}1");
+
+        clear_delayed_keys_map();
+        assert!(
+            is_key_in_slot_import(b"{j}1"),
+            "the import itself is still running"
+        );
+        let done = finish_import(&job(b'9'), &importing).expect("registered");
+        assert!(pending_keys(&done, 98).is_empty());
     }
 
     /// A synthetic event payload, laid out exactly as the server fills it in.
@@ -703,9 +886,16 @@ mod tests {
                 .iter()
                 .map(|&(start, end)| ValkeyModuleSlotRange { start, end })
                 .collect();
+            let mut job_name = [0 as c_char; VALKEYMODULE_NODE_ID_LEN + 1];
+            for (dst, src) in job_name
+                .iter_mut()
+                .zip(b"0123456789abcdef0123456789abcdef01234567")
+            {
+                *dst = *src as c_char;
+            }
             let info = ValkeyModuleAtomicSlotMigrationInfoV1 {
                 version,
-                job_name: [0; VALKEYMODULE_NODE_ID_LEN + 1],
+                job_name,
                 slot_ranges: ranges.as_mut_ptr(),
                 num_slot_ranges: ranges.len() as u32,
             };
@@ -720,7 +910,9 @@ mod tests {
     #[test]
     fn test_payload_valid_ranges_are_parsed() {
         let p = Payload::new(1, &[(0, 100), (200, 300), (16383, 16383)]);
-        let slots = parse_event_payload(p.ptr()).expect("valid payload");
+        let event = parse_event_payload(p.ptr()).expect("valid payload");
+        assert_eq!(&event.job[..], b"0123456789abcdef0123456789abcdef01234567");
+        let slots = event.slots;
         assert_eq!(slots.ranges_len(), 3);
         assert!(slots.contains(0) && slots.contains(100) && slots.contains(16383));
         assert!(!slots.contains(101) && !slots.contains(199));
@@ -730,7 +922,7 @@ mod tests {
     #[test]
     fn test_payload_overlapping_and_unsorted_ranges_merge() {
         let p = Payload::new(1, &[(50, 60), (10, 55), (7, 7)]);
-        let slots = parse_event_payload(p.ptr()).expect("valid payload");
+        let slots = parse_event_payload(p.ptr()).expect("valid payload").slots;
         assert_eq!(slots.ranges_len(), 2);
         assert_eq!(slots.len(), 51 + 1);
         let _ = &p.ranges;
@@ -775,7 +967,7 @@ mod tests {
             1,
             &[(20, 10), (-1, 5), (16380, 16384), (-70000, 3), (100, 110)],
         );
-        let slots = parse_event_payload(p.ptr()).expect("one good range");
+        let slots = parse_event_payload(p.ptr()).expect("one good range").slots;
         assert_eq!(slots.ranges_len(), 1);
         assert_eq!(slots.len(), 11);
         assert!(slots.contains(100) && slots.contains(110));
