@@ -157,7 +157,8 @@ impl Postings {
         hidden
     }
 
-    /// The import of `slots` completed: their hidden series become visible. Returns how many.
+    /// The import of `slots` ended: their hidden series become visible. Returns how many. Called
+    /// on completion and on abort, where only series whose key survived are left.
     pub(in crate::series::index) fn publish_hidden_in_slots(
         &mut self,
         slots: &RangeSetBlaze<u16>,
@@ -168,22 +169,6 @@ impl Postings {
         let ids = self.hidden_ids.take_slots(slots);
         self.all_postings |= &ids;
         ids.cardinality()
-    }
-
-    /// The import of `slots` aborted. The server deletes an aborted import's keys through
-    /// `unlink` before it reports the abort, so this normally finds nothing; anything it does find
-    /// has no key behind it and goes the way of any other dangling id. Returns how many.
-    pub(in crate::series::index) fn retire_hidden_in_slots(
-        &mut self,
-        slots: &RangeSetBlaze<u16>,
-    ) -> u64 {
-        if self.hidden_ids.is_empty() {
-            return 0;
-        }
-        let ids = self.hidden_ids.take_slots(slots);
-        let ids: Vec<SeriesRef> = ids.iter().collect();
-        self.mark_ids_as_stale(&ids);
-        ids.len() as u64
     }
 
     /// How many of `postings`' ids a read may see: neither tombstoned nor hidden. For the readers
@@ -389,21 +374,6 @@ mod tests {
         assert_eq!(postings.hidden_ids, HiddenSet::default());
         assert_eq!(postings.publish_hidden_in_slots(&importing()), 0);
         assert!(!postings.all_postings.contains(IMPORTED));
-    }
-
-    #[test]
-    fn an_abort_retires_whatever_is_left_hidden() {
-        let mut postings = hidden_fixture();
-        assert_eq!(postings.retire_hidden_in_slots(&importing()), 1);
-        assert_eq!(postings.hidden_ids, HiddenSet::default());
-        assert!(!postings.has_id(IMPORTED));
-        assert!(!postings.all_postings.contains(IMPORTED));
-        assert!(
-            postings
-                .terms()
-                .postings_for_label_value("job", "imported")
-                .is_empty()
-        );
     }
 
     #[test]
