@@ -20,7 +20,7 @@ use crate::series::tasks::{optimize_index_fully, remove_all_stale_series_interna
 use crate::series::{SeriesRef, TimeSeries};
 use range_set_blaze::RangeSetBlaze;
 use std::ffi::{c_char, c_int, c_void};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock};
 use valkey_module::{Context, MODULE_CONTEXT, Version, raw};
 
@@ -570,9 +570,22 @@ fn handle_post_migration_cleanup(source_slots: RangeSetBlaze<u16>) {
 static IMPORTING_SLOTS: LazyLock<Mutex<RangeSetBlaze<u16>>> =
     LazyLock::new(|| Mutex::new(RangeSetBlaze::new()));
 
+/// Whether `IMPORTING_SLOTS` is non-empty. Maintained under its mutex, so it is only ever
+/// stale in the direction of "take the lock and look": the check below runs on every series
+/// creation, restore and load, and almost always with no import in flight.
+static IMPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn set_importing_slots(importing: &mut RangeSetBlaze<u16>, slots: RangeSetBlaze<u16>) {
+    *importing = slots;
+    IMPORT_ACTIVE.store(!importing.is_empty(), Ordering::Release);
+}
+
 /// Whether `key` belongs to a slot being imported, in which case indexing it waits for that
 /// import to complete.
 pub(crate) fn is_key_in_slot_import(key: &[u8]) -> bool {
+    if !IMPORT_ACTIVE.load(Ordering::Acquire) {
+        return false;
+    }
     let importing = lock(&IMPORTING_SLOTS);
     !importing.is_empty() && importing.contains(crate::fanout::calculate_hash_slot(key))
 }
@@ -588,7 +601,8 @@ fn discard_delayed_keys_in_slots(slots: &RangeSetBlaze<u16>) {
 
 fn remove_importing_slots(slots: &RangeSetBlaze<u16>) {
     let mut importing = lock(&IMPORTING_SLOTS);
-    *importing = &*importing - slots;
+    let remaining = &*importing - slots;
+    set_importing_slots(&mut importing, remaining);
 }
 
 fn slot_migration_event_handler(event: AtomicSlotMigrationEvent, slots: RangeSetBlaze<u16>) {
@@ -597,7 +611,9 @@ fn slot_migration_event_handler(event: AtomicSlotMigrationEvent, slots: RangeSet
             handle_post_migration_cleanup(slots);
         }
         AtomicSlotMigrationEvent::ImportStarted => {
-            *lock(&IMPORTING_SLOTS) |= &slots;
+            let mut importing = lock(&IMPORTING_SLOTS);
+            let all = &*importing | &slots;
+            set_importing_slots(&mut importing, all);
         }
         AtomicSlotMigrationEvent::ImportCompleted => {
             remove_importing_slots(&slots);

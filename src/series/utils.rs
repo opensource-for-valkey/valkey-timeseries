@@ -8,6 +8,7 @@ use crate::error_consts;
 use crate::labels::{InternedLabel, Label, MetricName};
 use crate::parser::metric_name::parse_metric_name;
 use crate::series::chunks::ChunkEncoding;
+use crate::series::index::asm::{add_delayed_indexing_key, is_key_in_slot_import};
 use crate::series::index::{get_db_index, next_timeseries_id};
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
 use crate::series::{
@@ -164,7 +165,13 @@ pub fn create_series(
         }
     }
 
-    index.index_timeseries(&ts, key.iter().as_slice());
+    // A series created by a replayed write while its slot is being imported stays out of the
+    // index, like a restored one, until the import completes (see `series::index::asm`).
+    if is_key_in_slot_import(key.as_slice()) {
+        add_delayed_indexing_key(db, key.as_slice());
+    } else {
+        index.index_timeseries(&ts, key.iter().as_slice());
+    }
     Ok(ts)
 }
 

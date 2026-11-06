@@ -1,7 +1,9 @@
 use crate::commands::command_parser::CommandArgToken;
 use crate::commands::ts_create::parse_series_options_onto;
+use crate::common::context::get_current_db;
 use crate::common::context::notify_keyspace_event;
 use crate::labels::MetricName;
+use crate::series::index::asm::{add_delayed_indexing_key, is_key_in_slot_import};
 use crate::series::index::get_timeseries_index;
 use crate::series::{TimeSeries, TimeSeriesOptions, with_timeseries_mut};
 use std::ffi::CStr;
@@ -82,7 +84,15 @@ fn update_series(
         let guard = get_timeseries_index(ctx);
         let ts_index = guard.deref();
 
-        ts_index.remove_timeseries(series);
+        let importing = is_key_in_slot_import(key.as_slice());
+        if importing {
+            // A replayed ALTER on a key whose slot is being imported: the series is not
+            // indexed yet (or is, under a replayed create), and must stay hidden until the
+            // import completes. Key-checked, so a never-indexed series retires nothing.
+            ts_index.remove_timeseries_for_key(series, key.as_slice());
+        } else {
+            ts_index.remove_timeseries(series);
+        }
         // update labels in series
         series.labels = if labels.is_empty() {
             MetricName::default()
@@ -90,7 +100,11 @@ fn update_series(
             MetricName::new(&labels)
         };
 
-        ts_index.index_timeseries(series, key.as_slice());
+        if importing {
+            add_delayed_indexing_key(get_current_db(ctx), key.as_slice());
+        } else {
+            ts_index.index_timeseries(series, key.as_slice());
+        }
     }
 
     if let Some(retention) = options.retention

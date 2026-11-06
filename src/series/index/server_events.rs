@@ -109,7 +109,15 @@ fn handle_key_rename(ctx: &Context, old_key: &[u8], new_key: &[u8]) {
         return;
     };
     series.key = new_key.into();
-    index.reindex_timeseries(&series, old_key, new_key);
+    if is_key_in_slot_import(new_key) {
+        // A replayed RENAME inside an importing slot: retire whatever the old key had (nothing,
+        // unless a replayed create indexed it) and keep the new key hidden until the import
+        // completes.
+        index.remove_timeseries_for_key(&series, old_key);
+        add_delayed_indexing_key(get_current_db(ctx), new_key);
+    } else {
+        index.reindex_timeseries(&series, old_key, new_key);
+    }
     // Compaction partners link to each other by key.
     relink_renamed_series(ctx, &mut series, old_key);
 }
@@ -150,6 +158,11 @@ fn handle_key_copy(ctx: &Context, key: &[u8]) {
         return;
     };
     series._db = Some(db);
+    if is_key_in_slot_import(key) {
+        // A replayed COPY inside an importing slot stays hidden until the import completes.
+        add_delayed_indexing_key(db, key);
+        return;
+    }
     let index = get_db_index(db);
     let mut postings = index.get_postings_mut();
     index_loaded_series(&mut postings, &mut series, key);

@@ -20,7 +20,10 @@ from valkey import ResponseError, Valkey, ValkeyCluster
 from common import CompactionRule, parse_info_response
 from valkeytestframework.util.waiters import wait_for_true, WaitTimeout
 from valkeytestframework.conftest import resource_port_tracker
-from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCaseDebugMode
+from valkey_timeseries_test_case import (
+    ValkeyTimeSeriesClusterTestCase,
+    ValkeyTimeSeriesClusterTestCaseDebugMode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -634,11 +637,11 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
     # ------------------------------------------------------------------------------------------
     # Compaction rules across a migration
     #
-    # A rule links its source and destination series by series id (the source's rule holds the
-    # destination id, the destination holds the source id), and compaction resolves the
-    # destination id through the secondary index. On the importing node that index is populated
-    # late (after ImportCompleted, on a background thread) and imported ids can be remapped on a
-    # collision, so the links have to survive both.
+    # A rule links its source and destination series by key (the source's rule names the
+    # destination key, the destination names its source key), so a link survives the id remap
+    # every imported series gets when the importing node indexes it late (after ImportCompleted,
+    # on a background thread). These tests pin that the link, and the compaction it drives, come
+    # through a migration intact.
     # ------------------------------------------------------------------------------------------
 
     RULE_BUCKET = 100
@@ -925,6 +928,99 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
             f"{local_src}'s own rule changed: {[(r.dest_key, r.aggregation) for r in local_rules]}"
         )
 
+    # ------------------------------------------------------------------------------------------
+    # Replayed mutations during an import
+    #
+    # After the snapshot, the source streams every mutation of the migrating slots to the
+    # target, which applies them as ordinary commands while the slots are still importing. The
+    # server hides those keys until the handover; the module's index must hide them too, for
+    # every path that can index a key, not just TS._RESTORE.
+    # ------------------------------------------------------------------------------------------
+
+    def _cancel_migrations_quietly(self, client: Valkey):
+        try:
+            client.execute_command("CLUSTER", "CANCELSLOTMIGRATIONS")
+        except ResponseError as e:
+            if "No migrations ongoing" not in str(e):
+                raise
+
+    def test_replayed_mutations_stay_hidden_until_import_completes(self):
+        source_client = self.new_client_for_primary(0)
+        self._skip_if_asm_not_supported(source_client)
+        target_client = self.new_client_for_primary(1)
+        observer = self.new_client_for_primary(2)
+
+        hash_tag = self._find_hash_tag_for_shard(source_client, "asm_hidden", shard_index=0)
+        existing = f"ts:{{{hash_tag}}}:existing"
+        created = f"ts:{{{hash_tag}}}:created"
+        via_add = f"ts:{{{hash_tag}}}:via_add"
+        rename_from = f"ts:{{{hash_tag}}}:rename_from"
+        rename_to = f"ts:{{{hash_tag}}}:rename_to"
+        copy_src = f"ts:{{{hash_tag}}}:copy_src"
+        copy_dst = f"ts:{{{hash_tag}}}:copy_dst"
+        source_client.execute_command("TS.CREATE", existing, "LABELS", "review", "before")
+        source_client.execute_command("TS.CREATE", rename_from, "LABELS", "review", "renamed")
+        source_client.execute_command("TS.CREATE", copy_src, "LABELS", "review", "copied")
+        source_client.execute_command("TS.ADD", copy_src, 500, 7)
+        slot = self._get_key_slot(source_client, existing)
+
+        # Hold the migration open after the snapshot so the replayed stream is observable.
+        source_client.execute_command("DEBUG", "SLOTMIGRATION", "PREVENT-PAUSE", 1)
+        try:
+            self._migrate_slot_range(source_client, self._get_node_id(target_client), slot, slot)
+            wait_for_true(
+                lambda: "waiting-to-pause" in
+                        [self._migration_state(m) for m in self._get_slot_migrations(source_client)],
+                timeout=20,
+            )
+            # The snapshot's series are deferred on the target.
+            for selector in ("review=before", "review=renamed", "review=copied"):
+                assert self._local_queryindex(target_client, selector) == set(), selector
+
+            # Every mutation path that can index a key, replayed into the importing slot.
+            source_client.execute_command("TS.CREATE", created, "LABELS", "review", "created")
+            source_client.execute_command("TS.ADD", created, 1000, 42)
+            source_client.execute_command("TS.ADD", via_add, 1000, 43, "LABELS", "review", "via_add")
+            source_client.execute_command("TS.ALTER", existing, "LABELS", "review", "altered")
+            source_client.execute_command("RENAME", rename_from, rename_to)
+            source_client.execute_command("COPY", copy_src, copy_dst)
+            # The replay link has no observable "caught up" signal while the keys are hidden;
+            # the post-commit checks below prove the stream was applied.
+            time.sleep(1.0)
+
+            assert target_client.dbsize() == 0, "the server hides importing keys"
+            hidden = {
+                "review=created": [created],
+                "review=via_add": [via_add],
+                "review=altered": [existing],
+                "review=renamed": [rename_to],
+                "review=copied": [copy_src, copy_dst],
+            }
+            for selector in hidden:
+                assert self._local_queryindex(target_client, selector) == set(), (
+                    f"{selector} is indexed on the target before the import completed"
+                )
+            for selector, keys in hidden.items():
+                card = observer.execute_command("TS.CARD", "FILTER", selector)
+                assert card == len(keys), f"TS.CARD {selector} = {card}, expected {len(keys)}"
+            rows = observer.execute_command("TS.MGET", "FILTER", "review=created")
+            assert len(rows) == 1, f"TS.MGET returned {len(rows)} rows for one series: {rows}"
+
+            source_client.execute_command("DEBUG", "SLOTMIGRATION", "PREVENT-PAUSE", 0)
+            self._wait_for_no_migrations(source_client)
+
+            # After the handover the target indexes everything exactly once, with its data.
+            for selector, keys in hidden.items():
+                self._assert_local_queryindex_contains(target_client, selector, keys)
+                self._assert_local_queryindex_empty(source_client, selector)
+            assert target_client.execute_command("TS.RANGE", created, "-", "+") == [[1000, b"42"]]
+            assert target_client.execute_command("TS.RANGE", via_add, "-", "+") == [[1000, b"43"]]
+            assert target_client.execute_command("TS.RANGE", copy_dst, "-", "+") == [[500, b"7"]]
+            assert target_client.execute_command("TS.RANGE", rename_to, "-", "+") == []
+        finally:
+            self._cancel_migrations_quietly(source_client)
+            source_client.execute_command("DEBUG", "SLOTMIGRATION", "PREVENT-PAUSE", 0)
+
     def _find_hash_tag_for_shard(self, client: Valkey, prefix: str, shard_index: int, max_attempts: int = 512) -> str:
         """Find a hash tag whose slot is owned by the requested shard."""
         for i in range(max_attempts):
@@ -934,3 +1030,69 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
             if self._shard_index_for_slot(slot) == shard_index:
                 return candidate
         raise AssertionError(f"Failed to find hash tag for shard {shard_index} after {max_attempts} attempts")
+
+
+class TestAtomicSlotMigrationProductionMode(ValkeyTimeSeriesClusterTestCase):
+    """One migration with `ts.debug-mode` **off**.
+
+    Every test above runs in debug mode, where `TS._RESTORE` waives its caller guard
+    (`is_real_user_client`). The import stream reaches the handler as a replicated client in
+    production, so the guard must admit it; this is the only test that exercises that path.
+    """
+
+    CLUSTER_SIZE = 3
+    REPLICAS_COUNT = 1
+
+    # The slot/migration helpers only use `self.CLUSTER_SIZE` and the test's own clients.
+    TERMINAL_MIGRATION_STATES = TestAtomicSlotMigration.TERMINAL_MIGRATION_STATES
+    _migration_state = staticmethod(TestAtomicSlotMigration._migration_state)
+    _skip_if_asm_not_supported = TestAtomicSlotMigration._skip_if_asm_not_supported
+    _skip_if_asm_commands_not_supported = TestAtomicSlotMigration._skip_if_asm_commands_not_supported
+    _get_node_id = TestAtomicSlotMigration._get_node_id
+    _get_key_slot = TestAtomicSlotMigration._get_key_slot
+    _shard_index_for_slot = TestAtomicSlotMigration._shard_index_for_slot
+    _find_hash_tag_for_shard = TestAtomicSlotMigration._find_hash_tag_for_shard
+    _get_slot_migrations = TestAtomicSlotMigration._get_slot_migrations
+    _wait_for_no_migrations = TestAtomicSlotMigration._wait_for_no_migrations
+    _migrate_slot_range = TestAtomicSlotMigration._migrate_slot_range
+    _poll_until = TestAtomicSlotMigration._poll_until
+
+    def test_import_stream_passes_restore_guard_without_debug_mode(self):
+        n = 50
+        cluster_client = self.new_cluster_client()
+        source_client = self.new_client_for_primary(0)
+        self._skip_if_asm_not_supported(source_client)
+        target_client = self.new_client_for_primary(1)
+        observer = self.new_client_for_primary(2)
+
+        # Debug mode really is off: the debug surface is rejected.
+        with pytest.raises(ResponseError):
+            target_client.execute_command("TS._DEBUG", "QUERYINDEX", "x=y")
+
+        hash_tag = self._find_hash_tag_for_shard(source_client, "asm_prod", shard_index=0)
+        keys = [f"ts:{{{hash_tag}}}:s{i}" for i in range(n)]
+        for i, key in enumerate(keys):
+            cluster_client.execute_command("TS.CREATE", key, "LABELS", "prod", "yes", "tag", hash_tag)
+            cluster_client.execute_command("TS.ADD", key, 1000, i)
+        slot = self._get_key_slot(source_client, keys[0])
+
+        self._migrate_slot_range(source_client, self._get_node_id(target_client), slot, slot)
+        self._wait_for_no_migrations(source_client)
+        states = [self._migration_state(m) for m in self._get_slot_migrations(source_client)]
+        assert states == ["success"], states
+
+        def card():
+            # The first fan-out after a handover may report a (retriable) topology change.
+            try:
+                return observer.execute_command("TS.CARD", "FILTER", f"tag={hash_tag}")
+            except ResponseError as e:
+                if "topology has changed" in str(e):
+                    return -1
+                raise
+
+        self._poll_until(lambda: card() == n)
+        assert card() == n
+        assert target_client.dbsize() == n
+        assert len(observer.execute_command("TS.MGET", "FILTER", f"tag={hash_tag}")) == n
+        for i, key in enumerate(keys):
+            assert target_client.execute_command("TS.RANGE", key, "-", "+") == [[1000, str(i).encode()]]
