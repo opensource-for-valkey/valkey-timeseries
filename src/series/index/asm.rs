@@ -629,6 +629,26 @@ fn reply_fields(entry: &ValkeyValue) -> Vec<(String, String)> {
     }
 }
 
+/// Registers each of `found` that this module does not know yet. Returns every slot of `found`, so
+/// that one scan of the index can hide them all.
+fn register_restored_imports(
+    found: impl IntoIterator<Item = (JobName, RangeSetBlaze<u16>)>,
+) -> RangeSetBlaze<u16> {
+    let mut all = RangeSetBlaze::new();
+    for (job, slots) in found {
+        all |= &slots;
+        log_notice(format!(
+            "ASM import {} in progress after load: {} slot range(s)",
+            job_display(&job),
+            slots.ranges_len()
+        ));
+        if !with_imports(|imports| imports.iter().any(|j| j.name == job)) {
+            start_import(job, slots);
+        }
+    }
+    all
+}
+
 /// Registers the imports the server restored from a snapshot, and hides their keys.
 ///
 /// A node that loads an in-flight import from an RDB — a target primary restarting, or a
@@ -652,20 +672,20 @@ pub(super) fn reconcile_imports_after_load(ctx: &Context) {
             return;
         }
     };
-    for (job, slots) in entries
-        .iter()
-        .filter_map(|entry| restored_import_from_fields(&reply_fields(entry)))
-    {
-        if !with_imports(|imports| imports.iter().any(|j| j.name == job)) {
-            start_import(job, slots.clone());
-        }
-        let hidden = for_each_db_postings(|postings| postings.hide_indexed_keys_in_slots(&slots));
-        log_notice(format!(
-            "ASM import {} restored from snapshot: {} slot range(s), {hidden} loaded series hidden",
-            job_display(&job),
-            slots.ranges_len()
-        ));
+    let slots = register_restored_imports(
+        entries
+            .iter()
+            .filter_map(|entry| restored_import_from_fields(&reply_fields(entry))),
+    );
+    if slots.is_empty() {
+        return;
     }
+    // One walk of each db's directory, whatever the number of imports: it hashes every key.
+    let hidden = for_each_db_postings(|postings| postings.hide_indexed_keys_in_slots(&slots));
+    log_notice(format!(
+        "ASM imports restored from snapshot: {} slot range(s), {hidden} loaded series hidden",
+        slots.ranges_len()
+    ));
 }
 
 /// Set once the event handler is registered: this server can migrate slots atomically.
@@ -1014,6 +1034,38 @@ mod tests {
 
         complete(job(b'0'), &shared);
         assert_eq!(visible_values(DB), ["imported", "local"]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_restored_imports_are_registered_and_their_slots_combined() {
+        let first = slots(&[b"{n}x"]);
+        let second = slots(&[b"{o}x"]);
+        let known = slots(&[b"{p2}x"]);
+        assert_ne!(first, second);
+        start(job(b'k'), &known);
+
+        let all = register_restored_imports([
+            (job(b'f'), first.clone()),
+            (job(b's'), second.clone()),
+            (job(b'k'), known.clone()),
+        ]);
+
+        assert_eq!(all, &(&first | &second) | &known);
+        assert!(importing(b"{n}1") && importing(b"{o}1") && importing(b"{p2}1"));
+        assert_eq!(
+            with_imports(|imports| imports.iter().filter(|j| j.name == job(b'k')).count()),
+            1,
+            "a known import is not registered twice"
+        );
+        for (tag, registered) in [(b'f', first), (b's', second), (b'k', known)] {
+            assert!(finish_import(&job(tag), &registered).is_some());
+        }
+    }
+
+    #[test]
+    fn test_no_restored_imports_means_no_slots_to_scan() {
+        assert!(register_restored_imports([]).is_empty());
     }
 
     #[test]
