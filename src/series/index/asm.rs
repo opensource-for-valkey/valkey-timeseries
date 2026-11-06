@@ -24,6 +24,7 @@ use crate::series::index::TIMESERIES_INDEX;
 use crate::series::index::postings::Postings;
 use crate::series::tasks::optimize_index_fully;
 use range_set_blaze::RangeSetBlaze;
+use std::collections::BTreeSet;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -407,21 +408,104 @@ fn publish_import(slots: &RangeSetBlaze<u16>) {
     optimize_after_import(dbs);
 }
 
+/// The dbs waiting for their post-import optimize, and whether a worker is draining them.
+///
+/// A run of small imports would otherwise repeat a pass over every posting list per import, and
+/// several passes over one db at a time would only contend for its write lock. Publishes during a
+/// run fold into one more pass per db. Both fields sit behind one mutex so that a worker's decision
+/// to exit and a publish's decision not to start one cannot miss each other, which a separate
+/// single-flight guard released after the exit check would allow.
+struct OptimizeQueue {
+    dbs: BTreeSet<i32>,
+    running: bool,
+}
+
+impl OptimizeQueue {
+    const fn new() -> Self {
+        Self {
+            dbs: BTreeSet::new(),
+            running: false,
+        }
+    }
+
+    /// Queues `dbs`. Returns whether the caller must start a worker.
+    fn add(&mut self, dbs: impl IntoIterator<Item = i32>) -> bool {
+        self.dbs.extend(dbs);
+        !std::mem::replace(&mut self.running, true)
+    }
+
+    /// What a worker should optimize next. `None` ends its run.
+    fn next_batch(&mut self) -> Option<BTreeSet<i32>> {
+        if self.dbs.is_empty() {
+            self.running = false;
+            return None;
+        }
+        Some(std::mem::take(&mut self.dbs))
+    }
+
+    /// The worker the last [`OptimizeQueue::add`] asked for could not start. Its dbs wait for the
+    /// next publish, and the periodic optimizer reaches them regardless.
+    fn worker_not_started(&mut self) {
+        self.running = false;
+    }
+}
+
+/// Runs `optimize` on queued dbs until none are left. Stopping is for shutdown, so it does not
+/// bother handing the queue back.
+fn drain_optimize_queue(
+    queue: &Mutex<OptimizeQueue>,
+    should_stop: impl Fn() -> bool,
+    mut optimize: impl FnMut(i32),
+) {
+    /// A worker that panics must not leave the queue believing it still runs.
+    struct ReleaseOnPanic<'a>(&'a Mutex<OptimizeQueue>);
+    impl Drop for ReleaseOnPanic<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                lock(self.0).running = false;
+            }
+        }
+    }
+    let _release = ReleaseOnPanic(queue);
+
+    loop {
+        let Some(dbs) = lock(queue).next_batch() else {
+            return;
+        };
+        for db in dbs {
+            if should_stop() {
+                return;
+            }
+            optimize(db);
+        }
+    }
+}
+
+static OPTIMIZE_QUEUE: Mutex<OptimizeQueue> = Mutex::new(OptimizeQueue::new());
+
 /// The import added a slot's worth of series to the postings in one burst, which the periodic
 /// optimizer would take a long time to reach. On its own thread because it takes the postings
-/// write lock batch by batch; if the thread cannot start, the periodic optimizer gets there.
+/// write lock batch by batch.
 fn optimize_after_import(dbs: Vec<i32>) {
     if dbs.is_empty() {
         return;
     }
-    crate::common::threads::spawn_task(&metrics::OPTIMIZE, move |run| {
-        for db in dbs {
-            if run.check_shutdown() {
-                return;
-            }
-            optimize_index_fully(db);
-        }
+    if !lock(&OPTIMIZE_QUEUE).add(dbs) {
+        metrics::OPTIMIZE
+            .skipped_inflight
+            .fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let started = crate::common::threads::spawn_task(&metrics::OPTIMIZE, |run| {
+        drain_optimize_queue(
+            &OPTIMIZE_QUEUE,
+            || run.check_shutdown(),
+            optimize_index_fully,
+        );
     });
+    if !started {
+        lock(&OPTIMIZE_QUEUE).worker_not_started();
+    }
 }
 
 /// The import of `slots` aborted, and the server has already deleted its keys.
@@ -607,6 +691,7 @@ mod tests {
     use crate::series::index::{IndexKey, get_db_index};
     use crate::series::{SeriesRef, TimeSeries};
     use serial_test::serial;
+    use std::sync::atomic::AtomicI32;
 
     fn slot_of(key: &[u8]) -> u16 {
         crate::fanout::calculate_hash_slot(key)
@@ -667,6 +752,88 @@ mod tests {
         let mut values = index.get_label_values("asm_test");
         values.sort();
         values
+    }
+
+    #[test]
+    fn test_publishes_during_a_pass_fold_into_one_more_pass() {
+        let mut queue = OptimizeQueue::new();
+        assert!(queue.add([1]), "nothing is running: start a worker");
+        assert!(
+            !queue.add([2]),
+            "the worker is not known to have looked yet"
+        );
+        assert_eq!(queue.next_batch(), Some(BTreeSet::from([1, 2])));
+
+        assert!(!queue.add([2]), "a pass is in progress");
+        assert!(!queue.add([3]));
+        assert!(!queue.add([2]));
+        assert_eq!(queue.next_batch(), Some(BTreeSet::from([2, 3])));
+
+        assert_eq!(queue.next_batch(), None, "nothing is left: the run ends");
+        assert!(queue.add([4]), "and the next publish starts a new one");
+    }
+
+    #[test]
+    fn test_a_worker_that_cannot_start_keeps_the_dbs_for_the_next_one() {
+        let mut queue = OptimizeQueue::new();
+        assert!(queue.add([1]));
+        queue.worker_not_started();
+        assert!(queue.add([2]), "no worker is running");
+        assert_eq!(queue.next_batch(), Some(BTreeSet::from([1, 2])));
+    }
+
+    #[test]
+    fn test_a_publish_racing_a_worker_exit_is_never_stranded() {
+        // The worker's "nothing left" and a publish's "a worker is running" must be one decision.
+        // Each publish lands just after the previous db was optimized, as its worker heads for the
+        // exit, and must be drained before the next: a later worker would hide a stranded db.
+        static QUEUE: Mutex<OptimizeQueue> = Mutex::new(OptimizeQueue::new());
+        const PUBLISHES: i32 = 2_000;
+        let last_seen = std::sync::Arc::new(AtomicI32::new(-1));
+        let mut handles = Vec::new();
+        for db in 0..PUBLISHES {
+            if lock(&QUEUE).add([db]) {
+                let last_seen = last_seen.clone();
+                handles.push(std::thread::spawn(move || {
+                    drain_optimize_queue(
+                        &QUEUE,
+                        || false,
+                        |db| last_seen.store(db, Ordering::SeqCst),
+                    );
+                }));
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while last_seen.load(Ordering::SeqCst) != db {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "db {db} was queued but no worker came for it"
+                );
+                std::hint::spin_loop();
+            }
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_a_panicking_pass_does_not_block_later_ones() {
+        static QUEUE: Mutex<OptimizeQueue> = Mutex::new(OptimizeQueue::new());
+        assert!(lock(&QUEUE).add([1]));
+        let outcome = std::panic::catch_unwind(|| {
+            drain_optimize_queue(&QUEUE, || false, |_| panic!("optimize failed"));
+        });
+        assert!(outcome.is_err());
+        assert!(lock(&QUEUE).add([2]), "the dead worker no longer counts");
+    }
+
+    #[test]
+    fn test_a_stopped_pass_runs_nothing_more() {
+        static QUEUE: Mutex<OptimizeQueue> = Mutex::new(OptimizeQueue::new());
+        assert!(lock(&QUEUE).add([1, 2]));
+        let mut ran = Vec::new();
+        drain_optimize_queue(&QUEUE, || true, |db| ran.push(db));
+        assert!(ran.is_empty());
     }
 
     #[test]

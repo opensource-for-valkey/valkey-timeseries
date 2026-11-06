@@ -189,8 +189,10 @@ So `asm_optimize_started_total`, `asm_optimize_completed_total`,
 `asm_optimize_skipped_inflight_total`, `asm_optimize_spawn_failures_total`, `asm_optimize_running`,
 `asm_optimize_duration_seconds` and `asm_optimize_last_completed_timestamp_seconds`. The task only
 compacts: imported series are indexed as they arrive, hidden from reads, and published on the main
-thread when the import completes. If its thread cannot start, the periodic optimizer gets there
-later.
+thread when the import completes. One runs at a time. An import that completes during a run counts
+in `asm_optimize_skipped_inflight_total` and folds into one more pass per db, so `started` can stay
+well below the number of imports. If its thread cannot start, the next completed import retries,
+and the periodic optimizer gets there regardless.
 
 | Work counter | Description |
 |--------------|-------------|
