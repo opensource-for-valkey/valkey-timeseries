@@ -1,8 +1,9 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::time::Duration;
 use valkey_timeseries::common::{Sample, Timestamp};
-use valkey_timeseries::series::ValueFilter;
+use valkey_timeseries::iterators::TimestampFilterIterator;
 use valkey_timeseries::series::chunks::{ChunkEncoding, ChunkOps, TimeSeriesChunk};
+use valkey_timeseries::series::{TimeSeries, TimeSeriesOptions, ValueFilter};
 
 mod support;
 
@@ -259,8 +260,6 @@ const SERIES_SCAN_SAMPLES: usize = 20_000;
 /// `series_scan` group: a `for` loop over `TimeSeries::range_iter`, the forward scan behind
 /// `TS.RANGE`, `TS.READ` and compaction, over a multi-chunk series per encoding and chunk size.
 fn bench_series_scan(c: &mut Criterion) {
-    use valkey_timeseries::series::{TimeSeries, TimeSeriesOptions};
-
     let registry = DatasetRegistry::new();
     let mut group = c.benchmark_group("series_scan");
     group.measurement_time(Duration::from_secs(2));
@@ -313,8 +312,69 @@ fn bench_series_scan(c: &mut Criterion) {
     group.finish();
 }
 
+/// `timestamp_filter` group: FILTER_BY_TS lookups near the end of one chunk, so a compressed reader
+/// has to get past the prefix. Hits, misses and a mix, because a miss is where decoder state has
+/// been lost in the past. 128 is the most a query can name.
+fn bench_timestamp_filter(c: &mut Criterion) {
+    const LOOKUPS: usize = 128;
+
+    let registry = DatasetRegistry::new();
+    let mut group = c.benchmark_group("timestamp_filter");
+    group.measurement_time(Duration::from_secs(2));
+
+    let key = DatasetKey::new(ValueWorkload::Drift, TimestampModel::Regular);
+    let dataset = registry.dataset(key);
+
+    for encoding in encodings() {
+        for chunk_size in SCAN_CHUNK_SIZES {
+            let chunk = build_chunk(encoding, chunk_size, dataset);
+            let stored: Vec<Timestamp> = chunk.iter().map(|sample| sample.timestamp).collect();
+            let mut series = TimeSeries::with_options(TimeSeriesOptions {
+                chunk_encoding: encoding,
+                chunk_size: Some(chunk_size),
+                ..Default::default()
+            })
+            .unwrap();
+            // Written in order, so a chunk this size holds them all.
+            for sample in chunk.iter() {
+                series.add(sample.timestamp, sample.value, None);
+            }
+
+            let tail = &stored[stored.len().saturating_sub(LOOKUPS + 1)..stored.len() - 1];
+            let hits: Vec<Timestamp> = tail.to_vec();
+            let misses: Vec<Timestamp> = tail.iter().map(|ts| ts + 1).collect();
+            let mixed: Vec<Timestamp> = tail
+                .iter()
+                .enumerate()
+                .map(|(i, ts)| if i % 2 == 0 { *ts } else { ts + 1 })
+                .collect();
+
+            for (case, timestamps) in [("hits", &hits), ("misses", &misses), ("mixed", &mixed)] {
+                let bench_id = format!("{}/{}/{case}", encoding.name(), chunk_size_id(chunk_size));
+                group.bench_function(BenchmarkId::from_parameter(&bench_id), |b| {
+                    b.iter(|| {
+                        TimestampFilterIterator::new(
+                            &series,
+                            timestamps,
+                            Timestamp::MIN,
+                            Timestamp::MAX,
+                            false,
+                        )
+                        .for_each(|s| {
+                            std::hint::black_box((s.timestamp, s.value));
+                        });
+                    });
+                });
+            }
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_timestamp_filter,
     bench_scan,
     bench_scan_next,
     bench_series_scan,
