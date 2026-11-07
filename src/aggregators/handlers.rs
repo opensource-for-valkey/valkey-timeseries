@@ -307,7 +307,7 @@ impl RangeAggregatorState {
 }
 
 #[derive(Clone, Default, Debug, PartialEq, GetSize, Hash)]
-pub struct RangeAggregator(Box<RangeAggregatorState>);
+pub struct RangeAggregator(RangeAggregatorState);
 impl AggregationHandler for RangeAggregator {
     fn update(&mut self, _timestamp: Timestamp, value: Value) -> bool {
         self.0.update(_timestamp, value)
@@ -328,7 +328,7 @@ impl RdbSerializable for RangeAggregator {
     }
 
     fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self> {
-        RangeAggregatorState::rdb_load(rdb).map(|state| Self(Box::new(state)))
+        RangeAggregatorState::rdb_load(rdb).map(Self)
     }
 }
 
@@ -635,21 +635,9 @@ impl Hash for AggStd {
     }
 }
 
-// boxed to minimize size of stack Aggregator enum
-pub(crate) type OnlineAggregator = Box<AggStd>;
-impl RdbSerializable for OnlineAggregator {
-    fn rdb_save(&self, rdb: *mut RedisModuleIO) {
-        self.as_ref().rdb_save(rdb);
-    }
-
-    fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self>
-    where
-        Self: Sized,
-    {
-        let inner = AggStd::rdb_load(rdb)?;
-        Ok(Box::new(inner))
-    }
-}
+/// Inline: at 32 bytes the state fits the `Aggregator` payload, so boxing it bought nothing
+/// and cost an allocation per aggregator plus an indirection per sample.
+pub(crate) type OnlineAggregator = AggStd;
 
 // -- VarP -----------------------------------------------------------------
 

@@ -7,7 +7,8 @@ use valkey_timeseries::aggregators::{
     AggregationHandler, AggregationType, Aggregator, PartialReducer, PartialSampleReducer,
 };
 use valkey_timeseries::common::Sample;
-use valkey_timeseries::series::request_types::AggregatorConfig;
+use valkey_timeseries::common::binop::ComparisonOperator;
+use valkey_timeseries::series::request_types::{AggregatorConfig, ValueComparisonFilter};
 
 const SAMPLES: usize = 100_000;
 const BUCKET: usize = 1000;
@@ -34,13 +35,54 @@ const TYPES: &[(&str, AggregationType)] = &[
     ("std.s", AggregationType::StdS),
 ];
 
+/// Bucket-only aggregators, with the condition the filtered ones need.
+fn bucket_configs() -> Vec<(&'static str, AggregatorConfig)> {
+    let above = |value| {
+        Some(ValueComparisonFilter {
+            operator: ComparisonOperator::GreaterThan,
+            value,
+        })
+    };
+    let mut configs: Vec<_> = TYPES
+        .iter()
+        .map(|&(name, ty)| (name, AggregatorConfig::new(ty, None).unwrap()))
+        .collect();
+    configs.extend([
+        (
+            "range",
+            AggregatorConfig::new(AggregationType::Range, None).unwrap(),
+        ),
+        (
+            "increase",
+            AggregatorConfig::new(AggregationType::Increase, None).unwrap(),
+        ),
+        (
+            "countif",
+            AggregatorConfig::new(AggregationType::CountIf, above(500.0)).unwrap(),
+        ),
+        (
+            "sumif",
+            AggregatorConfig::new(AggregationType::SumIf, above(500.0)).unwrap(),
+        ),
+        (
+            "share",
+            AggregatorConfig::new(AggregationType::Share, above(500.0)).unwrap(),
+        ),
+        (
+            "all",
+            AggregatorConfig::new(AggregationType::All, above(0.0)).unwrap(),
+        ),
+    ]);
+    configs
+}
+
 fn bucket_aggregators(c: &mut Criterion) {
     let values = values();
     let mut group = c.benchmark_group("aggregators/bucket");
     group.throughput(Throughput::Elements(SAMPLES as u64));
-    for &(name, ty) in TYPES {
+    for (name, config) in bucket_configs() {
         group.bench_function(BenchmarkId::from_parameter(name), |b| {
-            let mut agg = Aggregator::try_from(ty).unwrap();
+            let mut agg: Aggregator = config.create_aggregator();
             b.iter(|| {
                 let mut acc = 0.0;
                 for (bucket, chunk) in values.chunks(BUCKET).enumerate() {
