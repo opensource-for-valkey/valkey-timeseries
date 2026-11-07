@@ -7,7 +7,8 @@ use super::generated::{
     MetaDateRangeFilter as FanoutMetaDateRangeFilter, MultiRangeRequest,
     PostingStat as FanoutPostingStat, RangeRequest, ReducePartialState, Sample as FanoutSample,
     SeriesSelector as FanoutSeriesSelector, StatsResponse,
-    ValueComparisonFilter as FanoutValueComparisonFilter, ValueRange as FanoutValueFilter,
+    TimestampFilter as FanoutTimestampFilter, ValueComparisonFilter as FanoutValueComparisonFilter,
+    ValueRange as FanoutValueFilter,
 };
 use crate::aggregators::PartialState;
 use crate::commands::fanout_codec::MGetValue;
@@ -613,11 +614,10 @@ impl TryFrom<&RangeRequest> for RangeOptions {
             None
         };
 
-        let timestamp_filter = if value.timestamp_filter.is_empty() {
-            None
-        } else {
-            Some(value.timestamp_filter.clone())
-        };
+        let timestamp_filter = value
+            .timestamp_filter
+            .as_ref()
+            .map(|filter| filter.timestamps.clone());
 
         let value_filter: Option<ValueFilter> = value.value_filter.map(|filter| ValueFilter {
             min: filter.min,
@@ -651,10 +651,13 @@ impl From<&RangeOptions> for RangeRequest {
             .as_ref()
             .map(FanoutAggregationOptions::from);
 
-        let timestamp_filter = match value.timestamp_filter {
-            Some(ref ts) => ts.clone(),
-            None => vec![],
-        };
+        let timestamp_filter =
+            value
+                .timestamp_filter
+                .as_ref()
+                .map(|timestamps| FanoutTimestampFilter {
+                    timestamps: timestamps.clone(),
+                });
 
         let value_filter: Option<FanoutValueFilter> =
             value.value_filter.map(|filter| FanoutValueFilter {
@@ -1017,6 +1020,27 @@ mod tests {
         }
     }
 
+    /// `Some([])` means "match nothing" (the parser clips FILTER_BY_TS to the query window, which
+    /// can empty it) and `None` means "no filter". Encoded through real protobuf bytes because
+    /// proto3 cannot tell an empty repeated field from an absent one.
+    #[test]
+    fn test_timestamp_filter_presence_survives_the_wire() {
+        for filter in [None, Some(vec![]), Some(vec![1050, 1100])] {
+            let options = RangeOptions {
+                date_range: TimestampRange::from_timestamps(1000, 2000).unwrap(),
+                timestamp_filter: filter.clone(),
+                ..Default::default()
+            };
+
+            let request: RangeRequest = (&options).into();
+            let bytes = prost::Message::encode_to_vec(&request);
+            let decoded: RangeRequest = prost::Message::decode(bytes.as_slice()).unwrap();
+            let round_tripped: RangeOptions = (&decoded).try_into().unwrap();
+
+            assert_eq!(round_tripped.timestamp_filter, filter);
+        }
+    }
+
     #[test]
     fn test_range_request_to_range_options_full() {
         let request = RangeRequest {
@@ -1033,7 +1057,9 @@ mod tests {
                 alignment_timestamp: 0,
                 report_empty: true,
             }),
-            timestamp_filter: vec![1050, 1100],
+            timestamp_filter: Some(FanoutTimestampFilter {
+                timestamps: vec![1050, 1100],
+            }),
             value_filter: Some(FanoutValueFilter {
                 min: 10.5,
                 max: 20.5,
@@ -1079,7 +1105,7 @@ mod tests {
         assert_eq!(request.range.unwrap().end, 1500);
         assert_eq!(request.count, 0);
         assert!(request.aggregation.is_none());
-        assert!(request.timestamp_filter.is_empty());
+        assert!(request.timestamp_filter.is_none());
         assert!(request.value_filter.is_none());
         assert!(!request.latest);
     }

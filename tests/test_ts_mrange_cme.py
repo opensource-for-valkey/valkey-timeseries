@@ -193,6 +193,75 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
                 val = float(val.decode())
                 assert 55 <= val <= 70
 
+    @pytest.mark.parametrize('command, options', [
+        ('TS.MRANGE', []),
+        ('TS.MREVRANGE', []),
+        ('TS.MRANGE', ['AGGREGATION', 'sum', 10]),
+        ('TS.MRANGE', ['AGGREGATION', 'sum', 10, 'EMPTY']),
+        ('TS.MRANGE', ['AGGREGATION', 'sum,max', 10]),
+    ])
+    def test_mrange_cme_filter_by_ts_outside_window_matches_nothing(self, command, options):
+        """Every FILTER_BY_TS entry outside the window leaves nothing to match.
+
+        The parser clips the filter to the window, so it arrives at the fan-out codec empty.
+        That must stay distinct from "no filter", which returns the whole window. Each series
+        is still listed, with no samples, as it is on a standalone server.
+        """
+        self.setup_clustered_data()
+
+        client = self.new_client_for_primary(0)
+        result = client.execute_command(command, self.start_ts, self.start_ts + 90,
+                                        'FILTER_BY_TS', self.start_ts - 500,
+                                        *options,
+                                        'FILTER', 'sensor=~".+"')
+
+        assert sorted((series[0], series[2]) for series in result) == [
+            (b'ts:{slot1}:temp1', []),
+            (b'ts:{slot1}:temp2', []),
+            (b'ts:{slot2}:humid1', []),
+            (b'ts:{slot2}:humid2', []),
+        ]
+
+    def test_mrange_cme_filter_by_ts_outside_window_groupby(self):
+        """A clipped-to-empty FILTER_BY_TS leaves every group with no samples."""
+        self.setup_clustered_data()
+
+        client = self.new_client_for_primary(0)
+        result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 90,
+                                        'FILTER_BY_TS', self.start_ts - 500,
+                                        'FILTER', 'sensor=~".+"',
+                                        'GROUPBY', 'sensor', 'REDUCE', 'sum')
+
+        assert sorted((group[0], group[2]) for group in result) == [
+            (b'sensor=humid', []),
+            (b'sensor=temp', []),
+        ]
+
+    def test_mrange_cme_filter_by_ts_outside_window_excludeempty(self):
+        """EXCLUDEEMPTY drops every series once a clipped filter has emptied them."""
+        self.setup_clustered_data()
+
+        client = self.new_client_for_primary(0)
+        result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 90,
+                                        'FILTER_BY_TS', self.start_ts - 500,
+                                        'EXCLUDEEMPTY',
+                                        'FILTER', 'sensor=~".+"')
+
+        assert result == []
+
+    def test_mrange_cme_filter_by_ts_partly_outside_window(self):
+        """Clipping keeps the entries inside the window, and only those match."""
+        self.setup_clustered_data()
+
+        client = self.new_client_for_primary(0)
+        result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 90,
+                                        'FILTER_BY_TS', self.start_ts - 500, self.start_ts + 50,
+                                        'FILTER', 'sensor=temp')
+
+        assert len(result) == 2
+        for series in result:
+            assert [sample[0] for sample in series[2]] == [self.start_ts + 50]
+
     def test_mrange_cme_empty_result(self):
         """Test TS.MRANGE with no matching series across slots."""
         self.setup_clustered_data()
