@@ -10,6 +10,7 @@ use crate::fanout::serialization::Serializable;
 use crate::fanout::{FanoutCommand, FanoutContext, FanoutResult, FanoutTarget, NodeInfo};
 use metered::Counter;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use valkey_module::{Context, Status, ValkeyError, ValkeyResult, ValkeyValue};
 
 /// A trait for cluster-mode commands which send results back to clients after receiving responses from other nodes.
@@ -59,10 +60,10 @@ pub trait FanoutClientCommand: Default + Send + 'static {
             metrics::FANOUT_BLOCKING_DENIED.incr();
             return Err(ValkeyError::Str(FANOUT_BLOCKING_DENIED));
         }
-        let blocked_client = Arc::new(Mutex::new(FanoutBlockedClient::<Self>::new(
-            ctx,
-            get_cluster_command_timeout(),
-        )));
+        // One budget for the whole operation, counted from now (see `exec_command`).
+        let started = Instant::now();
+        let timeout = get_cluster_command_timeout();
+        let blocked_client = Arc::new(Mutex::new(FanoutBlockedClient::<Self>::new(ctx, timeout)));
         let bc_for_closure = Arc::clone(&blocked_client);
 
         let handle_response = move |op: Self, result: FanoutResult| {
@@ -72,7 +73,7 @@ pub trait FanoutClientCommand: Default + Send + 'static {
             lock(&bc_for_closure).set_private_data(op, result);
         };
 
-        let exec_result = Self::exec_command(self, ctx, handle_response);
+        let exec_result = Self::exec_command(self, ctx, started, timeout, handle_response);
         match exec_result {
             Ok(()) => Ok(ValkeyValue::NoReply),
             Err(err) => {

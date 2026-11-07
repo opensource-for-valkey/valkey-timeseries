@@ -1,4 +1,4 @@
-use super::cluster_rpc::{get_cluster_command_timeout, invoke_rpc};
+use super::cluster_rpc::invoke_rpc;
 use super::fanout_error::{ErrorKind, FanoutError};
 use crate::common::acl::caller_user_name;
 use crate::common::context::get_current_db;
@@ -66,14 +66,20 @@ pub trait FanoutCommand: Default + Send + 'static {
         compute_query_fanout_mode(ctx)
     }
 
-    /// Execute the fanout operation across cluster nodes.
-    fn exec_command<F>(self, ctx: &Context, f: F) -> FanoutResult
+    /// Execute the fanout operation across cluster nodes. `started` is when the
+    /// command began and `timeout` its whole budget; see [`exec_command`].
+    fn exec_command<F>(
+        self,
+        ctx: &Context,
+        started: Instant,
+        timeout: Duration,
+        f: F,
+    ) -> FanoutResult
     where
         F: FnOnce(Self, FanoutCommandResult) + Send + 'static,
     {
-        let timeout = get_cluster_command_timeout();
         let targets = self.get_targets(ctx);
-        exec_command(ctx, self, targets, timeout, f)
+        exec_command(ctx, self, targets, started, timeout, f)
     }
 
     /// Generate the request to be sent to each target node.
@@ -108,10 +114,18 @@ fn describe_target(target: &NodeInfo) -> String {
 }
 
 /// Execute the fanout operation across cluster nodes.
+///
+/// The whole operation shares one deadline, `started + timeout`, where
+/// `started` is when the command began (and the client was blocked with the
+/// same `timeout`). Everything after that counts against it: target selection
+/// and any cluster-map refresh it triggers, building and serializing the
+/// request, the remote shares (whose RPC timer gets what is left) and the
+/// local share. `fanout_duration_seconds` is measured from `started` too.
 pub fn exec_command<OP: FanoutCommand, F>(
     ctx: &Context,
     command: OP,
     targets: FanoutTarget,
+    started: Instant,
     timeout: Duration,
     f: F,
 ) -> FanoutResult
@@ -119,7 +133,7 @@ where
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
     let op = command;
-    let started = Instant::now();
+    let deadline = started + timeout;
     let (targets, cluster_fingerprint) = get_fanout_targets(ctx, targets);
     metrics::FANOUT_OPERATIONS.incr();
     metrics::FANOUT_TARGETS.incr_by(targets.len() as u64);
@@ -128,7 +142,10 @@ where
     let outstanding = targets.len();
     let fanout_user = caller_user_name(ctx);
     let db = get_current_db(ctx);
-    let deadline = Instant::now() + timeout;
+    // At least 1 ms: a zero-length timer would fire before any peer could answer.
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(1));
 
     let local_node = targets.iter().find(|x| x.is_local()).copied();
 
@@ -177,7 +194,7 @@ where
         targets,
         cluster_fingerprint,
         Box::new(response_handler),
-        timeout,
+        remaining,
     ) {
         // RPC invocation failed before the fanout could be set up. The local
         // share has deliberately not been spawned yet, so no callback can run
