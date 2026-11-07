@@ -478,6 +478,69 @@ class TestEmptyFillAroundStoredNan:
             )
 
 
+class TestReverseCountMatchesAFullRead:
+    """Reverse COUNT reads only as far back as it needs, which must not change a single row."""
+
+    SAMPLES = (
+        (0, 1.0), (7, 2.0), (250, NAN), (260, 5.0), (1400, 3.0), (1410, NAN), (5000, 9.0),
+        (5005, 1.0), (5999, 4.0), (6000, 0.0), (6020, 2.0),
+    )
+
+    @pytest.mark.parametrize("empty", [(), ("EMPTY",)], ids=["no-empty", "empty"])
+    @pytest.mark.parametrize("aggregator", AGGREGATORS)
+    def test_every_aggregator(self, diff, range_cmd, aggregator, empty):
+        mk_populated(diff, "r:revtail", self.SAMPLES)
+        for count in (1, 2, 3, 50):
+            diff(
+                range_cmd, "r:revtail", "-", "+", "COUNT", count,
+                "AGGREGATION", aggregator, 100, *empty,
+            )
+
+    @pytest.mark.parametrize("empty", [(), ("EMPTY",)], ids=["no-empty", "empty"])
+    @pytest.mark.parametrize(
+        "options",
+        [
+            pytest.param(("ALIGN", "start"), id="align-start"),
+            pytest.param(("ALIGN", "end"), id="align-end"),
+            pytest.param(("ALIGN", 37), id="align-timestamp"),
+            pytest.param(("BUCKETTIMESTAMP", "+"), id="timestamp-end"),
+            pytest.param(("BUCKETTIMESTAMP", "~"), id="timestamp-mid"),
+        ],
+    )
+    def test_bucket_options(self, diff, range_cmd, options, empty):
+        mk_populated(diff, "r:revtailopt", self.SAMPLES)
+        for start, end in ((0, 7000), (300, 5500), (5002, 6010)):
+            for count in (1, 3):
+                diff(
+                    range_cmd, "r:revtailopt", start, end, "COUNT", count,
+                    "AGGREGATION", "last", 100, *options, *empty,
+                )
+
+    def test_value_filter_that_empties_the_newest_buckets(self, diff, range_cmd):
+        # A short read has to widen: nothing near the end of this series passes.
+        mk_populated(diff, "r:revtailfbv", self.SAMPLES)
+        for count in (1, 2, 4):
+            diff(
+                range_cmd, "r:revtailfbv", "-", "+", "COUNT", count,
+                "FILTER_BY_VALUE", 4.5, 5.5, "AGGREGATION", "sum", 10,
+            )
+
+    def test_seeded_series(self, diff, range_cmd):
+        rng = random.Random(1515)
+        for case in range(120):
+            key = f"r:revtailrandom:{case}"
+            timestamps = sorted(rng.sample(range(3000), rng.randint(1, 30)))
+            mk_populated(
+                diff, key,
+                [(ts, NAN if rng.random() < 0.2 else float(rng.randint(1, 9))) for ts in timestamps],
+            )
+            diff(
+                range_cmd, key, "-", "+", "COUNT", rng.randint(1, 6),
+                "AGGREGATION", rng.choice(("last", "first", "sum", "avg", "max", "count")),
+                rng.choice((5, 25, 100, 500)), *rng.choice(((), ("EMPTY",))),
+            )
+
+
 class TestFilterByValue:
     def test_filter_by_value_basic(self, diff, range_cmd):
         mk_populated(diff, "r:fbv", BASE_SAMPLES)

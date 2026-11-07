@@ -37,6 +37,17 @@ impl EmptyBucketRun {
         self.next_bucket = start;
         self.end_exclusive = end_exclusive;
     }
+
+    /// Jump ahead so that at most `keep` buckets remain, without generating the ones skipped.
+    fn skip_to_last(&mut self, keep: usize, bucket_duration: u64) {
+        let duration = bucket_duration as i128;
+        let span = self.end_exclusive as i128 - self.next_bucket as i128;
+        let remaining = (span + duration - 1) / duration;
+        let surplus = remaining - keep as i128;
+        if surplus > 0 {
+            self.next_bucket = (self.next_bucket as i128 + surplus * duration) as Timestamp;
+        }
+    }
 }
 
 /// EMPTY's fill for `last`: unlike every other aggregator's it is not a constant, because a gap
@@ -384,6 +395,11 @@ pub struct EmptyFillBounds {
     pub carry_lookback: f64,
     /// `last` fills differently for a query that runs newest-first; see [`LastCarry`].
     pub carry_reverse: bool,
+    /// Only the last this-many rows of the stream will be used, which is what a newest-first
+    /// COUNT does with it. A run of gaps can then skip all but its own last rows: every gap in a
+    /// run reports the same value, and `last`'s carry only ever looks at the run's first and
+    /// last, so nothing the skipped ones would have done is lost.
+    pub tail_limit: Option<usize>,
 }
 
 impl Default for EmptyFillBounds {
@@ -394,6 +410,7 @@ impl Default for EmptyFillBounds {
             carry_seed: f64::NAN,
             carry_lookback: f64::NAN,
             carry_reverse: false,
+            tail_limit: None,
         }
     }
 }
@@ -474,6 +491,11 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
     fn pop_empty_bucket(&mut self) -> Option<MultiSample> {
         if self.empty_buckets.is_empty() {
             return None;
+        }
+
+        if let Some(keep) = self.empty_fill.tail_limit {
+            self.empty_buckets
+                .skip_to_last(keep, self.aggregator.bucket_duration);
         }
 
         let bucket_start = self.empty_buckets.next_bucket;
@@ -1112,6 +1134,45 @@ mod tests {
         assert_eq!(result[3].value, 5.0);
         assert_eq!(result[4].timestamp, 50);
         assert_eq!(result[4].value, 6.0);
+    }
+
+    #[test]
+    fn test_empty_bucket_run_skips_to_its_last_buckets() {
+        let run = |keep: usize| {
+            let mut run = EmptyBucketRun {
+                next_bucket: 0,
+                end_exclusive: 100,
+            };
+            run.skip_to_last(keep, 10);
+            run.next_bucket
+        };
+
+        assert_eq!(run(1), 90);
+        assert_eq!(run(3), 70);
+        assert_eq!(run(10), 0, "exactly what the run holds");
+        assert_eq!(run(50), 0, "more than the run holds");
+    }
+
+    /// The buckets a run keeps start on the grid, whatever the grid's offset.
+    #[test]
+    fn test_empty_bucket_run_skip_stays_on_the_bucket_grid() {
+        let mut run = EmptyBucketRun {
+            next_bucket: 7,
+            end_exclusive: 107,
+        };
+        run.skip_to_last(2, 10);
+        assert_eq!(run.next_bucket, 87);
+    }
+
+    /// Timestamps at the far ends of the range cannot overflow the arithmetic.
+    #[test]
+    fn test_empty_bucket_run_skip_over_the_whole_timestamp_range() {
+        let mut run = EmptyBucketRun {
+            next_bucket: i64::MIN,
+            end_exclusive: i64::MAX,
+        };
+        run.skip_to_last(1, 1);
+        assert_eq!(run.next_bucket, i64::MAX - 1);
     }
 
     #[test]
