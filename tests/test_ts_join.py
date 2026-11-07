@@ -885,3 +885,15 @@ class TestTSJoin(ValkeyTimeSeriesTestCaseBase):
         exact_only = self.client.execute_command(
             "TS.JOIN", "asof:l", "asof:r", "-", "+", "ASOF", "PREVIOUS", 0)
         assert exact_only == []
+
+    def test_join_aggregation_last_empty_carries_through_gaps(self):
+        """`last` means the same under EMPTY as it does on TS.RANGE: a gap keeps the last reading."""
+        for key in ('join:carry:l', 'join:carry:r'):
+            for timestamp, value in ((0, 1), (100, 2)):
+                self.client.execute_command('TS.ADD', key, timestamp, value)
+
+        result = self.client.execute_command('TS.JOIN', 'join:carry:l', 'join:carry:r', 0, 100,
+                                             'REDUCE', 'sum',
+                                             'AGGREGATION', 'last', 25, 'EMPTY')
+
+        assert result == [[0, b'2'], [25, b'2'], [50, b'2'], [75, b'2'], [100, b'4']]

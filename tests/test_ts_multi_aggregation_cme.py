@@ -200,6 +200,23 @@ class TestTimeSeriesMultiAggregationClustered(ValkeyTimeSeriesClusterTestCase):
         # latest bucket of the group is ts 2000 (c only) -> 6, 6
         assert rows == [[2000, b'6', b'6']]
 
+    def test_last_empty_carry_with_pushdown_on_and_off(self):
+        """A `last` column carries through gaps whether shards or the coordinator aggregate."""
+        cluster_client = self.new_cluster_client()
+        for timestamp, value in ((0, 1), (100, 2)):
+            cluster_client.execute_command('TS.ADD', 'ts:{slot1}:carry', timestamp, value,
+                                           'LABELS', 'k', 'carry')
+
+        client = self.new_client_for_primary(0)
+        expected = [[0, b'1', b'1'], [25, b'1', b'0'], [50, b'1', b'0'], [75, b'1', b'0'],
+                    [100, b'2', b'2']]
+        for pushdown in ('yes', 'no'):
+            self.set_pushdown(pushdown)
+            result = client.execute_command('TS.MRANGE', 0, 100,
+                                            'AGGREGATION', 'last,sum', 25, 'EMPTY',
+                                            'FILTER', 'k=carry')
+            assert result[0][2] == expected, f'pushdown={pushdown}'
+
     def test_multi_aggregation_pushdown_on_off_equivalence(self):
         """Push-down on and off must produce identical results. Toggling the
         coordinator config off restores the legacy raw-sample flow where the

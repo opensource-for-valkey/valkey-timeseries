@@ -278,6 +278,25 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         for series in result:
             assert series[2] == [[50, b'0'], [55, b'2'], [60, b'0'], [65, b'0'], [70, b'0']]
 
+    def test_mrevrange_cme_last_empty_fill_around_stored_nan(self):
+        """Shards aggregate ascending, but `last` still fills as the newest-first reply requires.
+
+        Expected rows are replies from the pinned reference. Forward, bucket 10 would be NaN.
+        """
+        client = self.new_client_for_primary(0)
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        for key in ('ts:{slot1}:nan', 'ts:{slot2}:nan'):
+            for timestamp, value in ((0, 5), (10, 'nan'), (100, 7)):
+                cluster_client.execute_command('TS.ADD', key, timestamp, value, 'LABELS', 'k', 'nan')
+
+        result = client.execute_command('TS.MREVRANGE', 10, 200,
+                                        'AGGREGATION', 'last', 10, 'EMPTY',
+                                        'FILTER', 'k=nan')
+
+        assert len(result) == 2
+        for series in result:
+            assert series[2] == [[100, b'7']] + [[t, b'5'] for t in range(90, 0, -10)]
+
     def test_mrange_cme_empty_result(self):
         """Test TS.MRANGE with no matching series across slots."""
         self.setup_clustered_data()

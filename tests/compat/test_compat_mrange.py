@@ -250,6 +250,16 @@ class TestPerSeriesOptions:
             "AGGREGATION", "sum", 5, "EMPTY", "FILTER", "fbtsfill=yes",
         )
 
+    def test_empty_fill_treats_stored_nan_as_no_data(self, diff, mrange_cmd):
+        mk_series(diff, "m:nanfill", "LABELS", "nanfill", "yes")
+        for ts, value in ((0, 5.0), (10, float("nan")), (100, 7.0), (300, float("nan"))):
+            diff("TS.ADD", "m:nanfill", ts, value)
+        for start, end, aggregator in ((50, 200, "last"), (10, 200, "last"), (150, 250, "sum")):
+            diff(
+                mrange_cmd, start, end, "AGGREGATION", aggregator, 10, "EMPTY",
+                "FILTER", "nanfill=yes",
+            )
+
     def test_filter_by_ts(self, diff, mrange_cmd):
         mk_label_universe(diff)
         diff(mrange_cmd, "-", "+", "FILTER_BY_TS", 100, 300, "FILTER", "metric=cpu")

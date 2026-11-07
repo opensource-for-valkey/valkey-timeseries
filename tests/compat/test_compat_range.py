@@ -18,6 +18,7 @@ test code (see tests/compat/README.md).
 """
 
 import itertools
+import random
 
 import pytest
 from valkey.exceptions import ResponseError
@@ -396,6 +397,85 @@ class TestFilterByTs:
         mk_populated(diff, "r:fbtsbad", BASE_SAMPLES)
         with pytest.raises(ResponseError):
             diff(range_cmd, "r:fbtsbad", "-", "+", "FILTER_BY_TS", "abc")
+
+
+NAN = float("nan")
+
+
+class TestEmptyFillAroundStoredNan:
+    """A stored NaN is a sample, but it is not data as far as EMPTY is concerned.
+
+    It does not extend the fill past the samples the query sees, whichever aggregator is used,
+    and `last` looks back past it for the value a gap inherits. Expectations come from the
+    reference through `diff`; the seeded case exists because these rules interact, and the
+    corners were found by comparing random series rather than by reasoning about them.
+    """
+
+    @pytest.mark.parametrize(
+        "samples, window",
+        [
+            pytest.param(((0, 5.0), (10, NAN), (100, 7.0)), (0, 200), id="nan-bucket-carries"),
+            pytest.param(((0, 5.0), (10, NAN), (100, 7.0)), (50, 200), id="seed-skips-nan"),
+            pytest.param(((0, 5.0), (10, NAN), (100, 7.0)), (20, 200), id="seed-skips-nan-at-edge"),
+            pytest.param(((0, 5.0), (10, NAN), (100, 7.0)), (15, 200), id="nan-sample-outside-window"),
+            pytest.param(((0, 5.0), (10, NAN), (100, 7.0)), (10, 200), id="first-bucket-only-nan"),
+            pytest.param(((0, 5.0), (10, NAN), (100, 7.0)), (5, 200), id="window-opens-mid-bucket"),
+            pytest.param(
+                ((0, 5.0), (10, NAN), (20, 6.0), (30, NAN), (100, 7.0)), (40, 200), id="seed-is-latest"
+            ),
+            pytest.param(
+                ((0, 5.0), (10, NAN), (20, 6.0), (30, NAN), (100, 7.0)), (25, 200), id="seed-held-by-run"
+            ),
+            pytest.param(((0, NAN), (100, 7.0)), (0, 200), id="only-nan-before"),
+            pytest.param(((0, NAN), (100, 7.0)), (50, 200), id="nan-does-not-lead"),
+            pytest.param(((12, 7.0), (40, NAN), (70, 6.0)), (15, 70), id="leading-run-holds-its-seed"),
+        ],
+    )
+    def test_last_carry(self, diff, range_cmd, samples, window):
+        mk_populated(diff, "r:nanlast", samples)
+        diff(range_cmd, "r:nanlast", *window, "AGGREGATION", "last", 10, "EMPTY")
+
+    @pytest.mark.parametrize("aggregator", AGGREGATORS)
+    @pytest.mark.parametrize(
+        "samples",
+        [
+            pytest.param(((0, NAN), (100, 7.0)), id="nan-before"),
+            pytest.param(((0, 7.0), (100, NAN)), id="nan-after"),
+            pytest.param(((0, NAN), (100, NAN)), id="nan-both-sides"),
+            pytest.param(((0, NAN), (60, 1.0)), id="nan-before-a-window-sample"),
+            pytest.param(((60, 1.0), (100, NAN)), id="nan-after-a-window-sample"),
+            pytest.param(((0, 1.0), (100, 2.0)), id="control-values-both-sides"),
+        ],
+    )
+    def test_nan_does_not_extend_the_fill(self, diff, range_cmd, samples, aggregator):
+        mk_populated(diff, "r:nanspan", samples)
+        diff(range_cmd, "r:nanspan", 50, 90, "AGGREGATION", aggregator, 10, "EMPTY")
+
+    def test_seeded_nan_heavy_series(self, diff, range_cmd):
+        rng = random.Random(1717)
+        for case in range(150):
+            key = f"r:nanrandom:{case}"
+            timestamps = sorted(rng.sample(range(160), rng.randint(1, 9)))
+            nan_chance = rng.choice((0.2, 0.5, 0.8))
+            samples = [
+                (ts, NAN if rng.random() < nan_chance else float(rng.randint(1, 9)))
+                for ts in timestamps
+            ]
+            mk_populated(diff, key, samples)
+
+            start = rng.randint(0, 150)
+            filters = rng.choice(
+                (
+                    (),
+                    ("FILTER_BY_TS", *rng.sample(timestamps, rng.randint(1, len(timestamps))), 170),
+                    ("FILTER_BY_VALUE", 2, 7),
+                )
+            )
+            diff(
+                range_cmd, key, start, rng.randint(start, 170), *filters,
+                "AGGREGATION", rng.choice(("last", "last", "sum", "count", "avg")),
+                rng.choice((5, 10, 25)), "EMPTY",
+            )
 
 
 class TestFilterByValue:

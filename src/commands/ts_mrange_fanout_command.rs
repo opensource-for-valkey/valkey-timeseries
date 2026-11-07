@@ -124,6 +124,9 @@ impl FanoutClientCommand for MRangeFanoutCommand {
         // results. Shards always aggregate/encode ascending; the coordinator
         // reverses bucket order and applies the authoritative COUNT.
         options.range.count = None;
+        // A group is aggregated per series before it is reduced, ascending whatever the reply's
+        // order, which is what the reference does too.
+        options.reply_reverse = options.is_reverse && options.grouping.is_none();
         options.is_reverse = false;
 
         if apply_group_reduce && options.grouping.is_some() {

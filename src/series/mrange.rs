@@ -7,7 +7,8 @@ use crate::common::{MultiSample, Sample, Timestamp};
 use crate::error_consts;
 use crate::iterators::{
     MultiSeriesRowIter, MultiSeriesSampleIter, RowReducer, SampleReducer, TailIter,
-    create_range_iterator, create_row_iterator, get_range_latest_sample,
+    create_range_iterator, create_range_iterator_for_reply, create_row_iterator,
+    create_row_iterator_for_reply, get_range_latest_sample,
 };
 use crate::labels::Label;
 use crate::series::TimeSeries;
@@ -307,12 +308,13 @@ fn create_iter<'a>(
     options: &MRangeOptions,
     latest: Option<Sample>,
 ) -> Box<dyn Iterator<Item = Sample> + 'a> {
-    create_range_iterator(
+    create_range_iterator_for_reply(
         series,
         &options.range,
         &options.grouping,
         latest,
         options.is_reverse,
+        options.is_reverse || options.reply_reverse,
     )
 }
 
@@ -384,11 +386,12 @@ fn handle_non_grouped(
             // as per-column chunks (SeriesRangeResponse.columns), so the
             // clustered path is valid here.
             let data = if is_multi {
-                let iter = create_row_iterator(
+                let iter = create_row_iterator_for_reply(
                     meta.series,
                     &options.range,
                     meta.latest,
                     options.is_reverse,
+                    options.is_reverse || options.reply_reverse,
                 );
                 let iter = match limit {
                     Some(limit) => limit.apply(iter),

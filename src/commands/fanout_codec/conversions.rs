@@ -708,6 +708,7 @@ impl TryFrom<&MultiRangeRequest> for MRangeOptions {
             selected_labels,
             grouping,
             is_reverse,
+            reply_reverse: false,
             exclude_empty: value.exclude_empty,
             tags: vec![],
         })
@@ -742,6 +743,7 @@ impl TryFrom<MultiRangeRequest> for MRangeOptions {
             selected_labels,
             grouping,
             is_reverse,
+            reply_reverse: false,
             exclude_empty: value.exclude_empty,
             tags: vec![],
         })

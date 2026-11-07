@@ -1,7 +1,8 @@
-use crate::aggregators::{AggregationHandler, Aggregator, BucketTimestamp};
+use crate::aggregators::{AggregationHandler, AggregationType, Aggregator, BucketTimestamp};
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::series::request_types::AggregationOptions;
 use smallvec::SmallVec;
+use std::collections::VecDeque;
 
 /// A pending run of empty (gap-fill) buckets, generated one at a time instead of being
 /// materialized up front. `[start, bucket_duration wide) * ceil((end_exclusive - start) /
@@ -38,6 +39,110 @@ impl EmptyBucketRun {
     }
 }
 
+/// EMPTY's fill for `last`: unlike every other aggregator's it is not a constant, because a gap
+/// means "no new reading, so the last reading still stands". It runs here rather than after the
+/// stream is built because it treats a gap and a bucket holding only NaN differently, and both
+/// look alike once emitted.
+///
+/// A stored NaN is not a reading. A leading run of gaps holds the last reading before its first
+/// bucket ([`EmptyFillBounds::carry_seed`]). After that, RedisTimeSeries' answer depends on the
+/// direction it scans in, though buckets are always produced chronologically here:
+///
+/// - **Forward:** a bucket holding only NaN reports the value held so far, or NaN if there is
+///   none. A gap reports the same, except that with nothing held it looks back to the last reading
+///   before the window ([`EmptyFillBounds::carry_lookback`]).
+/// - **Reverse:** a gap reports the last reading before it in time, looking back past the window
+///   if need be, and a leading run does not affect that. A bucket holding only NaN reports what the
+///   scan held when it got there: the value of the next bucket in time, so it is left unresolved
+///   for [`MultiAggregateIterator`] to fill once that bucket exists.
+#[derive(Debug)]
+struct LastCarry {
+    /// Which output columns are `last`. They all see the same samples, so one held value serves.
+    columns: SmallVec<[bool; 2]>,
+    held: f64,
+    seed: f64,
+    lookback: f64,
+    reverse: bool,
+    /// A bucket holding samples has been reported, so a gap is no longer part of the leading run.
+    past_leading_run: bool,
+    /// The most recent bucket holding samples still needs a value from the next one.
+    unresolved: bool,
+}
+
+impl LastCarry {
+    fn new(options: &AggregationOptions) -> Option<Self> {
+        if !options.report_empty {
+            return None;
+        }
+        let columns: SmallVec<[bool; 2]> = options
+            .aggregations
+            .iter()
+            .map(|a| matches!(a.aggregation_type(), AggregationType::Last))
+            .collect();
+        columns.iter().any(|&column| column).then_some(Self {
+            columns,
+            held: f64::NAN,
+            seed: f64::NAN,
+            lookback: f64::NAN,
+            reverse: false,
+            past_leading_run: false,
+            unresolved: false,
+        })
+    }
+
+    fn start_leading_run(&mut self, seed: f64) {
+        self.seed = seed;
+        if !self.reverse {
+            self.held = seed;
+        }
+    }
+
+    fn apply_to_bucket_with_samples(&mut self, values: &mut [f64]) {
+        self.past_leading_run = true;
+        let value = self.value_of(values);
+        if value.is_nan() {
+            if self.reverse {
+                self.unresolved = true;
+            } else {
+                self.fill(values, self.held);
+            }
+        } else {
+            self.held = value;
+        }
+    }
+
+    fn apply_to_gap(&mut self, values: &mut [f64]) {
+        let value = if !self.past_leading_run {
+            if self.reverse { self.seed } else { self.held }
+        } else if self.held.is_nan() {
+            if !self.reverse {
+                self.held = self.lookback;
+            }
+            self.lookback
+        } else {
+            self.held
+        };
+        self.fill(values, value);
+    }
+
+    fn value_of(&self, values: &[f64]) -> f64 {
+        self.columns
+            .iter()
+            .position(|&is_last| is_last)
+            .map_or(f64::NAN, |column| values[column])
+    }
+
+    fn fill(&self, values: &mut [f64], value: f64) {
+        for (slot, _) in values
+            .iter_mut()
+            .zip(self.columns.iter())
+            .filter(|(_, is_last)| **is_last)
+        {
+            *slot = value;
+        }
+    }
+}
+
 /// Helper class for minimizing monomorphization overhead for AggregationIterator.
 /// Holds one aggregator per AGGREGATION list entry; all share the bucket bookkeeping,
 /// so a query performs a single scan with N accumulator updates per sample.
@@ -57,6 +162,7 @@ struct AggregationHelper {
     /// by `finalize_last_bucket_if_any`.
     saw_sample: bool,
     report_empty: bool,
+    last_carry: Option<LastCarry>,
 }
 
 impl AggregationHelper {
@@ -78,18 +184,23 @@ impl AggregationHelper {
             align_timestamp,
             saw_sample: false,
             report_empty: options.report_empty,
+            last_carry: LastCarry::new(options),
         }
     }
 
-    fn empty_row(&self, timestamp: Timestamp) -> MultiSample {
-        MultiSample {
+    fn empty_row(&mut self, timestamp: Timestamp) -> MultiSample {
+        let mut row = MultiSample {
             timestamp,
             values: self
                 .aggregators
                 .iter()
                 .map(AggregationHandler::empty_bucket_value)
                 .collect(),
+        };
+        if let Some(carry) = self.last_carry.as_mut() {
+            carry.apply_to_gap(&mut row.values);
         }
+        row
     }
 
     fn add_empty_bucket_internal(
@@ -143,7 +254,7 @@ impl AggregationHelper {
         // so it is emitted once any aggregator accepted a sample and the rest take their fill.
         let any_accepted = self.accepted.iter().any(|&accepted| accepted);
 
-        let bucket = if any_accepted {
+        let mut bucket = if any_accepted {
             Some(MultiSample::new(
                 self.output_timestamp(),
                 self.aggregators
@@ -162,6 +273,9 @@ impl AggregationHelper {
         } else {
             None
         };
+        if let (Some(row), Some(carry)) = (bucket.as_mut(), self.last_carry.as_mut()) {
+            carry.apply_to_bucket_with_samples(&mut row.values);
+        }
 
         for aggregator in self.aggregators.iter_mut() {
             AggregationHandler::reset(aggregator);
@@ -245,8 +359,9 @@ pub fn aggregate(
 /// of the samples passing the query's filters — and that extent is taken over the *whole*
 /// series, not the queried slice of it. So a bucket holding nothing is still reported when
 /// passing data exists on both sides of it, while the window's own edge is only reached when
-/// the series really has passing data beyond it. Both directions are RedisTimeSeries 8.10
-/// behavior, confirmed by black-box probing of the reference.
+/// the series really has passing data beyond it. A stored NaN is not passing data for this,
+/// whatever the aggregator. All of this is RedisTimeSeries 8.10 behavior, confirmed by
+/// black-box probing of the reference.
 ///
 /// The sample stream is clipped to the window and so cannot answer "is there anything out
 /// there?"; these fields carry exactly that outside knowledge. `start` is
@@ -258,11 +373,17 @@ pub fn aggregate(
 pub struct EmptyFillBounds {
     pub start: Option<Timestamp>,
     pub end: Option<Timestamp>,
-    /// Value of the last passing sample *before* the window, or NaN when there is none.
-    /// `last`'s EMPTY fill is "the value of the last sample before the bucket's start", so a
-    /// leading gap bucket inherits a sample the query itself never reads. Carried here
-    /// rather than looked up downstream because it comes from the same scan as `start`.
+    /// Value of the last passing, non-NaN sample before the first bucket, or NaN when there is
+    /// none. A leading run of gap buckets holds it under `last`, inheriting a sample the query
+    /// itself never reads. Carried here rather than looked up downstream because it comes from
+    /// the same scan as `start`.
     pub carry_seed: f64,
+    /// Value of the last passing, non-NaN sample before the window, or NaN when there is none.
+    /// What a later gap inherits under `last` when every sample the query has read was NaN. It
+    /// differs from `carry_seed` only when the window opens mid-bucket.
+    pub carry_lookback: f64,
+    /// `last` fills differently for a query that runs newest-first; see [`LastCarry`].
+    pub carry_reverse: bool,
 }
 
 impl Default for EmptyFillBounds {
@@ -271,6 +392,8 @@ impl Default for EmptyFillBounds {
             start: None,
             end: None,
             carry_seed: f64::NAN,
+            carry_lookback: f64::NAN,
+            carry_reverse: false,
         }
     }
 }
@@ -293,6 +416,10 @@ pub struct MultiAggregateIterator<T: Iterator<Item = Sample>> {
     empty_buckets: EmptyBucketRun,
     init: bool,
     empty_fill: EmptyFillBounds,
+    /// Reverse `last` only: rows waiting on the next bucket's value, and how many at the front
+    /// of the queue have it.
+    pending: VecDeque<MultiSample>,
+    ready: usize,
 }
 
 impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
@@ -311,12 +438,19 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
         aligned_timestamp: Timestamp,
         empty_fill: EmptyFillBounds,
     ) -> Self {
+        let mut aggregator = AggregationHelper::new(options, aligned_timestamp);
+        if let Some(carry) = aggregator.last_carry.as_mut() {
+            carry.lookback = empty_fill.carry_lookback;
+            carry.reverse = empty_fill.carry_reverse;
+        }
         Self {
             inner,
-            aggregator: AggregationHelper::new(options, aligned_timestamp),
+            aggregator,
             empty_buckets: EmptyBucketRun::default(),
             init: false,
             empty_fill,
+            pending: VecDeque::new(),
+            ready: 0,
         }
     }
 
@@ -345,10 +479,8 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
         let bucket_start = self.empty_buckets.next_bucket;
         self.empty_buckets.next_bucket =
             bucket_start.saturating_add_unsigned(self.aggregator.bucket_duration);
-        Some(
-            self.aggregator
-                .empty_row(self.aggregator.render_timestamp(bucket_start)),
-        )
+        let timestamp = self.aggregator.render_timestamp(bucket_start);
+        Some(self.aggregator.empty_row(timestamp))
     }
 
     /// One past the last bucket of `ts`, for the exclusive end `add_empty_bucket_internal` takes.
@@ -374,6 +506,17 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
                 requested_first_bucket,
                 first_sample_bucket,
             );
+            self.seed_leading_run();
+        }
+    }
+
+    /// The run just queued precedes every sample the query will read, so it holds what came
+    /// before it.
+    fn seed_leading_run(&mut self) {
+        if let Some(carry) = self.aggregator.last_carry.as_mut()
+            && !self.empty_buckets.is_empty()
+        {
+            carry.start_leading_run(self.empty_fill.carry_seed);
         }
     }
 
@@ -393,6 +536,7 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
                 first_bucket,
                 end_exclusive,
             );
+            self.seed_leading_run();
         }
     }
 
@@ -458,10 +602,34 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
     }
 }
 
-impl<T: Iterator<Item = Sample>> Iterator for MultiAggregateIterator<T> {
-    type Item = MultiSample;
+impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
+    /// Hold back buckets a reverse `last` cannot answer yet until the next bucket can.
+    fn next_resolved_row(&mut self) -> Option<MultiSample> {
+        while self.ready == 0 {
+            let Some(row) = self.next_row() else {
+                // No later bucket exists, so a scan starting here held nothing: they stay NaN.
+                self.ready = self.pending.len();
+                break;
+            };
+            let carry = self.aggregator.last_carry.as_mut()?;
+            if std::mem::take(&mut carry.unresolved) {
+                self.pending.push_back(row);
+                continue;
+            }
+            let value = carry.value_of(&row.values);
+            for waiting in self.pending.iter_mut() {
+                carry.fill(&mut waiting.values, value);
+            }
+            self.pending.push_back(row);
+            self.ready = self.pending.len();
+        }
 
-    fn next(&mut self) -> Option<Self::Item> {
+        let row = self.pending.pop_front()?;
+        self.ready -= 1;
+        Some(row)
+    }
+
+    fn next_row(&mut self) -> Option<MultiSample> {
         if let Some(row) = self.pop_empty_bucket() {
             return Some(row);
         }
@@ -482,6 +650,18 @@ impl<T: Iterator<Item = Sample>> Iterator for MultiAggregateIterator<T> {
 
         self.finalize_last_bucket_if_any()
             .or_else(|| self.pop_empty_bucket())
+    }
+}
+
+impl<T: Iterator<Item = Sample>> Iterator for MultiAggregateIterator<T> {
+    type Item = MultiSample;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.empty_fill.carry_reverse && self.aggregator.last_carry.is_some() {
+            self.next_resolved_row()
+        } else {
+            self.next_row()
+        }
     }
 }
 
@@ -936,8 +1116,6 @@ mod tests {
 
     #[test]
     fn test_empty_buckets_last() {
-        // This iterator leaves an empty `last` bucket as NaN; carrying the previous value
-        // into it is `CarryLastEmpty`'s job, applied downstream in the range pipeline.
         let samples = vec![
             Sample::new(10, 1.0),
             Sample::new(15, 99.0),
@@ -956,8 +1134,8 @@ mod tests {
         let timestamps: Vec<_> = result.iter().map(|s| s.timestamp).collect();
         assert_eq!(timestamps, vec![10, 20, 30, 40, 50]);
         assert_eq!(result[0].value, 99.0);
-        assert!(result[1].value.is_nan(), "empty bucket");
-        assert!(result[2].value.is_nan(), "empty bucket");
+        assert_eq!(result[1].value, 99.0, "a gap keeps the previous reading");
+        assert_eq!(result[2].value, 99.0, "a gap keeps the previous reading");
         assert_eq!(result[3].value, 5.0);
         assert_eq!(result[4].value, 6.0);
     }
