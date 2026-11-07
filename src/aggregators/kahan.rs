@@ -47,10 +47,6 @@ impl KahanSum {
     pub fn err(&self) -> f64 {
         self.compensation
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.sum == 0.0 && self.compensation == 0.0
-    }
 }
 
 impl Add<f64> for KahanSum {

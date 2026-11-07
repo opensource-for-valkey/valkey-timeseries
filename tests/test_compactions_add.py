@@ -623,6 +623,17 @@ class TestCompactionAdd(ValkeyTimeSeriesTestCaseBase):
         # that has to survive the reload.
         assert c.execute_command("TS.RANGE", "rate:dst", "-", "+") == [[0, b"10"], [500, b"20"]]
 
+    def test_open_sum_bucket_of_zero_reports_its_value(self):
+        """A bucket whose sum is 0 still has samples and a current aggregate."""
+        c = self.client
+        c.execute_command("TS.CREATE", "zs:src")
+        c.execute_command("TS.CREATE", "zs:dst")
+        c.execute_command("TS.CREATERULE", "zs:src", "zs:dst", "AGGREGATION", "sum", 1000)
+        c.execute_command("TS.ADD", "zs:src", 0, 0)
+        flat = c.execute_command("TS.INFO", "zs:src", "DEBUG")
+        info = {flat[i]: flat[i + 1] for i in range(0, len(flat), 2)}
+        assert info[b"rulesState"][0] == [b"zs:dst", 0, 1, b"0", 0]
+
     def test_increase_rule_matches_a_range_over_the_source(self):
         """A counter rule carries the last sample into the next bucket, as TS.RANGE does, and
         keeps doing so when a back-fill or a delete changes the sample a bucket starts from."""

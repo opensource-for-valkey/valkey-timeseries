@@ -370,25 +370,26 @@ impl RdbSerializable for AvgAggregator {
 
 // -- Sum -----------------------------------------------------------------
 
+/// Occupancy is tracked apart from the value: a sum that comes to zero is still a sum.
 #[derive(Copy, Clone, Default, Debug, PartialEq, GetSize, Hash)]
-pub struct SumAggregator(KahanSum);
+pub struct SumAggregator {
+    sum: KahanSum,
+    has_value: bool,
+}
 impl AggregationHandler for SumAggregator {
     fn update(&mut self, _timestamp: Timestamp, value: Value) -> bool {
         if value.is_nan() {
             return false;
         }
-        self.0 += value;
+        self.sum += value;
+        self.has_value = true;
         true
     }
     fn reset(&mut self) {
-        self.0.reset();
+        *self = Self::default();
     }
     fn current(&self) -> Option<Value> {
-        if self.0.is_empty() {
-            None
-        } else {
-            Some(self.0.value())
-        }
+        self.has_value.then(|| self.sum.value())
     }
     fn empty_value(&self) -> Value {
         0.
@@ -397,15 +398,17 @@ impl AggregationHandler for SumAggregator {
 
 impl RdbSerializable for SumAggregator {
     fn rdb_save(&self, rdb: *mut RedisModuleIO) {
-        self.0.rdb_save(rdb);
+        self.sum.rdb_save(rdb);
+        rdb_save_bool(rdb, self.has_value);
     }
 
     fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self>
     where
         Self: Sized,
     {
-        let inner = KahanSum::rdb_load(rdb)?;
-        Ok(Self(inner))
+        let sum = KahanSum::rdb_load(rdb)?;
+        let has_value = rdb_load_bool(rdb)?;
+        Ok(Self { sum, has_value })
     }
 }
 

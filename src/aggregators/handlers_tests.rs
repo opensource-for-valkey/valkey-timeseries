@@ -131,6 +131,24 @@ mod tests {
         assert_eq!(result, 45.0);
     }
 
+    /// A sum of zero is still a sum: one accepted zero, or values that cancel exactly, have a
+    /// current value, which is what a compaction rule's open bucket reports.
+    #[test]
+    fn test_sum_of_zero_has_a_value() {
+        for values in [&[0.0][..], &[1.0, -1.0][..], &[-0.0][..]] {
+            let mut agg = SumAggregator::default();
+            for (ts, &value) in values.iter().enumerate() {
+                agg.update(ts as i64, value);
+            }
+            assert_eq!(agg.current(), Some(0.0), "{values:?}");
+            agg.reset();
+            assert_eq!(agg.current(), None, "reset leaves nothing");
+        }
+        let mut nans = SumAggregator::default();
+        nans.update(0, f64::NAN);
+        assert_eq!(nans.current(), None);
+    }
+
     #[test]
     fn test_sum_aggregator_empty_value() {
         let mut agg = SumAggregator::default();
