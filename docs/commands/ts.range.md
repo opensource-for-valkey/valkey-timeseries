@@ -138,6 +138,9 @@ Control bucket alignment:
 | `any`      | `1.0` if any sample matches, `0.0` otherwise          | `NaN`              |
 | `none`     | `1.0` if no samples match, `0.0` otherwise            | `NaN`              |
 
+`NaN` samples never match a condition and are not counted: `share!=5` over `[NaN, 10, NaN, 20]` is
+`1.0`, not `0.5`, and a bucket holding only `NaN` gives these aggregators no value.
+
 `count` and `sum` also accept an *optional* inline condition (`count>5`, `sum<=2`) to count or
 sum only matching samples; without one they operate over every sample in the bucket as usual.
 

@@ -170,6 +170,19 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
                                                  'AGGREGATION', 'sum', top)
             assert result == [[0, b'3']]
 
+    def test_filtered_aggregators_skip_nan(self):
+        """NaN never matches a condition and is not counted, whatever the operator."""
+        for ts, value in ((0, 'nan'), (1, 10), (2, 'nan'), (3, 20), (100, 'nan')):
+            self.client.execute_command('TS.ADD', 'f', ts, value)
+
+        expected = {'share!=5': b'1', 'all!=5': b'1', 'any!=5': b'1', 'none!=5': b'0',
+                    'countif!=5': b'2', 'share==5': b'0'}
+        for agg, value in expected.items():
+            result = self.client.execute_command('TS.RANGE', 'f', '-', '+',
+                                                 'AGGREGATION', agg, 100)
+            # The bucket at 100 holds only a NaN, so it has no value to report.
+            assert result == [[0, value]], agg
+
     def test_compaction_with_the_largest_duration_stays_open(self):
         """A rule accepts any positive i64 duration; its one bucket never closes."""
         top = 2**63 - 1

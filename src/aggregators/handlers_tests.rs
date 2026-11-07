@@ -719,10 +719,70 @@ mod tests {
         let mut agg = ShareAggregator::new(ComparisonOperator::GreaterThan, 10.0);
 
         agg.update(1000, 15.0);
-        agg.update(2000, f64::NAN); // NaN comparison is false
+        assert!(!agg.update(2000, f64::NAN), "NaN is skipped, not counted");
         agg.update(3000, 20.0);
 
-        assert!((agg.current().unwrap() - 2.0 / 3.0).abs() < 1e-10); // 2/3
+        assert_eq!(agg.current(), Some(1.0));
+    }
+
+    /// The whole filtered family skips NaN, as `countif`/`sumif` do: under `!=` a NaN would
+    /// otherwise satisfy the condition, and under `==` it would count against the share.
+    #[test]
+    fn test_filtered_family_skips_nan() {
+        use crate::aggregators::{AllAggregator, AnyAggregator, NoneAggregator};
+        let ne = ComparisonOperator::NotEqual;
+        let values = [f64::NAN, 10.0, f64::NAN, 20.0];
+
+        fn run<A: AggregationHandler>(mut agg: A, values: &[f64]) -> (Vec<bool>, Option<f64>) {
+            let accepted = values
+                .iter()
+                .enumerate()
+                .map(|(ts, &v)| agg.update(ts as i64, v))
+                .collect();
+            (accepted, agg.current())
+        }
+        let expect_accepted = vec![false, true, false, true];
+
+        assert_eq!(
+            run(ShareAggregator::new(ne, 5.0), &values),
+            (expect_accepted.clone(), Some(1.0))
+        );
+        assert_eq!(
+            run(AllAggregator::new(ne, 5.0), &values),
+            (expect_accepted.clone(), Some(1.0))
+        );
+        assert_eq!(
+            run(AnyAggregator::new(ne, 5.0), &values),
+            (expect_accepted.clone(), Some(1.0))
+        );
+        assert_eq!(
+            run(NoneAggregator::new(ne, 5.0), &values),
+            (expect_accepted.clone(), Some(0.0))
+        );
+        assert_eq!(
+            run(CountIfAggregator::new(ne, 5.0), &values),
+            (expect_accepted, Some(2.0))
+        );
+
+        // A bucket of NaNs alone gives none of them anything to report.
+        let nans = [f64::NAN, f64::NAN];
+        let eq = ComparisonOperator::Equal;
+        assert_eq!(
+            run(ShareAggregator::new(eq, 5.0), &nans),
+            (vec![false; 2], None)
+        );
+        assert_eq!(
+            run(AllAggregator::new(eq, 5.0), &nans),
+            (vec![false; 2], None)
+        );
+        assert_eq!(
+            run(AnyAggregator::new(eq, 5.0), &nans),
+            (vec![false; 2], None)
+        );
+        assert_eq!(
+            run(NoneAggregator::new(eq, 5.0), &nans),
+            (vec![false; 2], None)
+        );
     }
 
     #[test]

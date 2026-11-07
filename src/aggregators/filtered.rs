@@ -64,10 +64,9 @@ impl ConditionalCountState {
         self.has_samples = false;
     }
 
-    // NaN is skipped, as every other aggregator skips it (and as the cluster push-down's
-    // partial reducer does). Passing it to the filter let `!=` match it, so `sumif` over
-    // [1, NaN] returned NaN and `countif` counted it — and a push-down GROUPBY of the same
-    // query answered 1.
+    // NaN is skipped, as by every filtered aggregator (and by the cluster push-down's partial
+    // reducer). Passing it to the filter let `!=` match it, so `sumif` over [1, NaN] returned
+    // NaN and `countif` counted it — and a push-down GROUPBY of the same query answered 1.
     fn update_sum(&mut self, value: f64) -> bool {
         if value.is_nan() {
             return false;
@@ -215,7 +214,12 @@ impl ShareAggregatorState {
         (self.match_count as f64) / (self.count as f64)
     }
 
+    /// NaN is skipped like everywhere else in the filtered family: under `!=` it would match,
+    /// and under any other operator it would still count against the share.
     pub fn update(&mut self, value: f64) -> bool {
+        if value.is_nan() {
+            return false;
+        }
         self.count = self.count.saturating_add(1);
         if self.filter.compare(value) {
             self.match_count = self.match_count.saturating_add(1);
@@ -298,7 +302,7 @@ impl AggregationHandler for ShareAggregator {
     }
 }
 
-// Support for ALL and NONE
+// Support for ALL, ANY and NONE. Each update skips NaN, like the rest of the filtered family.
 #[derive(Debug, Default, Clone, Copy, Hash, PartialEq, GetSize)]
 struct AllNoneAggregatorState {
     matches: Option<bool>,
@@ -307,6 +311,9 @@ struct AllNoneAggregatorState {
 
 impl AllNoneAggregatorState {
     fn update_all(&mut self, value: f64) -> bool {
+        if value.is_nan() {
+            return false;
+        }
         match self.matches {
             Some(false) => { // already failed
             }
@@ -319,6 +326,9 @@ impl AllNoneAggregatorState {
     }
 
     fn update_none(&mut self, value: f64) -> bool {
+        if value.is_nan() {
+            return false;
+        }
         match self.matches {
             Some(false) => (), // already false
             _ => {
@@ -329,6 +339,9 @@ impl AllNoneAggregatorState {
     }
 
     fn update_any(&mut self, value: f64) -> bool {
+        if value.is_nan() {
+            return false;
+        }
         match self.matches {
             Some(true) => (), // already matched
             _ => {
