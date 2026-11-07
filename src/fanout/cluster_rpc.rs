@@ -19,8 +19,8 @@ use crate::fanout::registry::{RegisteredOperation, get_fanout_request_handler};
 use crate::fanout::serialization::Serializable;
 use crate::fanout::workers::PEER_REQUEST_EXECUTOR;
 use crate::fanout::{
-    FanoutResult, NodeInfo, get_cluster_map, get_or_refresh_cluster_map, mark_cluster_map_stale,
-    refresh_cluster_map,
+    FanoutResult, NodeInfo, current_or_refreshed_cluster_map, get_cluster_map,
+    mark_cluster_map_stale, refresh_cluster_map,
 };
 use ahash::HashSet;
 use core::time::Duration;
@@ -528,8 +528,8 @@ fn alloc_db_if_needed(ctx: &Context, db: i32) {
 ///
 /// A fingerprint of `0` means the sender had no map when it built the request,
 /// so the check is skipped. Otherwise, we compare against a fresh local map: if
-/// they disagree, our map may merely be stale, so we force a single refresh and
-/// re-compare before declaring a mismatch. Building the map issues
+/// they disagree and that map was not just rebuilt, it may merely be stale, so
+/// we force a single refresh and re-compare before declaring a mismatch. Building the map issues
 /// `CLUSTER NODES` (not `CLUSTER SLOTS`), whose reply does not depend on a
 /// client, so this is safe on the worker thread that runs it; the GIL is taken
 /// only for that call, and the reply is parsed with it released.
@@ -540,9 +540,13 @@ fn cluster_fingerprint_matches(ctx: &DetachedContext, expected: u64) -> bool {
         return true;
     }
 
-    let local = get_or_refresh_cluster_map(ctx);
+    let (local, refreshed) = current_or_refreshed_cluster_map(ctx);
     if local.cluster_slots_fingerprint() == expected {
         return true;
+    }
+    if refreshed {
+        // Already built from a `CLUSTER NODES` reply taken just now.
+        return false;
     }
 
     // Our map might just be stale; force one refresh and re-check.

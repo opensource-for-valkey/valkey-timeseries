@@ -1,5 +1,5 @@
 use crate::common::hash::DeterministicHasher;
-use crate::common::logging::{log_notice, log_warning};
+use crate::common::logging::{log_debug, log_warning};
 use crate::common::threads::LockGil;
 use crate::common::time::current_time_millis;
 use crate::config::CLUSTER_MAP_EXPIRATION_MS;
@@ -16,7 +16,7 @@ use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use valkey_module::{
     CallOptionsBuilder, CallReply, CallResult, Context, DetachedContext, VALKEYMODULE_NODE_ID_LEN,
@@ -32,21 +32,28 @@ use valkey_module::{
 /// thread) and issues the call directly.
 pub trait ClusterNodesSource {
     /// The raw `CLUSTER NODES` reply, or `None` when the call did not produce a
-    /// usable string.
-    fn cluster_nodes(&self) -> Option<String>;
+    /// usable string, together with its observation sequence: a number that
+    /// increases strictly in the order the replies were produced, so a refresh
+    /// can tell whether a concurrently published map saw a newer topology.
+    fn cluster_nodes(&self) -> Option<(u64, String)>;
 }
 
+/// Observation sequence for `CLUSTER NODES` replies. Only advanced under the
+/// GIL, right after the call, so its order is the order of the observations.
+static CLUSTER_NODES_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
+
 impl ClusterNodesSource for Context {
-    fn cluster_nodes(&self) -> Option<String> {
+    fn cluster_nodes(&self) -> Option<(u64, String)> {
         let call_options = CallOptionsBuilder::new().errors_as_replies().build();
         let res: CallResult = self.call_ext::<_, CallResult>("CLUSTER", &call_options, &["NODES"]);
+        let observed = CLUSTER_NODES_OBSERVATIONS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
         // The reply is freed here, while the lock is still held.
-        reply_as_string(res)
+        reply_as_string(res).map(|text| (observed, text))
     }
 }
 
 impl ClusterNodesSource for DetachedContext {
-    fn cluster_nodes(&self) -> Option<String> {
+    fn cluster_nodes(&self) -> Option<(u64, String)> {
         let ctx = self.lock_gil();
         ctx.cluster_nodes()
     }
@@ -500,6 +507,9 @@ pub struct ClusterMap {
     /// finds the topology unchanged can extend the published map's lifetime
     /// in place instead of swapping in an identical copy.
     expiration_ts: AtomicI64,
+    /// Observation sequence of the `CLUSTER NODES` reply this map was built
+    /// from (see [`ClusterNodesSource`]); 0 for the initial empty map.
+    observed_seq: u64,
     /// is the current map consistent (no collisions/inconsistencies found while building)
     pub is_consistent: bool,
 }
@@ -703,9 +713,9 @@ impl ClusterMap {
     /// reply, so callers can distinguish a build failure from a successfully
     /// built (possibly inconsistent) map and avoid clobbering a good map.
     pub fn create(ctx: &impl ClusterNodesSource) -> Option<Self> {
-        log_notice("Calling CLUSTER NODES...");
+        log_debug("Calling CLUSTER NODES...");
 
-        let Some(text) = ctx.cluster_nodes() else {
+        let Some((observed_seq, text)) = ctx.cluster_nodes() else {
             log_warning("CLUSTER NODES did not return a usable string reply");
             return None;
         };
@@ -713,7 +723,20 @@ impl ClusterMap {
         let my_node_id = *CURRENT_NODE_ID;
         debug_assert!(!my_node_id.is_empty(), "Current node id is empty");
 
-        Some(Self::from_cluster_nodes(&text, &my_node_id))
+        let mut map = Self::from_cluster_nodes(&text, &my_node_id);
+        map.observed_seq = observed_seq;
+        Some(map)
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_observed_seq(mut self, observed_seq: u64) -> Self {
+        self.observed_seq = observed_seq;
+        self
+    }
+
+    /// See [`ClusterNodesSource`]: a map with a higher sequence saw a newer topology.
+    pub fn observed_seq(&self) -> u64 {
+        self.observed_seq
     }
 
     /// Build a ClusterMap from the raw text of a `CLUSTER NODES` reply.

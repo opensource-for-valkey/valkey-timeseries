@@ -43,7 +43,7 @@ fn inflight(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
 /// Rebuilds this node's cluster map from `CLUSTER NODES` now, instead of waiting for it to expire
 /// or be marked stale, and reports the map it ends up with: a map with `outcome` (`changed` when a
 /// new map was published, `unchanged` when the topology matched and only its expiry was
-/// extended), `consistent`, `shards` and `fingerprint` (a string: it spans the full `u64` range).
+/// extended, `superseded` when a concurrent refresh published a newer map first), `consistent`, `shards` and `fingerprint` (a string: it spans the full `u64` range).
 ///
 /// TS._DEBUG REFRESH_CLUSTERMAP
 ///
@@ -61,6 +61,7 @@ fn refresh_clustermap(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyRes
     let (outcome, map) = match refresh_cluster_map(ctx) {
         ClusterMapRefresh::Changed(map) => ("changed", map),
         ClusterMapRefresh::Unchanged(map) => ("unchanged", map),
+        ClusterMapRefresh::Superseded(map) => ("superseded", map),
         ClusterMapRefresh::Failed => {
             return Err(ValkeyError::Str(
                 "TSDB: failed to rebuild the cluster map; the previous map is kept",

@@ -11,6 +11,7 @@ pub mod serialization;
 mod utils;
 mod workers;
 
+use crate::common::logging::{log_debug, log_notice, log_warning};
 use crate::common::metrics::clustermap as metrics;
 use crate::common::time::current_time_millis;
 use crate::config::CLUSTER_MAP_EXPIRATION_MS;
@@ -21,7 +22,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use valkey_module::Context;
-use valkey_module::logging::{log_notice, log_warning};
 
 use super::fanout::cluster_rpc::register_cluster_message_handlers;
 pub(crate) use cluster_rpc::{inflight_request_count, inflight_requests};
@@ -53,10 +53,11 @@ static CLUSTER_MAP: LazyLock<ArcSwap<ClusterMap>> =
 /// refresh, so the following fanout is built from up-to-date topology.
 static CLUSTER_MAP_STALE: AtomicBool = AtomicBool::new(false);
 
-/// Upper bound on the adaptive refresh interval. Replica membership changes
-/// alter neither the slot fingerprint (so no peer ever rejects with a
-/// mismatch) nor, on remote nodes, any local event: the periodic refresh is
-/// the only mechanism that detects them, so the backoff must stay bounded.
+/// Upper bound on the adaptive refresh interval. Replica membership and node
+/// health changes alter neither the slot fingerprint (so no peer ever rejects
+/// with a mismatch) nor, on remote nodes, any local event. The only thing that
+/// notices them is the lazy refresh a fanout triggers once the map expires, so
+/// the backoff must stay bounded.
 const CLUSTER_MAP_BACKOFF_CAP_MS: u64 = 5_000;
 
 /// Current adaptive refresh interval in ms. Starts at (and resets to) the
@@ -124,10 +125,6 @@ fn take_cluster_map_stale() -> bool {
     CLUSTER_MAP_STALE.swap(false, Ordering::AcqRel)
 }
 
-fn update_cluster_map(map: Arc<ClusterMap>) {
-    CLUSTER_MAP.store(map);
-}
-
 /// Get the set of target nodes for a fanout, together with the cluster-map
 /// fingerprint of the *same* snapshot the targets were chosen from. If the
 /// local cluster map is stale, rebuild it first. The returned fingerprint is
@@ -139,20 +136,39 @@ pub fn get_fanout_targets(ctx: &Context, mode: FanoutTarget) -> (Arc<HashSet<Nod
     // Check if we need to refresh. A stale flag is set when a peer rejected one
     // of our requests due to a topology mismatch.
     let stale = take_cluster_map_stale();
-    let needs_refresh = !current_map.is_consistent || current_map.is_expired() || stale;
-    if !needs_refresh {
+    if !needs_refresh(&current_map, stale) {
         return (
             current_map.get_targets(mode),
             current_map.cluster_slots_fingerprint(),
         );
     }
-    // Possibly race condition, but only if called concurrently, which is possible but very unlikely.
-    // In any case, the worst that can happen is that we refresh more than once.
+    drop(current_map);
     // Take targets and fingerprint from the snapshot the refresh produced, not a reload.
-    let map = refresh_cluster_map(ctx)
-        .into_map()
-        .unwrap_or_else(|| CLUSTER_MAP.load_full());
+    let map = refresh_after_trigger(ctx, stale);
     (map.get_targets(mode), map.cluster_slots_fingerprint())
+}
+
+/// Whether the published map must be rebuilt before use: it expired, or a peer
+/// rejected one of our requests with a fingerprint mismatch (`stale`).
+///
+/// An inconsistent map is deliberately *not* a trigger. It is rebuilt when it
+/// expires, like any other, and its expiry never backs off; rebuilding it on
+/// every use made each fanout pay a `CLUSTER NODES` call and parse for as long
+/// as the view stayed inconsistent (a node in handshake, a transient slot gap).
+fn needs_refresh(map: &ClusterMap, stale: bool) -> bool {
+    stale || map.is_expired()
+}
+
+/// Refresh because [`needs_refresh`] said so, and return the map to use. A
+/// stale mark this caller consumed is put back when the refresh fails, so the
+/// invalidation is not lost with it.
+fn refresh_after_trigger(ctx: &impl ClusterNodesSource, stale: bool) -> Arc<ClusterMap> {
+    refresh_cluster_map(ctx).into_map().unwrap_or_else(|| {
+        if stale {
+            CLUSTER_MAP_STALE.store(true, Ordering::Release);
+        }
+        CLUSTER_MAP.load_full()
+    })
 }
 
 /// What [`refresh_cluster_map`] did with the map it built, carrying the exact snapshot the
@@ -164,6 +180,9 @@ pub enum ClusterMapRefresh {
     Changed(Arc<ClusterMap>),
     /// The topology was unchanged: this published map was kept, its expiry extended.
     Unchanged(Arc<ClusterMap>),
+    /// The topology differed, but a concurrent refresh had already published a map built from
+    /// a newer `CLUSTER NODES` observation; that map was kept and is carried here.
+    Superseded(Arc<ClusterMap>),
     /// `CLUSTER NODES` gave no usable reply: the previous map stays in place.
     Failed,
 }
@@ -172,7 +191,7 @@ impl ClusterMapRefresh {
     /// The snapshot this refresh published or kept; `None` when it failed.
     pub fn into_map(self) -> Option<Arc<ClusterMap>> {
         match self {
-            Self::Changed(map) | Self::Unchanged(map) => Some(map),
+            Self::Changed(map) | Self::Unchanged(map) | Self::Superseded(map) => Some(map),
             Self::Failed => None,
         }
     }
@@ -185,64 +204,124 @@ impl ClusterMapRefresh {
 // in-flight readers. If building the new map fails, the previous map is kept
 // in place and a warning is logged so subsequent calls will retry the refresh.
 //
+// Refreshes may run concurrently (the main thread and the peer-request
+// workers), and a slow one can finish after a faster, newer one. A new map is
+// therefore published only if no map built from a later `CLUSTER NODES`
+// observation is already in place (see `publish_if_newer`).
+//
 // `ctx` is a `Context` on the main thread or a `DetachedContext` on a worker;
 // the latter holds the GIL only for the `CLUSTER NODES` call (see
 // `ClusterNodesSource`).
 pub fn refresh_cluster_map(ctx: &impl ClusterNodesSource) -> ClusterMapRefresh {
-    log_notice("Refreshing cluster map...");
+    log_debug("Refreshing cluster map...");
     metrics::REFRESHES.incr();
-    match ClusterMap::create(ctx) {
-        Some(new_map) => {
-            let current_map = CLUSTER_MAP.load_full();
-            if new_map.is_consistent
-                && current_map.is_consistent
-                && new_map.same_topology(&current_map)
-            {
-                current_map.extend_expiration(grow_refresh_interval());
-                metrics::REFRESH_UNCHANGED.incr();
-                log_notice("Cluster map unchanged; extended expiration");
-                mark_cluster_map_verified();
-                ClusterMapRefresh::Unchanged(current_map)
-            } else {
-                drop(current_map);
-                reset_refresh_interval();
-                let new_map = Arc::new(new_map);
-                update_cluster_map(Arc::clone(&new_map));
-                metrics::REFRESH_CHANGED.incr();
-                log_notice("Cluster map refreshed");
-                mark_cluster_map_verified();
-                ClusterMapRefresh::Changed(new_map)
-            }
-        }
-        None => {
-            metrics::REFRESH_FAILURES.incr();
+    let Some(new_map) = ClusterMap::create(ctx) else {
+        metrics::REFRESH_FAILURES.incr();
+        reset_refresh_interval();
+        log_warning("Failed to build cluster map; keeping the previous map and retrying later");
+        return ClusterMapRefresh::Failed;
+    };
+    mark_cluster_map_verified();
+
+    let current_map = CLUSTER_MAP.load_full();
+    if new_map.is_consistent == current_map.is_consistent && new_map.same_topology(&current_map) {
+        // Only a consistent view earns a longer interval; an inconsistent one
+        // is re-checked at the configured floor.
+        let ttl = if new_map.is_consistent {
+            grow_refresh_interval()
+        } else {
             reset_refresh_interval();
-            log_warning("Failed to build cluster map; keeping the previous map and retrying later");
-            ClusterMapRefresh::Failed
+            CLUSTER_MAP_EXPIRATION_MS.load(Ordering::Relaxed)
+        };
+        current_map.extend_expiration(ttl);
+        metrics::REFRESH_UNCHANGED.incr();
+        log_debug("Cluster map unchanged; extended expiration");
+        return ClusterMapRefresh::Unchanged(current_map);
+    }
+    drop(current_map);
+
+    reset_refresh_interval();
+    match publish_if_newer(Arc::new(new_map)) {
+        Ok(published) => {
+            metrics::REFRESH_CHANGED.incr();
+            log_notice("Cluster map refreshed: topology changed");
+            ClusterMapRefresh::Changed(published)
         }
+        Err(newer) => ClusterMapRefresh::Superseded(newer),
     }
 }
 
-pub fn get_or_refresh_cluster_map(ctx: &impl ClusterNodesSource) -> Arc<ClusterMap> {
+/// Publish `map` unless the published map was built from a later observation.
+/// `Ok` carries `map` once published; `Err` the newer map that was kept.
+fn publish_if_newer(map: Arc<ClusterMap>) -> Result<Arc<ClusterMap>, Arc<ClusterMap>> {
+    let previous = CLUSTER_MAP.rcu(|current| {
+        if current.observed_seq() < map.observed_seq() {
+            Arc::clone(&map)
+        } else {
+            Arc::clone(current)
+        }
+    });
+    if previous.observed_seq() < map.observed_seq() {
+        Ok(map)
+    } else {
+        Err(previous)
+    }
+}
+
+/// The map to use now, and whether this call rebuilt it (so it reflects a
+/// `CLUSTER NODES` observation taken just now).
+pub fn current_or_refreshed_cluster_map(ctx: &impl ClusterNodesSource) -> (Arc<ClusterMap>, bool) {
     let current_map = get_cluster_map();
     let stale = take_cluster_map_stale();
-
-    // Check if we need to refresh
-    let needs_refresh = !current_map.is_consistent || current_map.is_expired() || stale;
-
-    if needs_refresh {
-        drop(current_map);
-        return refresh_cluster_map(ctx)
-            .into_map()
-            .unwrap_or_else(|| CLUSTER_MAP.load_full());
+    if !needs_refresh(&current_map, stale) {
+        return (current_map.clone(), false);
     }
-
-    current_map.clone()
+    drop(current_map);
+    (refresh_after_trigger(ctx, stale), true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ONE_SHARD: &str = "1111111111111111111111111111111111111111 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-16383\n";
+    const SLOT_GAP: &str = "1111111111111111111111111111111111111111 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-100\n";
+
+    fn map(text: &str, observed_seq: u64) -> Arc<ClusterMap> {
+        let me = cluster_map::NodeId::from_bytes(&text.as_bytes()[..40]);
+        Arc::new(ClusterMap::from_cluster_nodes(text, &me).with_observed_seq(observed_seq))
+    }
+
+    /// A refresh that observed the topology earlier must not replace a map
+    /// published from a later observation, whatever order they finish in.
+    /// The only test that touches the published map.
+    #[test]
+    fn test_publication_follows_observation_order() {
+        let newer = map(ONE_SHARD, u64::MAX - 1);
+        assert!(Arc::ptr_eq(
+            &publish_if_newer(newer.clone()).unwrap(),
+            &newer
+        ));
+
+        let older = map(SLOT_GAP, u64::MAX - 2);
+        let kept = publish_if_newer(older).unwrap_err();
+        assert!(Arc::ptr_eq(&kept, &newer));
+        assert!(Arc::ptr_eq(&CLUSTER_MAP.load_full(), &newer));
+
+        let newest = map(SLOT_GAP, u64::MAX);
+        publish_if_newer(newest.clone()).unwrap();
+        assert!(Arc::ptr_eq(&CLUSTER_MAP.load_full(), &newest));
+    }
+
+    #[test]
+    fn test_inconsistent_map_is_not_rebuilt_before_it_expires() {
+        let inconsistent = map(SLOT_GAP, 1);
+        assert!(!inconsistent.is_consistent);
+        assert!(!needs_refresh(&inconsistent, false));
+        assert!(needs_refresh(&inconsistent, true));
+        inconsistent.extend_expiration(0);
+        assert!(needs_refresh(&inconsistent, false));
+    }
 
     /// The whole grow/reset lifecycle in one test: the interval is a
     /// process-wide static, so splitting this across tests would race under
