@@ -379,6 +379,9 @@ pub struct MRangeOptions {
     pub tags: Vec<String>,
     pub grouping: Option<RangeGroupingOptions>,
     pub is_reverse: bool,
+    /// Set on a shard, whose `is_reverse` is cleared because it streams ascending for the
+    /// coordinator to reverse: the reply is still newest-first, and EMPTY depends on that.
+    pub reply_reverse: bool,
     /// `EXCLUDEEMPTY`: drop matched series that report no samples/buckets for the
     /// query. Mutually exclusive with `grouping` (rejected at parse time).
     pub exclude_empty: bool,

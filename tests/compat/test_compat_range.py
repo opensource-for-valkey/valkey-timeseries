@@ -18,6 +18,7 @@ test code (see tests/compat/README.md).
 """
 
 import itertools
+import random
 
 import pytest
 from valkey.exceptions import ResponseError
@@ -354,6 +355,39 @@ class TestFilterByTs:
             "FILTER_BY_TS", 0, 250, 3000, "AGGREGATION", "sum", 1000,
         )
 
+    @pytest.mark.parametrize("aggregator", ["sum", "last", "count"])
+    @pytest.mark.parametrize(
+        "window, timestamps",
+        [
+            pytest.param((50, 70), (10, 55, 90), id="passing-data-on-both-sides"),
+            pytest.param((50, 70), (55, 90), id="passing-data-after-only"),
+            pytest.param((50, 70), (10, 55), id="passing-data-before-only"),
+            pytest.param((60, 70), (10, 90), id="window-is-a-gap"),
+            pytest.param((60, 70), (10,), id="window-past-the-last-entry"),
+            pytest.param((60, 70), (90,), id="window-before-the-first-entry"),
+            pytest.param((50, 70), (11, 55, 91), id="outside-entries-match-no-sample"),
+            pytest.param((60, 70), (90, 10, 90), id="unsorted-and-duplicated"),
+        ],
+    )
+    def test_empty_fill_sees_entries_outside_the_window(
+        self, diff, range_cmd, window, timestamps, aggregator
+    ):
+        # Entries outside the window return no samples, but they still decide how far EMPTY
+        # reaches, exactly as passing samples outside the window do under FILTER_BY_VALUE.
+        mk_populated(diff, "r:fbtsfill", [(10, 1.0), (55, 2.0), (90, 3.0)])
+        diff(
+            range_cmd, "r:fbtsfill", *window, "FILTER_BY_TS", *timestamps,
+            "AGGREGATION", aggregator, 5, "EMPTY",
+        )
+
+    def test_empty_fill_applies_the_value_filter_to_outside_entries(self, diff, range_cmd):
+        mk_populated(diff, "r:fbtsfillv", [(10, 1.0), (55, 2.0), (90, 3.0)])
+        for bounds in ((1.5, 2.5), (1.5, 3.5), (0.5, 2.5)):
+            diff(
+                range_cmd, "r:fbtsfillv", 50, 70, "FILTER_BY_TS", 10, 55, 90,
+                "FILTER_BY_VALUE", *bounds, "AGGREGATION", "sum", 5, "EMPTY",
+            )
+
     def test_filter_by_ts_requires_a_timestamp(self, diff, range_cmd):
         mk_populated(diff, "r:fbtsempty", BASE_SAMPLES)
         with pytest.raises(ResponseError):
@@ -363,6 +397,148 @@ class TestFilterByTs:
         mk_populated(diff, "r:fbtsbad", BASE_SAMPLES)
         with pytest.raises(ResponseError):
             diff(range_cmd, "r:fbtsbad", "-", "+", "FILTER_BY_TS", "abc")
+
+
+NAN = float("nan")
+
+
+class TestEmptyFillAroundStoredNan:
+    """A stored NaN is a sample, but it is not data as far as EMPTY is concerned.
+
+    It does not extend the fill past the samples the query sees, whichever aggregator is used,
+    and `last` looks back past it for the value a gap inherits. Expectations come from the
+    reference through `diff`; the seeded case exists because these rules interact, and the
+    corners were found by comparing random series rather than by reasoning about them.
+    """
+
+    @pytest.mark.parametrize(
+        "samples, window",
+        [
+            pytest.param(((0, 5.0), (10, NAN), (100, 7.0)), (0, 200), id="nan-bucket-carries"),
+            pytest.param(((0, 5.0), (10, NAN), (100, 7.0)), (50, 200), id="seed-skips-nan"),
+            pytest.param(((0, 5.0), (10, NAN), (100, 7.0)), (20, 200), id="seed-skips-nan-at-edge"),
+            pytest.param(((0, 5.0), (10, NAN), (100, 7.0)), (15, 200), id="nan-sample-outside-window"),
+            pytest.param(((0, 5.0), (10, NAN), (100, 7.0)), (10, 200), id="first-bucket-only-nan"),
+            pytest.param(((0, 5.0), (10, NAN), (100, 7.0)), (5, 200), id="window-opens-mid-bucket"),
+            pytest.param(
+                ((0, 5.0), (10, NAN), (20, 6.0), (30, NAN), (100, 7.0)), (40, 200), id="seed-is-latest"
+            ),
+            pytest.param(
+                ((0, 5.0), (10, NAN), (20, 6.0), (30, NAN), (100, 7.0)), (25, 200), id="seed-held-by-run"
+            ),
+            pytest.param(((0, NAN), (100, 7.0)), (0, 200), id="only-nan-before"),
+            pytest.param(((0, NAN), (100, 7.0)), (50, 200), id="nan-does-not-lead"),
+            pytest.param(((12, 7.0), (40, NAN), (70, 6.0)), (15, 70), id="leading-run-holds-its-seed"),
+        ],
+    )
+    def test_last_carry(self, diff, range_cmd, samples, window):
+        mk_populated(diff, "r:nanlast", samples)
+        diff(range_cmd, "r:nanlast", *window, "AGGREGATION", "last", 10, "EMPTY")
+
+    @pytest.mark.parametrize("aggregator", AGGREGATORS)
+    @pytest.mark.parametrize(
+        "samples",
+        [
+            pytest.param(((0, NAN), (100, 7.0)), id="nan-before"),
+            pytest.param(((0, 7.0), (100, NAN)), id="nan-after"),
+            pytest.param(((0, NAN), (100, NAN)), id="nan-both-sides"),
+            pytest.param(((0, NAN), (60, 1.0)), id="nan-before-a-window-sample"),
+            pytest.param(((60, 1.0), (100, NAN)), id="nan-after-a-window-sample"),
+            pytest.param(((0, 1.0), (100, 2.0)), id="control-values-both-sides"),
+        ],
+    )
+    def test_nan_does_not_extend_the_fill(self, diff, range_cmd, samples, aggregator):
+        mk_populated(diff, "r:nanspan", samples)
+        diff(range_cmd, "r:nanspan", 50, 90, "AGGREGATION", aggregator, 10, "EMPTY")
+
+    def test_seeded_nan_heavy_series(self, diff, range_cmd):
+        rng = random.Random(1717)
+        for case in range(150):
+            key = f"r:nanrandom:{case}"
+            timestamps = sorted(rng.sample(range(160), rng.randint(1, 9)))
+            nan_chance = rng.choice((0.2, 0.5, 0.8))
+            samples = [
+                (ts, NAN if rng.random() < nan_chance else float(rng.randint(1, 9)))
+                for ts in timestamps
+            ]
+            mk_populated(diff, key, samples)
+
+            start = rng.randint(0, 150)
+            filters = rng.choice(
+                (
+                    (),
+                    ("FILTER_BY_TS", *rng.sample(timestamps, rng.randint(1, len(timestamps))), 170),
+                    ("FILTER_BY_VALUE", 2, 7),
+                )
+            )
+            diff(
+                range_cmd, key, start, rng.randint(start, 170), *filters,
+                "AGGREGATION", rng.choice(("last", "last", "sum", "count", "avg")),
+                rng.choice((5, 10, 25)), "EMPTY",
+            )
+
+
+class TestReverseCountMatchesAFullRead:
+    """Reverse COUNT reads only as far back as it needs, which must not change a single row."""
+
+    SAMPLES = (
+        (0, 1.0), (7, 2.0), (250, NAN), (260, 5.0), (1400, 3.0), (1410, NAN), (5000, 9.0),
+        (5005, 1.0), (5999, 4.0), (6000, 0.0), (6020, 2.0),
+    )
+
+    @pytest.mark.parametrize("empty", [(), ("EMPTY",)], ids=["no-empty", "empty"])
+    @pytest.mark.parametrize("aggregator", AGGREGATORS)
+    def test_every_aggregator(self, diff, range_cmd, aggregator, empty):
+        mk_populated(diff, "r:revtail", self.SAMPLES)
+        for count in (1, 2, 3, 50):
+            diff(
+                range_cmd, "r:revtail", "-", "+", "COUNT", count,
+                "AGGREGATION", aggregator, 100, *empty,
+            )
+
+    @pytest.mark.parametrize("empty", [(), ("EMPTY",)], ids=["no-empty", "empty"])
+    @pytest.mark.parametrize(
+        "options",
+        [
+            pytest.param(("ALIGN", "start"), id="align-start"),
+            pytest.param(("ALIGN", "end"), id="align-end"),
+            pytest.param(("ALIGN", 37), id="align-timestamp"),
+            pytest.param(("BUCKETTIMESTAMP", "+"), id="timestamp-end"),
+            pytest.param(("BUCKETTIMESTAMP", "~"), id="timestamp-mid"),
+        ],
+    )
+    def test_bucket_options(self, diff, range_cmd, options, empty):
+        mk_populated(diff, "r:revtailopt", self.SAMPLES)
+        for start, end in ((0, 7000), (300, 5500), (5002, 6010)):
+            for count in (1, 3):
+                diff(
+                    range_cmd, "r:revtailopt", start, end, "COUNT", count,
+                    "AGGREGATION", "last", 100, *options, *empty,
+                )
+
+    def test_value_filter_that_empties_the_newest_buckets(self, diff, range_cmd):
+        # A short read has to widen: nothing near the end of this series passes.
+        mk_populated(diff, "r:revtailfbv", self.SAMPLES)
+        for count in (1, 2, 4):
+            diff(
+                range_cmd, "r:revtailfbv", "-", "+", "COUNT", count,
+                "FILTER_BY_VALUE", 4.5, 5.5, "AGGREGATION", "sum", 10,
+            )
+
+    def test_seeded_series(self, diff, range_cmd):
+        rng = random.Random(1515)
+        for case in range(120):
+            key = f"r:revtailrandom:{case}"
+            timestamps = sorted(rng.sample(range(3000), rng.randint(1, 30)))
+            mk_populated(
+                diff, key,
+                [(ts, NAN if rng.random() < 0.2 else float(rng.randint(1, 9))) for ts in timestamps],
+            )
+            diff(
+                range_cmd, key, "-", "+", "COUNT", rng.randint(1, 6),
+                "AGGREGATION", rng.choice(("last", "first", "sum", "avg", "max", "count")),
+                rng.choice((5, 25, 100, 500)), *rng.choice(((), ("EMPTY",))),
+            )
 
 
 class TestFilterByValue:

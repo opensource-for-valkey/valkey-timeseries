@@ -3,9 +3,8 @@ use crate::common::{Sample, Timestamp};
 use crate::config::SPLIT_FACTOR;
 use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
-use crate::iterators::{FilteredSampleIterator, SampleIter};
+use crate::iterators::SampleIter;
 use crate::series::chunks::chimp::ChimpChunk;
-use crate::series::types::ValueFilter;
 use crate::series::{
     DuplicatePolicy, SampleAddResult,
     chunks::{Chunk, ChunkEncoding, ChunkOps, GorillaChunk, UncompressedChunk},
@@ -196,33 +195,6 @@ impl TimeSeriesChunk {
                 value: self.last_value(),
             })
         }
-    }
-
-    pub fn filtered_iter(
-        &'_ self,
-        start_timestamp: Timestamp,
-        end_timestamp: Timestamp,
-        timestamp_filter: Option<&[Timestamp]>,
-        value_filter: Option<ValueFilter>,
-    ) -> FilteredSampleIterator<SampleIter<'_>> {
-        // determine the range of timestamps to filter
-        let (start_timestamp, end_timestamp) = if let Some(ts_filter) = timestamp_filter {
-            if ts_filter.is_empty() {
-                (start_timestamp, end_timestamp)
-            } else {
-                let first_ts = ts_filter[0];
-                let last_ts = ts_filter[ts_filter.len() - 1];
-                (start_timestamp.max(first_ts), end_timestamp.min(last_ts))
-            }
-        } else {
-            (start_timestamp, end_timestamp)
-        };
-
-        FilteredSampleIterator::new(
-            self.range_iter(start_timestamp, end_timestamp),
-            value_filter,
-            timestamp_filter,
-        )
     }
 
     pub fn is_compressed(&self) -> bool {

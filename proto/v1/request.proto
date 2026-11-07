@@ -17,10 +17,18 @@ message MDelRequest {
   repeated SeriesSelector filters = 2;
 }
 
+// FILTER_BY_TS. A message rather than a bare `repeated` field so its presence survives the wire:
+// an empty list means "match nothing", while an absent one means "no filter". It carries every
+// entry the query named, including those outside its window, because those still decide how far
+// EMPTY fills.
+message TimestampFilter {
+  repeated int64 timestamps = 1;
+}
+
 message RangeRequest {
   DateRange range = 1;
   uint32 count = 2;
-  repeated int64 timestamp_filter = 3;
+  TimestampFilter timestamp_filter = 3;
   ValueRange value_filter = 4;
   AggregationOptions aggregation = 5;
   bool latest = 6;

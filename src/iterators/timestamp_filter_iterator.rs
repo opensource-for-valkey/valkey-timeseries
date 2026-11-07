@@ -31,6 +31,9 @@ pub struct TimestampFilterIterator<'a> {
     series: &'a TimeSeries,
     chunk: Option<&'a TimeSeriesChunk>,
     sample_iter: SampleIter<'a>,
+    /// A sample `sample_iter` read past the timestamp it was looking for, which a later lookup in
+    /// the same chunk may want.
+    lookahead: Option<Sample>,
     timestamps: SmallVec<[Timestamp; 16]>,
     is_reverse: bool,
     /// reusable sample buffer for reverse iteration
@@ -44,16 +47,23 @@ pub struct TimestampFilterIterator<'a> {
 
 impl<'a> TimestampFilterIterator<'a> {
     /// Create a new iterator.
-    /// - `chunks` should be the series chunks in chronological order (earliest -> latest).
-    /// - `timestamps` is the list of timestamps to look up.
+    /// - `series` is the series to look the timestamps up in.
+    /// - `timestamps` is the list of timestamps to look up, in any order. Duplicates are ignored,
+    ///   and so is any entry outside `[start, end]` or older than the series' retention floor.
     /// - `is_reverse` controls whether iteration goes from the end of `timestamps` to the start.
-    pub fn new(series: &'a TimeSeries, timestamps: &[Timestamp], is_reverse: bool) -> Self {
+    pub fn new(
+        series: &'a TimeSeries,
+        timestamps: &[Timestamp],
+        start: Timestamp,
+        end: Timestamp,
+        is_reverse: bool,
+    ) -> Self {
         let mut timestamps: SmallVec<[Timestamp; 16]> = SmallVec::from(timestamps);
         timestamps.sort_unstable();
         timestamps.dedup();
         // Expired samples the write path has not trimmed yet are not part of the series.
-        let min_timestamp = series.get_min_timestamp();
-        timestamps.retain(|ts| *ts >= min_timestamp);
+        let start = start.max(series.get_min_timestamp());
+        timestamps.retain(|ts| (start..=end).contains(ts));
 
         let chunk_idx = if series.is_empty() {
             -1
@@ -68,6 +78,7 @@ impl<'a> TimestampFilterIterator<'a> {
             series,
             chunk: None,
             sample_iter: Default::default(),
+            lookahead: None,
             timestamps,
             is_reverse,
             pos,
@@ -100,6 +111,11 @@ impl<'a> TimestampFilterIterator<'a> {
             }
             let idx = idx as usize;
             let chunk = chunks.get(idx)?;
+            // An empty chunk reports zero bounds, which say nothing about where `ts` lies.
+            if chunk.is_empty() {
+                self.chunk_idx += if self.is_reverse { -1 } else { 1 };
+                continue;
+            }
             if ts < chunk.first_timestamp() {
                 if self.is_reverse {
                     self.chunk_idx -= 1;
@@ -146,6 +162,7 @@ impl<'a> TimestampFilterIterator<'a> {
         }
 
         if let Some(chunk) = self.seek_chunk(ts) {
+            self.lookahead = None;
             if self.is_reverse || !chunk.is_compressed() {
                 self.random_access = true;
                 self.sample_iter = SampleIter::Empty;
@@ -177,14 +194,27 @@ impl<'a> TimestampFilterIterator<'a> {
             return None;
         }
 
+        // Timestamps only increase here, so a miss keeps its place: restarting would decode the
+        // chunk's prefix again for every lookup.
+        if let Some(sample) = self.lookahead {
+            if sample.timestamp > ts {
+                return None;
+            }
+            self.lookahead = None;
+            if sample.timestamp == ts {
+                return Some(sample);
+            }
+        }
+
         for sample in self.sample_iter.by_ref() {
             if sample.timestamp == ts {
                 return Some(sample);
-            } else if sample.timestamp > ts {
-                break;
+            }
+            if sample.timestamp > ts {
+                self.lookahead = Some(sample);
+                return None;
             }
         }
-        self.chunk = None;
         None
     }
 }
@@ -211,7 +241,7 @@ mod tests {
     use super::*;
     use crate::common::Sample;
     use crate::series::TimeSeries;
-    use crate::series::chunks::{GorillaChunk, TimeSeriesChunk, UncompressedChunk};
+    use crate::series::chunks::{ChunkEncoding, GorillaChunk, TimeSeriesChunk, UncompressedChunk};
 
     // helper to create a sample
     fn s(ts: Timestamp, v: f64) -> Sample {
@@ -238,7 +268,7 @@ mod tests {
         let series = build_series();
         // timestamps include matches and a missing entry (4)
         let timestamps = &[1, 4, 6];
-        let it = TimestampFilterIterator::new(&series, timestamps, false);
+        let it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, false);
 
         let out: Vec<Sample> = it.collect();
         // Expect samples for 1 and 6 only
@@ -251,7 +281,7 @@ mod tests {
     fn finds_exact_matches_reverse() {
         let series = build_series();
         let timestamps = &[2, 5, 7];
-        let it = TimestampFilterIterator::new(&series, timestamps, true);
+        let it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, true);
 
         let out: Vec<Sample> = it.collect();
         // Expect samples for 7,5,2 in that order
@@ -263,7 +293,7 @@ mod tests {
     fn missing_timestamps_are_skipped() {
         let series = build_series();
         let timestamps = &[0, 4, 8]; // none exist
-        let mut it = TimestampFilterIterator::new(&series, timestamps, false);
+        let mut it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, false);
         assert!(it.next().is_none());
     }
 
@@ -272,7 +302,7 @@ mod tests {
         let series = build_series();
         // timestamps mostly increasing, ensures iterator moves forward across chunks
         let timestamps = &[1, 2, 3, 5, 6, 7];
-        let mut it = TimestampFilterIterator::new(&series, timestamps, false);
+        let mut it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, false);
 
         // consume partially to exercise chunk switching
         assert_eq!(it.next().map(|s| s.timestamp), Some(1));
@@ -303,7 +333,7 @@ mod tests {
     fn finds_exact_matches_forward_compressed() {
         let series = build_compressed_series();
         let timestamps = &[1, 4, 6];
-        let it = TimestampFilterIterator::new(&series, timestamps, false);
+        let it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, false);
 
         let out: Vec<Sample> = it.collect();
         assert_eq!(out.len(), 2);
@@ -312,7 +342,7 @@ mod tests {
 
         // ensure that we can find consecutive timestamps
         let timestamps = &[2, 3];
-        let it = TimestampFilterIterator::new(&series, timestamps, false);
+        let it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, false);
         let out: Vec<Sample> = it.collect();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].timestamp, 2);
@@ -323,7 +353,7 @@ mod tests {
     fn finds_exact_matches_reverse_compressed() {
         let series = build_compressed_series();
         let timestamps = &[2, 5, 7];
-        let it = TimestampFilterIterator::new(&series, timestamps, true);
+        let it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, true);
 
         let out: Vec<Sample> = it.collect();
         let ts: Vec<Timestamp> = out.into_iter().map(|s| s.timestamp).collect();
@@ -334,7 +364,7 @@ mod tests {
     fn missing_timestamps_are_skipped_compressed() {
         let series = build_compressed_series();
         let timestamps = &[0, 4, 8];
-        let mut it = TimestampFilterIterator::new(&series, timestamps, false);
+        let mut it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, false);
         assert!(it.next().is_none());
     }
 
@@ -342,7 +372,7 @@ mod tests {
     fn reuses_chunk_lookup_hint_across_timestamps_compressed() {
         let series = build_compressed_series();
         let timestamps = &[1, 2, 3, 5, 6, 7];
-        let mut it = TimestampFilterIterator::new(&series, timestamps, false);
+        let mut it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, false);
 
         assert_eq!(it.next().map(|s| s.timestamp), Some(1));
         assert_eq!(it.next().map(|s| s.timestamp), Some(2));
@@ -351,5 +381,119 @@ mod tests {
         assert_eq!(it.next().map(|s| s.timestamp), Some(6));
         assert_eq!(it.next().map(|s| s.timestamp), Some(7));
         assert!(it.next().is_none());
+    }
+
+    const ENCODINGS: [ChunkEncoding; 3] = [
+        ChunkEncoding::Uncompressed,
+        ChunkEncoding::Gorilla,
+        ChunkEncoding::Chimp,
+    ];
+
+    fn empty_chunk(encoding: ChunkEncoding) -> TimeSeriesChunk {
+        TimeSeriesChunk::new(encoding, 4096)
+    }
+
+    /// `[0, 2, 4]` and `[6, 8]`, in two chunks of `encoding`.
+    fn two_chunks(encoding: ChunkEncoding) -> Vec<TimeSeriesChunk> {
+        [&[0i64, 2, 4][..], &[6, 8][..]]
+            .iter()
+            .map(|timestamps| {
+                let samples: Vec<Sample> = timestamps.iter().map(|&t| s(t, t as f64)).collect();
+                let mut chunk = empty_chunk(encoding);
+                chunk.set_data(&samples).unwrap();
+                chunk
+            })
+            .collect()
+    }
+
+    fn lookup(series: &TimeSeries, timestamps: &[Timestamp], is_reverse: bool) -> Vec<i64> {
+        TimestampFilterIterator::new(series, timestamps, i64::MIN, i64::MAX, is_reverse)
+            .map(|sample| sample.timestamp)
+            .collect()
+    }
+
+    /// An empty chunk reports zero bounds, which is neither "before" nor "after" a timestamp, and
+    /// used to end a reverse lookup or swallow timestamp 0 going forward. Wherever it sits, the
+    /// lookup goes on to the chunks that hold the samples.
+    #[test]
+    fn empty_chunks_are_skipped_wherever_they_sit() {
+        for encoding in ENCODINGS {
+            let timestamps = [0, 2, 6, 8];
+            for (name, position) in [("leading", 0), ("interior", 1), ("trailing", 2)] {
+                let mut series = TimeSeries::from_chunks(two_chunks(encoding)).unwrap();
+                series.chunks.insert(position, empty_chunk(encoding));
+
+                assert_eq!(
+                    lookup(&series, &timestamps, false),
+                    vec![0, 2, 6, 8],
+                    "{encoding:?} {name} forward"
+                );
+                assert_eq!(
+                    lookup(&series, &timestamps, true),
+                    vec![8, 6, 2, 0],
+                    "{encoding:?} {name} reverse"
+                );
+            }
+        }
+    }
+
+    /// A miss reads one sample past the timestamp it wanted, and that sample may be the very next
+    /// one asked for.
+    #[test]
+    fn a_hit_directly_after_a_miss_is_found() {
+        for encoding in ENCODINGS {
+            let series = TimeSeries::from_chunks(two_chunks(encoding)).unwrap();
+
+            assert_eq!(lookup(&series, &[1, 2], false), vec![2], "{encoding:?}");
+            assert_eq!(lookup(&series, &[1, 3, 4], false), vec![4], "{encoding:?}");
+            assert_eq!(
+                lookup(&series, &[-1, 0, 1, 2], false),
+                vec![0, 2],
+                "{encoding:?}"
+            );
+        }
+    }
+
+    /// A miss between two chunks, or past the last one, leaves the later lookups unaffected.
+    #[test]
+    fn misses_at_chunk_edges_do_not_disturb_later_lookups() {
+        for encoding in ENCODINGS {
+            let series = TimeSeries::from_chunks(two_chunks(encoding)).unwrap();
+
+            assert_eq!(lookup(&series, &[3, 5, 6], false), vec![6], "{encoding:?}");
+            assert_eq!(
+                lookup(&series, &[4, 5, 6, 7, 8, 9], false),
+                vec![4, 6, 8],
+                "{encoding:?}"
+            );
+            assert_eq!(
+                lookup(&series, &[9, 10], false),
+                Vec::<i64>::new(),
+                "{encoding:?}"
+            );
+        }
+    }
+
+    /// Hits and misses interleaved across a chunk large enough for decoder state to matter, in
+    /// both directions, against what the arithmetic says must match.
+    #[test]
+    fn mixed_lookups_across_a_large_chunk() {
+        for encoding in ENCODINGS {
+            let samples: Vec<Sample> = (0..2000).map(|i| s(i * 2, i as f64)).collect();
+            let mut chunk = TimeSeriesChunk::new(encoding, 1024 * 1024);
+            chunk.set_data(&samples).unwrap();
+            let series = TimeSeries::from_chunks(vec![chunk]).unwrap();
+
+            let timestamps: Vec<i64> = (0..4000).step_by(3).collect();
+            let expected: Vec<i64> = (0..4000).step_by(6).collect();
+
+            assert_eq!(
+                lookup(&series, &timestamps, false),
+                expected,
+                "{encoding:?}"
+            );
+            let reversed: Vec<i64> = expected.iter().rev().copied().collect();
+            assert_eq!(lookup(&series, &timestamps, true), reversed, "{encoding:?}");
+        }
     }
 }

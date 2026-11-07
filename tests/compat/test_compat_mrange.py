@@ -241,6 +241,37 @@ class TestPerSeriesOptions:
             "AGGREGATION", "sum", 1000, "EMPTY", "FILTER", "k=v",
         )
 
+    def test_empty_fill_sees_filter_by_ts_entries_outside_the_window(self, diff, mrange_cmd):
+        mk_series(diff, "m:fbtsfill", "LABELS", "fbtsfill", "yes")
+        for ts, value in ((10, 1.0), (55, 2.0), (90, 3.0)):
+            diff("TS.ADD", "m:fbtsfill", ts, value)
+        diff(
+            mrange_cmd, 50, 70, "FILTER_BY_TS", 10, 55, 90,
+            "AGGREGATION", "sum", 5, "EMPTY", "FILTER", "fbtsfill=yes",
+        )
+
+    def test_empty_fill_treats_stored_nan_as_no_data(self, diff, mrange_cmd):
+        mk_series(diff, "m:nanfill", "LABELS", "nanfill", "yes")
+        for ts, value in ((0, 5.0), (10, float("nan")), (100, 7.0), (300, float("nan"))):
+            diff("TS.ADD", "m:nanfill", ts, value)
+        for start, end, aggregator in ((50, 200, "last"), (10, 200, "last"), (150, 250, "sum")):
+            diff(
+                mrange_cmd, start, end, "AGGREGATION", aggregator, 10, "EMPTY",
+                "FILTER", "nanfill=yes",
+            )
+
+    def test_count_reads_only_the_newest_buckets(self, diff, mrange_cmd):
+        for name, offset in (("a", 0), ("b", 3)):
+            mk_series(diff, f"m:revtail:{name}", "LABELS", "revtail", "yes")
+            for ts, value in ((0, 1.0), (250, 5.0), (260, float("nan")), (5000, 9.0), (6000, 2.0)):
+                diff("TS.ADD", f"m:revtail:{name}", ts + offset, value + offset)
+        for count in (1, 2, 4):
+            for empty in ((), ("EMPTY",)):
+                diff(
+                    mrange_cmd, "-", "+", "COUNT", count, "AGGREGATION", "last", 100, *empty,
+                    "FILTER", "revtail=yes",
+                )
+
     def test_filter_by_ts(self, diff, mrange_cmd):
         mk_label_universe(diff)
         diff(mrange_cmd, "-", "+", "FILTER_BY_TS", 100, 300, "FILTER", "metric=cpu")

@@ -17,7 +17,7 @@ mod xor_chunk;
 pub use chimp::*;
 pub use chunk::*;
 pub use gorilla::*;
-pub use merge::*;
+pub(crate) use merge::*;
 pub use range_iter::*;
 pub use serialization::*;
 pub use timeseries_chunk::*;

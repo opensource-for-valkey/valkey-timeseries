@@ -3,9 +3,9 @@ use crate::aggregators::{
 };
 use crate::common::hash::IntSet;
 use crate::common::{MultiSample, Sample, Timestamp};
-use crate::iterators::{ReduceIterator, TimestampFilterIterator};
-use crate::series::request_types::{AggregationOptions, RangeGroupingOptions, RangeOptions};
-use crate::series::{SeriesSampleIterator, TimeSeries};
+use crate::iterators::TimestampFilterIterator;
+use crate::series::request_types::{AggregationOptions, RangeOptions};
+use crate::series::{SeriesSampleIterator, TimeSeries, ValueFilter};
 use smallvec::SmallVec;
 
 macro_rules! apply_iter_limit {
@@ -18,7 +18,7 @@ macro_rules! apply_iter_limit {
     };
 }
 
-pub fn create_aggregate_iterator<I>(
+fn create_aggregate_iterator<I>(
     iter: I,
     range: &RangeOptions,
     aggregation: &AggregationOptions,
@@ -35,11 +35,18 @@ where
     AggregateIterator::with_empty_fill(iter, aggregation, aligned_timestamp, empty_fill)
 }
 
-/// Does any sample in `[from, to]` pass the query's `FILTER_BY_TS`/`FILTER_BY_VALUE`?
+/// Is this sample data as far as `EMPTY` is concerned? A stored NaN is a sample, but it is not a
+/// reading: it neither extends the fill nor gives `last` a value to carry.
+fn is_empty_fill_data(sample: &Sample, value_filter: Option<ValueFilter>) -> bool {
+    !sample.value.is_nan() && value_filter.is_none_or(|filter| filter.is_match(sample.value))
+}
+
+/// Does any sample in `[from, to]` count as data for `EMPTY` under the query's
+/// `FILTER_BY_TS`/`FILTER_BY_VALUE`?
 ///
 /// Used to look *outside* the queried window, which is why it takes the series rather than the
-/// (clipped) sample stream. Unfiltered queries answer from the series' own extent without
-/// reading a chunk; only a filtered one has to scan, and then only until its first hit.
+/// (clipped) sample stream. `FILTER_BY_TS` looks up only the timestamps it names. Anything else
+/// scans, stopping at its first hit, which is normally the first sample it reads.
 fn has_passing_sample(
     series: &TimeSeries,
     options: &RangeOptions,
@@ -58,25 +65,24 @@ fn has_passing_sample(
         return false;
     }
 
-    if options.value_filter.is_none() && options.timestamp_filter.is_none() {
+    let value_filter = options.value_filter;
+    let is_data = |sample: Sample| is_empty_fill_data(&sample, value_filter);
+
+    if let Some(timestamps) = options.timestamp_filter.as_deref() {
+        return TimestampFilterIterator::new(series, timestamps, from, to, false).any(is_data);
+    }
+    // The last sample needs no chunk read, and is usually the hit when looking past the window.
+    if series
+        .last_sample
+        .is_some_and(|sample| sample.timestamp >= from && sample.timestamp <= to && is_data(sample))
+    {
         return true;
     }
-
-    let ts_filter = options
-        .timestamp_filter
-        .as_deref()
-        .map(TimestampFilter::new);
-    let value_filter = options.value_filter;
-    SeriesSampleIterator::new(series, from.max(first), to, false).any(|sample| {
-        ts_filter
-            .as_ref()
-            .is_none_or(|filter| filter.matches(sample.timestamp))
-            && value_filter.is_none_or(|filter| filter.is_match(sample.value))
-    })
+    SeriesSampleIterator::new(series, from.max(first), to, false).any(is_data)
 }
 
-/// The last sample before `to` that passes the query's filters, scanning backwards from it.
-/// `None` when there is none.
+/// The last sample before `to` that counts as data for `EMPTY` under the query's filters,
+/// searching backwards from it. `None` when there is none.
 fn last_passing_sample_before(
     series: &TimeSeries,
     options: &RangeOptions,
@@ -89,23 +95,28 @@ fn last_passing_sample_before(
         return None;
     }
 
-    let ts_filter = options
-        .timestamp_filter
-        .as_deref()
-        .map(TimestampFilter::new);
     let value_filter = options.value_filter;
-    SeriesSampleIterator::new(series, first, to, true).find(|sample| {
-        ts_filter
-            .as_ref()
-            .is_none_or(|filter| filter.matches(sample.timestamp))
-            && value_filter.is_none_or(|filter| filter.is_match(sample.value))
-    })
+    let is_data = |sample: &Sample| is_empty_fill_data(sample, value_filter);
+
+    if let Some(timestamps) = options.timestamp_filter.as_deref() {
+        return TimestampFilterIterator::new(series, timestamps, first, to, true).find(is_data);
+    }
+    SeriesSampleIterator::new(series, first, to, true).find(is_data)
 }
 
 /// How far this query's `EMPTY` fill may run past the samples it sees — see
 /// [`EmptyFillBounds`]. Cheap and `Default` (interior gaps only) whenever `EMPTY` was not
 /// requested, so non-EMPTY queries never touch the series for this.
-pub(crate) fn empty_fill_bounds(series: &TimeSeries, options: &RangeOptions) -> EmptyFillBounds {
+///
+/// `carry_reverse` says the query's *reply* runs newest-first, which `last` depends on even though
+/// buckets are always produced chronologically. `tail_limit` says only that many of the stream's
+/// last rows will be used.
+fn empty_fill_bounds(
+    series: &TimeSeries,
+    options: &RangeOptions,
+    carry_reverse: bool,
+    tail_limit: Option<usize>,
+) -> EmptyFillBounds {
     let Some(aggregation) = options.aggregation.as_ref().filter(|a| a.report_empty) else {
         return EmptyFillBounds::default();
     };
@@ -122,27 +133,39 @@ pub(crate) fn empty_fill_bounds(series: &TimeSeries, options: &RangeOptions) -> 
     // reason to fill back towards data that ends before the window.
     let overlaps = leads && trails || has_passing_sample(series, options, start_ts, end_ts);
 
-    let start = (overlaps && leads).then_some(start_ts);
+    let uses_last = aggregation
+        .aggregations
+        .iter()
+        .any(|a| matches!(a.aggregation_type(), AggregationType::Last));
 
-    // `last` fills a gap bucket with "the value of the last sample before *the bucket's
-    // start*", so the seed is taken from before the first filled bucket, not from before the
-    // window: the two differ whenever the window opens mid-bucket, and a sample in between
-    // belongs to the bucket rather than preceding it.
-    let carry_seed = if start.is_some() && last_carry_mask(aggregation).is_some() {
+    // `last` fills a leading gap with the last reading before *the bucket's start*, and a later
+    // gap with the last reading before the window. The two differ whenever the window opens
+    // mid-bucket: a sample in between belongs to the first bucket rather than preceding it.
+    let (carry_seed, carry_lookback) = if leads && uses_last {
         let aligned = aggregation
             .alignment
             .get_aligned_timestamp(start_ts, end_ts);
         let first_bucket = bucket_start_for(start_ts, aligned, aggregation.bucket_duration);
-        last_passing_sample_before(series, options, first_bucket.saturating_sub(1))
-            .map_or(f64::NAN, |sample| sample.value)
+        let lookback = last_passing_sample_before(series, options, start_ts.saturating_sub(1));
+        let seed = match lookback {
+            Some(sample) if sample.timestamp < first_bucket => Some(sample),
+            _ => last_passing_sample_before(series, options, first_bucket.saturating_sub(1)),
+        };
+        (
+            seed.map_or(f64::NAN, |sample| sample.value),
+            lookback.map_or(f64::NAN, |sample| sample.value),
+        )
     } else {
-        f64::NAN
+        (f64::NAN, f64::NAN)
     };
 
     EmptyFillBounds {
-        start,
+        start: (overlaps && leads).then_some(start_ts),
         end: (overlaps && trails).then_some(end_ts),
         carry_seed,
+        carry_lookback,
+        carry_reverse,
+        tail_limit,
     }
 }
 
@@ -150,57 +173,207 @@ pub(crate) fn empty_fill_bounds(series: &TimeSeries, options: &RangeOptions) -> 
 pub fn create_range_iterator<'a>(
     series: &'a TimeSeries,
     options: &RangeOptions,
-    grouping: &Option<RangeGroupingOptions>,
     latest_sample: Option<Sample>,
     is_reverse: bool,
 ) -> Box<dyn Iterator<Item = Sample> + 'a> {
+    create_range_iterator_for_reply(series, options, latest_sample, is_reverse, is_reverse)
+}
+
+/// Reverse COUNT over buckets, without aggregating the whole range.
+///
+/// Buckets are always built forward, so a newest-first reply has to read ahead of what it returns.
+/// But buckets do not depend on each other, so COUNT `n` only needs enough of the range to hold
+/// `n` of them: this runs the ordinary pipeline over the newest `n` possible buckets, and widens
+/// when filters or gaps leave it short. Anything else about the pipeline stays as it is, including
+/// how each aggregator reads its samples in time order.
+///
+/// `EMPTY` is not handled here, since its buckets depend on the whole series, and `FILTER_BY_TS`
+/// already reads only the timestamps it names.
+struct ReverseTailRead {
+    count: usize,
+    newest_bucket: Timestamp,
+    bucket_duration: u64,
+    window_start: Timestamp,
+    /// A value filter that emptied the newest buckets says nothing good about the ones before
+    /// them, so a short read goes straight to the whole window rather than paying for more passes.
+    filtered: bool,
+}
+
+impl ReverseTailRead {
+    /// How much a short read widens by.
+    const GROWTH: i128 = 4;
+
+    fn plan(
+        series: &TimeSeries,
+        options: &RangeOptions,
+        latest: Option<Sample>,
+        count: usize,
+    ) -> Option<Self> {
+        if series.is_empty() || options.timestamp_filter.is_some() {
+            return None;
+        }
+        let aggregation = options.aggregation.as_ref().filter(|a| !a.report_empty)?;
+
+        let (start, end) = options.get_timestamp_range();
+        let newest = latest
+            .map_or(series.last_timestamp(), |sample| {
+                sample.timestamp.max(series.last_timestamp())
+            })
+            .min(end);
+        if newest < start {
+            return None;
+        }
+
+        let aligned = aggregation.alignment.get_aligned_timestamp(start, end);
+        Some(Self {
+            count,
+            newest_bucket: bucket_start_for(newest, aligned, aggregation.bucket_duration),
+            bucket_duration: aggregation.bucket_duration,
+            window_start: start,
+            filtered: options.value_filter.is_some(),
+        })
+    }
+
+    /// Where to start reading to cover the newest `buckets` buckets, or `None` once that is most
+    /// of the window, when reading the rest as well costs little more than failing and re-reading
+    /// it. Always a bucket start, so no bucket is read partially.
+    fn read_floor(&self, buckets: i128) -> Option<Timestamp> {
+        let span = (buckets - 1).saturating_mul(self.bucket_duration as i128);
+        let floor = (self.newest_bucket as i128).saturating_sub(span);
+        let window = self.newest_bucket as i128 - self.window_start as i128;
+        (span <= window / 2).then_some(floor as Timestamp)
+    }
+
+    /// `pipeline` builds the query's whole reversed and limited output from a read floor.
+    fn read<'a, T: 'a>(
+        &self,
+        mut pipeline: impl FnMut(Option<Timestamp>) -> Box<dyn Iterator<Item = T> + 'a>,
+    ) -> Box<dyn Iterator<Item = T> + 'a> {
+        let mut buckets = self.count as i128;
+        while let Some(floor) = self.read_floor(buckets) {
+            let rows: Vec<T> = pipeline(Some(floor)).collect();
+            if rows.len() >= self.count {
+                return Box::new(rows.into_iter());
+            }
+            if self.filtered {
+                break;
+            }
+            buckets = buckets.saturating_mul(Self::GROWTH);
+        }
+        pipeline(None)
+    }
+}
+
+/// [`create_range_iterator`] for a stream whose reply order is not its own: a shard streams
+/// ascending for a coordinator that will reverse it, and `reply_reverse` tells EMPTY about that.
+pub(crate) fn create_range_iterator_for_reply<'a>(
+    series: &'a TimeSeries,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    is_reverse: bool,
+    reply_reverse: bool,
+) -> Box<dyn Iterator<Item = Sample> + 'a> {
+    let tail_limit = options.count.filter(|_| is_reverse);
+    let build = |read_floor| {
+        range_pipeline(
+            series,
+            options,
+            latest_sample,
+            ReadPlan {
+                is_reverse,
+                reply_reverse,
+                read_floor,
+                tail_limit,
+            },
+        )
+    };
+    match tail_limit.and_then(|count| ReverseTailRead::plan(series, options, latest_sample, count))
+    {
+        Some(tail) => tail.read(build),
+        None => build(None),
+    }
+}
+
+/// A series' newest `count` items, oldest first, reading no more of it than that takes.
+///
+/// A shard's half of a newest-first COUNT: it streams ascending for the coordinator to reverse, and
+/// only the tail can reach the reply. `reply_reverse` is the reply's real order, for EMPTY.
+pub(crate) fn create_range_tail_iterator<'a>(
+    series: &'a TimeSeries,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    count: usize,
+    reply_reverse: bool,
+) -> Box<dyn Iterator<Item = Sample> + 'a> {
+    // Raw samples read newest-first without any buffering beyond a chunk, so the first `count`
+    // that pass the filters are the answer.
+    if options.aggregation.is_none() {
+        let plan = ReadPlan {
+            is_reverse: true,
+            reply_reverse,
+            read_floor: None,
+            tail_limit: None,
+        };
+        let mut newest_first: Vec<Sample> = range_pipeline(series, options, latest_sample, plan)
+            .take(count)
+            .collect();
+        newest_first.reverse();
+        return Box::new(newest_first.into_iter());
+    }
+
+    let build = |read_floor| -> Box<dyn Iterator<Item = Sample> + 'a> {
+        let plan = ReadPlan {
+            is_reverse: false,
+            reply_reverse,
+            read_floor,
+            tail_limit: Some(count),
+        };
+        Box::new(TailIter::new(
+            range_pipeline(series, options, latest_sample, plan),
+            count,
+        ))
+    };
+    match ReverseTailRead::plan(series, options, latest_sample, count) {
+        Some(tail) => tail.read(build),
+        None => build(None),
+    }
+}
+
+/// How one pass reads a series for a reply.
+#[derive(Clone, Copy)]
+struct ReadPlan {
+    /// The stream this pass produces runs newest-first.
+    is_reverse: bool,
+    /// The reply runs newest-first, whichever way this stream does.
+    reply_reverse: bool,
+    /// Read nothing older than this.
+    read_floor: Option<Timestamp>,
+    /// Only this many of the stream's last rows will be used.
+    tail_limit: Option<usize>,
+}
+
+fn range_pipeline<'a>(
+    series: &'a TimeSeries,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    plan: ReadPlan,
+) -> Box<dyn Iterator<Item = Sample> + 'a> {
+    let ReadPlan {
+        is_reverse,
+        reply_reverse,
+        read_floor,
+        tail_limit,
+    } = plan;
     let has_aggregation = options.aggregation.is_some();
     let should_reverse_iter = !has_aggregation && is_reverse;
     let should_reverse_aggr = has_aggregation && is_reverse;
     // Derived from the series, before the stream is clipped to the query window.
-    let empty_fill = empty_fill_bounds(series, options);
-
-    // Helper to handle the "latest sample" chaining logic which depends on direction
-    // and avoids boxing by using generics.
-    #[allow(clippy::too_many_arguments)]
-    fn chain_latest<'a, I>(
-        base: I,
-        latest: Option<Sample>,
-        opts: &RangeOptions,
-        grp: &Option<RangeGroupingOptions>,
-        reverse_aggr: bool,
-        should_reverse_iter: bool,
-        empty_fill: EmptyFillBounds,
-    ) -> Box<dyn Iterator<Item = Sample> + 'a>
-    where
-        I: Iterator<Item = Sample> + 'a,
-    {
-        if let Some(sample) = latest {
-            let latest_iter = std::iter::once(sample);
-            if should_reverse_iter && opts.aggregation.is_none() {
-                create_sample_iterator_adapter(
-                    latest_iter.chain(base),
-                    opts,
-                    grp,
-                    reverse_aggr,
-                    empty_fill,
-                )
-            } else {
-                create_sample_iterator_adapter(
-                    base.chain(latest_iter),
-                    opts,
-                    grp,
-                    reverse_aggr,
-                    empty_fill,
-                )
-            }
-        } else {
-            create_sample_iterator_adapter(base, opts, grp, reverse_aggr, empty_fill)
-        }
-    }
+    let empty_fill = empty_fill_bounds(series, options, reply_reverse, tail_limit);
 
     if let Some(ts_filter) = options.timestamp_filter.as_ref() {
-        let base_iter = TimestampFilterIterator::new(series, ts_filter, should_reverse_iter);
+        let (start_ts, end_ts) = options.get_timestamp_range();
+        let base_iter =
+            TimestampFilterIterator::new(series, ts_filter, start_ts, end_ts, should_reverse_iter);
         // Remove the timestamp filter from options to avoid double filtering
         let opts = RangeOptions {
             date_range: options.date_range,
@@ -210,27 +383,73 @@ pub fn create_range_iterator<'a>(
             value_filter: options.value_filter,
             timestamp_filter: None,
         };
-        chain_latest(
-            base_iter,
-            latest_sample,
-            &opts,
-            grouping,
-            should_reverse_aggr,
-            is_reverse,
+        let output = SampleOutput {
+            options: &opts,
+            is_reverse: should_reverse_aggr,
             empty_fill,
-        )
+        };
+        output.chain_latest(base_iter, latest_sample, should_reverse_iter)
     } else {
-        let base_iter =
-            SeriesSampleIterator::from_range_options(series, options, should_reverse_iter);
-        chain_latest(
-            base_iter,
-            latest_sample,
+        let base_iter = range_reader(series, options, should_reverse_iter, read_floor);
+        let output = SampleOutput {
             options,
-            grouping,
-            should_reverse_aggr,
-            is_reverse,
+            is_reverse: should_reverse_aggr,
             empty_fill,
-        )
+        };
+        output.chain_latest(base_iter, latest_sample, should_reverse_iter)
+    }
+}
+
+/// A series' samples within the query's window, or from `read_floor` if that is later.
+fn range_reader<'a>(
+    series: &'a TimeSeries,
+    options: &RangeOptions,
+    is_reverse: bool,
+    read_floor: Option<Timestamp>,
+) -> SeriesSampleIterator<'a> {
+    let (start, end) = options.get_timestamp_range();
+    let start = start
+        .max(series.get_min_timestamp())
+        .max(read_floor.unwrap_or(Timestamp::MIN));
+    SeriesSampleIterator::new(series, start, end, is_reverse)
+}
+
+/// What happens to a series' samples once they have been read.
+struct SampleOutput<'o> {
+    options: &'o RangeOptions,
+    /// Reverse the *finished* output. Distinct from reading the series newest-first, which is
+    /// what aggregation cannot do.
+    is_reverse: bool,
+    empty_fill: EmptyFillBounds,
+}
+
+impl SampleOutput<'_> {
+    /// Add LATEST's open bucket to the stream, which comes after every stored sample in time:
+    /// `read_newest_first` is the order `base` was read in, and has nothing to do with the order
+    /// of the reply, since an aggregated stream is read ascending whichever way the reply runs.
+    ///
+    /// Generic over `base` so that the common case, no LATEST sample, adds no adapter at all.
+    fn chain_latest<'a, I>(
+        &self,
+        base: I,
+        latest: Option<Sample>,
+        read_newest_first: bool,
+    ) -> Box<dyn Iterator<Item = Sample> + 'a>
+    where
+        I: Iterator<Item = Sample> + 'a,
+    {
+        match latest {
+            None => self.adapt(base),
+            Some(sample) if read_newest_first => self.adapt(std::iter::once(sample).chain(base)),
+            Some(sample) => self.adapt(base.chain(std::iter::once(sample))),
+        }
+    }
+
+    fn adapt<'a, I>(&self, stream: I) -> Box<dyn Iterator<Item = Sample> + 'a>
+    where
+        I: Iterator<Item = Sample> + 'a,
+    {
+        create_sample_iterator_adapter(stream, self.options, self.is_reverse, self.empty_fill)
     }
 }
 
@@ -242,15 +461,17 @@ fn create_filtered_sample_iterator<'a>(
     series: &'a TimeSeries,
     options: &RangeOptions,
     latest_sample: Option<Sample>,
+    read_floor: Option<Timestamp>,
 ) -> Box<dyn Iterator<Item = Sample> + 'a> {
     let base_iter: Box<dyn Iterator<Item = Sample> + 'a> =
         if let Some(ts_filter) = options.timestamp_filter.as_ref() {
             // The base iterator applies the timestamp filter; no re-filtering needed.
-            Box::new(TimestampFilterIterator::new(series, ts_filter, false))
-        } else {
-            Box::new(SeriesSampleIterator::from_range_options(
-                series, options, false,
+            let (start_ts, end_ts) = options.get_timestamp_range();
+            Box::new(TimestampFilterIterator::new(
+                series, ts_filter, start_ts, end_ts, false,
             ))
+        } else {
+            Box::new(range_reader(series, options, false, read_floor))
         };
 
     let base_iter: Box<dyn Iterator<Item = Sample> + 'a> = if let Some(sample) = latest_sample {
@@ -271,18 +492,88 @@ fn create_filtered_sample_iterator<'a>(
 /// Create the multi-aggregation row pipeline for one series:
 /// filtered samples -> MultiAggregateIterator -> optional reverse -> take(COUNT).
 /// Only valid when `options.aggregation` is present (typically multi).
-pub fn create_row_iterator<'a>(
+pub(crate) fn create_row_iterator<'a>(
     series: &'a TimeSeries,
     options: &RangeOptions,
     latest_sample: Option<Sample>,
     is_reverse: bool,
 ) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+    create_row_iterator_for_reply(series, options, latest_sample, is_reverse, is_reverse)
+}
+
+/// [`create_row_iterator`] with a separate reply order; see [`create_range_iterator_for_reply`].
+pub(crate) fn create_row_iterator_for_reply<'a>(
+    series: &'a TimeSeries,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    is_reverse: bool,
+    reply_reverse: bool,
+) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+    let tail_limit = options.count.filter(|_| is_reverse);
+    let build = |read_floor| {
+        row_pipeline(
+            series,
+            options,
+            latest_sample,
+            ReadPlan {
+                is_reverse,
+                reply_reverse,
+                read_floor,
+                tail_limit,
+            },
+        )
+    };
+    match tail_limit.and_then(|count| ReverseTailRead::plan(series, options, latest_sample, count))
+    {
+        Some(tail) => tail.read(build),
+        None => build(None),
+    }
+}
+
+/// [`create_range_tail_iterator`] for multi-aggregation rows.
+pub(crate) fn create_row_tail_iterator<'a>(
+    series: &'a TimeSeries,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    count: usize,
+    reply_reverse: bool,
+) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+    let build = |read_floor| -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+        let plan = ReadPlan {
+            is_reverse: false,
+            reply_reverse,
+            read_floor,
+            tail_limit: Some(count),
+        };
+        Box::new(TailIter::new(
+            row_pipeline(series, options, latest_sample, plan),
+            count,
+        ))
+    };
+    match ReverseTailRead::plan(series, options, latest_sample, count) {
+        Some(tail) => tail.read(build),
+        None => build(None),
+    }
+}
+
+fn row_pipeline<'a>(
+    series: &'a TimeSeries,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    plan: ReadPlan,
+) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+    let ReadPlan {
+        is_reverse,
+        reply_reverse,
+        read_floor,
+        tail_limit,
+    } = plan;
     let aggregation = options
         .aggregation
         .as_ref()
         .expect("create_row_iterator requires aggregation options");
 
-    let filtered = create_filtered_sample_iterator(series, options, latest_sample);
+    let filtered = create_filtered_sample_iterator(series, options, latest_sample, read_floor);
 
     let (start_ts, end_ts) = options.get_timestamp_range();
     let aligned_timestamp = aggregation
@@ -291,8 +582,7 @@ pub fn create_row_iterator<'a>(
     // first/last are chronological (earliest/latest sample) regardless of direction: this
     // stream is aggregated forward and reversed at the end, which already lands on the
     // chronological answer, so the aggregation is used as requested.
-    let carry = last_carry_mask(aggregation);
-    let empty_fill = empty_fill_bounds(series, options);
+    let empty_fill = empty_fill_bounds(series, options, reply_reverse, tail_limit);
     let aggr_iter = MultiAggregateIterator::with_empty_fill(
         filtered,
         aggregation,
@@ -300,49 +590,34 @@ pub fn create_row_iterator<'a>(
         empty_fill,
     );
 
-    finalize_row_iterator(
-        aggr_iter,
-        is_reverse,
-        options.count,
-        carry,
-        empty_fill.carry_seed,
-    )
+    finalize(aggr_iter, is_reverse, options.count)
 }
 
-/// Apply the `last` EMPTY carry, reversal and COUNT to a row stream (COUNT limits output
-/// buckets, exactly like the sample path).
-pub(crate) fn finalize_row_iterator<'a, I: Iterator<Item = MultiSample> + 'a>(
+/// Apply reversal and COUNT, then box. Buckets and samples alike: COUNT limits output items, and
+/// the stream arrives in its final chronological form, `last`'s EMPTY carry included.
+fn finalize<'a, I>(
     iter: I,
     is_reverse: bool,
     count: Option<usize>,
-    carry: Option<SmallVec<[bool; 2]>>,
-    carry_seed: f64,
-) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
-    match (is_reverse, carry) {
-        (true, Some(mask)) => {
-            let rev = reverse_limited(CarryLastEmpty::new(iter, mask, carry_seed), count);
-            apply_iter_limit!(rev, count)
-        }
-        (true, None) => {
-            let rev = reverse_limited(iter, count);
-            apply_iter_limit!(rev, count)
-        }
-        (false, Some(mask)) => {
-            let filled = CarryLastEmpty::new(iter, mask, carry_seed);
-            apply_iter_limit!(filled, count)
-        }
-        (false, None) => apply_iter_limit!(iter, count),
+) -> Box<dyn Iterator<Item = I::Item> + 'a>
+where
+    I: Iterator + 'a,
+    I::Item: 'a,
+{
+    if is_reverse {
+        let rev = reverse_limited(iter, count);
+        apply_iter_limit!(rev, count)
+    } else {
+        apply_iter_limit!(iter, count)
     }
 }
 
-/// Create a sample iterator adapter that applies filtering, aggregation, grouping, and limits
-/// based on the provided options. The resulting iterator yields samples according to the specified
-/// criteria.
+/// Create a sample iterator adapter that applies filtering, aggregation and limits based on the
+/// provided options. The resulting iterator yields samples according to the specified criteria.
 /// Boxing is delayed to the last possible moment to allow for compiler optimizations.
-pub fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
+pub(crate) fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
     base_iter: T,
     options: &RangeOptions,
-    grouping: &Option<RangeGroupingOptions>,
     is_reverse: bool,
     empty_fill: EmptyFillBounds,
 ) -> Box<dyn Iterator<Item = Sample> + 'a> {
@@ -369,148 +644,13 @@ pub fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
 
     let count = options.count;
 
-    // Helper to apply the EMPTY carry, reversal and limits, then box.
-    // This ensures we only box once at the very end of the chain.
-    //
-    // Order matters: the carry runs chronologically (before reversal, if any) but before
-    // COUNT, so a truncated reply still carries from the buckets that precede it in time.
-    fn finalize<'a, I: Iterator<Item = Sample> + 'a>(
-        iter: I,
-        is_reverse: bool,
-        count: Option<usize>,
-        carry: Option<SmallVec<[bool; 2]>>,
-        carry_seed: f64,
-    ) -> Box<dyn Iterator<Item = Sample> + 'a> {
-        match (is_reverse, carry) {
-            (true, Some(mask)) => {
-                let rev = reverse_limited(CarryLastEmpty::new(iter, mask, carry_seed), count);
-                apply_iter_limit!(rev, count)
-            }
-            (true, None) => {
-                let rev = reverse_limited(iter, count);
-                apply_iter_limit!(rev, count)
-            }
-            (false, Some(mask)) => {
-                let filled = CarryLastEmpty::new(iter, mask, carry_seed);
-                apply_iter_limit!(filled, count)
-            }
-            (false, None) => apply_iter_limit!(iter, count),
-        }
-    }
-
-    match (&options.aggregation, grouping) {
-        (Some(agg), Some(grp)) => {
-            // Only valid when `base_iter` is a single series: this buckets the whole stream
-            // and then reduces one value per bucket. A multi-series group has to bucket each
-            // series on its own before reducing across them (`get_grouped_samples`,
-            // `reduce_aggregated_group`); bucketing their merged samples here gave the reducer
-            // one value per bucket instead of one per series.
-            //
-            // No carry here: the group reducer combines across series, so a gap in one
-            // series is not a gap in the reduced bucket.
+    match &options.aggregation {
+        Some(agg) => {
             let aggr_iter = create_aggregate_iterator(filtered, options, agg, empty_fill);
-            let aggregator = grp.aggregation.create_aggregator();
-            let reducer = ReduceIterator::new(aggr_iter, aggregator);
-            finalize(reducer, is_reverse, count, None, f64::NAN)
+            finalize(aggr_iter, is_reverse, count)
         }
-        (None, Some(grp)) => {
-            let aggregator = grp.aggregation.create_aggregator();
-            let reducer = ReduceIterator::new(filtered, aggregator);
-            finalize(reducer, is_reverse, count, None, f64::NAN)
-        }
-        (Some(agg), None) => {
-            let carry = last_carry_mask(agg);
-            let aggr_iter = create_aggregate_iterator(filtered, options, agg, empty_fill);
-            finalize(aggr_iter, is_reverse, count, carry, empty_fill.carry_seed)
-        }
-        (None, None) => finalize(filtered, is_reverse, count, None, f64::NAN),
+        None => finalize(filtered, is_reverse, count),
     }
-}
-
-/// One value slot of an emitted bucket, so the EMPTY carry can be applied to the sample
-/// stream and the multi-aggregation row stream through the same adapter.
-pub(crate) trait BucketValues {
-    fn values_mut(&mut self) -> &mut [f64];
-}
-
-impl BucketValues for Sample {
-    fn values_mut(&mut self) -> &mut [f64] {
-        std::slice::from_mut(&mut self.value)
-    }
-}
-
-impl BucketValues for MultiSample {
-    fn values_mut(&mut self) -> &mut [f64] {
-        &mut self.values
-    }
-}
-
-/// Fills each `last` column's gap buckets with the chronologically preceding value.
-///
-/// RTS's EMPTY fill for `last` is "the value already reported for the preceding bucket in
-/// time" (RedisTimeSeries 8.10; prior RTS pins defined the carry against output order
-/// instead, so a reverse query carried from the chronologically *later* neighbor — see the
-/// 8.10 reference bump for the reproducer). We always aggregate forward and reverse the
-/// finished buckets, so running the carry *before* `ReverseIter` — while the stream is still
-/// chronological — lands on the same answer for both directions with one rule; running it
-/// after reversal is also why the aggregator itself cannot do the carry (see
-/// `LastAggregator::empty_value`).
-///
-/// `carry[i]` marks the columns whose requested aggregator is `last`.
-pub(crate) struct CarryLastEmpty<I: Iterator> {
-    inner: I,
-    carry: SmallVec<[bool; 2]>,
-    prev: SmallVec<[f64; 2]>,
-}
-
-impl<I: Iterator> CarryLastEmpty<I> {
-    /// `seed` is what a gap bucket inherits before any bucket has been seen: the last
-    /// passing sample before the query window (see [`EmptyFillBounds::carry_seed`]), or NaN
-    /// when the fill does not reach back past the first sample the query read.
-    pub fn new(inner: I, carry: SmallVec<[bool; 2]>, seed: f64) -> Self {
-        let prev = smallvec::smallvec![seed; carry.len()];
-        Self { inner, carry, prev }
-    }
-}
-
-impl<I: Iterator> Iterator for CarryLastEmpty<I>
-where
-    I::Item: BucketValues,
-{
-    type Item = I::Item;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut item = self.inner.next()?;
-        for (idx, value) in item.values_mut().iter_mut().enumerate() {
-            if self.carry.get(idx).copied() != Some(true) {
-                continue;
-            }
-            if value.is_nan() {
-                *value = self.prev[idx];
-            } else {
-                self.prev[idx] = *value;
-            }
-        }
-        Some(item)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-}
-
-/// Which output columns need the `last` EMPTY carry, or `None` when none do (the common
-/// case, so the adapter is skipped entirely).
-pub(crate) fn last_carry_mask(options: &AggregationOptions) -> Option<SmallVec<[bool; 2]>> {
-    if !options.report_empty {
-        return None;
-    }
-    let mask: SmallVec<[bool; 2]> = options
-        .aggregations
-        .iter()
-        .map(|a| matches!(a.aggregation_type(), AggregationType::Last))
-        .collect();
-    mask.iter().any(|c| *c).then_some(mask)
 }
 
 /// Reverses `iter`, buffering only the items a COUNT limit can reach.
@@ -579,7 +719,7 @@ impl<I: Iterator> Iterator for ReverseIter<I> {
 /// buffering at most `capacity` items (ring buffer). Used by COUNT push-down
 /// to take the tail of an ascending shard stream for reverse queries without
 /// disturbing the ascending pipeline.
-pub struct TailIter<I: Iterator> {
+pub(crate) struct TailIter<I: Iterator> {
     inner: I,
     capacity: usize,
     buf: std::collections::VecDeque<I::Item>,
@@ -621,7 +761,7 @@ const TIMESTAMP_FILTER_INLINE_THRESHOLD: usize = 16;
 
 // this may be overkill, but we'll try optimizing memory for a
 // very common case of a very small number of timestamps
-pub enum TimestampFilter {
+enum TimestampFilter {
     Set(IntSet<Timestamp>),
     List(SmallVec<[Timestamp; TIMESTAMP_FILTER_INLINE_THRESHOLD]>),
 }
@@ -645,7 +785,8 @@ impl TimestampFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::TailIter;
+    use super::*;
+    use crate::series::TimestampRange;
 
     #[test]
     fn test_tail_iter() {
@@ -661,6 +802,675 @@ mod tests {
         // degenerate cases
         assert_eq!(tail(0, &[1, 2, 3]), Vec::<i32>::new());
         assert_eq!(tail(3, &[]), Vec::<i32>::new());
+    }
+
+    fn series_with(samples: &[(i64, f64)]) -> TimeSeries {
+        let mut series = TimeSeries::default();
+        for &(ts, value) in samples {
+            series.add(ts, value, None);
+        }
+        series
+    }
+
+    fn sum_empty_buckets(bucket_duration: u64) -> AggregationOptions {
+        AggregationOptions {
+            aggregations: smallvec::smallvec![AggregationType::Sum.into()],
+            bucket_duration,
+            report_empty: true,
+            ..Default::default()
+        }
+    }
+
+    /// FILTER_BY_TS selects within the query window: an entry outside it returns nothing.
+    #[test]
+    fn test_timestamp_filter_is_limited_to_the_window() {
+        let series = series_with(&[(0, 1.0), (2, 2.0), (4, 3.0), (6, 4.0)]);
+        let options = RangeOptions {
+            date_range: TimestampRange::from_timestamps(2, 4).unwrap(),
+            timestamp_filter: Some(vec![0, 2, 4, 6]),
+            ..Default::default()
+        };
+
+        let timestamps = |is_reverse| -> Vec<i64> {
+            create_range_iterator(&series, &options, None, is_reverse)
+                .map(|s| s.timestamp)
+                .collect()
+        };
+        assert_eq!(timestamps(false), vec![2, 4]);
+        assert_eq!(timestamps(true), vec![4, 2]);
+    }
+
+    /// The window limits what is returned, not what EMPTY can see: entries past each edge are
+    /// what make the buckets out to that edge reportable.
+    #[test]
+    fn test_empty_fill_reaches_window_edges_from_outside_filter_entries() {
+        let series = series_with(&[(10, 1.0), (55, 2.0), (90, 3.0)]);
+        let options = RangeOptions {
+            date_range: TimestampRange::from_timestamps(50, 70).unwrap(),
+            timestamp_filter: Some(vec![10, 55, 90]),
+            aggregation: Some(sum_empty_buckets(5)),
+            ..Default::default()
+        };
+        let expected = vec![(50, 0.0), (55, 2.0), (60, 0.0), (65, 0.0), (70, 0.0)];
+
+        let scalar: Vec<(i64, f64)> = create_range_iterator(&series, &options, None, false)
+            .map(|s| (s.timestamp, s.value))
+            .collect();
+        assert_eq!(scalar, expected);
+
+        let rows: Vec<(i64, f64)> = create_row_iterator(&series, &options, None, false)
+            .map(|r| (r.timestamp, r.values[0]))
+            .collect();
+        assert_eq!(rows, expected);
+    }
+
+    fn tail_read(count: usize) -> ReverseTailRead {
+        ReverseTailRead {
+            count,
+            newest_bucket: 100_000,
+            bucket_duration: 100,
+            window_start: 0,
+            filtered: false,
+        }
+    }
+
+    /// Records where each pass reads from, and answers with however many rows the case gives it.
+    fn read_floors(
+        tail: &ReverseTailRead,
+        rows_at: impl Fn(Option<i64>) -> usize,
+    ) -> Vec<Option<i64>> {
+        let floors = std::cell::RefCell::new(Vec::new());
+        tail.read(|floor| {
+            floors.borrow_mut().push(floor);
+            Box::new(std::iter::repeat_n(0, rows_at(floor)))
+        })
+        .for_each(drop);
+        floors.into_inner()
+    }
+
+    /// The point of the plan: one pass over just the newest buckets when they hold enough.
+    #[test]
+    fn test_reverse_tail_read_stops_at_the_first_window_with_enough_rows() {
+        assert_eq!(read_floors(&tail_read(1), |_| 1), vec![Some(100_000)]);
+        assert_eq!(read_floors(&tail_read(5), |_| 5), vec![Some(99_600)]);
+    }
+
+    #[test]
+    fn test_reverse_tail_read_widens_until_it_has_enough() {
+        // COUNT 3 starts 3 buckets back, then widens to 12, where this series has enough.
+        let rows_at = |floor: Option<i64>| match floor {
+            Some(floor) if floor >= 99_000 => 1,
+            _ => 3,
+        };
+        assert_eq!(
+            read_floors(&tail_read(3), rows_at),
+            vec![Some(99_800), Some(98_900)]
+        );
+    }
+
+    /// The value filter's worst case, matching almost nothing, gets one cheap look at the newest
+    /// buckets and then the same whole read it would have had anyway.
+    #[test]
+    fn test_reverse_tail_read_with_a_value_filter_does_not_keep_widening() {
+        let tail = ReverseTailRead {
+            filtered: true,
+            ..tail_read(1)
+        };
+        let floors = read_floors(&tail, |floor| if floor.is_none() { 1 } else { 0 });
+        assert_eq!(floors, vec![Some(100_000), None]);
+    }
+
+    /// Past half the window, another partial pass stops being worth it: the total a failed search
+    /// reads stays below 1.7 times the window, however the windows land.
+    #[test]
+    fn test_reverse_tail_read_goes_to_the_whole_window_past_halfway() {
+        let floors = read_floors(&tail_read(1), |floor| if floor.is_none() { 1 } else { 0 });
+        let last_partial = floors.iter().rev().flatten().next().copied().unwrap();
+        assert!(last_partial >= 50_000, "{floors:?}");
+        assert_eq!(floors.last(), Some(&None), "{floors:?}");
+
+        let read: i128 = floors
+            .iter()
+            .map(|floor| 100_000 - floor.unwrap_or(0) as i128 + 100)
+            .sum();
+        assert!(read * 10 < 100_000 * 17, "{floors:?} read {read}");
+    }
+
+    /// A window that reaches the start of the range is the ordinary, unbounded read, and it ends
+    /// the search whether or not it has enough rows: there is nothing further back to read.
+    #[test]
+    fn test_reverse_tail_read_falls_back_to_the_whole_window() {
+        let floors = read_floors(&tail_read(1), |floor| if floor.is_none() { 1 } else { 0 });
+        assert_eq!(floors.last(), Some(&None));
+        assert_eq!(floors.iter().filter(|floor| floor.is_none()).count(), 1);
+        assert!(floors.len() <= 8, "{floors:?}");
+
+        // COUNT itself spans the window: no point reading anything but all of it.
+        assert_eq!(read_floors(&tail_read(5000), |_| 0), vec![None]);
+    }
+
+    /// What a shard keeps for a newest-first COUNT has to be what the reply would show: the same
+    /// rows as a full read, whichever way it reads the series. A grouped query's reply order does
+    /// not reach the shard's EMPTY fill, so it is checked against the forward read instead.
+    #[test]
+    fn test_shard_tail_matches_a_full_read() {
+        let same = |a: &[(i64, f64)], b: &[(i64, f64)]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(x, y)| x.0 == y.0 && (x.1 == y.1 || (x.1.is_nan() && y.1.is_nan())))
+        };
+        let pair = |s: Sample| (s.timestamp, s.value);
+        let aggregations = [
+            None,
+            Some(AggregationType::Sum),
+            Some(AggregationType::Last),
+            Some(AggregationType::First),
+            Some(AggregationType::Rate),
+        ];
+
+        for samples in tail_read_fixtures() {
+            let series = series_with(&samples);
+            for aggregation in aggregations {
+                for report_empty in [false, true] {
+                    for value_filter in [None, Some(ValueFilter { min: 2.0, max: 9.0 })] {
+                        for timestamp_filter in [None, Some(vec![35, 70, 350, 390, 4000, 9000])] {
+                            for latest in [None, Some(Sample::new(11_500, 4.0))] {
+                                let options = RangeOptions {
+                                    date_range: TimestampRange::from_timestamps(0, 12_000).unwrap(),
+                                    value_filter,
+                                    timestamp_filter: timestamp_filter.clone(),
+                                    aggregation: aggregation.map(|aggregator| AggregationOptions {
+                                        aggregations: smallvec::smallvec![aggregator.into()],
+                                        bucket_duration: 100,
+                                        report_empty,
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                };
+                                let mut newest_first: Vec<(i64, f64)> =
+                                    create_range_iterator(&series, &options, latest, true)
+                                        .map(pair)
+                                        .collect();
+                                newest_first.reverse();
+                                let forward: Vec<(i64, f64)> =
+                                    create_range_iterator(&series, &options, latest, false)
+                                        .map(pair)
+                                        .collect();
+                                let last_of = |rows: &[(i64, f64)], n: usize| {
+                                    rows[rows.len().saturating_sub(n)..].to_vec()
+                                };
+
+                                for count in [1usize, 3, 1000] {
+                                    let tail: Vec<(i64, f64)> = create_range_tail_iterator(
+                                        &series, &options, latest, count, true,
+                                    )
+                                    .map(pair)
+                                    .collect();
+                                    assert!(
+                                        same(&tail, &last_of(&newest_first, count)),
+                                        "{aggregation:?} empty {report_empty} {value_filter:?} \
+                                         {timestamp_filter:?} {latest:?} count {count}"
+                                    );
+
+                                    let grouped: Vec<(i64, f64)> = create_range_tail_iterator(
+                                        &series, &options, latest, count, false,
+                                    )
+                                    .map(pair)
+                                    .collect();
+                                    // Raw samples have no EMPTY fill, so direction cannot differ.
+                                    assert!(
+                                        same(&grouped, &last_of(&forward, count)),
+                                        "grouped, {aggregation:?} count {count}"
+                                    );
+
+                                    if options.aggregation.is_some() {
+                                        let rows: Vec<(i64, f64)> = create_row_tail_iterator(
+                                            &series, &options, latest, count, true,
+                                        )
+                                        .map(|r| (r.timestamp, r.values[0]))
+                                        .collect();
+                                        assert!(
+                                            same(&rows, &last_of(&newest_first, count)),
+                                            "rows, {aggregation:?} count {count}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A newest-first COUNT skips most of a long run of gaps. It finishes at once on a span that
+    /// would otherwise take days, and what it returns is what a short span shows row for row.
+    #[test]
+    fn test_reverse_empty_count_does_not_walk_the_gap() {
+        let span = 1_000_000_000_000i64;
+        let series = series_with(&[(0, 5.0), (10, f64::NAN), (span, 7.0)]);
+        let options = |aggregator: AggregationType, count: usize| RangeOptions {
+            date_range: TimestampRange::from_timestamps(0, span).unwrap(),
+            count: Some(count),
+            aggregation: Some(AggregationOptions {
+                aggregations: smallvec::smallvec![aggregator.into()],
+                bucket_duration: 1,
+                report_empty: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let replied = |options: &RangeOptions| -> Vec<(i64, f64)> {
+            create_range_iterator(&series, options, None, true)
+                .map(|s| (s.timestamp, s.value))
+                .collect()
+        };
+
+        assert_eq!(
+            replied(&options(AggregationType::Sum, 3)),
+            vec![(span, 7.0), (span - 1, 0.0), (span - 2, 0.0)]
+        );
+        assert_eq!(
+            replied(&options(AggregationType::Last, 3)),
+            vec![(span, 7.0), (span - 1, 5.0), (span - 2, 5.0)]
+        );
+
+        let row: Vec<(i64, f64)> =
+            create_row_iterator(&series, &options(AggregationType::Last, 2), None, true)
+                .map(|r| (r.timestamp, r.values[0]))
+                .collect();
+        assert_eq!(row, vec![(span, 7.0), (span - 1, 5.0)]);
+    }
+
+    /// Every shape of series a tail read could get wrong: gaps wider than a bucket, stored NaN,
+    /// counter resets for the rate family, a burst in one bucket, and nothing near the end.
+    fn tail_read_fixtures() -> Vec<Vec<(i64, f64)>> {
+        let regular: Vec<(i64, f64)> = (0..80).map(|i| (i * 7, (i % 17) as f64)).collect();
+        let counter: Vec<(i64, f64)> = (0..80)
+            .map(|i| {
+                (
+                    i * 11,
+                    if i % 30 == 29 {
+                        0.0
+                    } else {
+                        (i % 30) as f64 * 3.0
+                    },
+                )
+            })
+            .collect();
+        let gappy: Vec<(i64, f64)> = (0..60)
+            .map(|i| (i * 5 + (i / 10) * 1000, i as f64))
+            .collect();
+        let with_nan: Vec<(i64, f64)> = (0..60)
+            .map(|i| (i * 13, if i % 3 == 0 { f64::NAN } else { i as f64 }))
+            .collect();
+        let nan_tail: Vec<(i64, f64)> = (0..50)
+            .map(|i| (i * 13, if i > 30 { f64::NAN } else { i as f64 }))
+            .collect();
+        let sparse = vec![(3, 1.0), (4000, 2.0), (4001, f64::NAN), (9000, 3.0)];
+        vec![regular, counter, gappy, with_nan, nan_tail, sparse]
+    }
+
+    /// Reverse COUNT reads only as far back as it needs. Whatever it reads, the reply has to be
+    /// the full reversed result cut to COUNT, which also proves no aggregator carries state from
+    /// one bucket into the next.
+    #[test]
+    fn test_reverse_count_matches_the_full_reversed_result() {
+        use crate::aggregators::{BucketAlignment, BucketTimestamp};
+
+        let aggregators = [
+            AggregationType::All,
+            AggregationType::Any,
+            AggregationType::Avg,
+            AggregationType::Count,
+            AggregationType::CountAll,
+            AggregationType::CountNan,
+            AggregationType::First,
+            AggregationType::Increase,
+            AggregationType::IRate,
+            AggregationType::Last,
+            AggregationType::Max,
+            AggregationType::Min,
+            AggregationType::None,
+            AggregationType::Range,
+            AggregationType::Rate,
+            AggregationType::StdP,
+            AggregationType::StdS,
+            AggregationType::Sum,
+            AggregationType::VarP,
+            AggregationType::VarS,
+        ];
+        let alignments = [
+            BucketAlignment::Default,
+            BucketAlignment::Start,
+            BucketAlignment::End,
+            BucketAlignment::Timestamp(37),
+        ];
+        let windows = [(0, 12_000), (50, 400), (1000, 5000)];
+        let value_filters = [None, Some(ValueFilter { min: 2.0, max: 9.0 })];
+        let latest_samples = [None, Some(Sample::new(11_500, 4.0))];
+
+        let same = |a: &[(i64, f64)], b: &[(i64, f64)]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(x, y)| x.0 == y.0 && (x.1 == y.1 || (x.1.is_nan() && y.1.is_nan())))
+        };
+
+        for samples in tail_read_fixtures() {
+            let series = series_with(&samples);
+            for aggregator in aggregators {
+                for (bucket_duration, alignment) in [100u64, 1000, 30]
+                    .into_iter()
+                    .flat_map(|duration| alignments.map(|alignment| (duration, alignment)))
+                {
+                    for (start, end) in windows {
+                        for value_filter in value_filters {
+                            for (latest, report_empty) in latest_samples
+                                .into_iter()
+                                .flat_map(|latest| [false, true].map(|empty| (latest, empty)))
+                            {
+                                let mut options = RangeOptions {
+                                    date_range: TimestampRange::from_timestamps(start, end)
+                                        .unwrap(),
+                                    value_filter,
+                                    aggregation: Some(AggregationOptions {
+                                        aggregations: smallvec::smallvec![aggregator.into()],
+                                        bucket_duration,
+                                        alignment,
+                                        timestamp_output: BucketTimestamp::End,
+                                        report_empty,
+                                    }),
+                                    ..Default::default()
+                                };
+                                let full: Vec<(i64, f64)> =
+                                    create_range_iterator(&series, &options, latest, true)
+                                        .map(|s| (s.timestamp, s.value))
+                                        .collect();
+                                for count in [1usize, 3, 1000] {
+                                    options.count = Some(count);
+                                    let limited: Vec<(i64, f64)> =
+                                        create_range_iterator(&series, &options, latest, true)
+                                            .map(|s| (s.timestamp, s.value))
+                                            .collect();
+                                    let expected = &full[..count.min(full.len())];
+                                    assert!(
+                                        same(&limited, expected),
+                                        "{aggregator:?} bucket {bucket_duration} {alignment:?} \
+                                         {start}..{end} filter {value_filter:?} latest {latest:?} \
+                                         count {count}: {limited:?} != {expected:?}"
+                                    );
+
+                                    let rows: Vec<(i64, f64)> =
+                                        create_row_iterator(&series, &options, latest, true)
+                                            .map(|r| (r.timestamp, r.values[0]))
+                                            .collect();
+                                    assert!(same(&rows, expected), "row pipeline, {aggregator:?}");
+                                }
+                                options.count = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// LATEST's open bucket belongs after every stored sample in time, so it goes last on an
+    /// ascending stream and first on a stream read newest-first. Aggregation always reads
+    /// ascending and reverses afterwards, so there it goes last whichever way the reply runs.
+    #[test]
+    fn test_latest_sample_position_in_the_reply() {
+        let series = series_with(&[(0, 1.0), (1000, 2.0), (2000, 3.0)]);
+        let latest = Sample::new(3000, 9.0);
+        let filter = Some(vec![1000, 2000, 3000]);
+        let aggregation = Some(AggregationOptions {
+            aggregations: smallvec::smallvec![AggregationType::Sum.into()],
+            bucket_duration: 1000,
+            ..Default::default()
+        });
+        let options = |timestamp_filter: Option<Vec<i64>>,
+                       aggregation: Option<AggregationOptions>| {
+            RangeOptions {
+                date_range: TimestampRange::from_timestamps(0, 5000).unwrap(),
+                timestamp_filter,
+                aggregation,
+                ..Default::default()
+            }
+        };
+        let replied = |options: &RangeOptions, is_reverse: bool| -> Vec<(i64, f64)> {
+            create_range_iterator(&series, options, Some(latest), is_reverse)
+                .map(|s| (s.timestamp, s.value))
+                .collect()
+        };
+
+        let raw = options(None, None);
+        let ascending = vec![(0, 1.0), (1000, 2.0), (2000, 3.0), (3000, 9.0)];
+        let descending: Vec<(i64, f64)> = ascending.iter().rev().copied().collect();
+        assert_eq!(replied(&raw, false), ascending);
+        assert_eq!(replied(&raw, true), descending);
+
+        let aggregated = options(None, aggregation.clone());
+        assert_eq!(replied(&aggregated, false), ascending);
+        assert_eq!(replied(&aggregated, true), descending);
+
+        let filtered_ascending = vec![(1000, 2.0), (2000, 3.0), (3000, 9.0)];
+        let filtered_descending: Vec<(i64, f64)> =
+            filtered_ascending.iter().rev().copied().collect();
+
+        let filtered = options(filter.clone(), None);
+        assert_eq!(replied(&filtered, false), filtered_ascending);
+        assert_eq!(replied(&filtered, true), filtered_descending);
+
+        let filtered_aggregated = options(filter, aggregation);
+        assert_eq!(replied(&filtered_aggregated, false), filtered_ascending);
+        assert_eq!(replied(&filtered_aggregated, true), filtered_descending);
+
+        let rows = |is_reverse: bool| -> Vec<(i64, f64)> {
+            create_row_iterator(&series, &aggregated, Some(latest), is_reverse)
+                .map(|r| (r.timestamp, r.values[0]))
+                .collect()
+        };
+        assert_eq!(rows(false), ascending);
+        assert_eq!(rows(true), descending);
+    }
+
+    /// A LATEST sample inside an existing bucket has to reach the aggregator in time order, or it
+    /// opens a bucket of its own ahead of the stored samples.
+    #[test]
+    fn test_latest_sample_joins_its_bucket_on_a_reverse_aggregation() {
+        let series = series_with(&[(0, 1.0), (1000, 2.0)]);
+        let options = RangeOptions {
+            date_range: TimestampRange::from_timestamps(0, 5000).unwrap(),
+            aggregation: Some(AggregationOptions {
+                aggregations: smallvec::smallvec![AggregationType::Sum.into()],
+                bucket_duration: 1000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let replied: Vec<(i64, f64)> =
+            create_range_iterator(&series, &options, Some(Sample::new(1500, 5.0)), true)
+                .map(|s| (s.timestamp, s.value))
+                .collect();
+
+        assert_eq!(replied, vec![(1000, 7.0), (0, 1.0)]);
+    }
+
+    fn last_empty_rows(samples: &[(i64, f64)], start: i64, end: i64) -> Vec<(i64, Option<f64>)> {
+        last_empty_rows_in(samples, start, end, false)
+    }
+
+    fn last_empty_rows_in(
+        samples: &[(i64, f64)],
+        start: i64,
+        end: i64,
+        is_reverse: bool,
+    ) -> Vec<(i64, Option<f64>)> {
+        let series = series_with(samples);
+        let options = RangeOptions {
+            date_range: TimestampRange::from_timestamps(start, end).unwrap(),
+            aggregation: Some(AggregationOptions {
+                aggregations: smallvec::smallvec![AggregationType::Last.into()],
+                bucket_duration: 10,
+                report_empty: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        create_range_iterator(&series, &options, None, is_reverse)
+            .map(|s| (s.timestamp, (!s.value.is_nan()).then_some(s.value)))
+            .collect()
+    }
+
+    /// Expected rows are replies from the pinned reference server. A reverse query does not
+    /// mirror the forward one here: `last` looks back per gap, and a bucket holding only NaN
+    /// takes what the newest-first scan was holding.
+    #[test]
+    fn test_reverse_last_empty_fill_around_stored_nan() {
+        let a = [(0, 5.0), (10, f64::NAN), (100, 7.0)];
+        let b = [
+            (0, 5.0),
+            (10, f64::NAN),
+            (20, 6.0),
+            (30, f64::NAN),
+            (100, 7.0),
+        ];
+        let d = [(12, 7.0), (40, f64::NAN), (70, 6.0)];
+        let e = [
+            (24, f64::NAN),
+            (35, 4.0),
+            (56, f64::NAN),
+            (101, f64::NAN),
+            (119, 6.0),
+            (124, f64::NAN),
+        ];
+        let held = |value: f64, newest: i64, oldest: i64| -> Vec<(i64, Option<f64>)> {
+            (oldest..=newest)
+                .rev()
+                .step_by(10)
+                .map(|t| (t, Some(value)))
+                .collect()
+        };
+
+        // Bucket 10 holds only NaN and takes the 5 the scan was holding; forward it reports NaN.
+        let mut expected = vec![(100, Some(7.0))];
+        expected.extend(held(5.0, 90, 10));
+        assert_eq!(last_empty_rows_in(&a, 10, 200, true), expected);
+
+        // The sample at 20 is outside the window, yet it is what the later gaps look back to, and
+        // the NaN-only bucket 30 holds it. Leading bucket 20 keeps its own seed.
+        let mut expected = vec![(100, Some(7.0))];
+        expected.extend(held(6.0, 90, 30));
+        expected.push((20, Some(5.0)));
+        assert_eq!(last_empty_rows_in(&b, 25, 200, true), expected);
+
+        // Leading gaps do not look back: the 7 at 12 reaches the interior gaps only.
+        assert_eq!(
+            last_empty_rows_in(&d, 15, 70, true),
+            vec![
+                (70, Some(6.0)),
+                (60, Some(7.0)),
+                (50, Some(7.0)),
+                (40, Some(7.0)),
+                (30, None),
+                (20, None),
+                (10, None),
+            ]
+        );
+
+        // Nothing is held when the scan opens on a NaN-only bucket; bucket 100 holds the later 6.
+        assert_eq!(
+            last_empty_rows_in(&e, 91, 131, true),
+            vec![
+                (120, None),
+                (110, Some(6.0)),
+                (100, Some(6.0)),
+                (90, Some(4.0)),
+            ]
+        );
+    }
+
+    /// Expected rows are replies from the pinned reference server.
+    #[test]
+    fn test_last_empty_fill_around_stored_nan() {
+        let a = [(0, 5.0), (10, f64::NAN), (100, 7.0)];
+        let b = [
+            (0, 5.0),
+            (10, f64::NAN),
+            (20, 6.0),
+            (30, f64::NAN),
+            (100, 7.0),
+        ];
+        let c = [(0, f64::NAN), (100, 7.0)];
+        let held = |value: f64, from: i64, to: i64| -> Vec<(i64, Option<f64>)> {
+            (from..=to).step_by(10).map(|t| (t, Some(value))).collect()
+        };
+        let then_seven = |mut rows: Vec<(i64, Option<f64>)>| {
+            rows.push((100, Some(7.0)));
+            rows
+        };
+
+        // The seed looks back past a stored NaN.
+        assert_eq!(last_empty_rows(&a, 50, 200), then_seven(held(5.0, 50, 90)));
+        assert_eq!(last_empty_rows(&a, 20, 200), then_seven(held(5.0, 20, 90)));
+        assert_eq!(last_empty_rows(&b, 40, 200), then_seven(held(6.0, 40, 90)));
+
+        // A leading gap takes the seed from before its own bucket, and later buckets hold it.
+        assert_eq!(last_empty_rows(&b, 25, 200), then_seven(held(5.0, 20, 90)));
+
+        // A first bucket holding only NaN reports NaN, not the seed; the gap after it looks back.
+        let mut expected = vec![(10, None)];
+        expected.extend(then_seven(held(5.0, 20, 90)));
+        assert_eq!(last_empty_rows(&a, 10, 200), expected);
+
+        // Nothing precedes bucket 0, so it stays NaN; the sample at 0 predates the window but is
+        // still what a gap after the first window sample looks back to.
+        let mut expected = vec![(0, None), (10, None)];
+        expected.extend(then_seven(held(5.0, 20, 90)));
+        assert_eq!(last_empty_rows(&a, 5, 200), expected);
+
+        // A stored NaN before the window is not data, so nothing is filled back towards it.
+        assert_eq!(last_empty_rows(&c, 50, 200), vec![(100, Some(7.0))]);
+
+        // A leading run holds its seed, though the sample at 12 is in reach of a later gap.
+        let d = [(12, 7.0), (40, f64::NAN), (70, 6.0)];
+        assert_eq!(
+            last_empty_rows(&d, 15, 70),
+            vec![
+                (10, None),
+                (20, None),
+                (30, None),
+                (40, None),
+                (50, Some(7.0)),
+                (60, Some(7.0)),
+                (70, Some(6.0)),
+            ]
+        );
+    }
+
+    /// Expected rows are replies from the pinned reference server.
+    #[test]
+    fn test_stored_nan_does_not_extend_the_empty_fill() {
+        let sum_rows = |samples: &[(i64, f64)]| -> Vec<i64> {
+            let series = series_with(samples);
+            let options = RangeOptions {
+                date_range: TimestampRange::from_timestamps(50, 90).unwrap(),
+                aggregation: Some(sum_empty_buckets(10)),
+                ..Default::default()
+            };
+            create_range_iterator(&series, &options, None, false)
+                .map(|s| s.timestamp)
+                .collect()
+        };
+
+        assert_eq!(sum_rows(&[(0, f64::NAN), (100, 7.0)]), Vec::<i64>::new());
+        assert_eq!(sum_rows(&[(0, 7.0), (100, f64::NAN)]), Vec::<i64>::new());
+        assert_eq!(sum_rows(&[(0, f64::NAN), (60, 1.0)]), vec![60]);
+        assert_eq!(sum_rows(&[(60, 1.0), (100, f64::NAN)]), vec![60]);
+        assert_eq!(sum_rows(&[(0, 1.0), (100, 2.0)]), vec![50, 60, 70, 80, 90]);
     }
 
     #[test]

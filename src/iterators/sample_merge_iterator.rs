@@ -3,7 +3,14 @@ use crate::iterators::SampleIter;
 use crate::series::DuplicatePolicy;
 use std::iter::Peekable;
 
-pub struct SampleMergeIterator<'a> {
+/// Merges a chunk's stored samples (`left`) with incoming ones (`right`) in timestamp order,
+/// resolving equal timestamps by the duplicate policy.
+///
+/// [`next_internal`](Self::next_internal) returns each surviving sample and whether the policy
+/// refused the incoming one. On a refusal it emits the stored sample, with both inputs consumed,
+/// because the rebuilt chunk still has to contain it. It is deliberately not an `Iterator`:
+/// a caller has to see the flag, and one that dropped flagged samples would lose stored data.
+pub(crate) struct SampleMergeIterator<'a> {
     left: Peekable<SampleIter<'a>>,
     right: Peekable<SampleIter<'a>>,
     duplicate_policy: DuplicatePolicy,
@@ -40,12 +47,13 @@ impl<'a> SampleMergeIterator<'a> {
                             value: val,
                         })
                     } else {
-                        // block duplicate
+                        // BLOCK, or a NaN that MAX/MIN/SUM cannot combine. Both report
+                        // `Duplicate` to the client on every write path, so one flag serves.
                         blocked = true;
                         self.right.next();
                         self.left.next()
                     }
-                } else if left < right {
+                } else if left.timestamp < right.timestamp {
                     self.left.next()
                 } else {
                     self.right.next()
@@ -57,22 +65,5 @@ impl<'a> SampleMergeIterator<'a> {
         };
 
         sample.map(|sample| (sample, blocked))
-    }
-}
-
-impl Iterator for SampleMergeIterator<'_> {
-    type Item = Sample;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            return if let Some((sample, blocked)) = self.next_internal() {
-                if blocked {
-                    continue;
-                }
-                Some(sample)
-            } else {
-                None
-            };
-        }
     }
 }

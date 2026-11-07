@@ -1,8 +1,5 @@
-mod filtered_sample_iterator;
-mod multi_series_row_iter;
-mod multi_series_sample_iter;
+mod k_way_merge;
 mod pivot_iter;
-mod reduce_iterator;
 mod row_reducer;
 mod sample_iter;
 mod sample_merge_iterator;
@@ -11,16 +8,18 @@ mod timeseries_range_iterator;
 mod timestamp_filter_iterator;
 mod utils;
 
-pub use filtered_sample_iterator::FilteredSampleIterator;
-pub use multi_series_row_iter::MultiSeriesRowIter;
-pub use multi_series_sample_iter::MultiSeriesSampleIter;
-pub use pivot_iter::PivotIter;
-pub use reduce_iterator::*;
-pub use row_reducer::RowReducer;
-pub use sample_iter::*;
-pub use sample_merge_iterator::*;
-pub use sample_reducer::SampleReducer;
-pub(crate) use timeseries_range_iterator::get_range_latest_sample;
-pub use timeseries_range_iterator::{TimeSeriesRangeIterator, TimeSeriesRangeRowIterator};
+pub(crate) use k_way_merge::KWayMerge;
+pub(crate) use pivot_iter::PivotIter;
+pub(crate) use row_reducer::RowReducer;
+pub use sample_iter::SampleIter;
+pub(crate) use sample_merge_iterator::SampleMergeIterator;
+pub(crate) use sample_reducer::SampleReducer;
+pub(crate) use timeseries_range_iterator::{
+    TimeSeriesRangeIterator, TimeSeriesRangeRowIterator, get_range_latest_sample,
+};
 pub use timestamp_filter_iterator::TimestampFilterIterator;
-pub use utils::*;
+pub use utils::create_range_iterator;
+pub(crate) use utils::{
+    TailIter, create_range_iterator_for_reply, create_range_tail_iterator, create_row_iterator,
+    create_row_iterator_for_reply, create_row_tail_iterator, create_sample_iterator_adapter,
+};

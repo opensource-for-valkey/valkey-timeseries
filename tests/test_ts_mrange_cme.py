@@ -193,6 +193,180 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
                 val = float(val.decode())
                 assert 55 <= val <= 70
 
+    @pytest.mark.parametrize('command, options', [
+        ('TS.MRANGE', []),
+        ('TS.MREVRANGE', []),
+        ('TS.MRANGE', ['AGGREGATION', 'sum', 10]),
+        ('TS.MRANGE', ['AGGREGATION', 'sum', 10, 'EMPTY']),
+        ('TS.MRANGE', ['AGGREGATION', 'sum,max', 10]),
+    ])
+    def test_mrange_cme_filter_by_ts_outside_window_matches_nothing(self, command, options):
+        """Every FILTER_BY_TS entry outside the window leaves nothing to match.
+
+        That must stay distinct from "no filter", which returns the whole window. Each series
+        is still listed, with no samples, as it is on a standalone server.
+        """
+        self.setup_clustered_data()
+
+        client = self.new_client_for_primary(0)
+        result = client.execute_command(command, self.start_ts, self.start_ts + 90,
+                                        'FILTER_BY_TS', self.start_ts - 500,
+                                        *options,
+                                        'FILTER', 'sensor=~".+"')
+
+        assert sorted((series[0], series[2]) for series in result) == [
+            (b'ts:{slot1}:temp1', []),
+            (b'ts:{slot1}:temp2', []),
+            (b'ts:{slot2}:humid1', []),
+            (b'ts:{slot2}:humid2', []),
+        ]
+
+    def test_mrange_cme_filter_by_ts_outside_window_groupby(self):
+        """A FILTER_BY_TS entirely outside the window leaves every group with no samples."""
+        self.setup_clustered_data()
+
+        client = self.new_client_for_primary(0)
+        result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 90,
+                                        'FILTER_BY_TS', self.start_ts - 500,
+                                        'FILTER', 'sensor=~".+"',
+                                        'GROUPBY', 'sensor', 'REDUCE', 'sum')
+
+        assert sorted((group[0], group[2]) for group in result) == [
+            (b'sensor=humid', []),
+            (b'sensor=temp', []),
+        ]
+
+    def test_mrange_cme_filter_by_ts_outside_window_excludeempty(self):
+        """EXCLUDEEMPTY drops every series a FILTER_BY_TS outside the window has emptied."""
+        self.setup_clustered_data()
+
+        client = self.new_client_for_primary(0)
+        result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 90,
+                                        'FILTER_BY_TS', self.start_ts - 500,
+                                        'EXCLUDEEMPTY',
+                                        'FILTER', 'sensor=~".+"')
+
+        assert result == []
+
+    def test_mrange_cme_filter_by_ts_partly_outside_window(self):
+        """Only the entries inside the window return samples."""
+        self.setup_clustered_data()
+
+        client = self.new_client_for_primary(0)
+        result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 90,
+                                        'FILTER_BY_TS', self.start_ts - 500, self.start_ts + 50,
+                                        'FILTER', 'sensor=temp')
+
+        assert len(result) == 2
+        for series in result:
+            assert [sample[0] for sample in series[2]] == [self.start_ts + 50]
+
+    def test_mrange_cme_empty_fill_sees_filter_by_ts_entries_outside_the_window(self):
+        """Shards get the whole list, so entries past each edge let EMPTY fill out to it."""
+        client = self.new_client_for_primary(0)
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        for key in ('ts:{slot1}:fill', 'ts:{slot2}:fill'):
+            for timestamp, value in ((10, 1), (55, 2), (90, 3)):
+                cluster_client.execute_command('TS.ADD', key, timestamp, value, 'LABELS', 'k', 'fill')
+
+        result = client.execute_command('TS.MRANGE', 50, 70,
+                                        'FILTER_BY_TS', 10, 55, 90,
+                                        'AGGREGATION', 'sum', 5, 'EMPTY',
+                                        'FILTER', 'k=fill')
+
+        assert len(result) == 2
+        for series in result:
+            assert series[2] == [[50, b'0'], [55, b'2'], [60, b'0'], [65, b'0'], [70, b'0']]
+
+    def test_mrevrange_cme_last_empty_fill_around_stored_nan(self):
+        """Shards aggregate ascending, but `last` still fills as the newest-first reply requires.
+
+        Expected rows are replies from the pinned reference. Forward, bucket 10 would be NaN.
+        """
+        client = self.new_client_for_primary(0)
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        for key in ('ts:{slot1}:nan', 'ts:{slot2}:nan'):
+            for timestamp, value in ((0, 5), (10, 'nan'), (100, 7)):
+                cluster_client.execute_command('TS.ADD', key, timestamp, value, 'LABELS', 'k', 'nan')
+
+        result = client.execute_command('TS.MREVRANGE', 10, 200,
+                                        'AGGREGATION', 'last', 10, 'EMPTY',
+                                        'FILTER', 'k=nan')
+
+        assert len(result) == 2
+        for series in result:
+            assert series[2] == [[100, b'7']] + [[t, b'5'] for t in range(90, 0, -10)]
+
+    @pytest.mark.parametrize('options, expected', [
+        pytest.param(['COUNT', 2], [[6000, b'2'], [5000, b'9']], id='raw'),
+        pytest.param(['COUNT', 1, 'FILTER_BY_VALUE', 4, 6], [[250, b'5']], id='raw-value-filter'),
+        pytest.param(['COUNT', 1, 'FILTER_BY_TS', 0, 250], [[250, b'5']], id='raw-timestamp-filter'),
+        pytest.param(['COUNT', 2, 'AGGREGATION', 'sum', 100],
+                     [[6000, b'2'], [5000, b'9']], id='aggregated'),
+        pytest.param(['COUNT', 1, 'FILTER_BY_VALUE', 4, 6, 'AGGREGATION', 'sum', 100],
+                     [[200, b'5']], id='aggregated-value-filter-widens'),
+        pytest.param(['COUNT', 2, 'FILTER_BY_TS', 0, 250, 5000, 'AGGREGATION', 'sum', 100],
+                     [[5000, b'9'], [200, b'5']], id='aggregated-timestamp-filter'),
+        pytest.param(['COUNT', 3, 'AGGREGATION', 'sum', 100, 'EMPTY'],
+                     [[6000, b'2'], [5900, b'0'], [5800, b'0']], id='empty'),
+        pytest.param(['COUNT', 3, 'AGGREGATION', 'last', 100, 'EMPTY'],
+                     [[6000, b'2'], [5900, b'9'], [5800, b'9']], id='empty-last'),
+        pytest.param(['COUNT', 2, 'AGGREGATION', 'avg,max', 100],
+                     [[6000, b'2', b'2'], [5000, b'9', b'9']], id='multi-aggregation'),
+        pytest.param(['COUNT', 50, 'AGGREGATION', 'sum', 1000],
+                     [[6000, b'2'], [5000, b'9'], [0, b'6']], id='count-above-the-buckets'),
+    ])
+    def test_mrevrange_cme_count_returns_each_series_tail(self, options, expected):
+        """Shards keep each series' newest COUNT items, however they choose to read them."""
+        client = self.new_client_for_primary(0)
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        keys = ('ts:{slot1}:tail', 'ts:{slot2}:tail')
+        for key in keys:
+            for timestamp, value in ((0, 1), (250, 5), (260, 'nan'), (5000, 9), (6000, 2)):
+                cluster_client.execute_command('TS.ADD', key, timestamp, value, 'LABELS', 'k', 'tail')
+
+        result = client.execute_command('TS.MREVRANGE', '-', '+', *options, 'FILTER', 'k=tail')
+
+        assert sorted(series[0].decode() for series in result) == sorted(keys)
+        for series in result:
+            assert series[2] == expected
+
+    def test_mrevrange_cme_count_with_latest_includes_the_open_bucket(self):
+        """LATEST's open bucket is the newest item, so it is part of a shard's tail."""
+        client = self.new_client_for_primary(0)
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        cluster_client.execute_command('TS.CREATE', 'ts:{slot1}:src')
+        cluster_client.execute_command('TS.CREATE', 'ts:{slot1}:dst', 'LABELS', 'k', 'open')
+        cluster_client.execute_command('TS.CREATERULE', 'ts:{slot1}:src', 'ts:{slot1}:dst',
+                                       'AGGREGATION', 'sum', 100)
+        for timestamp, value in ((10, 1), (110, 2), (210, 3), (310, 4)):
+            cluster_client.execute_command('TS.ADD', 'ts:{slot1}:src', timestamp, value)
+
+        result = client.execute_command('TS.MREVRANGE', '-', '+', 'LATEST', 'COUNT', 2,
+                                        'FILTER', 'k=open')
+        assert result[0][2] == [[300, b'4'], [200, b'3']]
+
+        result = client.execute_command('TS.MREVRANGE', '-', '+', 'LATEST', 'COUNT', 2,
+                                        'AGGREGATION', 'sum', 200, 'FILTER', 'k=open')
+        assert result[0][2] == [[200, b'7'], [0, b'3']]
+
+    def test_mrevrange_cme_count_with_groupby_reduces_each_bucket_fully(self):
+        """A bucket in the reply has to include every series holding it, not just the newest."""
+        client = self.new_client_for_primary(0)
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        for timestamp, value in ((0, 1), (100, 2), (200, 3)):
+            cluster_client.execute_command('TS.ADD', 'ts:{slot1}:grp', timestamp, value,
+                                           'LABELS', 'k', 'grp')
+        for timestamp, value in ((100, 10), (200, 20), (900, 30)):
+            cluster_client.execute_command('TS.ADD', 'ts:{slot2}:grp', timestamp, value,
+                                           'LABELS', 'k', 'grp')
+
+        for reducer, expected in (('sum', [[900, b'30'], [200, b'23']]),
+                                  ('range', [[900, b'0'], [200, b'17']])):
+            result = client.execute_command('TS.MREVRANGE', '-', '+', 'COUNT', 2, 'FILTER', 'k=grp',
+                                            'GROUPBY', 'k', 'REDUCE', reducer)
+            assert result[0][2] == expected, reducer
+
     def test_mrange_cme_empty_result(self):
         """Test TS.MRANGE with no matching series across slots."""
         self.setup_clustered_data()

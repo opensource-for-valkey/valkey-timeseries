@@ -1,5 +1,4 @@
 use crate::common::Sample;
-use crate::iterators::TimeSeriesRangeIterator;
 use crate::series::chunks::{ChimpChunkIterator, GorillaChunkIterator};
 
 #[derive(Default)]
@@ -7,7 +6,6 @@ pub enum SampleIter<'a> {
     Slice(std::slice::Iter<'a, Sample>),
     Gorilla(GorillaChunkIterator<'a>),
     Chimp(ChimpChunkIterator<'a>),
-    Range(TimeSeriesRangeIterator<'a>),
     #[default]
     Empty,
 }
@@ -27,7 +25,6 @@ impl Iterator for SampleIter<'_> {
             SampleIter::Slice(slice) => slice.next().copied(),
             SampleIter::Gorilla(iter) => iter.next(),
             SampleIter::Chimp(iter) => iter.next(),
-            SampleIter::Range(range) => range.next(),
             SampleIter::Empty => None,
         }
     }
@@ -37,7 +34,6 @@ impl Iterator for SampleIter<'_> {
             SampleIter::Slice(slice) => slice.size_hint(),
             SampleIter::Gorilla(iter) => iter.size_hint(),
             SampleIter::Chimp(iter) => iter.size_hint(),
-            SampleIter::Range(range) => range.size_hint(),
             SampleIter::Empty => (0, Some(0)),
         }
     }
@@ -53,7 +49,6 @@ impl Iterator for SampleIter<'_> {
             SampleIter::Slice(slice) => slice.copied().fold(init, f),
             SampleIter::Gorilla(iter) => iter.fold(init, f),
             SampleIter::Chimp(iter) => iter.fold(init, f),
-            SampleIter::Range(range) => range.fold(init, f),
             SampleIter::Empty => init,
         }
     }

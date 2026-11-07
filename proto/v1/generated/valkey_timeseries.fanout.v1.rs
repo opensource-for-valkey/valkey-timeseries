@@ -521,14 +521,23 @@ pub struct MDelRequest {
     #[prost(message, repeated, tag = "2")]
     pub filters: ::prost::alloc::vec::Vec<SeriesSelector>,
 }
+/// FILTER_BY_TS. A message rather than a bare `repeated` field so its presence survives the wire:
+/// an empty list means "match nothing", while an absent one means "no filter". It carries every
+/// entry the query named, including those outside its window, because those still decide how far
+/// EMPTY fills.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TimestampFilter {
+    #[prost(int64, repeated, tag = "1")]
+    pub timestamps: ::prost::alloc::vec::Vec<i64>,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RangeRequest {
     #[prost(message, optional, tag = "1")]
     pub range: ::core::option::Option<DateRange>,
     #[prost(uint32, tag = "2")]
     pub count: u32,
-    #[prost(int64, repeated, tag = "3")]
-    pub timestamp_filter: ::prost::alloc::vec::Vec<i64>,
+    #[prost(message, optional, tag = "3")]
+    pub timestamp_filter: ::core::option::Option<TimestampFilter>,
     #[prost(message, optional, tag = "4")]
     pub value_filter: ::core::option::Option<ValueRange>,
     #[prost(message, optional, tag = "5")]
