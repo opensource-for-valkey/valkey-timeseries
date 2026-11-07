@@ -42,7 +42,8 @@ pub enum PartialReducerKind {
     /// acc1 = sum, acc2 = the sum scaled by `kahan::AVG_SHADOW_SCALE`, read only when acc1
     /// overflowed; finalize sum / count
     Avg,
-    /// acc1 = running mean, acc2 = M2 (Welford); finalize per variant
+    /// acc1 = running mean of `value - acc1_c`, acc2 = M2 (Welford), acc1_c = the shift (the
+    /// first value), as `AggStd` keeps them; finalize per variant
     StdP,
     StdS,
     VarP,
@@ -58,7 +59,8 @@ pub struct PartialState {
     pub count: u64,
     pub acc1: f64,
     pub acc2: f64,
-    /// Neumaier compensation for `acc1` (Sum/SumIf/Avg only, 0.0 elsewhere).
+    /// Neumaier compensation for `acc1` (Sum/SumIf/Avg); the dispersion kinds'
+    /// shift; 0.0 elsewhere.
     /// Folded into the finalized value; carried separately so merges stay
     /// compensated. A partial without one (e.g. an older peer) is exactly
     /// "a sum with no accumulated error".
@@ -197,10 +199,15 @@ impl PartialReducer {
                 // Welford: acc1 = running mean, acc2 = M2. Unlike the
                 // sum-of-squares form this cannot cancel catastrophically and
                 // M2 is nonnegative by construction. `count` was already
-                // incremented above.
-                let delta = value - s.acc1;
+                // incremented above. Accumulated relative to the first value, as
+                // `AggStd` does, so the mean keeps the data's precision.
+                if first_value {
+                    s.acc1_c = value;
+                }
+                let x = value - s.acc1_c;
+                let delta = x - s.acc1;
                 s.acc1 += delta / s.count as f64;
-                s.acc2 += delta * (value - s.acc1);
+                s.acc2 += delta * (x - s.acc1);
             }
         }
     }
@@ -246,9 +253,10 @@ impl PartialReducer {
             | PartialReducerKind::StdS
             | PartialReducerKind::VarP
             | PartialReducerKind::VarS => {
-                // Chan's parallel combine of two Welford states.
+                // Chan's parallel combine of two Welford states, `other`'s mean
+                // re-expressed relative to `into`'s shift first.
                 let n = n_a + n_b;
-                let delta = other.acc1 - into.acc1;
+                let delta = ((other.acc1_c - into.acc1_c) + other.acc1) - into.acc1;
                 into.acc1 += delta * (n_b / n);
                 into.acc2 += other.acc2 + delta * delta * (n_a * n_b / n);
             }
@@ -673,6 +681,36 @@ mod tests {
         let tiny = (1e-310, 3e-310);
         let (partial, ordinary) = both_paths(AggregationType::Avg, &[&[tiny.0], &[tiny.1]]);
         assert_eq!((partial, ordinary), (2e-310, 2e-310));
+    }
+
+    /// Two samples 2 apart at 1e16, where the ulp is 2: the running mean, 1e16 + 1, is not
+    /// representable, and updating it in place doubled M2. The exact answers are representable,
+    /// and every partition and both paths must give them.
+    #[test]
+    fn test_dispersion_near_the_precision_limit_is_exact() {
+        let (a, b) = (1e16, 1e16 + 2.0);
+        for (ty, expected) in [
+            (AggregationType::VarP, 1.0),
+            (AggregationType::StdP, 1.0),
+            (AggregationType::VarS, 2.0),
+            (AggregationType::StdS, 2f64.sqrt()),
+        ] {
+            for shards in [
+                &[&[a, b][..]][..],
+                &[&[a][..], &[b][..]][..],
+                &[&[b][..], &[a][..]][..],
+            ] {
+                let (partial, ordinary) = both_paths(ty, shards);
+                assert_eq!(
+                    (partial, ordinary),
+                    (expected, expected),
+                    "{ty} over {shards:?}"
+                );
+            }
+        }
+        // Offsets that differ between partials still merge exactly.
+        let (partial, _) = both_paths(AggregationType::VarP, &[&[1e9, 1e9 + 1.0], &[1e9 + 2.0]]);
+        assert_eq!(partial, 2.0 / 3.0);
     }
 
     /// One infinite sample has no spread to report on either path.

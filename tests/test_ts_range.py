@@ -183,6 +183,16 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
             # The bucket at 100 holds only a NaN, so it has no value to report.
             assert result == [[0, value]], agg
 
+    def test_dispersion_near_the_precision_limit(self):
+        """At 1e16 the ulp is 2, so the mean of 1e16 and 1e16 + 2 is not representable; the
+        variance is still exactly 1 (DIV-0022: the reference cancels it to 1.8e16)."""
+        self.client.execute_command('TS.ADD', 'prec', 0, '1e16')
+        self.client.execute_command('TS.ADD', 'prec', 1, '10000000000000002')
+        for agg, expected in (('var.p', 1.0), ('std.p', 1.0), ('var.s', 2.0)):
+            result = self.client.execute_command('TS.RANGE', 'prec', '-', '+',
+                                                 'AGGREGATION', agg, 10)
+            assert float(result[0][1]) == expected, agg
+
     def test_compaction_with_the_largest_duration_stays_open(self):
         """A rule accepts any positive i64 duration; its one bucket never closes."""
         top = 2**63 - 1

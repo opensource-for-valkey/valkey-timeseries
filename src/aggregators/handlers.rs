@@ -550,11 +550,18 @@ impl Hash for CountAllAggregator {
 /// sum-of-squares form this cannot cancel catastrophically and `m2` is
 /// nonnegative by construction. Mirrors the partial-reducer Std/Var state
 /// (partial_reducer.rs), so push-down matches single-node results.
+///
+/// Values are accumulated relative to `shift`, the bucket's first value, so
+/// `mean` is small next to the data and keeps the precision the data has: at
+/// 1e16, where the ulp is 2, an absolute running mean of `[1e16, 1e16 + 2]`
+/// cannot hold 1e16 + 1, and the rounding doubled M2.
 #[derive(Copy, Clone, Default, Debug, PartialEq, GetSize)]
 pub struct AggStd {
+    /// Running mean of `value - shift`.
     mean: Value,
     m2: Value,
     count: usize,
+    shift: Value,
 }
 
 impl AggStd {
@@ -562,16 +569,18 @@ impl AggStd {
         if value.is_nan() {
             return false;
         }
+        if self.count == 0 {
+            self.shift = value;
+        }
         self.count += 1;
-        let delta = value - self.mean;
+        let x = value - self.shift;
+        let delta = x - self.mean;
         self.mean += delta / self.count as Value;
-        self.m2 += delta * (value - self.mean);
+        self.m2 += delta * (x - self.mean);
         true
     }
     fn reset(&mut self) {
-        self.mean = 0.;
-        self.m2 = 0.;
-        self.count = 0;
+        *self = Self::default();
     }
     /// The variance numerator (M2); callers divide by n or n - 1.
     fn variance(&self) -> Value {
@@ -583,8 +592,8 @@ impl Display for AggStd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "mean: {}, m2: {}, count: {}",
-            self.mean, self.m2, self.count
+            "mean: {}, m2: {}, count: {}, shift: {}",
+            self.mean, self.m2, self.count, self.shift
         )
     }
 }
@@ -594,6 +603,7 @@ impl RdbSerializable for AggStd {
         raw::save_double(rdb, self.mean);
         raw::save_double(rdb, self.m2);
         rdb_save_usize(rdb, self.count);
+        raw::save_double(rdb, self.shift);
     }
 
     fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self>
@@ -603,7 +613,13 @@ impl RdbSerializable for AggStd {
         let mean = raw::load_double(rdb)?;
         let m2 = raw::load_double(rdb)?;
         let count = rdb_load_usize(rdb)?;
-        Ok(Self { mean, m2, count })
+        let shift = raw::load_double(rdb)?;
+        Ok(Self {
+            mean,
+            m2,
+            count,
+            shift,
+        })
     }
 }
 
@@ -612,6 +628,7 @@ impl Hash for AggStd {
         hash_f64(self.mean, state);
         hash_f64(self.m2, state);
         self.count.hash(state);
+        hash_f64(self.shift, state);
     }
 }
 
