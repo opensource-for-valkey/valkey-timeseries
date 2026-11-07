@@ -762,15 +762,16 @@ impl RdbSerializable for StdSAggregator {
 /// It also properly handles resets
 #[derive(Debug, Default, Clone, PartialEq, GetSize)]
 pub struct CounterAggregatorState {
-    /// Accumulated deltas
-    sum_deltas: f64,
+    /// Accumulated deltas, compensated like every other sum in the module: a counter that
+    /// resets often adds small deltas to a large total.
+    sum_deltas: KahanSum,
     // last raw value we saw
     last_value: Option<f64>,
 }
 
 impl Hash for CounterAggregatorState {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        hash_f64(self.sum_deltas, state);
+        self.sum_deltas.hash(state);
         hash_f64(self.last_value.unwrap_or(f64::NAN), state);
     }
 }
@@ -778,7 +779,7 @@ impl Hash for CounterAggregatorState {
 impl RdbSerializable for CounterAggregatorState {
     fn rdb_save(&self, rdb: *mut RedisModuleIO) {
         rdb_save_optional_f64(rdb, self.last_value);
-        raw::save_double(rdb, self.sum_deltas);
+        self.sum_deltas.rdb_save(rdb);
     }
 
     fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self>
@@ -786,7 +787,7 @@ impl RdbSerializable for CounterAggregatorState {
         Self: Sized,
     {
         let last_value = rdb_load_optional_f64(rdb)?;
-        let sum_deltas = raw::load_double(rdb)?;
+        let sum_deltas = KahanSum::rdb_load(rdb)?;
         Ok(CounterAggregatorState {
             sum_deltas,
             last_value,
@@ -806,7 +807,7 @@ impl CounterAggregatorState {
     }
 
     fn clear(&mut self) {
-        self.sum_deltas = 0.0;
+        self.sum_deltas.reset();
         self.last_value = None;
     }
 }
@@ -825,7 +826,7 @@ impl AggregationHandler for IncreaseAggregator {
     }
     fn current(&self) -> Option<Value> {
         self.0.last_value?;
-        Some(self.0.sum_deltas)
+        Some(self.0.sum_deltas.value())
     }
 }
 
@@ -850,23 +851,19 @@ pub struct RateAggregatorState {
     counter: CounterAggregatorState,
 }
 
-/// Online rate calculator for a monotonically increasing counter with resets.
+/// Rate of a monotonically increasing counter with resets, per second of bucket.
 ///
-/// Algorithm:
-/// - For each new sample, compute delta = max(v - last_v, 0).
-///   This treats negative jumps as resets and never produces negative deltas.
-/// - Maintain a sliding time window of these deltas and their timestamps.
-/// - Rate ≈ sum(deltas in window) / window_length.
+/// Each sample adds `max(v - last_v, 0)` to the bucket's delta sum (a drop is a reset and
+/// contributes nothing), and the rate is that sum divided by the bucket length. The length must
+/// be set — [`RateAggregator::new`] or [`RateAggregator::set_window_ms`] — before the first
+/// update; `Default` leaves it 0, which can only report no value.
 #[derive(Debug, Default, Clone, Hash, PartialEq, GetSize)]
 pub struct RateAggregator(Box<RateAggregatorState>);
 
 impl RateAggregator {
     /// Create a new online rate calculator with the given window length.
     pub fn new(window: Duration) -> Self {
-        let counter = CounterAggregatorState {
-            sum_deltas: 0.0,
-            last_value: None,
-        };
+        let counter = CounterAggregatorState::default();
         let state = Box::new(RateAggregatorState {
             window_ms: window.as_millis() as u64,
             counter,
@@ -909,6 +906,10 @@ impl RdbSerializable for RateAggregator {
 
 impl AggregationHandler for RateAggregator {
     fn update(&mut self, timestamp: Timestamp, value: Value) -> bool {
+        debug_assert!(
+            self.0.window_ms > 0,
+            "rate window must be set before the first update"
+        );
         self.0.counter.update(timestamp, value)
     }
     fn reset(&mut self) {
@@ -918,7 +919,7 @@ impl AggregationHandler for RateAggregator {
         let state = &self.0;
         state.counter.last_value?;
         if state.window_ms > 0 {
-            Some(state.counter.sum_deltas / (state.window_ms as f64 / 1000.0))
+            Some(state.counter.sum_deltas.value() / (state.window_ms as f64 / 1000.0))
         } else {
             None
         }

@@ -256,6 +256,35 @@ mod tests {
         assert_eq!(agg.current(), Some(35.0)); // 25 + 10 = 35
     }
 
+    /// A counter that jumps by 1e16 and then resets a hundred times, each time climbing by 1:
+    /// a plain running sum absorbs every 1 into the 1e16 (its ulp is 2), the compensated one
+    /// keeps them. `1e16 + 100` is representable, so it is the exact answer.
+    #[test]
+    fn test_counter_delta_sum_is_compensated() {
+        let mut values = vec![0.0, 1e16];
+        for _ in 0..100 {
+            values.extend([0.0, 1.0]);
+        }
+        let expected = 1e16 + 100.0;
+
+        let mut increase = IncreaseAggregator::default();
+        let mut rate = RateAggregator::new(Duration::from_secs(1));
+        for (ts, &value) in values.iter().enumerate() {
+            increase.update(ts as i64, value);
+            rate.update(ts as i64, value);
+        }
+        assert_eq!(increase.current(), Some(expected));
+        assert_eq!(rate.current(), Some(expected));
+    }
+
+    #[test]
+    #[should_panic(expected = "rate window")]
+    #[cfg(debug_assertions)]
+    fn test_rate_without_a_window_is_a_bug() {
+        let mut agg = RateAggregator::default();
+        agg.update(0, 1.0);
+    }
+
     #[test]
     fn test_increase_aggregator_negative_delta() {
         let mut agg = IncreaseAggregator::default();
