@@ -636,6 +636,14 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
             let carry = self.aggregator.last_carry.as_mut()?;
             if std::mem::take(&mut carry.unresolved) {
                 self.pending.push_back(row);
+                // Every row queued here is unresolved (`ready` is 0), and one with `keep` newer
+                // rows behind it cannot reach the stream's last `keep`, so a long NaN run holds
+                // no more than that rather than all of itself.
+                if let Some(keep) = self.empty_fill.tail_limit
+                    && self.pending.len() > keep
+                {
+                    self.pending.pop_front();
+                }
                 continue;
             }
             let value = carry.value_of(&row.values);
@@ -1199,6 +1207,59 @@ mod tests {
         assert_eq!(result[2].value, 99.0, "a gap keeps the previous reading");
         assert_eq!(result[3].value, 5.0);
         assert_eq!(result[4].value, 6.0);
+    }
+
+    /// Reverse `last` holds NaN-only buckets until a later bucket resolves them. Under a tail
+    /// limit that queue must stay bounded by the limit, not by the length of the NaN run, and the
+    /// rows that survive must match the unlimited stream's tail.
+    #[test]
+    fn test_reverse_last_pending_run_bounded_by_tail_limit() {
+        let mut samples: Vec<Sample> = (0..1_000).map(|i| Sample::new(i * 10, f64::NAN)).collect();
+        samples.push(Sample::new(10_000, 5.0));
+
+        let mut options = create_options(AggregationType::Last);
+        options.report_empty = true;
+        let fill = |tail_limit| EmptyFillBounds {
+            carry_reverse: true,
+            tail_limit,
+            ..Default::default()
+        };
+
+        let unlimited: Vec<MultiSample> = MultiAggregateIterator::with_empty_fill(
+            samples.clone().into_iter(),
+            &options,
+            0,
+            fill(None),
+        )
+        .collect();
+
+        for keep in [1usize, 3] {
+            let mut iter = MultiAggregateIterator::with_empty_fill(
+                samples.clone().into_iter(),
+                &options,
+                0,
+                fill(Some(keep)),
+            );
+            let first = iter.next().expect("a row");
+            assert!(
+                iter.pending.len() <= keep,
+                "keep={keep}: {} rows still queued",
+                iter.pending.len()
+            );
+            let limited: Vec<MultiSample> = std::iter::once(first).chain(iter).collect();
+
+            let tail = |rows: &[MultiSample]| -> Vec<(Timestamp, f64)> {
+                rows[rows.len() - keep..]
+                    .iter()
+                    .map(|row| (row.timestamp, row.values[0]))
+                    .collect()
+            };
+            assert_eq!(tail(&limited), tail(&unlimited), "keep={keep}");
+            assert_eq!(limited.last().map(|r| r.values[0]), Some(5.0));
+            if keep > 1 {
+                assert_eq!(limited[limited.len() - 2].values[0], 5.0, "NaN run filled");
+            }
+        }
     }
 
     #[test]
