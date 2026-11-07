@@ -168,11 +168,8 @@ impl RdbSerializable for KahanAvg {
 /// Returns (new_sum, new_compensation)
 ///
 /// Copyright (c) 2024-present, OpenData project, and contributors
-#[inline(never)]
-// Important: do NOT inline.
-// Compiler reordering of floating-point operations can cause precision loss.
-// This was observed in Prometheus (issue #16714) and we lock the behavior
-// to maintain IEEE-754 semantics exactly.
+// Safe to inline: Rust has no fast-math, so LLVM may not reassociate these operations.
+#[inline(always)]
 fn kahan_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
     let t = sum + inc;
 
@@ -259,6 +256,21 @@ mod tests {
         let mut merged2 = b;
         merged2 += &a;
         assert_eq!(merged2.value(), 2.0);
+    }
+
+    #[test]
+    fn test_compensation_survives_inlining() {
+        let mut sum = KahanSum::default();
+        for value in [1e16, 1.0, 1.0, -1e16] {
+            sum += value;
+        }
+        assert_eq!(sum.value(), 2.0);
+
+        let mut sum = KahanSum::default();
+        for value in [1.0, 1e100, 1.0, -1e100] {
+            sum += value;
+        }
+        assert_eq!(sum.value(), 2.0);
     }
 
     #[test]
