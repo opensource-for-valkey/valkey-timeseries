@@ -130,33 +130,33 @@ where
     // The local share always runs off the main thread: `get_local_response`
     // takes the GIL itself, which this thread already holds, and running it on
     // a worker keeps the main thread free while the reply is materialized.
-    let local_req = match local_node {
-        // Local-only fanout: there is no RPC to set up, so the local share is
-        // the whole operation. If the workers are saturated, nothing has run:
-        // dropping `state` while it is still `Pending` discards the callback
-        // without invoking it, as on an RPC setup failure below.
-        Some(local) if outstanding == 1 => {
-            metrics::FANOUT_LOCAL_ONLY.incr();
-            let state = Arc::new(FanoutState::new(op, outstanding, f, started));
-            return spawn_local_request(state, req, local, fanout_user, db, deadline).map_err(
-                |_| {
-                    metrics::FANOUT_LOCAL_SHARE_BUSY.incr();
-                    metrics::FANOUT_DURATION.observe_duration(started.elapsed());
-                    FanoutError::busy()
-                },
-            );
-        }
-        Some(_) => Some(op.generate_request()),
-        None => None,
-    };
+    //
+    // Local-only fanout: there is no RPC to set up, so the local share is the
+    // whole operation. If the workers are saturated, nothing has run: dropping
+    // `state` while it is still `Pending` discards the callback without
+    // invoking it, as on an RPC setup failure below.
+    if let Some(local) = local_node
+        && outstanding == 1
+    {
+        metrics::FANOUT_LOCAL_ONLY.incr();
+        let state = Arc::new(FanoutState::new(op, outstanding, f, started));
+        return spawn_local_request(state, req, local, fanout_user, db, deadline).map_err(|_| {
+            metrics::FANOUT_LOCAL_SHARE_BUSY.incr();
+            metrics::FANOUT_DURATION.observe_duration(started.elapsed());
+            FanoutError::busy()
+        });
+    }
 
     let state = Arc::new(FanoutState::new(op, outstanding, f, started));
 
     let rpc_state = state.clone();
     let response_handler = move |res: Result<&[u8], FanoutError>, target: &NodeInfo| {
-        let Ok(buf) = res else {
-            rpc_state.on_error(res.err().unwrap(), target);
-            return;
+        let buf = match res {
+            Ok(buf) => buf,
+            Err(err) => {
+                rpc_state.on_error(err, target);
+                return;
+            }
         };
         match OP::Response::deserialize(buf) {
             Ok(resp) => rpc_state.on_response(resp, target),
@@ -171,7 +171,7 @@ where
     if let Err(e) = invoke_rpc(
         ctx,
         OP::name(),
-        req,
+        &req,
         targets,
         cluster_fingerprint,
         Box::new(response_handler),
@@ -190,12 +190,15 @@ where
         return Err(FanoutError::from(e));
     }
 
-    // Only now that the remote side is in flight is it safe to spawn the local
-    // share: from here on the fanout completes through the normal
-    // response/timeout path.
-    if let Some((local, req_local)) = local_node.zip(local_req) {
+    // The local share is spawned only once the RPC is set up, so a setup
+    // failure above leaves the state `Pending` with no callback able to run.
+    // A send that failed synchronously inside `invoke_rpc` may already have
+    // completed the fanout, though; the share then sees it completed and, if
+    // cancellable, skips its work, while a write still runs and its answer is
+    // ignored.
+    if let Some(local) = local_node {
         let local_state = Arc::clone(&state);
-        if spawn_local_request(local_state, req_local, local, fanout_user, db, deadline).is_err() {
+        if spawn_local_request(local_state, req, local, fanout_user, db, deadline).is_err() {
             // Remote shares are already in flight, so this one fails through
             // the fanout: `Busy` aborts it with that error.
             metrics::FANOUT_LOCAL_SHARE_BUSY.incr();
@@ -332,12 +335,6 @@ where
             return;
         }
         self.activate();
-        if self.timed_out {
-            // We already timed out; ignore responses but mark RPC as done.
-            metrics::FANOUT_IGNORED_AFTER_COMPLETION.incr();
-            self.rpc_done();
-            return;
-        }
 
         // Treat an error from the operation as a per-shard error, with the same
         // bookkeeping (error_count, timed_out handling, logging).

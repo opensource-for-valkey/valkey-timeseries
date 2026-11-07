@@ -362,7 +362,7 @@ pub fn get_cluster_command_timeout() -> Duration {
 pub fn invoke_rpc<Request: Serializable>(
     ctx: &Context,
     name: &'static str,
-    req: Request,
+    req: &Request,
     targets: Arc<HashSet<NodeInfo>>,
     cluster_fingerprint: u64,
     response_handler: FanoutResponseCallback,
@@ -413,17 +413,11 @@ pub(super) fn send_cluster_request(
         request_buf,
     );
 
-    let remote_targets: Vec<NodeInfo> = targets
-        .iter()
-        .filter(|node| !node.is_local())
-        .copied()
-        .collect();
-
-    if remote_targets.is_empty() {
+    let node_count = targets.iter().filter(|node| !node.is_local()).count();
+    if node_count == 0 {
         return Err(ValkeyError::Str(error_consts::NO_CLUSTER_NODES_AVAILABLE));
     }
 
-    let node_count = remote_targets.len();
     let timer_id = ctx.create_timer(timeout, on_request_timeout, id);
 
     let request = InFlightRequest {
@@ -444,7 +438,7 @@ pub(super) fn send_cluster_request(
         map.insert(id, request);
     }
 
-    for node in remote_targets {
+    for node in targets.iter().filter(|node| !node.is_local()) {
         let target_id = node.id.raw_ptr();
         let status = send_cluster_message(ctx, target_id, FANOUT_REQUEST_MESSAGE, buf.as_slice());
         if status == Status::Err {
@@ -722,13 +716,22 @@ pub fn send_cluster_message(
     msg_type: u8,
     message_body: &[u8],
 ) -> Status {
+    // The bus carries a u32 length; refuse what it cannot describe rather than
+    // send a truncated length.
+    let Ok(len) = u32::try_from(message_body.len()) else {
+        log_warning(format!(
+            "cluster rpc: refusing to send a {} byte message, over the cluster bus limit",
+            message_body.len()
+        ));
+        return Status::Err;
+    };
     let sent = unsafe {
         ValkeyModule_SendClusterMessage.expect("ValkeyModule_SendClusterMessage is not available")(
             ctx.ctx as *mut ValkeyModuleCtx,
             target_node_id,
             msg_type,
             message_body.as_ptr().cast::<c_char>(),
-            message_body.len() as u32,
+            len,
         ) == VALKEYMODULE_OK as c_int
     };
     if !sent {
