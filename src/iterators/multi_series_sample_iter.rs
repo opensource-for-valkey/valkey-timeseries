@@ -1,6 +1,7 @@
 use crate::common::Sample;
-use min_max_heap::MinMaxHeap;
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
+use std::collections::binary_heap::PeekMut;
 
 /// A pending sample tagged with the iterator it came from, so the merge can refill exactly
 /// that iterator once the sample is emitted.
@@ -40,8 +41,11 @@ impl Ord for Entry {
 ///
 /// A textbook k-way merge: the heap holds the next unread sample of **every** live iterator,
 /// and emitting one refills from that same iterator. Holding that invariant is the whole
-/// correctness argument — `pop_min` is only the global minimum if every iterator is
+/// correctness argument — the heap's top is only the global minimum if every iterator is
 /// represented.
+///
+/// Emitting replaces the top in place with `peek_mut`, one sift rather than a pop and a push, so
+/// a source that keeps winning costs almost nothing. `Reverse` because `BinaryHeap` is a max-heap.
 ///
 /// An earlier version pushed a bounded *prefix* of each iterator and drained the heap
 /// completely before reloading, which broke the invariant: with `{0,10}` and `{1,2,3}` it
@@ -49,7 +53,7 @@ impl Ord for Entry {
 /// `0,1,2,10,3`. That surfaced as out-of-order `TS.MRANGE ... GROUPBY ... REDUCE` replies
 /// (found by the Tier C differential fuzzer).
 pub struct MultiSeriesSampleIter<T: Iterator<Item = Sample>> {
-    heap: MinMaxHeap<Entry>,
+    heap: BinaryHeap<Reverse<Entry>>,
     inner: Vec<T>,
     primed: bool,
 }
@@ -59,7 +63,7 @@ impl<T: Iterator<Item = Sample>> MultiSeriesSampleIter<T> {
         let len = list.len();
         Self {
             inner: list,
-            heap: MinMaxHeap::with_capacity(len),
+            heap: BinaryHeap::with_capacity(len),
             primed: false,
         }
     }
@@ -68,7 +72,7 @@ impl<T: Iterator<Item = Sample>> MultiSeriesSampleIter<T> {
     fn prime(&mut self) {
         for source in 0..self.inner.len() {
             if let Some(sample) = self.inner[source].next() {
-                self.heap.push(Entry { sample, source });
+                self.heap.push(Reverse(Entry { sample, source }));
             }
         }
         self.primed = true;
@@ -83,40 +87,20 @@ impl<T: Iterator<Item = Sample>> Iterator for MultiSeriesSampleIter<T> {
             self.prime();
         }
 
-        let entry = self.heap.pop_min()?;
+        let mut top = self.heap.peek_mut()?;
+        let source = top.0.source;
         // Refill from the iterator just consumed, keeping every live iterator represented.
         // An exhausted one simply stops contributing.
-        if let Some(sample) = self.inner[entry.source].next() {
-            self.heap.push(Entry {
-                sample,
-                source: entry.source,
-            });
+        match self.inner[source].next() {
+            Some(sample) => Some(std::mem::replace(&mut top.0.sample, sample)),
+            None => Some(PeekMut::pop(top).0.sample),
         }
-        Some(entry.sample)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_heap_supports_duplicates() {
-        let mut heap = MinMaxHeap::<u32>::new();
-
-        heap.push(1);
-        heap.push(1);
-        assert_eq!(heap.len(), 2);
-        heap.push(1);
-        assert_eq!(heap.len(), 3);
-        heap.push(2);
-        heap.push(3);
-        heap.push(3);
-        assert_eq!(heap.len(), 6);
-        let mut vec = heap.into_vec();
-        vec.sort();
-        assert_eq!(vec, vec![1, 1, 1, 2, 3, 3]);
-    }
 
     // Helper constructor matching the project's Sample shape (timestamp, value).
     fn make_sample(ts: i64, val: f64) -> Sample {
@@ -386,5 +370,74 @@ mod tests {
 
         let timestamps: Vec<i64> = iter.by_ref().map(|s| s.timestamp).collect();
         assert_eq!(timestamps, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    fn values(iter: impl Iterator<Item = Sample>) -> Vec<f64> {
+        iter.map(|s| s.value).collect()
+    }
+
+    /// Order-sensitive reducers (`first`, `last`) see equal timestamps in this order, so it has
+    /// to be series order rather than whatever order the heap happens to hold them in.
+    #[test]
+    fn equal_timestamps_come_out_in_source_order() {
+        let sources = vec![
+            vec![make_sample(1, 30.0)],
+            vec![make_sample(1, 10.0)],
+            vec![make_sample(1, 20.0)],
+        ];
+        let iter = MultiSeriesSampleIter::new(sources.into_iter().map(|s| s.into_iter()).collect());
+
+        assert_eq!(values(iter), vec![30.0, 10.0, 20.0]);
+    }
+
+    /// A source that repeats a timestamp finishes it before the next source starts, because its
+    /// refilled entry still sorts first.
+    #[test]
+    fn a_source_repeating_a_timestamp_stays_ahead_of_later_sources() {
+        let a = vec![make_sample(5, 1.0), make_sample(5, 2.0)];
+        let b = vec![make_sample(5, 3.0), make_sample(5, 4.0)];
+        let iter = MultiSeriesSampleIter::new(vec![a.into_iter(), b.into_iter()]);
+
+        assert_eq!(values(iter), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// Values never take part in the ordering, so NaN cannot disturb it.
+    #[test]
+    fn nan_values_do_not_affect_merge_order() {
+        let a = vec![make_sample(1, f64::NAN), make_sample(3, 3.0)];
+        let b = vec![make_sample(1, 1.0), make_sample(2, f64::NAN)];
+        let iter = MultiSeriesSampleIter::new(vec![a.into_iter(), b.into_iter()]);
+
+        let merged: Vec<Sample> = iter.collect();
+        assert_eq!(
+            merged.iter().map(|s| s.timestamp).collect::<Vec<_>>(),
+            vec![1, 1, 2, 3]
+        );
+        assert!(merged[0].value.is_nan());
+        assert_eq!(merged[1].value, 1.0);
+        assert!(merged[2].value.is_nan());
+        assert_eq!(merged[3].value, 3.0);
+    }
+
+    /// Full-sequence comparison against a stable sort: timestamps, ties and values together, over
+    /// enough ragged sources to exercise refills, exhaustion and the heap's interior.
+    #[test]
+    fn matches_a_stable_sort_of_the_concatenated_sources() {
+        let sources: Vec<Vec<Sample>> = (0..64i64)
+            .map(|source| {
+                (0..(source % 13))
+                    .map(|i| make_sample((i * 3 + source % 5) * 10, (source * 1000 + i) as f64))
+                    .collect()
+            })
+            .collect();
+
+        let mut expected: Vec<Sample> = sources.iter().flatten().copied().collect();
+        expected.sort_by_key(|s| s.timestamp);
+
+        let merged: Vec<Sample> =
+            MultiSeriesSampleIter::new(sources.into_iter().map(|s| s.into_iter()).collect())
+                .collect();
+
+        assert_eq!(merged, expected);
     }
 }

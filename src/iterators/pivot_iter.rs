@@ -1,7 +1,8 @@
 use crate::common::{MultiSample, SampleValue};
-use min_max_heap::MinMaxHeap;
 use smallvec::{SmallVec, smallvec};
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
+use std::collections::binary_heap::PeekMut;
 
 /// A pending row tagged with the iterator it came from, so the merge can refill exactly that
 /// iterator once the row is consumed, and knows which output columns to write it into.
@@ -48,13 +49,13 @@ impl Ord for Entry {
 /// `AGGREGATION` gives it one per aggregator.
 ///
 /// The merge is the same k-way merge as [`MultiSeriesRowIter`] — the heap holds the next unread
-/// row of *every* live source and emitting one refills from that same source, so `pop_min` is
-/// the global minimum — with one addition: after taking the minimum, every other source sitting
-/// at the same timestamp is drained into the same output row before it is emitted.
+/// row of *every* live source and emitting one refills from that same source, so its top is the
+/// global minimum — with one addition: every source sitting at the minimum's timestamp is drained
+/// into the same output row before it is emitted.
 ///
 /// [`MultiSeriesRowIter`]: crate::iterators::MultiSeriesRowIter
 pub struct PivotIter<T: Iterator<Item = MultiSample>> {
-    heap: MinMaxHeap<Entry>,
+    heap: BinaryHeap<Reverse<Entry>>,
     inner: Vec<T>,
     /// First output column of each source, i.e. the running sum of the widths.
     offsets: Vec<usize>,
@@ -81,7 +82,7 @@ impl<T: Iterator<Item = MultiSample>> PivotIter<T> {
             total_columns += width;
         }
         Self {
-            heap: MinMaxHeap::with_capacity(sources.len()),
+            heap: BinaryHeap::with_capacity(sources.len()),
             inner: sources,
             offsets,
             widths,
@@ -94,28 +95,10 @@ impl<T: Iterator<Item = MultiSample>> PivotIter<T> {
     fn prime(&mut self) {
         for source in 0..self.inner.len() {
             if let Some(row) = self.inner[source].next() {
-                self.heap.push(Entry { row, source });
+                self.heap.push(Reverse(Entry { row, source }));
             }
         }
         self.primed = true;
-    }
-
-    /// Copy an entry's values into its column block and pull that source's next row.
-    fn absorb(&mut self, entry: Entry, values: &mut [SampleValue]) {
-        let start = self.offsets[entry.source];
-        let width = self.widths[entry.source];
-        // A source yields exactly `width` values per row (one per aggregator, or the single
-        // raw sample value), but truncate rather than trust it: a short row leaves the rest of
-        // the block NaN and a long one cannot spill into the neighbouring key's columns.
-        let len = width.min(entry.row.values.len());
-        values[start..start + len].copy_from_slice(&entry.row.values[..len]);
-
-        if let Some(row) = self.inner[entry.source].next() {
-            self.heap.push(Entry {
-                row,
-                source: entry.source,
-            });
-        }
     }
 }
 
@@ -127,26 +110,33 @@ impl<T: Iterator<Item = MultiSample>> Iterator for PivotIter<T> {
             self.prime();
         }
 
-        let entry = self.heap.pop_min()?;
-        let timestamp = entry.row.timestamp;
-
+        let timestamp = self.heap.peek()?.0.row.timestamp;
         let mut values: SmallVec<[SampleValue; 4]> = smallvec![f64::NAN; self.total_columns];
-        self.absorb(entry, &mut values);
 
-        // Every other source at this timestamp joins the same row. Refills happen inside
-        // `absorb`, so a source that repeats a timestamp (which a series cannot do, but a
-        // pipeline feeding this iterator might) is consumed here too rather than producing a
-        // second row for a timestamp already emitted.
-        while self
-            .heap
-            .peek_min()
-            .is_some_and(|e| e.row.timestamp == timestamp)
-        {
-            let entry = self
-                .heap
-                .pop_min()
-                .expect("peek_min matched, so pop_min cannot be empty");
-            self.absorb(entry, &mut values);
+        // Every source at this timestamp joins the same row. A refill replaces the top in place,
+        // so a source that repeats a timestamp (which a series cannot do, but a pipeline feeding
+        // this iterator might) is consumed here too rather than producing a second row for a
+        // timestamp already emitted.
+        while let Some(mut top) = self.heap.peek_mut() {
+            let entry = &top.0;
+            if entry.row.timestamp != timestamp {
+                break;
+            }
+
+            // A source yields exactly `width` values per row (one per aggregator, or the single
+            // raw sample value), but truncate rather than trust it: a short row leaves the rest
+            // of the block NaN and a long one cannot spill into the neighbouring key's columns.
+            let source = entry.source;
+            let start = self.offsets[source];
+            let len = self.widths[source].min(entry.row.values.len());
+            values[start..start + len].copy_from_slice(&entry.row.values[..len]);
+
+            match self.inner[source].next() {
+                Some(row) => top.0.row = row,
+                None => {
+                    PeekMut::pop(top);
+                }
+            }
         }
 
         Some(MultiSample { timestamp, values })
@@ -280,5 +270,46 @@ mod tests {
 
         let timestamps: Vec<i64> = iter.map(|r| r.timestamp).collect();
         assert_eq!(timestamps, vec![1, 2, 3, 4, 5, 9]);
+    }
+
+    /// A source that repeats a timestamp is consumed into the same row rather than producing a
+    /// second row for it, and its later value wins its column.
+    #[test]
+    fn test_source_repeating_a_timestamp_joins_one_row() {
+        let a = vec![row(1, &[1.0]), row(1, &[2.0]), row(2, &[3.0])];
+        let b = vec![row(1, &[9.0])];
+
+        let iter = PivotIter::new(vec![a.into_iter(), b.into_iter()], vec![1, 1]);
+
+        assert_eq!(
+            collect(iter),
+            vec![(1, vec![Some(2.0), Some(9.0)]), (2, vec![Some(3.0), None])]
+        );
+    }
+
+    /// Enough sources to exercise the heap's interior: every source fills only its own column.
+    #[test]
+    fn test_many_sources_each_fill_their_own_column() {
+        const SOURCES: usize = 40;
+        let sources: Vec<_> = (0..SOURCES as i64)
+            .map(|s| {
+                let rows: Vec<MultiSample> = (0..3)
+                    .filter(|t| (s + t) % 3 != 0)
+                    .map(|t| row(t, &[(s * 10 + t) as f64]))
+                    .collect();
+                rows.into_iter()
+            })
+            .collect();
+
+        let rows = collect(PivotIter::new(sources, vec![1; SOURCES]));
+
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![0, 1, 2]);
+        for (t, values) in rows {
+            for (s, value) in values.into_iter().enumerate() {
+                let s = s as i64;
+                let expected = ((s + t) % 3 != 0).then_some((s * 10 + t) as f64);
+                assert_eq!(value, expected, "t={t} source={s}");
+            }
+        }
     }
 }

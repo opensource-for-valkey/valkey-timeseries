@@ -1,6 +1,7 @@
 use crate::common::MultiSample;
-use min_max_heap::MinMaxHeap;
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
+use std::collections::binary_heap::PeekMut;
 
 /// Heap entry ordering rows by bucket timestamp, with the source iterator index breaking
 /// ties so equal timestamps come out in series order. `source` also lets the merge refill
@@ -36,10 +37,10 @@ impl Ord for RowEntry {
 /// Iterate over multiple multi-aggregation row iterators, returning the rows in timestamp
 /// order. Structural clone of `MultiSeriesSampleIter` — including its correctness argument:
 /// the heap holds the next unread row of **every** live iterator, and emitting one refills
-/// from that same iterator, so `pop_min` really is the global minimum. See the sibling for
+/// from that same iterator, so its top really is the global minimum. See the sibling for
 /// the out-of-order bug that arose from loading prefixes instead.
 pub struct MultiSeriesRowIter<T: Iterator<Item = MultiSample>> {
-    heap: MinMaxHeap<RowEntry>,
+    heap: BinaryHeap<Reverse<RowEntry>>,
     inner: Vec<T>,
     primed: bool,
 }
@@ -49,7 +50,7 @@ impl<T: Iterator<Item = MultiSample>> MultiSeriesRowIter<T> {
         let len = list.len();
         Self {
             inner: list,
-            heap: MinMaxHeap::with_capacity(len),
+            heap: BinaryHeap::with_capacity(len),
             primed: false,
         }
     }
@@ -58,7 +59,7 @@ impl<T: Iterator<Item = MultiSample>> MultiSeriesRowIter<T> {
     fn prime(&mut self) {
         for source in 0..self.inner.len() {
             if let Some(row) = self.inner[source].next() {
-                self.heap.push(RowEntry { row, source });
+                self.heap.push(Reverse(RowEntry { row, source }));
             }
         }
         self.primed = true;
@@ -73,14 +74,12 @@ impl<T: Iterator<Item = MultiSample>> Iterator for MultiSeriesRowIter<T> {
             self.prime();
         }
 
-        let entry = self.heap.pop_min()?;
-        if let Some(row) = self.inner[entry.source].next() {
-            self.heap.push(RowEntry {
-                row,
-                source: entry.source,
-            });
+        let mut top = self.heap.peek_mut()?;
+        let source = top.0.source;
+        match self.inner[source].next() {
+            Some(row) => Some(std::mem::replace(&mut top.0.row, row)),
+            None => Some(PeekMut::pop(top).0.row),
         }
-        Some(entry.row)
     }
 }
 
@@ -143,5 +142,59 @@ mod tests {
         let rows: Vec<MultiSample> = MultiSeriesRowIter::new(vec![a.into_iter()]).collect();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values.as_slice(), &[1.5, 2.5, 3.5]);
+    }
+
+    /// See the sibling test on `MultiSeriesSampleIter`: reducers rely on this order.
+    #[test]
+    fn equal_timestamps_come_out_in_source_order() {
+        let sources = vec![
+            vec![row(1, &[30.0])],
+            vec![row(1, &[10.0])],
+            vec![row(1, &[20.0])],
+        ];
+        let rows: Vec<MultiSample> =
+            MultiSeriesRowIter::new(sources.into_iter().map(|s| s.into_iter()).collect()).collect();
+
+        assert_eq!(
+            rows,
+            vec![row(1, &[30.0]), row(1, &[10.0]), row(1, &[20.0])]
+        );
+    }
+
+    #[test]
+    fn a_source_repeating_a_timestamp_stays_ahead_of_later_sources() {
+        let a = vec![row(5, &[1.0]), row(5, &[2.0])];
+        let b = vec![row(5, &[3.0])];
+        let rows: Vec<MultiSample> =
+            MultiSeriesRowIter::new(vec![a.into_iter(), b.into_iter()]).collect();
+
+        assert_eq!(rows, vec![row(5, &[1.0]), row(5, &[2.0]), row(5, &[3.0])]);
+    }
+
+    /// Full-sequence comparison against a stable sort, over rows wide enough to spill to the
+    /// heap, so a refill that mishandled the entry's payload would show up as a wrong value.
+    #[test]
+    fn matches_a_stable_sort_of_the_concatenated_sources() {
+        let sources: Vec<Vec<MultiSample>> = (0..32i64)
+            .map(|source| {
+                (0..(source % 7))
+                    .map(|i| {
+                        let v = (source * 1000 + i) as f64;
+                        row(
+                            (i * 3 + source % 5) * 10,
+                            &[v, v + 0.5, v + 1.0, v + 1.5, v + 2.0],
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let mut expected: Vec<MultiSample> = sources.iter().flatten().cloned().collect();
+        expected.sort_by_key(|r| r.timestamp);
+
+        let merged: Vec<MultiSample> =
+            MultiSeriesRowIter::new(sources.into_iter().map(|s| s.into_iter()).collect()).collect();
+
+        assert_eq!(merged, expected);
     }
 }
