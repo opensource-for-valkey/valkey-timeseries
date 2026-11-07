@@ -17,7 +17,7 @@ use get_size2::GetSize;
 use std::fmt::Display;
 use std::hash::Hash;
 use std::time::Duration;
-use valkey_module::{RedisModuleIO, ValkeyResult, raw};
+use valkey_module::{RedisModuleIO, ValkeyError, ValkeyResult, raw};
 
 type Value = f64;
 type Timestamp = i64;
@@ -1139,19 +1139,29 @@ pub enum Aggregator {
 
 impl Default for Aggregator {
     fn default() -> Self {
-        AggregationType::Avg.into()
+        Aggregator::Avg(AvgAggregator::default())
     }
 }
 
-impl From<AggregationType> for Aggregator {
-    fn from(agg: AggregationType) -> Self {
-        match agg {
-            AggregationType::All => Aggregator::All(AllAggregator::default()),
-            AggregationType::Any => Aggregator::Any(AnyAggregator::default()),
+/// An aggregator that needs no condition. The filtered ones (`all`, `any`, `countif`, `none`,
+/// `share`, `sumif`) have none to give them here, and their `Default` would match everything,
+/// so they are refused: build them through `AggregatorConfig`, which requires the condition.
+impl TryFrom<AggregationType> for Aggregator {
+    type Error = ValkeyError;
+
+    fn try_from(agg: AggregationType) -> Result<Self, Self::Error> {
+        Ok(match agg {
+            AggregationType::All
+            | AggregationType::Any
+            | AggregationType::CountIf
+            | AggregationType::None
+            | AggregationType::Share
+            | AggregationType::SumIf => {
+                return Err(ValkeyError::Str("TSDB: missing condition for aggregator"));
+            }
             AggregationType::Avg => Aggregator::Avg(AvgAggregator::default()),
             AggregationType::Count => Aggregator::Count(CountAggregator::default()),
             AggregationType::CountAll => Aggregator::CountAll(CountAllAggregator::default()),
-            AggregationType::CountIf => Aggregator::CountIf(CountIfAggregator::default()),
             AggregationType::CountNan => Aggregator::CountNan(CountNanAggregator::default()),
             AggregationType::First => Aggregator::First(FirstAggregator::default()),
             AggregationType::Increase => Aggregator::Increase(IncreaseAggregator::default()),
@@ -1159,17 +1169,14 @@ impl From<AggregationType> for Aggregator {
             AggregationType::Last => Aggregator::Last(LastAggregator::default()),
             AggregationType::Max => Aggregator::Max(MaxAggregator::default()),
             AggregationType::Min => Aggregator::Min(MinAggregator::default()),
-            AggregationType::None => Aggregator::None(NoneAggregator::default()),
             AggregationType::Range => Aggregator::Range(RangeAggregator::default()),
             AggregationType::Rate => Aggregator::Rate(RateAggregator::default()),
-            AggregationType::Share => Aggregator::Share(ShareAggregator::default()),
             AggregationType::StdP => Aggregator::StdP(StdPAggregator::default()),
             AggregationType::StdS => Aggregator::StdS(StdSAggregator::default()),
             AggregationType::VarP => Aggregator::VarP(VarPAggregator::default()),
             AggregationType::VarS => Aggregator::VarS(VarSAggregator::default()),
             AggregationType::Sum => Aggregator::Sum(SumAggregator::default()),
-            AggregationType::SumIf => Aggregator::SumIf(SumIfAggregator::default()),
-        }
+        })
     }
 }
 

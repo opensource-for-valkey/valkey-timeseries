@@ -332,7 +332,7 @@ mod tests {
     fn rule(agg: AggregationType, bucket: u64) -> CompactionRule {
         CompactionRule {
             dest: SeriesLink::from("dst"),
-            aggregator: agg.into(),
+            aggregator: crate::aggregators::Aggregator::try_from(agg).unwrap(),
             bucket_duration: bucket,
             align_timestamp: 0,
             bucket_start: None,

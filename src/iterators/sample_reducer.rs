@@ -118,7 +118,7 @@ mod tests {
     use crate::aggregators::{AggregationType, Aggregator};
 
     fn reduce_using_sum(samples: Vec<Sample>) -> Vec<Sample> {
-        let aggregator: Aggregator = AggregationType::Sum.into();
+        let aggregator = Aggregator::try_from(AggregationType::Sum).unwrap();
         SampleReducer::new(samples.into_iter(), aggregator).collect()
     }
 
@@ -203,7 +203,7 @@ mod tests {
         // A tally of nothing is 0, not "undefined". EMPTY makes this routine: the per-series
         // fill contributes a NaN to every reduce, so a bucket no series covered arrives here
         // as an all-NaN group. RedisTimeSeries reports 0 for it under `REDUCE count`.
-        let aggregator: Aggregator = AggregationType::Count.into();
+        let aggregator = Aggregator::try_from(AggregationType::Count).unwrap();
         let samples = vec![
             Sample {
                 timestamp: 1,
@@ -254,7 +254,7 @@ mod tests {
                     value: f64::NAN,
                 },
             ];
-            let aggregator: Aggregator = aggregation.into();
+            let aggregator = Aggregator::try_from(aggregation).unwrap();
             let result: Vec<Sample> = SampleReducer::new(samples.into_iter(), aggregator).collect();
 
             assert_eq!(result.len(), 2, "{aggregation:?}");

@@ -1225,6 +1225,18 @@ mod tests {
     #[test]
     fn test_reverse_count_matches_the_full_reversed_result() {
         use crate::aggregators::{BucketAlignment, BucketTimestamp};
+        use crate::common::binop::ComparisonOperator;
+        use crate::series::request_types::{AggregatorConfig, ValueComparisonFilter};
+
+        // all, any and none take a condition; without one there is nothing to build.
+        let config = |aggregator: AggregationType| {
+            let condition = ValueComparisonFilter {
+                operator: ComparisonOperator::GreaterThan,
+                value: 5.0,
+            };
+            AggregatorConfig::new(aggregator, aggregator.is_filtered().then_some(condition))
+                .unwrap()
+        };
 
         let aggregators = [
             AggregationType::All,
@@ -1283,7 +1295,7 @@ mod tests {
                                         .unwrap(),
                                     value_filter,
                                     aggregation: Some(AggregationOptions {
-                                        aggregations: smallvec::smallvec![aggregator.into()],
+                                        aggregations: smallvec::smallvec![config(aggregator)],
                                         bucket_duration,
                                         alignment,
                                         timestamp_output: BucketTimestamp::End,

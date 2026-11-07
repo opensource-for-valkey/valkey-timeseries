@@ -40,7 +40,7 @@ fn bucket_aggregators(c: &mut Criterion) {
     group.throughput(Throughput::Elements(SAMPLES as u64));
     for &(name, ty) in TYPES {
         group.bench_function(BenchmarkId::from_parameter(name), |b| {
-            let mut agg: Aggregator = ty.into();
+            let mut agg = Aggregator::try_from(ty).unwrap();
             b.iter(|| {
                 let mut acc = 0.0;
                 for (bucket, chunk) in values.chunks(BUCKET).enumerate() {

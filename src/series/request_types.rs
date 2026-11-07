@@ -151,31 +151,25 @@ impl AggregatorConfig {
     }
 
     pub fn create_aggregator(&self) -> Aggregator {
-        let aggr_type = self.aggregation;
-        if let Some(filter) = self.value_filter {
-            match self.aggregation {
-                AggregationType::All => {
-                    Aggregator::All(AllAggregator::new(filter.operator, filter.value))
-                }
-                AggregationType::Any => {
-                    Aggregator::Any(AnyAggregator::new(filter.operator, filter.value))
-                }
-                AggregationType::Count | AggregationType::CountIf => {
-                    Aggregator::CountIf(CountIfAggregator::new(filter.operator, filter.value))
-                }
-                AggregationType::None => {
-                    Aggregator::None(NoneAggregator::new(filter.operator, filter.value))
-                }
-                AggregationType::Share => {
-                    Aggregator::Share(ShareAggregator::new(filter.operator, filter.value))
-                }
-                AggregationType::Sum | AggregationType::SumIf => {
-                    Aggregator::SumIf(SumIfAggregator::new(filter.operator, filter.value))
-                }
-                _ => aggr_type.into(),
+        // `new` is the only constructor: it gives every filtered type a condition and refuses one
+        // on a type that cannot take it, so neither `expect` can fire.
+        let Some(filter) = self.value_filter else {
+            return Aggregator::try_from(self.aggregation)
+                .expect("AggregatorConfig::new gives every filtered aggregator a condition");
+        };
+        let (op, value) = (filter.operator, filter.value);
+        match self.aggregation {
+            AggregationType::All => Aggregator::All(AllAggregator::new(op, value)),
+            AggregationType::Any => Aggregator::Any(AnyAggregator::new(op, value)),
+            AggregationType::Count | AggregationType::CountIf => {
+                Aggregator::CountIf(CountIfAggregator::new(op, value))
             }
-        } else {
-            aggr_type.into()
+            AggregationType::None => Aggregator::None(NoneAggregator::new(op, value)),
+            AggregationType::Share => Aggregator::Share(ShareAggregator::new(op, value)),
+            AggregationType::Sum | AggregationType::SumIf => {
+                Aggregator::SumIf(SumIfAggregator::new(op, value))
+            }
+            other => unreachable!("AggregatorConfig::new refuses a condition on {other}"),
         }
     }
 }
@@ -201,7 +195,9 @@ impl Default for AggregatorConfig {
     }
 }
 
-// Allow easy conversion from AggregationType to AggregatorConfig without filter
+/// Test shorthand for an unconditional config. Production goes through [`AggregatorConfig::new`],
+/// which refuses a filtered type without its condition; this does not check.
+#[cfg(test)]
 impl From<AggregationType> for AggregatorConfig {
     fn from(aggregation: AggregationType) -> Self {
         Self {

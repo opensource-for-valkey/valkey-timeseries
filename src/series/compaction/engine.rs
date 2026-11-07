@@ -710,7 +710,8 @@ where
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
 pub fn bench_rule(agg: crate::aggregators::AggregationType, bucket_ms: u64) -> CompactionRule {
-    let mut aggregator: crate::aggregators::Aggregator = agg.into();
+    let mut aggregator =
+        crate::aggregators::Aggregator::try_from(agg).expect("a rule type needs no condition");
     if let crate::aggregators::Aggregator::Rate(r) = &mut aggregator {
         r.set_window_ms(bucket_ms);
     }
@@ -777,7 +778,7 @@ mod tests {
     ];
 
     fn fresh_rule(agg: AggregationType, bucket: u64) -> CompactionRule {
-        let mut aggregator: Aggregator = agg.into();
+        let mut aggregator = crate::aggregators::Aggregator::try_from(agg).unwrap();
         if let Aggregator::Rate(r) = &mut aggregator {
             r.set_window_ms(bucket);
         }

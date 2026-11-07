@@ -855,6 +855,26 @@ mod tests {
         assert_eq!(agg.current(), Some(1.0));
     }
 
+    /// A filtered aggregator has no condition to take from a bare type, and its `Default` would
+    /// match everything, so the conversion refuses it.
+    #[test]
+    fn test_filtered_types_need_a_condition() {
+        use crate::aggregators::{AggregationType as At, Aggregator};
+        for ty in [
+            At::All,
+            At::Any,
+            At::CountIf,
+            At::None,
+            At::Share,
+            At::SumIf,
+        ] {
+            assert!(Aggregator::try_from(ty).is_err(), "{ty}");
+        }
+        for ty in [At::Sum, At::Count, At::Avg, At::Rate, At::StdS] {
+            assert_eq!(Aggregator::try_from(ty).unwrap().aggregation_type(), ty);
+        }
+    }
+
     /// The whole filtered family skips NaN, as `countif`/`sumif` do: under `!=` a NaN would
     /// otherwise satisfy the condition, and under `==` it would count against the share.
     #[test]

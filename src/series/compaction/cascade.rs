@@ -626,7 +626,7 @@ mod tests {
             .iter()
             .map(|dest| CompactionRule {
                 dest: SeriesLink::from(*dest),
-                aggregator: AggregationType::Sum.into(),
+                aggregator: crate::aggregators::Aggregator::try_from(AggregationType::Sum).unwrap(),
                 bucket_duration: 1000,
                 align_timestamp: 0,
                 bucket_start: None,
