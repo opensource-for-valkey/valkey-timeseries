@@ -150,8 +150,9 @@ pub(super) const BUSY_ERROR: &str =
 
 impl ErrorKind {
     /// An outcome the client sees and can act on (a denial, a busy or swapped
-    /// shard, a deadline, a topology change), as opposed to a fault. A client can
-    /// cause one per shard on every command it issues, so these log at debug.
+    /// shard, a deadline), as opposed to a fault. A client can cause one per
+    /// shard on every command it issues, so these log at debug. A cluster-map
+    /// mismatch is not one: it reports a topology change an operator should see.
     pub fn is_client_visible(self) -> bool {
         matches!(
             self,
@@ -160,7 +161,6 @@ impl ErrorKind {
                 | Self::Busy
                 | Self::DatabaseSwapped
                 | Self::Timeout
-                | Self::ClusterMapMismatch
         )
     }
 
