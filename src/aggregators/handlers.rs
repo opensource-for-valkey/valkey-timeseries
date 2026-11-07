@@ -17,7 +17,7 @@ use get_size2::GetSize;
 use std::fmt::Display;
 use std::hash::Hash;
 use std::time::Duration;
-use valkey_module::{RedisModuleIO, ValkeyError, ValkeyResult, ValkeyString, raw};
+use valkey_module::{RedisModuleIO, ValkeyResult, raw};
 
 type Value = f64;
 type Timestamp = i64;
@@ -29,9 +29,6 @@ pub trait AggregationHandler: RdbSerializable + Default + GetSize {
     fn current(&self) -> Option<Value>;
     fn empty_value(&self) -> Value {
         f64::NAN
-    }
-    fn empty_bucket_value(&self) -> Value {
-        self.empty_value()
     }
     fn finalize(&mut self) -> f64 {
         let result = if let Some(v) = self.current() {
@@ -1057,10 +1054,6 @@ impl AggregationHandler for IRateAggregator {
     }
 }
 
-// Deriv implementation for gauge aggregators
-#[derive(Clone, Debug, Hash, PartialEq, GetSize)]
-pub struct DerivAggregator(IRateAggregatorState);
-
 #[enum_dispatch(AggregationHandler)]
 #[derive(Clone, Debug, Hash, PartialEq, GetSize)]
 pub enum Aggregator {
@@ -1092,25 +1085,6 @@ pub enum Aggregator {
 impl Default for Aggregator {
     fn default() -> Self {
         AggregationType::Avg.into()
-    }
-}
-
-impl TryFrom<&ValkeyString> for Aggregator {
-    type Error = ValkeyError;
-
-    fn try_from(value: &ValkeyString) -> Result<Self, Self::Error> {
-        let str = value.to_string_lossy();
-        let aggregation = AggregationType::try_from(str.as_str())?;
-        Ok(aggregation.into())
-    }
-}
-
-impl TryFrom<&str> for Aggregator {
-    type Error = ValkeyError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let aggregation = AggregationType::try_from(value)?;
-        Ok(aggregation.into())
     }
 }
 

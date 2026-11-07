@@ -554,7 +554,53 @@ mod tests {
         agg.update(2000, 20.0);
 
         assert_eq!(agg.current(), None);
+        assert_eq!(agg.finalize(), 0.0);
+    }
+
+    /// `[values, expected]` per aggregator, condition `> 5`, through the trait contract: the
+    /// result, then a reset that leaves nothing to report.
+    fn assert_quantifier<A: AggregationHandler>(mut agg: A, cases: &[(&[f64], f64)]) {
+        for &(values, expected) in cases {
+            assert_eq!(agg.current(), None);
+            for (ts, &value) in values.iter().enumerate() {
+                assert!(agg.update(ts as i64, value), "every sample is accepted");
+            }
+            assert_eq!(agg.current(), Some(expected), "{values:?}");
+            assert_eq!(agg.finalize(), expected, "{values:?}");
+        }
+        assert_eq!(agg.current(), None);
         assert!(agg.finalize().is_nan());
+    }
+
+    #[test]
+    fn test_all_aggregator() {
+        let agg = crate::aggregators::AllAggregator::new(ComparisonOperator::GreaterThan, 5.0);
+        assert_quantifier(
+            agg,
+            &[
+                (&[10.0, 20.0], 1.0),
+                (&[10.0, 1.0, 20.0], 0.0),
+                (&[1.0], 0.0),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_any_aggregator() {
+        let agg = crate::aggregators::AnyAggregator::new(ComparisonOperator::GreaterThan, 5.0);
+        assert_quantifier(
+            agg,
+            &[(&[1.0, 10.0, 2.0], 1.0), (&[1.0, 2.0], 0.0), (&[10.0], 1.0)],
+        );
+    }
+
+    #[test]
+    fn test_none_aggregator() {
+        let agg = crate::aggregators::NoneAggregator::new(ComparisonOperator::GreaterThan, 5.0);
+        assert_quantifier(
+            agg,
+            &[(&[1.0, 2.0], 1.0), (&[1.0, 10.0, 2.0], 0.0), (&[10.0], 0.0)],
+        );
     }
 
     #[test]

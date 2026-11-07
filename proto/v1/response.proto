@@ -43,7 +43,7 @@ message ReducePartialState {
   uint64 count = 1;
   double acc1 = 2;
   double acc2 = 3;
-  int64 ts = 4;
+  reserved 4;
   double acc1_compensation = 5;
 }
 

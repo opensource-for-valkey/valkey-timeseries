@@ -471,13 +471,11 @@ proptest! {
         acc1 in any_value(),
         acc2 in any_value(),
         acc1_c in any_value(),
-        ts in any::<i64>(),
     ) {
-        let local = PartialState { count, acc1, acc2, acc1_c, ts };
+        let local = PartialState { count, acc1, acc2, acc1_c };
         let wire: ReducePartialState = local.into();
         let back: PartialState = (&wire).into();
         prop_assert_eq!(local.count, back.count);
-        prop_assert_eq!(local.ts, back.ts);
         for (l, b) in [(local.acc1, back.acc1), (local.acc2, back.acc2), (local.acc1_c, back.acc1_c)] {
             prop_assert!(l == b || (l.is_nan() && b.is_nan()), "{} != {}", l, b);
         }

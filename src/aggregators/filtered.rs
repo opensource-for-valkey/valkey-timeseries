@@ -156,12 +156,6 @@ impl RdbSerializable for CountIfAggregator {
 #[derive(Debug, Clone, Hash, PartialEq, GetSize)]
 pub struct SumIfAggregator(Box<ConditionalCountState>);
 
-impl SumIfAggregator {
-    pub fn finalize(&self) -> f64 {
-        self.0.get_value()
-    }
-}
-
 impl RdbSerializable for SumIfAggregator {
     fn rdb_save(&self, rdb: *mut RedisModuleIO) {
         self.0.save_to_rdb(rdb);
@@ -264,10 +258,6 @@ impl ShareAggregator {
                 value: comparand,
             },
         }))
-    }
-
-    pub fn reset(&mut self) {
-        self.0.reset();
     }
 
     pub fn share(&self) -> f64 {
@@ -479,10 +469,6 @@ macro_rules! impl_conditional_aggregator {
 
             pub fn condition(&self) -> ValueComparisonFilter {
                 self.0.filter
-            }
-
-            pub fn reset(&mut self) {
-                self.0.reset();
             }
 
             pub fn save_to_rdb(&self, rdb: *mut RedisModuleIO) {

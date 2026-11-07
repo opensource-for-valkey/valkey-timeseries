@@ -207,7 +207,7 @@ impl AggregationHelper {
             values: self
                 .aggregators
                 .iter()
-                .map(AggregationHandler::empty_bucket_value)
+                .map(AggregationHandler::empty_value)
                 .collect(),
         };
         if let Some(carry) = self.last_carry.as_mut() {

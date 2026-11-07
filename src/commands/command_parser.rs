@@ -1,4 +1,4 @@
-use crate::aggregators::{AggregationType, BucketAlignment, BucketTimestamp};
+use crate::aggregators::{AggregationType, BucketAlignment, BucketTimestamp, ReducerSupport};
 use crate::common::Timestamp;
 use crate::common::binop::ComparisonOperator;
 use crate::common::rounding::{
@@ -646,20 +646,11 @@ fn validate_align_against_bounds(
     Ok(())
 }
 
-/// Whether an aggregator may be used as a `GROUPBY ... REDUCE` reducer.
-///
-/// Rejects the scan-order-dependent aggregators (`first`/`last`) and the counter
-/// family (`rate`, `irate`, `increase`), matching RedisTimeSeries, which reports
-/// "Invalid reducer type" for them: a reducer sees every member at one timestamp,
-/// where `irate` has no time delta and `increase` would depend on member order.
-/// Everything else `AggregationType` recognizes stays
-/// valid — including this engine's filtered-reducer extensions (`countif`,
-/// `sumif`, …), which RTS lacks but which are out of scope for parity and must
-/// keep working (tests/test_ts_mrange.py). Unknown names never reach here: they
-/// fail `AggregationType::try_from` and are rejected on the same path.
+/// Whether an aggregator may be used as a `GROUPBY ... REDUCE` reducer. Matches
+/// RedisTimeSeries' "Invalid reducer type" on the shared surface; the filtered extensions
+/// (`countif`, `sumif`, ...) stay valid (tests/test_ts_mrange.py).
 fn is_valid_reducer(agg: &AggregationType) -> bool {
-    use AggregationType::*;
-    !matches!(agg, First | Last | Rate | IRate | Increase)
+    agg.reducer_support() != ReducerSupport::Invalid
 }
 
 pub(super) fn parse_grouping_params(

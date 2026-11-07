@@ -25,12 +25,6 @@ impl KahanSum {
         self.compensation = 0.0;
     }
 
-    pub fn incr(&mut self, inc: f64) {
-        let (new_sum, new_compensation) = kahan_inc(inc, self.sum, self.compensation);
-        self.sum = new_sum;
-        self.compensation = new_compensation;
-    }
-
     /// Reconstitutes a sum from its transported parts (see
     /// `PartialState::acc1`/`acc1_c` in the partial reducer). A plain f64 sum
     /// round-trips as `from_parts(sum, 0.0)`.

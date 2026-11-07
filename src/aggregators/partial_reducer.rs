@@ -46,10 +46,6 @@ pub enum PartialReducerKind {
     StdS,
     VarP,
     VarS,
-    /// acc1 = value, ts = contributing timestamp; keep min ts
-    First,
-    /// acc1 = value, ts = contributing timestamp; keep max ts
-    Last,
 }
 
 /// Mergeable accumulator for one bucket timestamp.
@@ -66,7 +62,6 @@ pub struct PartialState {
     /// compensated. A partial without one (e.g. an older peer) is exactly
     /// "a sum with no accumulated error".
     pub acc1_c: f64,
-    pub ts: Timestamp,
 }
 
 /// Accumulates one timestamp group shard-side. Created per group via
@@ -121,12 +116,10 @@ impl PartialReducer {
             At::StdS => (PartialReducerKind::StdS, NanAcceptance::Reject),
             At::VarP => (PartialReducerKind::VarP, NanAcceptance::Reject),
             At::VarS => (PartialReducerKind::VarS, NanAcceptance::Reject),
-            At::First => (PartialReducerKind::First, NanAcceptance::Reject),
-            At::Last => (PartialReducerKind::Last, NanAcceptance::Reject),
-            // Order-sensitive across series: not decomposable.
-            At::Increase | At::IRate => return None,
-            // Not valid reducers (rejected by the parser) — never pushed down.
-            At::All | At::Any | At::None | At::Share | At::Rate => return None,
+            // The coordinator reduces these itself, or the parser rejected them; see
+            // `AggregationType::reducer_support`, which a test pins against this match.
+            At::All | At::Any | At::None | At::Share => return None,
+            At::First | At::Last | At::Rate | At::IRate | At::Increase => return None,
         };
         Some(Self {
             kind,
@@ -153,7 +146,7 @@ impl PartialReducer {
         }
     }
 
-    pub fn update(&mut self, ts: Timestamp, value: f64) {
+    pub fn update(&mut self, value: f64) {
         if !self.accepts(value) {
             return;
         }
@@ -202,18 +195,6 @@ impl PartialReducer {
                 s.acc1 += delta / s.count as f64;
                 s.acc2 += delta * (value - s.acc1);
             }
-            PartialReducerKind::First => {
-                if first_value || ts < s.ts {
-                    s.acc1 = value;
-                    s.ts = ts;
-                }
-            }
-            PartialReducerKind::Last => {
-                if first_value || ts >= s.ts {
-                    s.acc1 = value;
-                    s.ts = ts;
-                }
-            }
         }
     }
 
@@ -258,18 +239,6 @@ impl PartialReducer {
                 into.acc1 += delta * (n_b / n);
                 into.acc2 += other.acc2 + delta * delta * (n_a * n_b / n);
             }
-            PartialReducerKind::First => {
-                if other.ts < into.ts {
-                    into.acc1 = other.acc1;
-                    into.ts = other.ts;
-                }
-            }
-            PartialReducerKind::Last => {
-                if other.ts >= into.ts {
-                    into.acc1 = other.acc1;
-                    into.ts = other.ts;
-                }
-            }
         }
     }
 
@@ -295,10 +264,7 @@ impl PartialReducer {
             PartialReducerKind::Sum | PartialReducerKind::SumIf => state.acc1 + state.acc1_c,
             // Selector kinds return acc1 untouched (acc1_c is always 0.0
             // here, and e.g. min must preserve a -0.0).
-            PartialReducerKind::Min
-            | PartialReducerKind::Max
-            | PartialReducerKind::First
-            | PartialReducerKind::Last => state.acc1,
+            PartialReducerKind::Min | PartialReducerKind::Max => state.acc1,
             PartialReducerKind::Count | PartialReducerKind::CountIf => n,
             PartialReducerKind::Range => state.acc2 - state.acc1,
             PartialReducerKind::Avg => (state.acc1 + state.acc1_c) / n,
@@ -364,11 +330,11 @@ where
         };
 
         let timestamp = first.timestamp;
-        self.reducer.update(first.timestamp, first.value);
+        self.reducer.update(first.value);
 
         for next in self.inner.by_ref() {
             if next.timestamp == timestamp {
-                self.reducer.update(next.timestamp, next.value);
+                self.reducer.update(next.value);
             } else {
                 self.buffer = Some(next);
                 break;
@@ -411,7 +377,7 @@ where
 fn update_columns(reducers: &mut [PartialReducer], row: &MultiSample) {
     debug_assert_eq!(row.values.len(), reducers.len());
     for (reducer, value) in reducers.iter_mut().zip(row.values.iter()) {
-        reducer.update(row.timestamp, *value);
+        reducer.update(*value);
     }
 }
 
@@ -492,8 +458,6 @@ mod tests {
             At::StdS,
             At::VarP,
             At::VarS,
-            At::First,
-            At::Last,
         ]
         .iter()
         .map(|&ty| AggregatorConfig::new(ty, None).unwrap())
@@ -553,7 +517,7 @@ mod tests {
                     for part in [&values[..cut1], &values[cut1..cut2], &values[cut2..]] {
                         let mut reducer = template.clone();
                         for &value in part {
-                            reducer.update(TS, value);
+                            reducer.update(value);
                         }
                         PartialReducer::merge(kind, &mut merged, &reducer.take_state());
                     }
@@ -577,7 +541,6 @@ mod tests {
     /// recovers the exact 2.0.
     #[test]
     fn test_sum_partials_survive_catastrophic_cancellation() {
-        const TS: Timestamp = 1;
         let config = AggregatorConfig::new(AggregationType::Sum, None).unwrap();
         let template = PartialReducer::for_config(&config).unwrap();
         let kind = template.kind();
@@ -587,7 +550,7 @@ mod tests {
         for part in shards {
             let mut reducer = template.clone();
             for &value in part {
-                reducer.update(TS, value);
+                reducer.update(value);
             }
             PartialReducer::merge(kind, &mut merged, &reducer.take_state());
         }
@@ -599,7 +562,6 @@ mod tests {
     /// Welford accumulation + Chan merge keep it exact.
     #[test]
     fn test_variance_partials_survive_large_offset() {
-        const TS: Timestamp = 1;
         for (ty, expected) in [
             (AggregationType::VarP, 2.0 / 3.0),
             (AggregationType::VarS, 1.0),
@@ -615,7 +577,7 @@ mod tests {
             for part in shards {
                 let mut reducer = template.clone();
                 for &value in part {
-                    reducer.update(TS, value);
+                    reducer.update(value);
                 }
                 PartialReducer::merge(kind, &mut merged, &reducer.take_state());
             }
@@ -639,34 +601,26 @@ mod tests {
         }
     }
 
-    /// `AggregationType::is_decomposable` is the coordinator's cheap
-    /// eligibility test; `for_config` is what actually builds the state. They
-    /// must never disagree, or the coordinator sets `apply_group_reduce` for a
-    /// reducer no shard can pre-reduce (or forgoes push-down for one it can).
+    /// `reducer_support` is what the parser consults; `for_config` is what actually builds the
+    /// state. If they disagreed the coordinator would forgo push-down for a reducer shards could
+    /// pre-reduce, or keep dead kinds alive for one the parser rejects.
     #[test]
-    fn test_is_decomposable_agrees_with_for_config() {
-        use AggregationType as At;
+    fn test_reducer_support_agrees_with_for_config() {
+        use crate::aggregators::ReducerSupport;
 
-        for config in decomposable_configs() {
-            assert!(
-                config.aggregation.is_decomposable(),
-                "{} is decomposable but is_decomposable() said no",
-                config.aggregation
+        let filter = ValueComparisonFilter {
+            operator: ComparisonOperator::GreaterThan,
+            value: 0.0,
+        };
+        let all = (0..=u8::MAX).filter_map(|byte| AggregationType::try_from(byte).ok());
+        for ty in all {
+            let condition = ty.is_filtered().then_some(filter);
+            let config = AggregatorConfig::new(ty, condition).unwrap();
+            assert_eq!(
+                PartialReducer::for_config(&config).is_some(),
+                ty.reducer_support() == ReducerSupport::Decomposable,
+                "{ty}"
             );
-        }
-
-        for ty in [At::Increase, At::IRate, At::Rate] {
-            let config = AggregatorConfig::new(ty, None).unwrap();
-            assert!(
-                !ty.is_decomposable(),
-                "{ty} is not decomposable but is_decomposable() said yes"
-            );
-            assert!(PartialReducer::for_config(&config).is_none());
-        }
-
-        // Not valid reducers; is_decomposable() must not admit them either.
-        for ty in [At::All, At::Any, At::None, At::Share] {
-            assert!(!ty.is_decomposable(), "{ty} is not a valid reducer");
         }
     }
 
