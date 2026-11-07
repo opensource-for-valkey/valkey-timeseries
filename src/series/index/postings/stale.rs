@@ -144,12 +144,21 @@ impl Postings {
     /// We remove the key from the index and mark the ID as stale, which will be cleaned up later in a background task.
     /// The stale IDs are stored in a bitmap for efficient removal and are checked to ensure that no stale IDs are
     /// returned in queries until they are removed.
-    pub(crate) fn mark_ids_as_stale(&mut self, ids: &[SeriesRef]) {
-        for id in ids {
-            let _ = self.id_to_key.remove(id);
+    /// Returns how many of `ids` had a key mapping, i.e. were indexed until now; an id another
+    /// path retired in the meantime is marked again harmlessly but not counted.
+    pub(crate) fn mark_ids_as_stale(&mut self, ids: &[SeriesRef]) -> usize {
+        if !self.hidden_ids.is_empty() {
+            for &id in ids {
+                self.forget_hidden(id);
+            }
         }
+        let removed = ids
+            .iter()
+            .filter(|id| self.id_to_key.remove(id).is_some())
+            .count();
         self.stale_ids.mark_many(ids);
         self.all_postings.remove_many(ids);
+        removed
     }
 
     #[cfg(test)]

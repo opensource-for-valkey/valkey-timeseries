@@ -19,7 +19,6 @@
 use crate::common::context::{get_current_db, is_real_user_client};
 use crate::config::is_debug_mode_enabled;
 use crate::series::TimeSeries;
-use crate::series::index::asm::{add_delayed_indexing_key, is_key_in_slot_import};
 use crate::series::index::index_series_by_key;
 use crate::series::series_data_type::{VK_TIME_SERIES_TYPE, is_supported_encoding_version};
 use std::os::raw::c_void;
@@ -94,13 +93,8 @@ pub fn ts_restore_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // so AOF replay of this command does not re-append it.
     ctx.replicate_verbatim();
 
-    // During a slot import we defer indexing until the import completes to avoid phantom reads.
-    // Outside of an import (e.g. plain AOF command replay) we index immediately.
-    if is_key_in_slot_import(key.as_slice()) {
-        add_delayed_indexing_key(db, key.as_slice());
-    } else {
-        index_series_by_key(ctx, key.as_slice());
-    }
+    // During a slot import the index hides this series until the import completes.
+    index_series_by_key(ctx, key.as_slice());
 
     Ok(ValkeyValue::SimpleStringStatic("OK"))
 }

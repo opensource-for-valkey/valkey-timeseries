@@ -18,6 +18,7 @@ use crate::series::index::IndexKey;
 use crate::series::{SeriesRef, TimeSeries};
 use croaring::Bitmap64;
 use std::ops::{Bound, ControlFlow, Deref, DerefMut};
+use std::time::Duration;
 use valkey_module::{AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString};
 
 /// A read-only guard for accessing Postings data.
@@ -538,7 +539,11 @@ impl TimeSeriesIndex {
         let mut focus_label_value_counts = StatsMaxHeap::new(limit);
 
         let series_count = match matching {
-            Some(matching) => matching.cardinality(),
+            // `matching` may have been resolved under an earlier hold: `all_postings` holds what
+            // is visible now, so this also drops a series deleted since.
+            Some(matching) => read_lock(&self.inner)
+                .all_postings
+                .and_cardinality(matching),
             None => {
                 let inner = read_lock(&self.inner);
                 inner.count() as u64
@@ -628,8 +633,10 @@ impl TimeSeriesIndex {
         inner.label_index.len()
     }
 
+    /// Whether this index holds no series at all. Not `count() == 0`: an import in progress may
+    /// have hidden every series here, and dropping the index would lose them for good.
     pub fn is_empty(&self) -> bool {
-        self.count() == 0
+        read_lock(&self.inner).holds_no_series()
     }
 
     pub fn with_postings<F, R, STATE>(&self, state: &mut STATE, f: F) -> R
@@ -653,12 +660,13 @@ impl TimeSeriesIndex {
         inner.mark_id_as_stale(id);
     }
 
-    pub fn mark_ids_as_stale(&self, ids: &[SeriesRef]) {
+    /// Marks `ids` stale and returns how many of them were indexed until now.
+    pub fn mark_ids_as_stale(&self, ids: &[SeriesRef]) -> usize {
         if ids.is_empty() {
-            return;
+            return 0;
         }
         let mut inner = write_lock(&self.inner);
-        inner.mark_ids_as_stale(ids);
+        inner.mark_ids_as_stale(ids)
     }
 
     pub fn remove_stale_ids(&self) -> usize {
@@ -688,16 +696,25 @@ impl TimeSeriesIndex {
         inner.optimize_postings(start_prefix, count)
     }
 
-    /// Optimizes every posting list in one pass, taking the write lock for `batch_size` lists
-    /// at a time so queries and writes interleave. Returns `false` if `should_stop` ended the
-    /// pass early.
-    pub fn optimize_all(&self, batch_size: usize, should_stop: impl Fn() -> bool) -> bool {
+    /// Optimizes every posting list in one pass, taking the write lock for at most `hold_budget`
+    /// or `max_lists` lists at a time, whichever comes first, so queries and writes interleave.
+    /// Returns `false` if `should_stop` ended the pass early.
+    pub fn optimize_all(
+        &self,
+        max_lists: usize,
+        hold_budget: Duration,
+        should_stop: impl Fn() -> bool,
+    ) -> bool {
         let mut cursor = None;
         loop {
             if should_stop() {
                 return false;
             }
-            cursor = self.optimize_incremental(cursor, batch_size);
+            cursor = write_lock(&self.inner).optimize_postings_within(
+                cursor,
+                max_lists,
+                Some(hold_budget),
+            );
             if cursor.is_none() {
                 return true;
             }
@@ -710,7 +727,7 @@ impl TimeSeriesIndex {
 struct BatchIterator<'a> {
     index: &'a TimeSeriesIndex,
     /// When set, posting lists are counted through their intersection with this set rather than
-    /// in full. Must be stale-free — see [`BatchIterator::restricted`].
+    /// in full. See [`BatchIterator::restricted`].
     matching: Option<&'a PostingsBitmap>,
     cursor: Option<IndexKey>,
     batch_size: usize,
@@ -718,9 +735,9 @@ struct BatchIterator<'a> {
 }
 
 impl<'a> BatchIterator<'a> {
-    /// An iterator reporting the size of each posting list within `matching` only. `matching` must
-    /// already have stale ids removed (as everything out of [`Postings::postings_for_selector`]
-    /// and friends does), since the intersection is reported as-is.
+    /// An iterator reporting the size of each posting list within `matching` only. `matching` was
+    /// resolved under an earlier lock hold, so each hold applies the visibility current then: an
+    /// id may have been tombstoned or hidden since. Not a point-in-time view.
     fn restricted(
         index: &'a TimeSeriesIndex,
         batch_size: usize,
@@ -735,18 +752,6 @@ impl<'a> BatchIterator<'a> {
         }
     }
 
-    #[inline]
-    fn adjusted_cardinality(inner: &Postings, bitmap: &PostingsBitmap, has_stale_ids: bool) -> u64 {
-        let mut count = bitmap.cardinality();
-        if has_stale_ids {
-            let stale_count = inner.stale_ids.stale_count_in(bitmap);
-            if stale_count > 0 {
-                count = count.saturating_sub(stale_count);
-            }
-        }
-        count
-    }
-
     fn next_batch<F>(&mut self, mut processor: F)
     where
         F: FnMut(&IndexKey, &PostingsBitmap, u64) -> ControlFlow<()>,
@@ -758,7 +763,7 @@ impl<'a> BatchIterator<'a> {
         let mut processed_in_batch = 0usize;
 
         let inner = read_lock(&self.index.inner);
-        let has_stale_ids = !inner.stale_ids.is_empty();
+        let matching = self.matching.map(|matching| inner.visible_subset(matching));
         let mut cursor: Option<&IndexKey> = None;
 
         // Resume from the cursor key using an ordered range rather than a prefix scan (a full key
@@ -779,9 +784,9 @@ impl<'a> BatchIterator<'a> {
 
             processed_in_batch += 1;
 
-            let cardinality = match self.matching {
+            let cardinality = match matching.as_deref() {
                 Some(matching) => bitmap.and_cardinality(matching),
-                None => Self::adjusted_cardinality(&inner, bitmap, has_stale_ids),
+                None => inner.visible_cardinality(bitmap),
             };
             if cardinality > 0
                 && let ControlFlow::Break(_) = processor(key, bitmap, cardinality)
@@ -815,6 +820,101 @@ impl<'a> BatchIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Series 1 and 2 share both labels, and each has a key.
+    fn two_series_two_labels() -> TimeSeriesIndex {
+        let index = TimeSeriesIndex::new();
+        {
+            let mut postings = index.get_postings_mut();
+            for id in [1, 2] {
+                postings.add_posting_for_label_value(id, "a", "x");
+                postings.add_posting_for_label_value(id, "b", "x");
+                postings
+                    .id_to_key
+                    .insert(id, format!("key{id}").into_bytes().into_boxed_slice());
+            }
+        }
+        index
+    }
+
+    fn hide_first_series(index: &TimeSeriesIndex) {
+        let slot = crate::fanout::calculate_hash_slot(b"key1");
+        let slots = range_set_blaze::RangeSetBlaze::from_iter([slot]);
+        assert_eq!(
+            index.get_postings_mut().hide_indexed_keys_in_slots(&slots),
+            1
+        );
+    }
+
+    fn pair_count(stats: &PostingsStats, pair: &str) -> u64 {
+        stats
+            .series_count_by_label_value_pairs
+            .iter()
+            .find(|stat| stat.name == pair)
+            .map_or(0, |stat| stat.count)
+    }
+
+    fn matching_all(index: &TimeSeriesIndex) -> PostingsBitmap {
+        let postings = index.get_postings();
+        postings.all_postings.clone()
+    }
+
+    #[test]
+    fn filtered_stats_leave_out_a_series_hidden_after_the_filter_resolved() {
+        let index = two_series_two_labels();
+        let matching = matching_all(&index);
+        hide_first_series(&index);
+
+        let stats = index.stats_restricted(Some(&matching), "a", 10);
+        assert_eq!(stats.series_count, 1);
+        assert_eq!(pair_count(&stats, "a=x"), 1);
+    }
+
+    #[test]
+    fn filtered_stats_leave_out_a_series_marked_stale_after_the_filter_resolved() {
+        let index = two_series_two_labels();
+        let matching = matching_all(&index);
+        index.mark_id_as_stale(1);
+
+        let stats = index.stats_restricted(Some(&matching), "a", 10);
+        assert_eq!(stats.series_count, 1);
+        assert_eq!(pair_count(&stats, "a=x"), 1);
+    }
+
+    #[test]
+    fn filtered_stats_do_not_count_a_series_removed_after_the_filter_resolved() {
+        let index = two_series_two_labels();
+        let matching = matching_all(&index);
+        let mut removed = TimeSeries::new();
+        removed.id = 1;
+        removed.labels = crate::labels::MetricName::new(&[
+            crate::labels::Label::new("a", "x"),
+            crate::labels::Label::new("b", "x"),
+        ]);
+        index.remove_timeseries(&removed);
+
+        let stats = index.stats_restricted(Some(&matching), "a", 10);
+        assert_eq!(stats.series_count, 1);
+    }
+
+    #[test]
+    fn a_restricted_scan_applies_visibility_at_each_lock_hold() {
+        let index = two_series_two_labels();
+        let matching = matching_all(&index);
+        let mut iterator = BatchIterator::restricted(&index, 1, Some(&matching));
+
+        let mut counts = Vec::new();
+        iterator.next_batch(|_, _, count| {
+            counts.push(count);
+            ControlFlow::Continue(())
+        });
+        hide_first_series(&index);
+        iterator.next_batch(|_, _, count| {
+            counts.push(count);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(counts, [2, 1], "the second hold sees the series hidden");
+    }
 
     fn index_with_posting(id: SeriesRef, label: &str, value: &str) -> TimeSeriesIndex {
         let index = TimeSeriesIndex::new();

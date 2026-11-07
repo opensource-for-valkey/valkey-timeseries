@@ -25,7 +25,7 @@
 //!
 //! Stale ids are not part of the format; see [`serialize`].
 
-use super::{IndexKey, Postings, PostingsBitmap, PostingsIndex, StaleSet};
+use super::{HiddenSet, IndexKey, Postings, PostingsBitmap, PostingsIndex, StaleSet};
 use crate::common::encoding::{
     try_read_byte_slice, try_read_u8, try_read_uvarint, write_byte_slice, write_u8, write_uvarint,
 };
@@ -163,8 +163,9 @@ pub(in crate::series::index) fn serialize(buf: &mut Vec<u8>, postings: &Postings
     // First, so the decoder has it before the label bitmaps it validates. Needs no stale masking
     // of its own: `mark_ids_as_stale` evicts from this set eagerly, which is also what makes the
     // subset property hold on the written form — every label bitmap below is masked by the same
-    // stale set that `all_postings` has already had removed.
-    write_bitmap(buf, &postings.all_postings);
+    // stale set that `all_postings` has already had removed. Hidden ids are written as ordinary
+    // ones: their keys are in the snapshot too, and hiding them again is the load's job.
+    write_bitmap(buf, &postings.hidden_ids.union_with(&postings.all_postings));
 
     // label_index in tree iteration order (sorted): cache-friendly ART rebuild on load. Sorted
     // order is also what makes the grouping a single pass — a group's entries are necessarily
@@ -344,6 +345,7 @@ pub(in crate::series::index) fn deserialize(buf: &mut &[u8]) -> DecodeResult<Pos
         id_to_key,
         // Stale ids were subtracted at save time; the loaded index starts clean.
         stale_ids: StaleSet::default(),
+        hidden_ids: HiddenSet::default(),
         all_postings,
     })
 }

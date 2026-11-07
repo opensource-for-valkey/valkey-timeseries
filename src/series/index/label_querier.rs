@@ -516,7 +516,8 @@ pub(crate) fn label_search_exceeds_inline_budget(
             if scanned == entries_budget {
                 return true;
             }
-            if !map.is_empty() {
+            // As the scan does: an entry no read can see is not a result, so it cannot end this.
+            if postings.visible_cardinality(map) > 0 {
                 live_entries += 1;
                 if stop_after == Some(live_entries) {
                     return false;
@@ -663,6 +664,15 @@ where
                 .range::<[u8], _>((start_bound, Bound::<&[u8]>::Unbounded))
             {
                 read_this_hold += 1;
+                let visible = postings.visible_cardinality(map) as usize;
+                if visible == 0 {
+                    // Only hidden or tombstoned series carry this entry: it does not exist yet.
+                    if read_this_hold >= entries_per_hold {
+                        set_resume_key(&mut resume_after, key.as_ref());
+                        continue 'hold;
+                    }
+                    continue;
+                }
                 let Some((key_name, _)) = key.split() else {
                     // Defensive: a malformed entry is passed over, never re-visited.
                     if read_this_hold >= entries_per_hold {
@@ -696,9 +706,9 @@ where
                         }
                         continue 'range;
                     }
-                    pending = Some((score, map.cardinality() as usize));
+                    pending = Some((score, visible));
                 } else if let Some((_, cardinality)) = pending.as_mut() {
-                    *cardinality += map.cardinality() as usize;
+                    *cardinality += visible;
                 }
 
                 if read_this_hold >= entries_per_hold {
@@ -805,6 +815,15 @@ fn get_label_names_desc_in_holds(
                 .rev()
             {
                 read_this_hold += 1;
+                let visible = postings.visible_cardinality(map) as usize;
+                if visible == 0 {
+                    // Only hidden or tombstoned series carry this entry: it does not exist yet.
+                    if read_this_hold >= entries_per_hold {
+                        set_resume_key(&mut resume_below, key.as_ref());
+                        continue 'hold;
+                    }
+                    continue;
+                }
                 let Some((key_name, _)) = key.split() else {
                     if read_this_hold >= entries_per_hold {
                         // Malformed entries still count toward the lock budget.
@@ -841,10 +860,10 @@ fn get_label_names_desc_in_holds(
                     current_result = Some(LabelSearchResult {
                         value: key_name.to_owned(),
                         score,
-                        cardinality: map.cardinality() as usize,
+                        cardinality: visible,
                     });
                 } else if let Some(active) = current_result.as_mut() {
-                    active.cardinality += map.cardinality() as usize;
+                    active.cardinality += visible;
                 }
 
                 if read_this_hold >= entries_per_hold {
@@ -873,7 +892,8 @@ fn get_label_names_desc_in_holds(
 /// The values of one label, in index order, read at most `entries_per_hold` entries per hold
 /// of the postings read lock.
 ///
-/// Under each hold `check` turns an entry into a result or rejects it, and the results are
+/// Under each hold `check` turns an entry and its visible series count, which is never zero, into a
+/// result or rejects it, and the results are
 /// buffered, owned, for after the lock is given back: nothing borrowed from the postings
 /// outlives a hold. A hold also ends once `results_per_hold` results are buffered, so a
 /// value-order read with `LIMIT n`, which needs only `n + 1`, scores no more entries than a
@@ -899,7 +919,7 @@ struct LabelValueScan<'a, F> {
 
 impl<'a, F> LabelValueScan<'a, F>
 where
-    F: FnMut(&IndexKey, &PostingsBitmap) -> Option<LabelSearchResult>,
+    F: FnMut(&IndexKey, usize) -> Option<LabelSearchResult>,
 {
     fn new(
         index: &'a TimeSeriesIndex,
@@ -945,7 +965,10 @@ where
         let mut stopped_at: Option<Vec<u8>> = None;
         for (key, map) in entries {
             read += 1;
-            if let Some(result) = (self.check)(key, map) {
+            let visible = postings.visible_cardinality(map) as usize;
+            if visible > 0
+                && let Some(result) = (self.check)(key, visible)
+            {
                 self.buffered.push_back(result);
             }
             if read == self.entries_per_hold || self.buffered.len() >= self.results_per_hold {
@@ -963,7 +986,7 @@ where
 
 impl<F> Iterator for LabelValueScan<'_, F>
 where
-    F: FnMut(&IndexKey, &PostingsBitmap) -> Option<LabelSearchResult>,
+    F: FnMut(&IndexKey, usize) -> Option<LabelSearchResult>,
 {
     type Item = LabelSearchResult;
 
@@ -975,7 +998,7 @@ where
     }
 }
 
-/// The sum of the cardinalities of `name`'s values, read at most `entries_per_hold` entries
+/// The sum of the visible cardinalities of `name`'s values, read at most `entries_per_hold` entries
 /// per hold of the postings read lock: a high-cardinality name has a million entries.
 fn label_cardinality_in_holds(
     index: &TimeSeriesIndex,
@@ -999,7 +1022,7 @@ fn label_cardinality_in_holds(
             .label_index
             .range::<[u8], _>((lower, Bound::Excluded(past.as_slice())))
         {
-            total += map.cardinality();
+            total += postings.visible_cardinality(map);
             read += 1;
             if read == entries_per_hold {
                 stopped_at = Some(key.as_ref().to_vec());
@@ -1225,13 +1248,9 @@ fn collect_unscoped_label_values_in_holds(
 
     index.read_without_swap(|| {
         Ok(with_search_filter(hints, |filter| {
-            let check = |entry: &IndexKey, map: &PostingsBitmap| {
-                if map.is_empty() {
-                    return None;
-                }
+            let check = |entry: &IndexKey, cardinality: usize| {
                 let (_, value) = entry.split()?;
                 let (accepted, score) = filter.accept(value);
-                let cardinality = map.cardinality() as usize;
                 accepted.then(|| LabelSearchResult {
                     value: value.to_owned(),
                     score,
@@ -1496,9 +1515,36 @@ mod tests {
         iterate_label_names_asc_in_holds, label_cardinality_in_holds,
         label_search_exceeds_inline_budget,
     };
+    use crate::labels::{Label, MetricName};
+    use crate::series::TimeSeries;
     use crate::series::index::FuzzyAlgorithm;
     use crate::series::index::postings::Postings;
     use itertools::Itertools;
+
+    /// One series on each side of an import: `imported` will be hidden, `local` stays visible.
+    fn index_with_hidden_series() -> TimeSeriesIndex {
+        let series = |id, labels: &[(&str, &str)]| {
+            let mut series = TimeSeries::new();
+            series.id = id;
+            let labels: Vec<Label> = labels.iter().map(|(n, v)| Label::new(*n, *v)).collect();
+            series.labels = MetricName::new(&labels);
+            series
+        };
+        let imported = b"{imported}1".as_slice();
+        let mut postings = Postings::default();
+        postings.index_timeseries(
+            &series(
+                1,
+                &[("env", "imported"), ("job", "api"), ("only_imported", "x")],
+            ),
+            imported,
+        );
+        postings.index_timeseries(&series(2, &[("env", "local"), ("job", "api")]), b"{local}1");
+        postings.hide_indexed_keys_in_slots(&range_set_blaze::RangeSetBlaze::from_iter([
+            crate::fanout::calculate_hash_slot(imported),
+        ]));
+        index_of(postings)
+    }
 
     /// An index holding `postings`, for the collectors that take the index and lock it
     /// themselves.
@@ -1672,6 +1718,58 @@ mod tests {
                 &hints,
                 2,
             ));
+        }
+    }
+
+    /// `region` values that no read can see, more of them than the budget used below.
+    fn postings_with_invisible_values(mask: impl FnOnce(&mut Postings, &[u64])) -> Postings {
+        let ids: Vec<u64> = (1..=6).collect();
+        let mut postings = Postings::default();
+        for &id in &ids {
+            postings.add_posting_for_label_value(id, "region", &format!("r{id}"));
+            postings
+                .id_to_key
+                .insert(id, format!("{{same}}{id}").into_bytes().into());
+        }
+        mask(&mut postings, &ids);
+        postings
+    }
+
+    #[test]
+    fn label_search_budget_does_not_count_invisible_entries_as_results() {
+        // The scan skips these, so stopping the probe at them would approve an inline search that
+        // must read past every one of them.
+        let tombstoned = postings_with_invisible_values(|postings, ids| {
+            postings.mark_ids_as_stale(ids);
+        });
+        let hidden = postings_with_invisible_values(|postings, _| {
+            postings.hide_indexed_keys_in_slots(&range_set_blaze::RangeSetBlaze::from_iter([
+                crate::fanout::calculate_hash_slot(b"{same}"),
+            ]));
+        });
+        for postings in [tombstoned, hidden] {
+            let index = index_of(postings);
+            for order_by in [
+                SearchResultOrdering::ValueAsc,
+                SearchResultOrdering::ValueDesc,
+            ] {
+                let hints = SearchHints {
+                    limit: 1,
+                    order_by,
+                    ..Default::default()
+                };
+                assert!(
+                    label_search_exceeds_inline_budget(
+                        &index,
+                        Some("region"),
+                        false,
+                        None,
+                        &hints,
+                        3,
+                    ),
+                    "{order_by:?}"
+                );
+            }
         }
     }
 
@@ -2578,6 +2676,62 @@ mod tests {
                         assert_eq!(held.has_more, one_hold.has_more, "{context}");
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn label_names_leave_out_what_only_hidden_series_carry() {
+        let index = index_with_hidden_series();
+        for order_by in all_orderings() {
+            let hints = SearchHints {
+                order_by,
+                ..Default::default()
+            };
+            let result = collect_unscoped_label_names(&index, &hints).unwrap();
+            let names: Vec<(&str, usize)> = result
+                .results
+                .iter()
+                .map(|r| (r.value.as_str(), r.cardinality))
+                .sorted()
+                .collect();
+            assert_eq!(names, [("env", 1), ("job", 1)], "{order_by:?}");
+        }
+    }
+
+    #[test]
+    fn label_values_leave_out_what_only_hidden_series_carry() {
+        let index = index_with_hidden_series();
+        for order_by in all_orderings() {
+            let hints = SearchHints {
+                order_by,
+                ..Default::default()
+            };
+            let env = collect_unscoped_label_values(&index, "env", &hints).unwrap();
+            assert_eq!(env.results.len(), 1, "{order_by:?}");
+            assert_eq!(env.results[0].value, "local");
+            let job = collect_unscoped_label_values(&index, "job", &hints).unwrap();
+            assert_eq!(job.results[0].cardinality, 1, "{order_by:?}");
+            assert!(
+                collect_unscoped_label_values(&index, "only_imported", &hints)
+                    .unwrap()
+                    .results
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn label_cardinality_of_a_filtered_search_leaves_out_hidden_series() {
+        // The filtered path reports this figure, and drops a name when it is zero.
+        let index = index_with_hidden_series();
+        for entries_per_hold in [1, 2, usize::MAX] {
+            for (name, expected) in [("job", 1), ("env", 1), ("only_imported", 0)] {
+                assert_eq!(
+                    label_cardinality_in_holds(&index, name, entries_per_hold),
+                    expected,
+                    "{name}, {entries_per_hold} per hold"
+                );
             }
         }
     }

@@ -190,17 +190,20 @@ pub fn spawn_background_single<F: FnOnce() + Send + 'static>(
 
 /// Spawns an instrumented maintenance task. The guard is created inside the thread, so a
 /// spawn failure counts no execution, and unwinding records a panic before the outer barrier.
-pub fn spawn_task<F>(task: &'static TaskMetrics, job: F)
+/// Returns whether the thread started; on `false` the job was dropped unrun.
+pub fn spawn_task<F>(task: &'static TaskMetrics, job: F) -> bool
 where
     F: FnOnce(&TaskRun<'_>) + Send + 'static,
 {
-    if !spawn_background(task.thread_name, move || {
+    let spawned = spawn_background(task.thread_name, move || {
         let run = task.start();
         job(&run);
-    }) {
+    });
+    if !spawned {
         task.spawn_failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    spawned
 }
 
 /// A periodic task with metrics for attempts suppressed by its single-flight guard.

@@ -9,6 +9,7 @@ mod tests {
     };
     use crate::series::time_series::TimeSeries;
     use crate::series::{CompactionRule, SeriesLink};
+    use std::time::Duration;
 
     fn create_series_from_metric_name(prometheus_name: &str) -> TimeSeries {
         let mut ts = TimeSeries::new();
@@ -142,6 +143,52 @@ mod tests {
             cardinality, 1,
             "intersection of selectors should yield exactly one series"
         );
+    }
+
+    #[test]
+    fn test_an_index_holding_only_hidden_series_is_not_empty() {
+        // Periodic cleanup drops empty indexes: this one holds a whole import in progress.
+        let index = TimeSeriesIndex::new();
+        assert!(index.is_empty());
+        let imported = create_series_from_metric_name(r#"latency{region="imported"}"#);
+        index.index_timeseries(&imported, b"{imported}1");
+        index.get_postings_mut().hide_indexed_keys_in_slots(
+            &range_set_blaze::RangeSetBlaze::from_iter([crate::fanout::calculate_hash_slot(
+                b"{imported}1",
+            )]),
+        );
+
+        assert_eq!(index.count(), 0, "no read sees it");
+        assert!(!index.is_empty());
+
+        index.remove_timeseries_for_key(&imported, b"{imported}1");
+        assert!(index.is_empty(), "nothing is left to keep the index for");
+    }
+
+    #[test]
+    fn test_stats_do_not_count_hidden_series() {
+        let index = TimeSeriesIndex::new();
+        let imported = create_series_from_metric_name(r#"latency{region="imported",env="qa"}"#);
+        let local = create_series_from_metric_name(r#"latency{region="local",env="qa"}"#);
+        index.index_timeseries(&imported, b"{imported}1");
+        index.index_timeseries(&local, b"{local}1");
+        index.get_postings_mut().hide_indexed_keys_in_slots(
+            &range_set_blaze::RangeSetBlaze::from_iter([crate::fanout::calculate_hash_slot(
+                b"{imported}1",
+            )]),
+        );
+
+        let stats = index.stats("region", 10);
+        assert_eq!(stats.series_count, 1);
+        let by_region = stats.series_count_by_focus_label_value.unwrap();
+        assert_eq!(by_region.len(), 1, "{by_region:?}");
+        assert_eq!(by_region[0].name, "local");
+        let qa = stats
+            .series_count_by_label_value_pairs
+            .iter()
+            .find(|stat| stat.name == "env=qa")
+            .unwrap();
+        assert_eq!(qa.count, 1);
     }
 
     #[test]
@@ -766,12 +813,19 @@ mod tests {
     }
 
     #[test]
+    fn test_optimize_all_reaches_every_posting_list_with_its_budget_spent() {
+        let index = index_with_run_shaped_postings();
+        assert!(index.optimize_all(usize::MAX, Duration::ZERO, || false));
+        assert_eq!(group_lists_with_runs(&index), (20, 20));
+    }
+
+    #[test]
     fn test_optimize_all_reaches_every_posting_list() {
         let index = index_with_run_shaped_postings();
         assert_eq!(group_lists_with_runs(&index), (0, 20));
 
         // Far more lists than one batch.
-        assert!(index.optimize_all(4, || false));
+        assert!(index.optimize_all(4, Duration::from_secs(3600), || false));
 
         assert_eq!(group_lists_with_runs(&index), (20, 20));
         assert!(
@@ -793,7 +847,7 @@ mod tests {
             calls.get() > 1
         };
 
-        assert!(!index.optimize_all(4, stop_after_one_batch));
+        assert!(!index.optimize_all(4, Duration::from_secs(3600), stop_after_one_batch));
 
         let (optimized, total) = group_lists_with_runs(&index);
         assert!(

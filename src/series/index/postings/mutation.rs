@@ -6,6 +6,7 @@
 use super::{IndexKey, Postings, PostingsBitmap};
 use crate::common::logging::log_warning;
 use crate::labels::{InternedLabel, SeriesLabel};
+use crate::series::index::asm::importing_slot;
 use crate::series::{SeriesRef, TimeSeries};
 use blart::AsBytes;
 use blart::map::Entry as ARTEntry;
@@ -91,7 +92,14 @@ impl Postings {
             }
         }
 
-        let mut ids: Vec<SeriesRef> = entries.iter().map(|e| e.id).collect();
+        let mut ids: Vec<SeriesRef> = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            self.forget_hidden(entry.id);
+            match importing_slot(&entry.key) {
+                Some(slot) => self.hidden_ids.hide(entry.id, slot, &mut self.all_postings),
+                None => ids.push(entry.id),
+            }
+        }
         ids.sort_unstable();
         self.all_postings.add_many(&ids);
 
@@ -147,12 +155,19 @@ impl Postings {
         if !self.stale_ids.is_empty() {
             self.stale_ids.revoke(id);
         }
+        // Before the directory entry changes: it says which slot the id is hidden under.
+        self.forget_hidden(id);
 
         for InternedLabel { name, value } in ts.labels.iter() {
             self.add_posting_for_label_value_internal(id, name, value);
         }
 
-        self.all_postings.add(id);
+        // Every path that indexes a series comes through here, or through `bulk_index`: this is
+        // what keeps an import in flight out of reads, whichever path brought the key.
+        match importing_slot(key) {
+            Some(slot) => self.hidden_ids.hide(id, slot, &mut self.all_postings),
+            None => self.all_postings.add(id),
+        }
         self.set_timeseries_key(id, key);
     }
 
@@ -177,12 +192,13 @@ impl Postings {
 
     pub fn remove_timeseries(&mut self, series: &TimeSeries) -> bool {
         let id = series.id;
+        let was_hidden = self.forget_hidden(id);
         if self.id_to_key.remove(&id).is_none() {
             log_warning(format!(
                 "Tried to remove non-existing series id {id} from index"
             ));
         };
-        let removed = self.all_postings.remove_checked(id);
+        let removed = self.all_postings.remove_checked(id) || was_hidden;
         for label in series.labels.iter() {
             self.remove_posting_for_label_value(label.name(), label.value(), id);
         }

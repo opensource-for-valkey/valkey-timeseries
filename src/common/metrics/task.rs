@@ -95,17 +95,9 @@ impl Drop for TaskRun<'_> {
 
 pub static RETENTION_TRIM: TaskMetrics = TaskMetrics::new("retention_trim", "ts-retention-trim");
 pub static TOMBSTONE_SWEEP: TaskMetrics = TaskMetrics::new("tombstone_sweep", "ts-tombstone-sweep");
-/// Not spawned: runs on the post-migration cleanup thread that requests it.
-pub static TOMBSTONE_FULL_SWEEP: TaskMetrics =
-    TaskMetrics::new("tombstone_full_sweep", "ts-asm-cleanup");
 pub static OPTIMIZE_INDEX: TaskMetrics = TaskMetrics::new("optimize_index", "ts-optimize-index");
 
-static TASKS: &[&TaskMetrics] = &[
-    &RETENTION_TRIM,
-    &TOMBSTONE_SWEEP,
-    &TOMBSTONE_FULL_SWEEP,
-    &OPTIMIZE_INDEX,
-];
+static TASKS: &[&TaskMetrics] = &[&RETENTION_TRIM, &TOMBSTONE_SWEEP, &OPTIMIZE_INDEX];
 
 pub static RETENTION_TRIM_SERIES_PROCESSED: AtomicU64 = AtomicU64::new(0);
 pub static RETENTION_TRIM_SAMPLES_DELETED: AtomicU64 = AtomicU64::new(0);
@@ -258,10 +250,6 @@ mod tests {
                 format!("ts-{}", task.name.replace('_', "-"))
             );
         }
-        assert_eq!(
-            TOMBSTONE_FULL_SWEEP.thread_name,
-            crate::common::metrics::asm::POST_MIGRATION_CLEANUP.thread_name
-        );
     }
 
     fn wait_until(mut condition: impl FnMut() -> bool) {

@@ -542,7 +542,8 @@ fn read_indexed_stats(db: i32) -> LoadStats {
 fn read_indexed_count(db: i32) -> u64 {
     let index = get_db_index(db);
     let postings = read_lock(&index.inner);
-    postings.count() as u64
+    // The directory, not `count()`: a series hidden by an import in progress loaded like any other.
+    postings.id_to_key.len() as u64
 }
 
 /// Post-sweep verification for a preloaded db. `reconcile_db` has just established that every
