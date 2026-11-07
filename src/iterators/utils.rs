@@ -109,11 +109,13 @@ fn last_passing_sample_before(
 /// requested, so non-EMPTY queries never touch the series for this.
 ///
 /// `carry_reverse` says the query's *reply* runs newest-first, which `last` depends on even though
-/// buckets are always produced chronologically.
-pub(crate) fn empty_fill_bounds(
+/// buckets are always produced chronologically. `tail_limit` says only that many of the stream's
+/// last rows will be used.
+fn empty_fill_bounds(
     series: &TimeSeries,
     options: &RangeOptions,
     carry_reverse: bool,
+    tail_limit: Option<usize>,
 ) -> EmptyFillBounds {
     let Some(aggregation) = options.aggregation.as_ref().filter(|a| a.report_empty) else {
         return EmptyFillBounds::default();
@@ -163,7 +165,7 @@ pub(crate) fn empty_fill_bounds(
         carry_seed,
         carry_lookback,
         carry_reverse,
-        tail_limit: if carry_reverse { options.count } else { None },
+        tail_limit,
     }
 }
 
@@ -205,12 +207,11 @@ impl ReverseTailRead {
         series: &TimeSeries,
         options: &RangeOptions,
         latest: Option<Sample>,
-        is_reverse: bool,
+        count: usize,
     ) -> Option<Self> {
-        if !is_reverse || series.is_empty() || options.timestamp_filter.is_some() {
+        if series.is_empty() || options.timestamp_filter.is_some() {
             return None;
         }
-        let count = options.count?;
         let aggregation = options.aggregation.as_ref().filter(|a| !a.report_empty)?;
 
         let (start, end) = options.get_timestamp_range();
@@ -272,35 +273,102 @@ pub(crate) fn create_range_iterator_for_reply<'a>(
     is_reverse: bool,
     reply_reverse: bool,
 ) -> Box<dyn Iterator<Item = Sample> + 'a> {
+    let tail_limit = options.count.filter(|_| is_reverse);
     let build = |read_floor| {
         range_pipeline(
             series,
             options,
             latest_sample,
-            is_reverse,
-            reply_reverse,
-            read_floor,
+            ReadPlan {
+                is_reverse,
+                reply_reverse,
+                read_floor,
+                tail_limit,
+            },
         )
     };
-    match ReverseTailRead::plan(series, options, latest_sample, is_reverse) {
+    match tail_limit.and_then(|count| ReverseTailRead::plan(series, options, latest_sample, count))
+    {
         Some(tail) => tail.read(build),
         None => build(None),
     }
+}
+
+/// A series' newest `count` items, oldest first, reading no more of it than that takes.
+///
+/// A shard's half of a newest-first COUNT: it streams ascending for the coordinator to reverse, and
+/// only the tail can reach the reply. `reply_reverse` is the reply's real order, for EMPTY.
+pub(crate) fn create_range_tail_iterator<'a>(
+    series: &'a TimeSeries,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    count: usize,
+    reply_reverse: bool,
+) -> Box<dyn Iterator<Item = Sample> + 'a> {
+    // Raw samples read newest-first without any buffering beyond a chunk, so the first `count`
+    // that pass the filters are the answer.
+    if options.aggregation.is_none() {
+        let plan = ReadPlan {
+            is_reverse: true,
+            reply_reverse,
+            read_floor: None,
+            tail_limit: None,
+        };
+        let mut newest_first: Vec<Sample> = range_pipeline(series, options, latest_sample, plan)
+            .take(count)
+            .collect();
+        newest_first.reverse();
+        return Box::new(newest_first.into_iter());
+    }
+
+    let build = |read_floor| -> Box<dyn Iterator<Item = Sample> + 'a> {
+        let plan = ReadPlan {
+            is_reverse: false,
+            reply_reverse,
+            read_floor,
+            tail_limit: Some(count),
+        };
+        Box::new(TailIter::new(
+            range_pipeline(series, options, latest_sample, plan),
+            count,
+        ))
+    };
+    match ReverseTailRead::plan(series, options, latest_sample, count) {
+        Some(tail) => tail.read(build),
+        None => build(None),
+    }
+}
+
+/// How one pass reads a series for a reply.
+#[derive(Clone, Copy)]
+struct ReadPlan {
+    /// The stream this pass produces runs newest-first.
+    is_reverse: bool,
+    /// The reply runs newest-first, whichever way this stream does.
+    reply_reverse: bool,
+    /// Read nothing older than this.
+    read_floor: Option<Timestamp>,
+    /// Only this many of the stream's last rows will be used.
+    tail_limit: Option<usize>,
 }
 
 fn range_pipeline<'a>(
     series: &'a TimeSeries,
     options: &RangeOptions,
     latest_sample: Option<Sample>,
-    is_reverse: bool,
-    reply_reverse: bool,
-    read_floor: Option<Timestamp>,
+    plan: ReadPlan,
 ) -> Box<dyn Iterator<Item = Sample> + 'a> {
+    let ReadPlan {
+        is_reverse,
+        reply_reverse,
+        read_floor,
+        tail_limit,
+    } = plan;
     let has_aggregation = options.aggregation.is_some();
     let should_reverse_iter = !has_aggregation && is_reverse;
     let should_reverse_aggr = has_aggregation && is_reverse;
     // Derived from the series, before the stream is clipped to the query window.
-    let empty_fill = empty_fill_bounds(series, options, reply_reverse);
+    let empty_fill = empty_fill_bounds(series, options, reply_reverse, tail_limit);
 
     if let Some(ts_filter) = options.timestamp_filter.as_ref() {
         let (start_ts, end_ts) = options.get_timestamp_range();
@@ -441,17 +509,48 @@ pub(crate) fn create_row_iterator_for_reply<'a>(
     is_reverse: bool,
     reply_reverse: bool,
 ) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+    let tail_limit = options.count.filter(|_| is_reverse);
     let build = |read_floor| {
         row_pipeline(
             series,
             options,
             latest_sample,
-            is_reverse,
-            reply_reverse,
-            read_floor,
+            ReadPlan {
+                is_reverse,
+                reply_reverse,
+                read_floor,
+                tail_limit,
+            },
         )
     };
-    match ReverseTailRead::plan(series, options, latest_sample, is_reverse) {
+    match tail_limit.and_then(|count| ReverseTailRead::plan(series, options, latest_sample, count))
+    {
+        Some(tail) => tail.read(build),
+        None => build(None),
+    }
+}
+
+/// [`create_range_tail_iterator`] for multi-aggregation rows.
+pub(crate) fn create_row_tail_iterator<'a>(
+    series: &'a TimeSeries,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    count: usize,
+    reply_reverse: bool,
+) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+    let build = |read_floor| -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+        let plan = ReadPlan {
+            is_reverse: false,
+            reply_reverse,
+            read_floor,
+            tail_limit: Some(count),
+        };
+        Box::new(TailIter::new(
+            row_pipeline(series, options, latest_sample, plan),
+            count,
+        ))
+    };
+    match ReverseTailRead::plan(series, options, latest_sample, count) {
         Some(tail) => tail.read(build),
         None => build(None),
     }
@@ -461,10 +560,14 @@ fn row_pipeline<'a>(
     series: &'a TimeSeries,
     options: &RangeOptions,
     latest_sample: Option<Sample>,
-    is_reverse: bool,
-    reply_reverse: bool,
-    read_floor: Option<Timestamp>,
+    plan: ReadPlan,
 ) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+    let ReadPlan {
+        is_reverse,
+        reply_reverse,
+        read_floor,
+        tail_limit,
+    } = plan;
     let aggregation = options
         .aggregation
         .as_ref()
@@ -479,7 +582,7 @@ fn row_pipeline<'a>(
     // first/last are chronological (earliest/latest sample) regardless of direction: this
     // stream is aggregated forward and reversed at the end, which already lands on the
     // chronological answer, so the aggregation is used as requested.
-    let empty_fill = empty_fill_bounds(series, options, reply_reverse);
+    let empty_fill = empty_fill_bounds(series, options, reply_reverse, tail_limit);
     let aggr_iter = MultiAggregateIterator::with_empty_fill(
         filtered,
         aggregation,
@@ -844,6 +947,101 @@ mod tests {
 
         // COUNT itself spans the window: no point reading anything but all of it.
         assert_eq!(read_floors(&tail_read(5000), |_| 0), vec![None]);
+    }
+
+    /// What a shard keeps for a newest-first COUNT has to be what the reply would show: the same
+    /// rows as a full read, whichever way it reads the series. A grouped query's reply order does
+    /// not reach the shard's EMPTY fill, so it is checked against the forward read instead.
+    #[test]
+    fn test_shard_tail_matches_a_full_read() {
+        let same = |a: &[(i64, f64)], b: &[(i64, f64)]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(x, y)| x.0 == y.0 && (x.1 == y.1 || (x.1.is_nan() && y.1.is_nan())))
+        };
+        let pair = |s: Sample| (s.timestamp, s.value);
+        let aggregations = [
+            None,
+            Some(AggregationType::Sum),
+            Some(AggregationType::Last),
+            Some(AggregationType::First),
+            Some(AggregationType::Rate),
+        ];
+
+        for samples in tail_read_fixtures() {
+            let series = series_with(&samples);
+            for aggregation in aggregations {
+                for report_empty in [false, true] {
+                    for value_filter in [None, Some(ValueFilter { min: 2.0, max: 9.0 })] {
+                        for timestamp_filter in [None, Some(vec![35, 70, 350, 390, 4000, 9000])] {
+                            for latest in [None, Some(Sample::new(11_500, 4.0))] {
+                                let options = RangeOptions {
+                                    date_range: TimestampRange::from_timestamps(0, 12_000).unwrap(),
+                                    value_filter,
+                                    timestamp_filter: timestamp_filter.clone(),
+                                    aggregation: aggregation.map(|aggregator| AggregationOptions {
+                                        aggregations: smallvec::smallvec![aggregator.into()],
+                                        bucket_duration: 100,
+                                        report_empty,
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                };
+                                let mut newest_first: Vec<(i64, f64)> =
+                                    create_range_iterator(&series, &options, latest, true)
+                                        .map(pair)
+                                        .collect();
+                                newest_first.reverse();
+                                let forward: Vec<(i64, f64)> =
+                                    create_range_iterator(&series, &options, latest, false)
+                                        .map(pair)
+                                        .collect();
+                                let last_of = |rows: &[(i64, f64)], n: usize| {
+                                    rows[rows.len().saturating_sub(n)..].to_vec()
+                                };
+
+                                for count in [1usize, 3, 1000] {
+                                    let tail: Vec<(i64, f64)> = create_range_tail_iterator(
+                                        &series, &options, latest, count, true,
+                                    )
+                                    .map(pair)
+                                    .collect();
+                                    assert!(
+                                        same(&tail, &last_of(&newest_first, count)),
+                                        "{aggregation:?} empty {report_empty} {value_filter:?} \
+                                         {timestamp_filter:?} {latest:?} count {count}"
+                                    );
+
+                                    let grouped: Vec<(i64, f64)> = create_range_tail_iterator(
+                                        &series, &options, latest, count, false,
+                                    )
+                                    .map(pair)
+                                    .collect();
+                                    // Raw samples have no EMPTY fill, so direction cannot differ.
+                                    assert!(
+                                        same(&grouped, &last_of(&forward, count)),
+                                        "grouped, {aggregation:?} count {count}"
+                                    );
+
+                                    if options.aggregation.is_some() {
+                                        let rows: Vec<(i64, f64)> = create_row_tail_iterator(
+                                            &series, &options, latest, count, true,
+                                        )
+                                        .map(|r| (r.timestamp, r.values[0]))
+                                        .collect();
+                                        assert!(
+                                            same(&rows, &last_of(&newest_first, count)),
+                                            "rows, {aggregation:?} count {count}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// A newest-first COUNT skips most of a long run of gaps. It finishes at once on a span that

@@ -7,8 +7,8 @@ use crate::common::{MultiSample, Sample, Timestamp};
 use crate::error_consts;
 use crate::iterators::{
     KWayMerge, RowReducer, SampleReducer, TailIter, create_range_iterator,
-    create_range_iterator_for_reply, create_row_iterator, create_row_iterator_for_reply,
-    get_range_latest_sample,
+    create_range_iterator_for_reply, create_range_tail_iterator, create_row_iterator,
+    create_row_iterator_for_reply, create_row_tail_iterator, get_range_latest_sample,
 };
 use crate::labels::Label;
 use crate::series::TimeSeries;
@@ -379,23 +379,46 @@ fn handle_non_grouped(
             // as per-column chunks (SeriesRangeResponse.columns), so the
             // clustered path is valid here.
             let data = if is_multi {
-                let iter = create_row_iterator_for_reply(
-                    meta.series,
-                    &options.range,
-                    meta.latest,
-                    options.is_reverse,
-                    options.is_reverse || options.reply_reverse,
-                );
+                let reply_reverse = options.is_reverse || options.reply_reverse;
                 let iter = match limit {
-                    Some(limit) => limit.apply(iter),
-                    None => iter,
+                    Some(SampleLimit::Tail(count)) => create_row_tail_iterator(
+                        meta.series,
+                        &options.range,
+                        meta.latest,
+                        count,
+                        reply_reverse,
+                    ),
+                    limit => {
+                        let iter = create_row_iterator_for_reply(
+                            meta.series,
+                            &options.range,
+                            meta.latest,
+                            options.is_reverse,
+                            reply_reverse,
+                        );
+                        match limit {
+                            Some(limit) => limit.apply(iter),
+                            None => iter,
+                        }
+                    }
                 };
                 SeriesResultData::Rows(iter.collect())
             } else {
-                let iter = create_iter(meta.series, &options, meta.latest);
                 let iter = match limit {
-                    Some(limit) => limit.apply(iter),
-                    None => iter,
+                    Some(SampleLimit::Tail(count)) => create_range_tail_iterator(
+                        meta.series,
+                        &options.range,
+                        meta.latest,
+                        count,
+                        options.is_reverse || options.reply_reverse,
+                    ),
+                    limit => {
+                        let iter = create_iter(meta.series, &options, meta.latest);
+                        match limit {
+                            Some(limit) => limit.apply(iter),
+                            None => iter,
+                        }
+                    }
                 };
                 let samples = iter.collect::<Vec<_>>();
                 // Only the clustered response crosses the network, so only it is
