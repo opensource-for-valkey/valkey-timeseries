@@ -44,16 +44,23 @@ pub struct TimestampFilterIterator<'a> {
 
 impl<'a> TimestampFilterIterator<'a> {
     /// Create a new iterator.
-    /// - `chunks` should be the series chunks in chronological order (earliest -> latest).
-    /// - `timestamps` is the list of timestamps to look up.
+    /// - `series` is the series to look the timestamps up in.
+    /// - `timestamps` is the list of timestamps to look up, in any order. Duplicates are ignored,
+    ///   and so is any entry outside `[start, end]` or older than the series' retention floor.
     /// - `is_reverse` controls whether iteration goes from the end of `timestamps` to the start.
-    pub fn new(series: &'a TimeSeries, timestamps: &[Timestamp], is_reverse: bool) -> Self {
+    pub fn new(
+        series: &'a TimeSeries,
+        timestamps: &[Timestamp],
+        start: Timestamp,
+        end: Timestamp,
+        is_reverse: bool,
+    ) -> Self {
         let mut timestamps: SmallVec<[Timestamp; 16]> = SmallVec::from(timestamps);
         timestamps.sort_unstable();
         timestamps.dedup();
         // Expired samples the write path has not trimmed yet are not part of the series.
-        let min_timestamp = series.get_min_timestamp();
-        timestamps.retain(|ts| *ts >= min_timestamp);
+        let start = start.max(series.get_min_timestamp());
+        timestamps.retain(|ts| (start..=end).contains(ts));
 
         let chunk_idx = if series.is_empty() {
             -1
@@ -238,7 +245,7 @@ mod tests {
         let series = build_series();
         // timestamps include matches and a missing entry (4)
         let timestamps = &[1, 4, 6];
-        let it = TimestampFilterIterator::new(&series, timestamps, false);
+        let it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, false);
 
         let out: Vec<Sample> = it.collect();
         // Expect samples for 1 and 6 only
@@ -251,7 +258,7 @@ mod tests {
     fn finds_exact_matches_reverse() {
         let series = build_series();
         let timestamps = &[2, 5, 7];
-        let it = TimestampFilterIterator::new(&series, timestamps, true);
+        let it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, true);
 
         let out: Vec<Sample> = it.collect();
         // Expect samples for 7,5,2 in that order
@@ -263,7 +270,7 @@ mod tests {
     fn missing_timestamps_are_skipped() {
         let series = build_series();
         let timestamps = &[0, 4, 8]; // none exist
-        let mut it = TimestampFilterIterator::new(&series, timestamps, false);
+        let mut it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, false);
         assert!(it.next().is_none());
     }
 
@@ -272,7 +279,7 @@ mod tests {
         let series = build_series();
         // timestamps mostly increasing, ensures iterator moves forward across chunks
         let timestamps = &[1, 2, 3, 5, 6, 7];
-        let mut it = TimestampFilterIterator::new(&series, timestamps, false);
+        let mut it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, false);
 
         // consume partially to exercise chunk switching
         assert_eq!(it.next().map(|s| s.timestamp), Some(1));
@@ -303,7 +310,7 @@ mod tests {
     fn finds_exact_matches_forward_compressed() {
         let series = build_compressed_series();
         let timestamps = &[1, 4, 6];
-        let it = TimestampFilterIterator::new(&series, timestamps, false);
+        let it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, false);
 
         let out: Vec<Sample> = it.collect();
         assert_eq!(out.len(), 2);
@@ -312,7 +319,7 @@ mod tests {
 
         // ensure that we can find consecutive timestamps
         let timestamps = &[2, 3];
-        let it = TimestampFilterIterator::new(&series, timestamps, false);
+        let it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, false);
         let out: Vec<Sample> = it.collect();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].timestamp, 2);
@@ -323,7 +330,7 @@ mod tests {
     fn finds_exact_matches_reverse_compressed() {
         let series = build_compressed_series();
         let timestamps = &[2, 5, 7];
-        let it = TimestampFilterIterator::new(&series, timestamps, true);
+        let it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, true);
 
         let out: Vec<Sample> = it.collect();
         let ts: Vec<Timestamp> = out.into_iter().map(|s| s.timestamp).collect();
@@ -334,7 +341,7 @@ mod tests {
     fn missing_timestamps_are_skipped_compressed() {
         let series = build_compressed_series();
         let timestamps = &[0, 4, 8];
-        let mut it = TimestampFilterIterator::new(&series, timestamps, false);
+        let mut it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, false);
         assert!(it.next().is_none());
     }
 
@@ -342,7 +349,7 @@ mod tests {
     fn reuses_chunk_lookup_hint_across_timestamps_compressed() {
         let series = build_compressed_series();
         let timestamps = &[1, 2, 3, 5, 6, 7];
-        let mut it = TimestampFilterIterator::new(&series, timestamps, false);
+        let mut it = TimestampFilterIterator::new(&series, timestamps, i64::MIN, i64::MAX, false);
 
         assert_eq!(it.next().map(|s| s.timestamp), Some(1));
         assert_eq!(it.next().map(|s| s.timestamp), Some(2));

@@ -200,7 +200,9 @@ pub fn create_range_iterator<'a>(
     }
 
     if let Some(ts_filter) = options.timestamp_filter.as_ref() {
-        let base_iter = TimestampFilterIterator::new(series, ts_filter, should_reverse_iter);
+        let (start_ts, end_ts) = options.get_timestamp_range();
+        let base_iter =
+            TimestampFilterIterator::new(series, ts_filter, start_ts, end_ts, should_reverse_iter);
         // Remove the timestamp filter from options to avoid double filtering
         let opts = RangeOptions {
             date_range: options.date_range,
@@ -246,7 +248,10 @@ fn create_filtered_sample_iterator<'a>(
     let base_iter: Box<dyn Iterator<Item = Sample> + 'a> =
         if let Some(ts_filter) = options.timestamp_filter.as_ref() {
             // The base iterator applies the timestamp filter; no re-filtering needed.
-            Box::new(TimestampFilterIterator::new(series, ts_filter, false))
+            let (start_ts, end_ts) = options.get_timestamp_range();
+            Box::new(TimestampFilterIterator::new(
+                series, ts_filter, start_ts, end_ts, false,
+            ))
         } else {
             Box::new(SeriesSampleIterator::from_range_options(
                 series, options, false,
@@ -645,7 +650,8 @@ impl TimestampFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::TailIter;
+    use super::*;
+    use crate::series::TimestampRange;
 
     #[test]
     fn test_tail_iter() {
@@ -661,6 +667,66 @@ mod tests {
         // degenerate cases
         assert_eq!(tail(0, &[1, 2, 3]), Vec::<i32>::new());
         assert_eq!(tail(3, &[]), Vec::<i32>::new());
+    }
+
+    fn series_with(samples: &[(i64, f64)]) -> TimeSeries {
+        let mut series = TimeSeries::default();
+        for &(ts, value) in samples {
+            series.add(ts, value, None);
+        }
+        series
+    }
+
+    fn sum_empty_buckets(bucket_duration: u64) -> AggregationOptions {
+        AggregationOptions {
+            aggregations: smallvec::smallvec![AggregationType::Sum.into()],
+            bucket_duration,
+            report_empty: true,
+            ..Default::default()
+        }
+    }
+
+    /// FILTER_BY_TS selects within the query window: an entry outside it returns nothing.
+    #[test]
+    fn test_timestamp_filter_is_limited_to_the_window() {
+        let series = series_with(&[(0, 1.0), (2, 2.0), (4, 3.0), (6, 4.0)]);
+        let options = RangeOptions {
+            date_range: TimestampRange::from_timestamps(2, 4).unwrap(),
+            timestamp_filter: Some(vec![0, 2, 4, 6]),
+            ..Default::default()
+        };
+
+        let timestamps = |is_reverse| -> Vec<i64> {
+            create_range_iterator(&series, &options, &None, None, is_reverse)
+                .map(|s| s.timestamp)
+                .collect()
+        };
+        assert_eq!(timestamps(false), vec![2, 4]);
+        assert_eq!(timestamps(true), vec![4, 2]);
+    }
+
+    /// The window limits what is returned, not what EMPTY can see: entries past each edge are
+    /// what make the buckets out to that edge reportable.
+    #[test]
+    fn test_empty_fill_reaches_window_edges_from_outside_filter_entries() {
+        let series = series_with(&[(10, 1.0), (55, 2.0), (90, 3.0)]);
+        let options = RangeOptions {
+            date_range: TimestampRange::from_timestamps(50, 70).unwrap(),
+            timestamp_filter: Some(vec![10, 55, 90]),
+            aggregation: Some(sum_empty_buckets(5)),
+            ..Default::default()
+        };
+        let expected = vec![(50, 0.0), (55, 2.0), (60, 0.0), (65, 0.0), (70, 0.0)];
+
+        let scalar: Vec<(i64, f64)> = create_range_iterator(&series, &options, &None, None, false)
+            .map(|s| (s.timestamp, s.value))
+            .collect();
+        assert_eq!(scalar, expected);
+
+        let rows: Vec<(i64, f64)> = create_row_iterator(&series, &options, None, false)
+            .map(|r| (r.timestamp, r.values[0]))
+            .collect();
+        assert_eq!(rows, expected);
     }
 
     #[test]

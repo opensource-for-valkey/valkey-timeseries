@@ -203,7 +203,6 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
     def test_mrange_cme_filter_by_ts_outside_window_matches_nothing(self, command, options):
         """Every FILTER_BY_TS entry outside the window leaves nothing to match.
 
-        The parser clips the filter to the window, so it arrives at the fan-out codec empty.
         That must stay distinct from "no filter", which returns the whole window. Each series
         is still listed, with no samples, as it is on a standalone server.
         """
@@ -223,7 +222,7 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         ]
 
     def test_mrange_cme_filter_by_ts_outside_window_groupby(self):
-        """A clipped-to-empty FILTER_BY_TS leaves every group with no samples."""
+        """A FILTER_BY_TS entirely outside the window leaves every group with no samples."""
         self.setup_clustered_data()
 
         client = self.new_client_for_primary(0)
@@ -238,7 +237,7 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         ]
 
     def test_mrange_cme_filter_by_ts_outside_window_excludeempty(self):
-        """EXCLUDEEMPTY drops every series once a clipped filter has emptied them."""
+        """EXCLUDEEMPTY drops every series a FILTER_BY_TS outside the window has emptied."""
         self.setup_clustered_data()
 
         client = self.new_client_for_primary(0)
@@ -250,7 +249,7 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         assert result == []
 
     def test_mrange_cme_filter_by_ts_partly_outside_window(self):
-        """Clipping keeps the entries inside the window, and only those match."""
+        """Only the entries inside the window return samples."""
         self.setup_clustered_data()
 
         client = self.new_client_for_primary(0)
@@ -261,6 +260,23 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         assert len(result) == 2
         for series in result:
             assert [sample[0] for sample in series[2]] == [self.start_ts + 50]
+
+    def test_mrange_cme_empty_fill_sees_filter_by_ts_entries_outside_the_window(self):
+        """Shards get the whole list, so entries past each edge let EMPTY fill out to it."""
+        client = self.new_client_for_primary(0)
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        for key in ('ts:{slot1}:fill', 'ts:{slot2}:fill'):
+            for timestamp, value in ((10, 1), (55, 2), (90, 3)):
+                cluster_client.execute_command('TS.ADD', key, timestamp, value, 'LABELS', 'k', 'fill')
+
+        result = client.execute_command('TS.MRANGE', 50, 70,
+                                        'FILTER_BY_TS', 10, 55, 90,
+                                        'AGGREGATION', 'sum', 5, 'EMPTY',
+                                        'FILTER', 'k=fill')
+
+        assert len(result) == 2
+        for series in result:
+            assert series[2] == [[50, b'0'], [55, b'2'], [60, b'0'], [65, b'0'], [70, b'0']]
 
     def test_mrange_cme_empty_result(self):
         """Test TS.MRANGE with no matching series across slots."""

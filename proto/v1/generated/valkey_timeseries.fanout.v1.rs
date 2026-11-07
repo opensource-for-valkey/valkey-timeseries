@@ -522,8 +522,9 @@ pub struct MDelRequest {
     pub filters: ::prost::alloc::vec::Vec<SeriesSelector>,
 }
 /// FILTER_BY_TS. A message rather than a bare `repeated` field so its presence survives the wire:
-/// an empty list means "match nothing", which the parser produces by clipping the filter to the
-/// query window, while an absent one means "no filter".
+/// an empty list means "match nothing", while an absent one means "no filter". It carries every
+/// entry the query named, including those outside its window, because those still decide how far
+/// EMPTY fills.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TimestampFilter {
     #[prost(int64, repeated, tag = "1")]

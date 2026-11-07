@@ -1020,9 +1020,8 @@ mod tests {
         }
     }
 
-    /// `Some([])` means "match nothing" (the parser clips FILTER_BY_TS to the query window, which
-    /// can empty it) and `None` means "no filter". Encoded through real protobuf bytes because
-    /// proto3 cannot tell an empty repeated field from an absent one.
+    /// `Some([])` means "match nothing" and `None` means "no filter". Encoded through real
+    /// protobuf bytes because proto3 cannot tell an empty repeated field from an absent one.
     #[test]
     fn test_timestamp_filter_presence_survives_the_wire() {
         for filter in [None, Some(vec![]), Some(vec![1050, 1100])] {

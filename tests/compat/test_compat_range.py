@@ -354,6 +354,39 @@ class TestFilterByTs:
             "FILTER_BY_TS", 0, 250, 3000, "AGGREGATION", "sum", 1000,
         )
 
+    @pytest.mark.parametrize("aggregator", ["sum", "last", "count"])
+    @pytest.mark.parametrize(
+        "window, timestamps",
+        [
+            pytest.param((50, 70), (10, 55, 90), id="passing-data-on-both-sides"),
+            pytest.param((50, 70), (55, 90), id="passing-data-after-only"),
+            pytest.param((50, 70), (10, 55), id="passing-data-before-only"),
+            pytest.param((60, 70), (10, 90), id="window-is-a-gap"),
+            pytest.param((60, 70), (10,), id="window-past-the-last-entry"),
+            pytest.param((60, 70), (90,), id="window-before-the-first-entry"),
+            pytest.param((50, 70), (11, 55, 91), id="outside-entries-match-no-sample"),
+            pytest.param((60, 70), (90, 10, 90), id="unsorted-and-duplicated"),
+        ],
+    )
+    def test_empty_fill_sees_entries_outside_the_window(
+        self, diff, range_cmd, window, timestamps, aggregator
+    ):
+        # Entries outside the window return no samples, but they still decide how far EMPTY
+        # reaches, exactly as passing samples outside the window do under FILTER_BY_VALUE.
+        mk_populated(diff, "r:fbtsfill", [(10, 1.0), (55, 2.0), (90, 3.0)])
+        diff(
+            range_cmd, "r:fbtsfill", *window, "FILTER_BY_TS", *timestamps,
+            "AGGREGATION", aggregator, 5, "EMPTY",
+        )
+
+    def test_empty_fill_applies_the_value_filter_to_outside_entries(self, diff, range_cmd):
+        mk_populated(diff, "r:fbtsfillv", [(10, 1.0), (55, 2.0), (90, 3.0)])
+        for bounds in ((1.5, 2.5), (1.5, 3.5), (0.5, 2.5)):
+            diff(
+                range_cmd, "r:fbtsfillv", 50, 70, "FILTER_BY_TS", 10, 55, 90,
+                "FILTER_BY_VALUE", *bounds, "AGGREGATION", "sum", 5, "EMPTY",
+            )
+
     def test_filter_by_ts_requires_a_timestamp(self, diff, range_cmd):
         mk_populated(diff, "r:fbtsempty", BASE_SAMPLES)
         with pytest.raises(ResponseError):

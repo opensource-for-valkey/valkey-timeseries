@@ -241,6 +241,15 @@ class TestPerSeriesOptions:
             "AGGREGATION", "sum", 1000, "EMPTY", "FILTER", "k=v",
         )
 
+    def test_empty_fill_sees_filter_by_ts_entries_outside_the_window(self, diff, mrange_cmd):
+        mk_series(diff, "m:fbtsfill", "LABELS", "fbtsfill", "yes")
+        for ts, value in ((10, 1.0), (55, 2.0), (90, 3.0)):
+            diff("TS.ADD", "m:fbtsfill", ts, value)
+        diff(
+            mrange_cmd, 50, 70, "FILTER_BY_TS", 10, 55, 90,
+            "AGGREGATION", "sum", 5, "EMPTY", "FILTER", "fbtsfill=yes",
+        )
+
     def test_filter_by_ts(self, diff, mrange_cmd):
         mk_label_universe(diff)
         diff(mrange_cmd, "-", "+", "FILTER_BY_TS", 100, 300, "FILTER", "metric=cpu")
