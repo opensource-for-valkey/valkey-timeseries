@@ -77,7 +77,9 @@ where
     /// freeing, as it used to, that result (an MRANGE's samples, say) leaked.
     pub fn new(ctx: &Context, timeout: Duration) -> Self {
         // 0 means "never" to the server.
-        let timeout_ms = (timeout.as_millis() as i64).max(1);
+        let timeout_ms = i64::try_from(timeout.as_millis())
+            .unwrap_or(i64::MAX)
+            .max(1);
         let bc_ptr = unsafe {
             ValkeyModule_BlockClient.unwrap()(
                 ctx.ctx as *mut ValkeyModuleCtx,

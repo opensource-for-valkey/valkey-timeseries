@@ -1,8 +1,10 @@
 use crate::common::context::is_blocking_denied;
 use crate::common::metrics::fanout as metrics;
 use crate::common::replies::ReplyContext;
+use crate::common::sync::lock;
 use crate::fanout::FanoutCommandResult;
 use crate::fanout::blocked_client::FanoutBlockedClient;
+use crate::fanout::cluster_rpc::get_cluster_command_timeout;
 use crate::fanout::serialization::Serializable;
 use crate::fanout::{FanoutCommand, FanoutContext, FanoutResult, FanoutTarget, NodeInfo};
 use metered::Counter;
@@ -61,15 +63,15 @@ pub trait FanoutClientCommand: Default + Send + 'static {
         }
         let blocked_client = Arc::new(Mutex::new(FanoutBlockedClient::<Self>::new(
             ctx,
-            self.get_timeout(),
+            get_cluster_command_timeout(),
         )));
         let bc_for_closure = Arc::clone(&blocked_client);
 
         let handle_response = move |op: Self, result: FanoutResult| {
-            // Runs on a background thread once all shard responses arrive.
-            if let Ok(mut bc) = bc_for_closure.lock() {
-                bc.set_private_data(op, result);
-            }
+            // Runs once, on whichever thread completes the fanout: the main thread
+            // for the last remote answer, a send failure or the RPC timer, a worker
+            // for the last local answer.
+            lock(&bc_for_closure).set_private_data(op, result);
         };
 
         let exec_result = Self::exec_command(self, ctx, handle_response);
@@ -80,9 +82,7 @@ pub trait FanoutClientCommand: Default + Send + 'static {
                 // proper error message instead of "No reply data".
                 let op = Self::default();
                 let fanout_result: FanoutResult = Err(err);
-                if let Ok(mut bc) = blocked_client.lock() {
-                    bc.set_private_data(op, fanout_result);
-                }
+                lock(&blocked_client).set_private_data(op, fanout_result);
 
                 // Dropping the last Arc triggers unblock(), and the reply_callback
                 // will send the error reply based on the stored fanout_result.

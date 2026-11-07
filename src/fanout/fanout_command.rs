@@ -2,6 +2,7 @@ use super::cluster_rpc::{get_cluster_command_timeout, invoke_rpc};
 use super::fanout_error::{ErrorKind, FanoutError};
 use crate::common::acl::caller_user_name;
 use crate::common::context::get_current_db;
+use crate::common::logging::{log_debug, log_warning};
 use crate::common::metrics::fanout as metrics;
 use crate::common::sync::lock;
 use crate::common::threads::Rejected;
@@ -12,6 +13,7 @@ use crate::fanout::{
     FanoutResult, FanoutTarget, NodeInfo, compute_query_fanout_mode, get_fanout_targets,
 };
 use metered::Counter;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use valkey_module::{Context, ValkeyResult};
@@ -52,12 +54,6 @@ pub trait FanoutCommand: Default + Send + 'static {
         true
     }
 
-    /// Return the timeout duration for the entire fanout operation.
-    /// This timeout applies to the overall operation, not individual RPC calls.
-    fn get_timeout(&self) -> Duration {
-        get_cluster_command_timeout()
-    }
-
     /// Get the target nodes for the fanout operation, bound to the cluster-map
     /// fingerprint of the snapshot they were selected from.
     /// By default, it retrieves a random replica per shard.
@@ -70,7 +66,7 @@ pub trait FanoutCommand: Default + Send + 'static {
     where
         F: FnOnce(Self, FanoutCommandResult) + Send + 'static,
     {
-        let timeout = self.get_timeout();
+        let timeout = get_cluster_command_timeout();
         let targets = self.get_targets(ctx);
         exec_command(ctx, self, targets, timeout, f)
     }
@@ -85,32 +81,39 @@ pub trait FanoutCommand: Default + Send + 'static {
     /// overall fanout to reply with an error at completion). Implementations should
     /// return `Ok(())` on success.
     fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult;
+}
 
-    fn on_error(&mut self, error: FanoutError, target: &NodeInfo) {
-        // Log the error with context
-        let msg = format!(
-            "Fanout operation {}, failed for target {}: {error}",
-            Self::name(),
-            target.socket_address,
-        );
-        crate::common::logging::log_warning(&msg)
+/// Error kinds that describe an outcome the client sees and can act on (a denial,
+/// a busy or swapped shard, a deadline, a topology change), as opposed to a fault.
+/// Logged at debug: a client can produce one per shard on every command it issues.
+fn is_client_visible(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::KeyPermissions
+            | ErrorKind::Permissions
+            | ErrorKind::Busy
+            | ErrorKind::DatabaseSwapped
+            | ErrorKind::Timeout
+            | ErrorKind::ClusterMapMismatch
+    )
+}
+
+/// The reply for a fanout that failed on some share with an error that does not
+/// abort it. Names the first such share, so the client sees more than that it failed.
+fn generic_error_reply(name: &str, first_error: Option<&(String, FanoutError)>) -> FanoutError {
+    match first_error {
+        Some((node, error)) => FanoutError::custom(format!(
+            "Internal error in fanout operation '{name}': {node}: {error}"
+        )),
+        None => FanoutError::custom(format!("Internal error in fanout operation '{name}'")),
     }
+}
 
-    /// Called once all responses have been received, or on timeout.
-    fn on_completion(&mut self) {}
-
-    /// If true, the fanout operation should abort immediately on the first
-    /// failing `on_response`. Default is `false` to preserve existing
-    /// per-shard error aggregation behavior.
-    fn fail_fast(&self) -> bool {
-        false
-    }
-
-    fn generate_error_reply(&self) -> FanoutError {
-        FanoutError::custom(format!(
-            "Internal error in fanout operation '{}'",
-            Self::name()
-        ))
+fn describe_target(target: &NodeInfo) -> String {
+    if target.is_local() {
+        "local node".to_string()
+    } else {
+        format!("node {}", target.socket_address)
     }
 }
 
@@ -240,6 +243,9 @@ where
     outstanding: usize,
     timed_out: bool,
     error_count: usize,
+    /// The first error that did not abort the fanout, with the share it came
+    /// from, for the generic error reply.
+    first_error: Option<(String, FanoutError)>,
     /// When set, the fanout has been aborted fail-fast (e.g. a cluster-map
     /// mismatch) and this exact error is returned to the client, bypassing the
     /// per-shard error aggregation.
@@ -281,8 +287,16 @@ where
         }
         self.activate();
         metrics::record_error(error.kind);
-        // Invoke the handler's error callback for custom error handling
-        self.operation.on_error(error.clone(), target);
+        let msg = format!(
+            "Fanout operation {} failed for {}: {error}",
+            OP::name(),
+            describe_target(target)
+        );
+        if is_client_visible(error.kind) {
+            log_debug(msg);
+        } else {
+            log_warning(msg);
+        }
         self.error_count += 1;
         if error.kind == ErrorKind::Timeout {
             self.timed_out = true;
@@ -319,6 +333,9 @@ where
             self.on_completion();
             return;
         }
+        if self.first_error.is_none() {
+            self.first_error = Some((describe_target(target), error));
+        }
         self.rpc_done();
     }
 
@@ -337,28 +354,11 @@ where
             return;
         }
 
-        // Call the operation's on_response and treat any error as a per-shard error, maintaining
-        // consistent bookkeeping (error_count, timed_out handling, logging).
+        // Treat an error from the operation as a per-shard error, with the same
+        // bookkeeping (error_count, timed_out handling, logging).
         match self.operation.on_response(resp, target) {
             Ok(()) => self.rpc_done(),
-            Err(err) => {
-                // If the operation requests fail-fast behavior, abort the fanout
-                // immediately after invoking the command's on_error hook and
-                // incrementing the error count. Otherwise, treat it as a normal
-                // per-shard error and continue.
-                if self.operation.fail_fast() {
-                    metrics::record_error(err.kind);
-                    // Allow the operation to run its error handler for diagnostics
-                    self.operation.on_error(err.clone(), target);
-                    self.error_count += 1;
-                    // Zero out outstanding so late responses are no-ops, then
-                    // immediately complete the fanout (do not wait for other shards).
-                    self.outstanding = 0;
-                    self.on_completion();
-                } else {
-                    self.on_error(err, target);
-                }
-            }
+            Err(err) => self.on_error(err, target),
         }
     }
 
@@ -381,9 +381,8 @@ where
             Err(FanoutError::timeout())
         } else if self.error_count > 0 {
             metrics::FANOUT_GENERIC_ERROR_REPLIES.incr();
-            Err(self.operation.generate_error_reply())
+            Err(generic_error_reply(OP::name(), self.first_error.as_ref()))
         } else {
-            self.operation.on_completion();
             Ok(())
         };
 
@@ -397,8 +396,21 @@ where
     OP: FanoutCommand + 'static,
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
+    /// The last reference went away while the fanout was still waiting on
+    /// shares (a share's owner was lost without answering). Complete it as a
+    /// failure: the answers it has are not the whole result.
     fn drop(&mut self) {
         if self.lifecycle == FanoutLifecycleState::Active {
+            if self.outstanding > 0 {
+                self.error_count += self.outstanding;
+                if self.first_error.is_none() {
+                    let error = FanoutError::custom(format!(
+                        "{} share(s) ended without an answer",
+                        self.outstanding
+                    ));
+                    self.first_error = Some(("fanout".to_string(), error));
+                }
+            }
             self.on_completion();
         }
     }
@@ -427,6 +439,7 @@ where
                 lifecycle: FanoutLifecycleState::Pending,
                 error_count: 0,
                 timed_out: false,
+                first_error: None,
                 abort_error: None,
                 callback: Some(f),
                 started,
@@ -490,9 +503,174 @@ where
             }
             fanout_ctx.set_deadline(deadline);
         }
-        match OP::get_local_response(&fanout_ctx, req) {
-            Ok(response) => state.on_response(response, &target),
-            Err(err) => state.on_error(err.into(), &target),
+        // A panic in the handler would otherwise unwind past the share and leave
+        // the fanout waiting on it; make it this share's failure instead.
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            OP::get_local_response(&fanout_ctx, req)
+        }));
+        match outcome {
+            Ok(Ok(response)) => state.on_response(response, &target),
+            Ok(Err(err)) => state.on_error(err.into(), &target),
+            Err(_) => {
+                let err =
+                    FanoutError::custom(format!("{} panicked on the local share", OP::name()));
+                state.on_error(err, &target);
+            }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fanout::cluster_map::{NodeLocation, NodeRole, SocketAddress};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::mpsc::{self, Receiver};
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct Count {
+        #[prost(uint64, tag = "1")]
+        count: u64,
+    }
+
+    /// Sums the counts it is sent; fails a share whose count is `u64::MAX`.
+    #[derive(Default)]
+    struct Sum {
+        total: u64,
+    }
+
+    impl FanoutCommand for Sum {
+        type Request = Count;
+        type Response = Count;
+
+        fn name() -> &'static str {
+            "sum"
+        }
+
+        fn get_local_response(_: &FanoutContext, req: Count) -> ValkeyResult<Count> {
+            Ok(req)
+        }
+
+        fn generate_request(&self) -> Count {
+            Count::default()
+        }
+
+        fn on_response(&mut self, resp: Count, _: &NodeInfo) -> FanoutCommandResult {
+            if resp.count == u64::MAX {
+                return Err(FanoutError::custom("bad count"));
+            }
+            self.total += resp.count;
+            Ok(())
+        }
+    }
+
+    type Outcome = (u64, FanoutCommandResult);
+
+    fn node(port: u16) -> NodeInfo {
+        NodeInfo {
+            id: Default::default(),
+            shard_id: Default::default(),
+            socket_address: SocketAddress {
+                primary_endpoint: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port,
+            },
+            role: NodeRole::Primary,
+            location: NodeLocation::Remote,
+            healthy: true,
+        }
+    }
+
+    fn fanout(
+        shares: usize,
+    ) -> (
+        FanoutState<Sum, impl FnOnce(Sum, FanoutCommandResult) + Send + 'static>,
+        Receiver<Outcome>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let callback = move |op: Sum, result| tx.send((op.total, result)).unwrap();
+        (
+            FanoutState::new(Sum::default(), shares, callback, Instant::now()),
+            rx,
+        )
+    }
+
+    fn answer(count: u64) -> Count {
+        Count { count }
+    }
+
+    #[test]
+    fn test_completes_once_after_every_share() {
+        let (state, rx) = fanout(2);
+        state.on_response(answer(3), &node(1));
+        assert!(rx.try_recv().is_err());
+        state.on_response(answer(4), &node(2));
+        let (total, result) = rx.try_recv().unwrap();
+        assert_eq!(total, 7);
+        assert!(result.is_ok());
+
+        // A late or duplicate answer neither completes again nor touches the placeholder.
+        state.on_response(answer(5), &node(2));
+        state.on_error(FanoutError::busy(), &node(2));
+        drop(state);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_drop_with_shares_outstanding_fails() {
+        let (state, rx) = fanout(2);
+        state.on_response(answer(7), &node(1));
+        drop(state);
+        let (total, result) = rx.try_recv().unwrap();
+        assert_eq!(total, 7);
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("ended without an answer"), "{err}");
+    }
+
+    #[test]
+    fn test_drop_before_any_share_discards_the_callback() {
+        let (state, rx) = fanout(2);
+        drop(state);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn test_generic_error_names_the_first_failed_share() {
+        let (state, rx) = fanout(3);
+        state.on_response(answer(u64::MAX), &node(7001));
+        state.on_error(FanoutError::custom("send failed"), &node(7002));
+        state.on_response(answer(1), &node(7003));
+        let err = rx.try_recv().unwrap().1.unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("Internal error in fanout operation 'sum'"),
+            "{text}"
+        );
+        assert!(text.contains("node 127.0.0.1:7001: bad count"), "{text}");
+    }
+
+    #[test]
+    fn test_aborting_error_wins_over_earlier_share_errors() {
+        let (state, rx) = fanout(3);
+        state.on_error(FanoutError::custom("send failed"), &node(1));
+        state.on_error(FanoutError::busy(), &node(2));
+        let err = rx.try_recv().unwrap().1.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Busy);
+    }
+
+    #[test]
+    fn test_timeout_completes_and_ignores_later_answers() {
+        let (state, rx) = fanout(2);
+        state.on_response(answer(1), &node(1));
+        state.on_error(FanoutError::timeout(), &node(0));
+        assert_eq!(
+            rx.try_recv().unwrap().1.unwrap_err().kind,
+            ErrorKind::Timeout
+        );
+        state.on_response(answer(1), &node(2));
+        drop(state);
+        assert!(rx.try_recv().is_err());
+    }
 }
