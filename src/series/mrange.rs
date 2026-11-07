@@ -6,9 +6,9 @@ use crate::common::threads::{IntoParRayon, IterIntoParRayon};
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::error_consts;
 use crate::iterators::{
-    MultiSeriesRowIter, MultiSeriesSampleIter, RowReducer, SampleReducer, TailIter,
-    create_range_iterator, create_range_iterator_for_reply, create_row_iterator,
-    create_row_iterator_for_reply, get_range_latest_sample,
+    KWayMerge, RowReducer, SampleReducer, TailIter, create_range_iterator,
+    create_range_iterator_for_reply, create_row_iterator, create_row_iterator_for_reply,
+    get_range_latest_sample,
 };
 use crate::labels::Label;
 use crate::series::TimeSeries;
@@ -152,7 +152,7 @@ pub(crate) fn process_mrange_group_partials(
                     })
                     .collect::<Vec<_>>();
 
-                let multi_iter = MultiSeriesRowIter::new(iterators);
+                let multi_iter = KWayMerge::new(iterators);
                 let rows = PartialRowReducer::new(multi_iter, reducer.clone(), columns);
                 let (timestamps, buckets): (Vec<Timestamp>, Vec<_>) = match limit {
                     Some(limit) => limit.apply(rows).unzip(),
@@ -165,17 +165,11 @@ pub(crate) fn process_mrange_group_partials(
                     .series
                     .iter()
                     .map(|meta| {
-                        create_range_iterator(
-                            meta.series,
-                            &options.range,
-                            &None,
-                            meta.latest,
-                            false,
-                        )
+                        create_range_iterator(meta.series, &options.range, meta.latest, false)
                     })
                     .collect::<Vec<_>>();
 
-                let multi_iter = MultiSeriesSampleIter::new(iterators);
+                let multi_iter = KWayMerge::new(iterators);
                 let rows = PartialSampleReducer::new(multi_iter, reducer.clone());
                 let (timestamps, states) = match limit {
                     Some(limit) => limit.apply(rows).unzip(),
@@ -311,7 +305,6 @@ fn create_iter<'a>(
     create_range_iterator_for_reply(
         series,
         &options.range,
-        &options.grouping,
         latest,
         options.is_reverse,
         options.is_reverse || options.reply_reverse,
@@ -503,7 +496,7 @@ fn get_grouped_samples(
     let is_reverse = options.is_reverse;
 
     // todo(perf): with sufficient memory, we could parallel load all samples into memory first,
-    // and construct the MultiSeriesSampleIter from those. In low memory, we could use the code
+    // and construct the KWayMerge from those. In low memory, we could use the code
     // below which iterates sequentially
     //
     // Per-series iterators must not apply the group reducer: reduction happens once,
@@ -515,10 +508,10 @@ fn get_grouped_samples(
     // on it buffering every iterator, which stopped holding once the merge was corrected.
     let iterators = series_metas
         .iter()
-        .map(|meta| create_range_iterator(meta.series, &options.range, &None, meta.latest, false))
+        .map(|meta| create_range_iterator(meta.series, &options.range, meta.latest, false))
         .collect::<Vec<_>>();
 
-    let multi_iter = MultiSeriesSampleIter::new(iterators);
+    let multi_iter = KWayMerge::new(iterators);
     let aggregator = grouping_options.aggregation.create_aggregator();
     let reducer = SampleReducer::new(multi_iter, aggregator);
 
@@ -548,7 +541,7 @@ fn get_grouped_rows(
         .map(|meta| create_row_iterator(meta.series, &options.range, meta.latest, false))
         .collect::<Vec<_>>();
 
-    let multi_iter = MultiSeriesRowIter::new(iterators);
+    let multi_iter = KWayMerge::new(iterators);
     let aggregator = grouping_options.aggregation.create_aggregator();
     let reducer = RowReducer::new(multi_iter, aggregator, columns);
 

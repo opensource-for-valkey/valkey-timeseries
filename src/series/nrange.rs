@@ -109,7 +109,7 @@ fn create_key_iterator<'a>(
         // one code path.
         create_row_iterator(meta.series, &range, meta.latest, false)
     } else {
-        let samples = create_range_iterator(meta.series, &range, &None, meta.latest, false);
+        let samples = create_range_iterator(meta.series, &range, meta.latest, false);
         Box::new(samples.map(|sample| MultiSample {
             timestamp: sample.timestamp,
             values: smallvec![sample.value],

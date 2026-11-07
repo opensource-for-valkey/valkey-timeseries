@@ -15,10 +15,7 @@ use crate::common::threads::{IntoParRayon, IterIntoParRayon};
 use crate::common::{MultiSample, Sample};
 use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
-use crate::iterators::{
-    MultiSeriesRowIter, MultiSeriesSampleIter, RowReducer, SampleReducer,
-    create_sample_iterator_adapter,
-};
+use crate::iterators::{KWayMerge, RowReducer, SampleReducer, create_sample_iterator_adapter};
 use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
 use crate::series::mrange::{
     SampleLimit, build_mrange_grouped_labels, collect_rows, collect_samples,
@@ -339,7 +336,6 @@ fn normalize_response_series(
             let samples: Vec<Sample> = create_sample_iterator_adapter(
                 result.data.sample_iter(),
                 &shard_range,
-                &None,
                 false,
                 EmptyFillBounds::default(),
             )
@@ -402,7 +398,7 @@ fn compensate_group_partials(
                     .iter()
                     .map(|s| series_rows_ascending(s, options))
                     .collect::<Vec<_>>();
-                let merged = MultiSeriesRowIter::new(row_iters);
+                let merged = KWayMerge::new(row_iters);
                 let (timestamps, buckets): (Vec<i64>, Vec<_>) =
                     PartialRowReducer::new(merged, reducer.clone(), columns).unzip();
                 let states = buckets.into_iter().flatten().collect::<Vec<_>>();
@@ -413,7 +409,7 @@ fn compensate_group_partials(
                     .iter()
                     .map(|s| s.data.sample_iter())
                     .collect::<Vec<_>>();
-                let merged = MultiSeriesSampleIter::new(iters);
+                let merged = KWayMerge::new(iters);
                 let (timestamps, states): (Vec<i64>, Vec<PartialState>) =
                     PartialSampleReducer::new(merged, reducer.clone()).unzip();
                 (timestamps, states, 1)
@@ -703,7 +699,7 @@ fn process_group(
             .iter()
             .map(|s| series_rows_ascending(s, options))
             .collect::<Vec<_>>();
-        let merged = MultiSeriesRowIter::new(row_iters);
+        let merged = KWayMerge::new(row_iters);
         let reducer = RowReducer::new(
             merged,
             group_options.aggregation.create_aggregator(),
@@ -774,13 +770,12 @@ fn reduce_aggregated_group(
             create_sample_iterator_adapter(
                 s.data.sample_iter(),
                 &range,
-                &None,
                 false,
                 EmptyFillBounds::default(),
             )
         })
         .collect::<Vec<_>>();
-    let merged = MultiSeriesSampleIter::new(per_series);
+    let merged = KWayMerge::new(per_series);
     let reducer = SampleReducer::new(merged, group_options.aggregation.create_aggregator());
     collect_samples(reducer, options.is_reverse, count)
 }
@@ -811,36 +806,37 @@ fn process_series_list(series: &[MRangeSeriesResult], options: &MRangeOptions) -
     if reverse_iter {
         let mut samples: Vec<_> = series.iter().flat_map(|s| s.data.sample_iter()).collect();
         samples.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
-        create_sample_iterator_adapter(
-            samples.into_iter(),
-            &options.range,
-            &options.grouping,
-            reverse_aggr,
-            EmptyFillBounds::default(),
-        )
-        .collect()
+        finish_series_list(samples.into_iter(), options, reverse_aggr)
     } else if series.len() == 1 {
-        create_sample_iterator_adapter(
-            series[0].data.sample_iter(),
-            &options.range,
-            &options.grouping,
-            reverse_aggr,
-            EmptyFillBounds::default(),
-        )
-        .collect()
+        finish_series_list(series[0].data.sample_iter(), options, reverse_aggr)
     } else {
         let iters = series
             .iter()
             .map(|s| s.data.sample_iter())
             .collect::<Vec<_>>();
-        create_sample_iterator_adapter(
-            MultiSeriesSampleIter::new(iters),
-            &options.range,
-            &options.grouping,
-            reverse_aggr,
-            EmptyFillBounds::default(),
-        )
-        .collect()
+        finish_series_list(KWayMerge::new(iters), options, reverse_aggr)
+    }
+}
+
+/// Reduce a group's merged samples per timestamp if there is a group, then apply the query's
+/// remaining options. A group reaches here only without AGGREGATION, since a group of aggregated
+/// series has to bucket each one first (`reduce_aggregated_group`), and after `reply` cleared the
+/// filters the shards already applied, so nothing filters the reduced values.
+fn finish_series_list(
+    samples: impl Iterator<Item = Sample>,
+    options: &MRangeOptions,
+    is_reverse: bool,
+) -> Vec<Sample> {
+    let empty_fill = EmptyFillBounds::default();
+    match &options.grouping {
+        Some(group) => {
+            debug_assert!(options.range.aggregation.is_none());
+            let reducer = SampleReducer::new(samples, group.aggregation.create_aggregator());
+            create_sample_iterator_adapter(reducer, &options.range, is_reverse, empty_fill)
+                .collect()
+        }
+        None => create_sample_iterator_adapter(samples, &options.range, is_reverse, empty_fill)
+            .collect(),
     }
 }
 
@@ -949,7 +945,6 @@ mod tests {
         create_sample_iterator_adapter(
             raw.into_iter(),
             &options.range,
-            &None,
             false,
             EmptyFillBounds::default(),
         )
@@ -1060,6 +1055,60 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].labels.is_empty());
         assert_eq!(results[0].key, "region=us".as_bytes());
+    }
+
+    /// GROUPBY + REDUCE with no AGGREGATION: the coordinator reduces the group's merged raw
+    /// samples per timestamp. An all-NaN timestamp still reports, as whatever the reducer gives
+    /// for a group it accepted nothing from, whether it falls mid-stream or at the end.
+    #[test]
+    fn test_grouped_raw_samples_reduce_per_timestamp() {
+        let reduce = |a: &[(i64, f64)],
+                      b: &[(i64, f64)],
+                      aggregation: AggregationType,
+                      is_reverse: bool,
+                      count: Option<usize>| {
+            let responses = vec![
+                to_response(series_result("a", Some("us"), samples(a))),
+                to_response(series_result("b", Some("us"), samples(b))),
+            ];
+            let mut options = mrange_options(0, 1000);
+            options.is_reverse = is_reverse;
+            options.range.count = count;
+            options.grouping = Some(RangeGroupingOptions {
+                aggregation: AggregatorConfig::new(aggregation, None).unwrap(),
+                group_label: "region".into(),
+            });
+            let results = handle_grouping(responses, &options).unwrap();
+            assert_eq!(results.len(), 1);
+            result_samples(&results[0])
+        };
+
+        let a = [(0, 1.0), (10, f64::NAN), (20, 3.0)];
+        let b = [(0, 2.0), (10, f64::NAN), (30, 4.0)];
+
+        assert_eq!(
+            reduce(&a, &b, AggregationType::Sum, false, None),
+            samples(&[(0, 3.0), (10, f64::NAN), (20, 3.0), (30, 4.0)])
+        );
+        assert_eq!(
+            reduce(&a, &b, AggregationType::Count, false, None),
+            samples(&[(0, 2.0), (10, 0.0), (20, 1.0), (30, 1.0)])
+        );
+        assert_eq!(
+            reduce(&a, &b, AggregationType::Sum, true, Some(2)),
+            samples(&[(30, 4.0), (20, 3.0)])
+        );
+
+        let ends_in_nan = [(0, 1.0), (10, f64::NAN)];
+        let nan_only = [(10, f64::NAN)];
+        assert_eq!(
+            reduce(&ends_in_nan, &nan_only, AggregationType::Sum, false, None),
+            samples(&[(0, 1.0), (10, f64::NAN)])
+        );
+        assert_eq!(
+            reduce(&ends_in_nan, &nan_only, AggregationType::Count, false, None),
+            samples(&[(0, 1.0), (10, 0.0)])
+        );
     }
 
     /// GROUPBY + REDUCE with AGGREGATION when the shards did not aggregate (push-down off):
@@ -1771,7 +1820,7 @@ mod tests {
                 rows.into_iter()
             })
             .collect();
-        let merged = MultiSeriesRowIter::new(row_iters);
+        let merged = KWayMerge::new(row_iters);
         let (bucket_timestamps, buckets): (Vec<i64>, Vec<_>) =
             PartialRowReducer::new(merged, reducer, columns).unzip();
 

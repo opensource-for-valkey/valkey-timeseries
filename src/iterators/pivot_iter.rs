@@ -1,40 +1,8 @@
 use crate::common::{MultiSample, SampleValue};
+use crate::iterators::k_way_merge::{MergeHeap, seeded_heap};
 use smallvec::{SmallVec, smallvec};
-use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::collections::binary_heap::PeekMut;
-
-/// A pending row tagged with the iterator it came from, so the merge can refill exactly that
-/// iterator once the row is consumed, and knows which output columns to write it into.
-struct Entry {
-    row: MultiSample,
-    source: usize,
-}
-
-impl PartialEq for Entry {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for Entry {}
-
-impl PartialOrd for Entry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Entry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Timestamp first; `source` only breaks ties. Values (which may be NaN) never take
-        // part in the comparison.
-        self.row
-            .timestamp
-            .cmp(&other.row.timestamp)
-            .then(self.source.cmp(&other.source))
-    }
-}
 
 /// Outer-joins several ascending row streams on timestamp, emitting one row per distinct
 /// timestamp with every source's values side by side.
@@ -42,20 +10,20 @@ impl Ord for Entry {
 /// Each source owns a fixed block of output columns (`widths[i]` of them, laid out in source
 /// order), so a row's position in the reply identifies which input produced it. Sources that
 /// have no row at an emitted timestamp leave their block as `NaN` — the outer join is what
-/// distinguishes this from [`MultiSeriesRowIter`], which concatenates streams into one
+/// distinguishes this from [`KWayMerge`], which concatenates streams into one
 /// timestamp-ordered sequence instead of widening them.
 ///
 /// Backs TS.NRANGE, whose reply is exactly this pivot: raw mode gives every source one column,
 /// `AGGREGATION` gives it one per aggregator.
 ///
-/// The merge is the same k-way merge as [`MultiSeriesRowIter`] — the heap holds the next unread
+/// The merge is the same k-way merge as [`KWayMerge`] — the heap holds the next unread
 /// row of *every* live source and emitting one refills from that same source, so its top is the
 /// global minimum — with one addition: every source sitting at the minimum's timestamp is drained
 /// into the same output row before it is emitted.
 ///
-/// [`MultiSeriesRowIter`]: crate::iterators::MultiSeriesRowIter
+/// [`KWayMerge`]: crate::iterators::KWayMerge
 pub struct PivotIter<T: Iterator<Item = MultiSample>> {
-    heap: BinaryHeap<Reverse<Entry>>,
+    heap: MergeHeap<MultiSample>,
     inner: Vec<T>,
     /// First output column of each source, i.e. the running sum of the widths.
     offsets: Vec<usize>,
@@ -82,23 +50,13 @@ impl<T: Iterator<Item = MultiSample>> PivotIter<T> {
             total_columns += width;
         }
         Self {
-            heap: BinaryHeap::with_capacity(sources.len()),
+            heap: BinaryHeap::new(),
             inner: sources,
             offsets,
             widths,
             total_columns,
             primed: false,
         }
-    }
-
-    /// Seed the heap with the first row of every source.
-    fn prime(&mut self) {
-        for source in 0..self.inner.len() {
-            if let Some(row) = self.inner[source].next() {
-                self.heap.push(Reverse(Entry { row, source }));
-            }
-        }
-        self.primed = true;
     }
 }
 
@@ -107,10 +65,11 @@ impl<T: Iterator<Item = MultiSample>> Iterator for PivotIter<T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.primed {
-            self.prime();
+            self.heap = seeded_heap(&mut self.inner);
+            self.primed = true;
         }
 
-        let timestamp = self.heap.peek()?.0.row.timestamp;
+        let timestamp = self.heap.peek()?.0.item.timestamp;
         let mut values: SmallVec<[SampleValue; 4]> = smallvec![f64::NAN; self.total_columns];
 
         // Every source at this timestamp joins the same row. A refill replaces the top in place,
@@ -119,7 +78,7 @@ impl<T: Iterator<Item = MultiSample>> Iterator for PivotIter<T> {
         // timestamp already emitted.
         while let Some(mut top) = self.heap.peek_mut() {
             let entry = &top.0;
-            if entry.row.timestamp != timestamp {
+            if entry.item.timestamp != timestamp {
                 break;
             }
 
@@ -128,11 +87,11 @@ impl<T: Iterator<Item = MultiSample>> Iterator for PivotIter<T> {
             // of the block NaN and a long one cannot spill into the neighbouring key's columns.
             let source = entry.source;
             let start = self.offsets[source];
-            let len = self.widths[source].min(entry.row.values.len());
-            values[start..start + len].copy_from_slice(&entry.row.values[..len]);
+            let len = self.widths[source].min(entry.item.values.len());
+            values[start..start + len].copy_from_slice(&entry.item.values[..len]);
 
             match self.inner[source].next() {
-                Some(row) => top.0.row = row,
+                Some(row) => top.0.item = row,
                 None => {
                     PeekMut::pop(top);
                 }

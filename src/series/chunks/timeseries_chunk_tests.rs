@@ -1266,23 +1266,6 @@ mod tests {
         }
     }
 
-    /// A filter can drop every sample, so it cannot promise its inner iterator's lower bound.
-    #[test]
-    fn test_filtered_iter_size_hint_has_no_lower_bound() {
-        use crate::series::types::ValueFilter;
-        for chunk_type in CHUNK_TYPES {
-            let mut chunk = TimeSeriesChunk::new(chunk_type, 4096);
-            chunk.set_data(&generate_random_samples(50)).unwrap();
-            let filter = ValueFilter {
-                min: 1e300,
-                max: 1e301,
-            };
-            let iter = chunk.filtered_iter(i64::MIN, i64::MAX, None, Some(filter));
-            assert_eq!(iter.size_hint().0, 0, "{chunk_type:?}");
-            assert_eq!(iter.count(), 0, "{chunk_type:?}");
-        }
-    }
-
     #[test]
     fn test_set_data_with_empty_slice_empties_the_chunk() {
         for chunk_type in CHUNK_TYPES {

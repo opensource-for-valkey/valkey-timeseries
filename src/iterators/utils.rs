@@ -3,8 +3,8 @@ use crate::aggregators::{
 };
 use crate::common::hash::IntSet;
 use crate::common::{MultiSample, Sample, Timestamp};
-use crate::iterators::{ReduceIterator, TimestampFilterIterator};
-use crate::series::request_types::{AggregationOptions, RangeGroupingOptions, RangeOptions};
+use crate::iterators::TimestampFilterIterator;
+use crate::series::request_types::{AggregationOptions, RangeOptions};
 use crate::series::{SeriesSampleIterator, TimeSeries, ValueFilter};
 use smallvec::SmallVec;
 
@@ -18,7 +18,7 @@ macro_rules! apply_iter_limit {
     };
 }
 
-pub fn create_aggregate_iterator<I>(
+fn create_aggregate_iterator<I>(
     iter: I,
     range: &RangeOptions,
     aggregation: &AggregationOptions,
@@ -170,18 +170,10 @@ pub(crate) fn empty_fill_bounds(
 pub fn create_range_iterator<'a>(
     series: &'a TimeSeries,
     options: &RangeOptions,
-    grouping: &Option<RangeGroupingOptions>,
     latest_sample: Option<Sample>,
     is_reverse: bool,
 ) -> Box<dyn Iterator<Item = Sample> + 'a> {
-    create_range_iterator_for_reply(
-        series,
-        options,
-        grouping,
-        latest_sample,
-        is_reverse,
-        is_reverse,
-    )
+    create_range_iterator_for_reply(series, options, latest_sample, is_reverse, is_reverse)
 }
 
 /// [`create_range_iterator`] for a stream whose reply order is not its own: a shard streams
@@ -189,7 +181,6 @@ pub fn create_range_iterator<'a>(
 pub(crate) fn create_range_iterator_for_reply<'a>(
     series: &'a TimeSeries,
     options: &RangeOptions,
-    grouping: &Option<RangeGroupingOptions>,
     latest_sample: Option<Sample>,
     is_reverse: bool,
     reply_reverse: bool,
@@ -215,7 +206,6 @@ pub(crate) fn create_range_iterator_for_reply<'a>(
         };
         let output = SampleOutput {
             options: &opts,
-            grouping,
             is_reverse: should_reverse_aggr,
             empty_fill,
         };
@@ -225,7 +215,6 @@ pub(crate) fn create_range_iterator_for_reply<'a>(
             SeriesSampleIterator::from_range_options(series, options, should_reverse_iter);
         let output = SampleOutput {
             options,
-            grouping,
             is_reverse: should_reverse_aggr,
             empty_fill,
         };
@@ -236,7 +225,6 @@ pub(crate) fn create_range_iterator_for_reply<'a>(
 /// What happens to a series' samples once they have been read.
 struct SampleOutput<'o> {
     options: &'o RangeOptions,
-    grouping: &'o Option<RangeGroupingOptions>,
     /// Reverse the *finished* output. Distinct from reading the series newest-first, which is
     /// what aggregation cannot do.
     is_reverse: bool,
@@ -269,13 +257,7 @@ impl SampleOutput<'_> {
     where
         I: Iterator<Item = Sample> + 'a,
     {
-        create_sample_iterator_adapter(
-            stream,
-            self.options,
-            self.grouping,
-            self.is_reverse,
-            self.empty_fill,
-        )
+        create_sample_iterator_adapter(stream, self.options, self.is_reverse, self.empty_fill)
     }
 }
 
@@ -319,7 +301,7 @@ fn create_filtered_sample_iterator<'a>(
 /// Create the multi-aggregation row pipeline for one series:
 /// filtered samples -> MultiAggregateIterator -> optional reverse -> take(COUNT).
 /// Only valid when `options.aggregation` is present (typically multi).
-pub fn create_row_iterator<'a>(
+pub(crate) fn create_row_iterator<'a>(
     series: &'a TimeSeries,
     options: &RangeOptions,
     latest_sample: Option<Sample>,
@@ -380,14 +362,12 @@ where
     }
 }
 
-/// Create a sample iterator adapter that applies filtering, aggregation, grouping, and limits
-/// based on the provided options. The resulting iterator yields samples according to the specified
-/// criteria.
+/// Create a sample iterator adapter that applies filtering, aggregation and limits based on the
+/// provided options. The resulting iterator yields samples according to the specified criteria.
 /// Boxing is delayed to the last possible moment to allow for compiler optimizations.
-pub fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
+pub(crate) fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
     base_iter: T,
     options: &RangeOptions,
-    grouping: &Option<RangeGroupingOptions>,
     is_reverse: bool,
     empty_fill: EmptyFillBounds,
 ) -> Box<dyn Iterator<Item = Sample> + 'a> {
@@ -414,28 +394,12 @@ pub fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
 
     let count = options.count;
 
-    match (&options.aggregation, grouping) {
-        (Some(agg), Some(grp)) => {
-            // Only valid when `base_iter` is a single series: this buckets the whole stream
-            // and then reduces one value per bucket. A multi-series group has to bucket each
-            // series on its own before reducing across them (`get_grouped_samples`,
-            // `reduce_aggregated_group`); bucketing their merged samples here gave the reducer
-            // one value per bucket instead of one per series.
-            let aggr_iter = create_aggregate_iterator(filtered, options, agg, empty_fill);
-            let aggregator = grp.aggregation.create_aggregator();
-            let reducer = ReduceIterator::new(aggr_iter, aggregator);
-            finalize(reducer, is_reverse, count)
-        }
-        (None, Some(grp)) => {
-            let aggregator = grp.aggregation.create_aggregator();
-            let reducer = ReduceIterator::new(filtered, aggregator);
-            finalize(reducer, is_reverse, count)
-        }
-        (Some(agg), None) => {
+    match &options.aggregation {
+        Some(agg) => {
             let aggr_iter = create_aggregate_iterator(filtered, options, agg, empty_fill);
             finalize(aggr_iter, is_reverse, count)
         }
-        (None, None) => finalize(filtered, is_reverse, count),
+        None => finalize(filtered, is_reverse, count),
     }
 }
 
@@ -505,7 +469,7 @@ impl<I: Iterator> Iterator for ReverseIter<I> {
 /// buffering at most `capacity` items (ring buffer). Used by COUNT push-down
 /// to take the tail of an ascending shard stream for reverse queries without
 /// disturbing the ascending pipeline.
-pub struct TailIter<I: Iterator> {
+pub(crate) struct TailIter<I: Iterator> {
     inner: I,
     capacity: usize,
     buf: std::collections::VecDeque<I::Item>,
@@ -547,7 +511,7 @@ const TIMESTAMP_FILTER_INLINE_THRESHOLD: usize = 16;
 
 // this may be overkill, but we'll try optimizing memory for a
 // very common case of a very small number of timestamps
-pub enum TimestampFilter {
+enum TimestampFilter {
     Set(IntSet<Timestamp>),
     List(SmallVec<[Timestamp; TIMESTAMP_FILTER_INLINE_THRESHOLD]>),
 }
@@ -618,7 +582,7 @@ mod tests {
         };
 
         let timestamps = |is_reverse| -> Vec<i64> {
-            create_range_iterator(&series, &options, &None, None, is_reverse)
+            create_range_iterator(&series, &options, None, is_reverse)
                 .map(|s| s.timestamp)
                 .collect()
         };
@@ -639,7 +603,7 @@ mod tests {
         };
         let expected = vec![(50, 0.0), (55, 2.0), (60, 0.0), (65, 0.0), (70, 0.0)];
 
-        let scalar: Vec<(i64, f64)> = create_range_iterator(&series, &options, &None, None, false)
+        let scalar: Vec<(i64, f64)> = create_range_iterator(&series, &options, None, false)
             .map(|s| (s.timestamp, s.value))
             .collect();
         assert_eq!(scalar, expected);
@@ -673,7 +637,7 @@ mod tests {
             }
         };
         let replied = |options: &RangeOptions, is_reverse: bool| -> Vec<(i64, f64)> {
-            create_range_iterator(&series, options, &None, Some(latest), is_reverse)
+            create_range_iterator(&series, options, Some(latest), is_reverse)
                 .map(|s| (s.timestamp, s.value))
                 .collect()
         };
@@ -725,7 +689,7 @@ mod tests {
         };
 
         let replied: Vec<(i64, f64)> =
-            create_range_iterator(&series, &options, &None, Some(Sample::new(1500, 5.0)), true)
+            create_range_iterator(&series, &options, Some(Sample::new(1500, 5.0)), true)
                 .map(|s| (s.timestamp, s.value))
                 .collect();
 
@@ -753,7 +717,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        create_range_iterator(&series, &options, &None, None, is_reverse)
+        create_range_iterator(&series, &options, None, is_reverse)
             .map(|s| (s.timestamp, (!s.value.is_nan()).then_some(s.value)))
             .collect()
     }
@@ -894,7 +858,7 @@ mod tests {
                 aggregation: Some(sum_empty_buckets(10)),
                 ..Default::default()
             };
-            create_range_iterator(&series, &options, &None, None, false)
+            create_range_iterator(&series, &options, None, false)
                 .map(|s| s.timestamp)
                 .collect()
         };

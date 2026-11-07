@@ -61,7 +61,7 @@ impl<'a> TimeSeriesRangeIterator<'a> {
         latest: Option<Sample>,
         is_reverse: bool,
     ) -> Self {
-        let inner = create_range_iterator(series, options, &None, latest, is_reverse);
+        let inner = create_range_iterator(series, options, latest, is_reverse);
         Self { inner }
     }
 }

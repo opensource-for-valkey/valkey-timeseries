@@ -1,9 +1,10 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::time::Duration;
 use valkey_timeseries::common::{Sample, Timestamp};
-use valkey_timeseries::iterators::TimestampFilterIterator;
+use valkey_timeseries::iterators::{TimestampFilterIterator, create_range_iterator};
 use valkey_timeseries::series::chunks::{ChunkEncoding, ChunkOps, TimeSeriesChunk};
-use valkey_timeseries::series::{TimeSeries, TimeSeriesOptions, ValueFilter};
+use valkey_timeseries::series::request_types::RangeOptions;
+use valkey_timeseries::series::{TimeSeries, TimeSeriesOptions, TimestampRange, ValueFilter};
 
 mod support;
 
@@ -104,10 +105,8 @@ fn bench_scan(c: &mut Criterion) {
     group.finish();
 }
 
-/// `scan_filtered` group: one `filtered_iter` (range_iter + value-filter
-/// iterator) per encoding, `drift` workload only, `mid_10pct` selectivity,
-/// at both 4 KiB and 64 KiB chunk sizes.  Measures the composed-iterator
-/// overhead the command layer sees.
+/// `scan_filtered` group: a value filter through the range pipeline commands use, per encoding,
+/// `drift` workload only, `mid_10pct` selectivity, at both 4 KiB and 64 KiB chunk sizes.
 ///
 /// Value filter covers ~50 % of drift samples (drift stays in [95, 105];
 /// we keep the central [97, 103] band).
@@ -135,6 +134,21 @@ fn bench_filtered_scan(c: &mut Criterion) {
             let start = mid - tenth / 2;
             let end = mid + tenth / 2;
 
+            let mut series = TimeSeries::with_options(TimeSeriesOptions {
+                chunk_encoding: encoding,
+                chunk_size: Some(chunk_size),
+                ..Default::default()
+            })
+            .expect("valid series options");
+            for sample in chunk.iter() {
+                series.add(sample.timestamp, sample.value, None);
+            }
+            let options = RangeOptions {
+                date_range: TimestampRange::from_timestamps(start, end).expect("valid range"),
+                value_filter: Some(value_filter),
+                ..Default::default()
+            };
+
             let bench_id = format!(
                 "{}/{}/{}/{}",
                 encoding.name(),
@@ -145,11 +159,9 @@ fn bench_filtered_scan(c: &mut Criterion) {
 
             group.bench_function(BenchmarkId::from_parameter(&bench_id), |b| {
                 b.iter(|| {
-                    chunk
-                        .filtered_iter(start, end, None, Some(value_filter))
-                        .for_each(|s| {
-                            std::hint::black_box((s.timestamp, s.value));
-                        });
+                    create_range_iterator(&series, &options, None, false).for_each(|s| {
+                        std::hint::black_box((s.timestamp, s.value));
+                    });
                 });
             });
         }

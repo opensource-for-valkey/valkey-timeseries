@@ -7,27 +7,6 @@ use crate::iterators::{SampleIter, SampleMergeIterator};
 use crate::series::chunks::{ChunkOps, TimeSeriesChunk};
 use crate::series::{DuplicatePolicy, SampleAddResult};
 
-pub fn merge_samples<'a, F, STATE>(
-    left: SampleIter<'a>,
-    right: SampleIter<'a>,
-    dp_policy: Option<DuplicatePolicy>,
-    state: &mut STATE,
-    mut f: F,
-) -> TsdbResult<()>
-where
-    F: FnMut(&mut STATE, Sample, bool) -> TsdbResult<()>,
-{
-    let dp_policy = dp_policy.unwrap_or(DuplicatePolicy::KeepLast);
-
-    let mut merge_iterator = SampleMergeIterator::new(left, right, dp_policy);
-
-    while let Some((sample, blocked)) = merge_iterator.next_internal() {
-        f(state, sample, blocked)?;
-    }
-
-    Ok(())
-}
-
 /// Shared bookkeeping for a chunk rebuild-merge: merges the chunk's `existing` samples with
 /// the incoming `samples` under `dp_policy` (default `KeepLast`), feeding every winning
 /// sample to `append` in timestamp order.
