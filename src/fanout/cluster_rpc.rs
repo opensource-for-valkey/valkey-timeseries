@@ -160,6 +160,7 @@ fn placeholder_node() -> NodeInfo {
         },
         role: NodeRole::Primary,
         location: Default::default(),
+        healthy: true,
     }
 }
 

@@ -1,4 +1,5 @@
 use crate::common::hash::DeterministicHasher;
+use crate::common::logging::{log_notice, log_warning};
 use crate::common::threads::LockGil;
 use crate::common::time::current_time_millis;
 use crate::config::CLUSTER_MAP_EXPIRATION_MS;
@@ -17,7 +18,6 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, OnceLock};
-use valkey_module::logging::{log_notice, log_warning};
 use valkey_module::{
     CallOptionsBuilder, CallReply, CallResult, Context, DetachedContext, VALKEYMODULE_NODE_ID_LEN,
     ValkeyModule_GetMyClusterID,
@@ -169,13 +169,6 @@ impl SlotRangeSet {
         for range in other.range_iter() {
             self.ranges.ranges_insert(range.clone());
         }
-    }
-
-    /// Helper method to calculate slot fingerprint
-    fn calculate_fingerprint(&self) -> u64 {
-        let mut hasher = DeterministicHasher::default();
-        self.hash(&mut hasher);
-        hasher.finish()
     }
 }
 
@@ -353,6 +346,10 @@ pub struct NodeInfo {
     pub socket_address: SocketAddress,
     pub role: NodeRole,
     pub location: NodeLocation,
+    /// False when `CLUSTER NODES` flags the node `fail`/`fail?` or reports its
+    /// bus link down. Target selection prefers healthy nodes within a shard but
+    /// never drops a shard because none of its nodes is healthy.
+    pub healthy: bool,
 }
 
 impl NodeInfo {
@@ -395,6 +392,7 @@ impl fmt::Debug for NodeInfo {
             .field("socket_address", &self.socket_address)
             .field("role", &self.role)
             .field("location", &self.location)
+            .field("healthy", &self.healthy)
             .finish()
     }
 }
@@ -416,58 +414,35 @@ pub struct ShardInfo {
     pub owned_slots: SlotRangeSet,
     /// Whether this shard is local
     pub is_local: bool,
-    /// Hash of an owned_slots set
-    pub slots_fingerprint: u64,
     pub is_consistent: bool,
 }
 
 impl ShardInfo {
-    /// Pick a node from the shard.
-    /// - replica_only: pick only from replicas (must exist)
-    /// - prefer_replica: pick a replica if available, else primary
-    fn pick_target<R: Rng + ?Sized>(
-        &self,
-        rng: &mut R,
-        replica_only: bool,
-        prefer_replica: bool,
-    ) -> NodeInfo {
-        if replica_only {
-            debug_assert!(
-                !self.replicas.is_empty(),
-                "Shard has no replicas to select from in replica-only mode"
-            );
-            let idx = rng.random_range(0..self.replicas.len());
-            return self.replicas[idx];
-        }
-
-        if prefer_replica && !self.replicas.is_empty() {
-            let idx = rng.random_range(0..self.replicas.len());
-            return self.replicas[idx];
-        }
-
-        if let Some(primary) = self.primary {
-            if self.replicas.is_empty() {
-                return primary;
+    /// Pick one node to serve the shard, uniformly among its healthy nodes.
+    ///
+    /// With `prefer_replica`, a healthy replica wins over the primary when one
+    /// exists. When no node is healthy the primary (or, lacking one, a replica)
+    /// is still returned, so the fanout fails on the dead node rather than
+    /// silently omitting the shard's data. `None` only for a shard with no nodes.
+    fn pick_target<R: Rng + ?Sized>(&self, rng: &mut R, prefer_replica: bool) -> Option<NodeInfo> {
+        fn pick_healthy<'a, R: Rng + ?Sized>(
+            rng: &mut R,
+            nodes: impl Iterator<Item = &'a NodeInfo> + Clone,
+        ) -> Option<NodeInfo> {
+            let healthy = nodes.filter(|node| node.healthy);
+            let count = healthy.clone().count();
+            if count == 0 {
+                return None;
             }
-            // random between primary + replicas
-            let idx = rng.random_range(0..(self.replicas.len() + 1));
-            if idx == 0 {
-                primary
-            } else {
-                self.replicas[idx - 1]
-            }
-        } else {
-            assert!(
-                !self.replicas.is_empty(),
-                "Shard has no nodes to select from"
-            );
-            let idx = rng.random_range(0..self.replicas.len());
-            self.replicas[idx]
+            healthy.clone().nth(rng.random_range(0..count)).copied()
         }
-    }
 
-    pub fn is_empty(&self) -> bool {
-        self.primary.is_none() && self.replicas.is_empty()
+        if prefer_replica && let Some(replica) = pick_healthy(rng, self.replicas.iter()) {
+            return Some(replica);
+        }
+        pick_healthy(rng, self.primary.iter().chain(self.replicas.iter()))
+            .or(self.primary)
+            .or_else(|| self.replicas.first().copied())
     }
 }
 
@@ -607,8 +582,7 @@ impl ClusterMap {
         match self.get_local_shard() {
             Some(local_shard) => {
                 let mut rng_ = rng();
-                let node = local_shard.pick_target(&mut rng_, false, false);
-                targets.insert(node);
+                targets.extend(local_shard.pick_target(&mut rng_, false));
             }
             None => {
                 log_warning("No local shard found in cluster map");
@@ -619,19 +593,19 @@ impl ClusterMap {
 
     fn random_one_per_shard(&self) -> Arc<HashSet<NodeInfo>> {
         let mut rng_ = rng();
-        let mut targets = HashSet::new();
-        for shard in self.shards.iter().filter(|shard| !shard.is_empty()) {
-            targets.insert(shard.pick_target(&mut rng_, false, false));
+        let mut targets = HashSet::with_capacity(self.shards.len());
+        for shard in self.shards.iter() {
+            targets.extend(shard.pick_target(&mut rng_, false));
         }
         Arc::new(targets)
     }
 
     fn random_one_replica_per_shard(&self) -> Arc<HashSet<NodeInfo>> {
         let mut rng_ = rng();
-        let mut targets = HashSet::new();
-        for shard in self.shards.iter().filter(|shard| !shard.is_empty()) {
-            // prefer a replica, fall back to primary if no replicas exist
-            targets.insert(shard.pick_target(&mut rng_, false, true));
+        let mut targets = HashSet::with_capacity(self.shards.len());
+        for shard in self.shards.iter() {
+            // prefer a healthy replica, fall back to the primary otherwise
+            targets.extend(shard.pick_target(&mut rng_, true));
         }
         Arc::new(targets)
     }
@@ -647,8 +621,7 @@ impl ClusterMap {
     fn random_one_from_slot(&self, slot: u16, targets: &mut HashSet<NodeInfo>) {
         if let Some(shard) = self.get_shard_by_slot(slot) {
             let mut rng_ = rng();
-            let node = shard.pick_target(&mut rng_, false, false);
-            targets.insert(node);
+            targets.extend(shard.pick_target(&mut rng_, false));
         }
     }
 
@@ -783,18 +756,38 @@ impl ClusterMap {
         let mut slot_ranges_parsed: Vec<SlotRangeInfo> = Vec::new();
         // The shard id (master node id) whose primary or a replica is the local node.
         let mut local_shard_id: Option<NodeId> = None;
+        // Masters that hold no data: no settled slots and none being imported.
+        let mut slotless_masters: HashSet<NodeId> = HashSet::new();
 
-        // Pass 1: masters become shards.
+        // Pass 1: masters that own (or are importing) slots become shards.
         for rec in records.iter() {
             if !rec.is_master {
                 continue;
             }
-            let Some(socket_address) = rec.socket_address else {
-                // A master with no usable address cannot serve; if it owns slots
-                // the map is not trustworthy.
-                if !rec.slot_ranges.is_empty() {
+            let mut slot_ranges = SlotRangeBuf::new();
+            for &(start, end) in rec.slot_ranges.iter() {
+                if start > end || end >= NUM_SLOTS {
                     new_map.is_consistent = false;
+                    continue;
                 }
+                slot_ranges.push((start, end));
+            }
+
+            // A master with no slots holds no data, so it is not a shard: it
+            // must neither be a fanout target nor enter the fingerprint. The
+            // common case is a failed former primary after a failover, which
+            // stays listed as `master,fail` until it rejoins or is forgotten.
+            // A master importing a slot keeps its shard, as keys already moved
+            // to it are only visible there until the migration settles.
+            if slot_ranges.is_empty() && !rec.imports_slots {
+                slotless_masters.insert(rec.id);
+                continue;
+            }
+
+            let Some(socket_address) = rec.socket_address else {
+                // A master that owns slots but has no usable address cannot
+                // serve them, so the map is not trustworthy.
+                new_map.is_consistent = false;
                 continue;
             };
 
@@ -804,6 +797,7 @@ impl ClusterMap {
                 socket_address,
                 role: NodeRole::Primary,
                 location: rec.location(),
+                healthy: rec.is_healthy,
             };
 
             let shard = shard_map.entry(rec.id).or_insert_with(|| ShardInfo {
@@ -816,11 +810,7 @@ impl ClusterMap {
                 local_shard_id = Some(rec.id);
             }
 
-            for &(start, end) in rec.slot_ranges.iter() {
-                if start > end || end >= NUM_SLOTS {
-                    new_map.is_consistent = false;
-                    continue;
-                }
+            for (start, end) in slot_ranges {
                 shard.owned_slots.insert_range(start, end);
                 slot_ranges_parsed.push(SlotRangeInfo {
                     start_slot: start,
@@ -839,8 +829,11 @@ impl ClusterMap {
                 continue;
             };
             let Some(shard) = shard_map.get_mut(&rec.master_id) else {
-                // Replica whose master is not (yet) known; view is inconsistent.
-                new_map.is_consistent = false;
+                // A replica of a slot-less master serves nothing; one whose
+                // master is not (yet) known makes the view inconsistent.
+                if !slotless_masters.contains(&rec.master_id) {
+                    new_map.is_consistent = false;
+                }
                 continue;
             };
             shard.replicas.push(NodeInfo {
@@ -849,6 +842,7 @@ impl ClusterMap {
                 socket_address,
                 role: NodeRole::Replica,
                 location: rec.location(),
+                healthy: rec.is_healthy,
             });
             if rec.is_local {
                 shard.is_local = true;
@@ -863,7 +857,7 @@ impl ClusterMap {
             new_map.owned_slots.append(&shard.owned_slots);
         }
 
-        // Finalize shards: back-pointers and per-shard fingerprints.
+        // Finalize shards: back-pointers.
         let mut shard_set: BTreeSet<ShardInfo> = BTreeSet::new();
         for (_, mut shard) in shard_map.into_iter() {
             if let Some(primary) = shard.primary.as_mut() {
@@ -872,7 +866,6 @@ impl ClusterMap {
             for replica in shard.replicas.iter_mut() {
                 replica.shard_id = shard.id;
             }
-            shard.slots_fingerprint = shard.owned_slots.calculate_fingerprint();
             shard_set.insert(shard);
         }
         new_map.shards = shard_set;
@@ -960,11 +953,15 @@ impl ClusterMap {
         }
     }
 
+    /// Hash of the slot -> owner assignment alone. Two nodes agree on it exactly
+    /// when they would route every slot to the same shard; membership that owns
+    /// no slots (replicas, empty or forgotten masters) leaves it unchanged.
     fn compute_cluster_fingerprint(&self) -> u64 {
         let mut hasher = DeterministicHasher::default();
-        for shard in self.shards.iter() {
-            hasher.write(shard.id.as_bytes());
-            shard.slots_fingerprint.hash(&mut hasher);
+        for (range, shard_id) in self.slot_to_shard_map.range_values() {
+            hasher.write_u16(*range.start());
+            hasher.write_u16(*range.end());
+            hasher.write(shard_id.as_bytes());
         }
         hasher.finish()
     }
@@ -992,6 +989,10 @@ struct ParsedNodeLine {
     socket_address: Option<SocketAddress>,
     is_master: bool,
     is_local: bool,
+    /// Not flagged `fail`/`fail?`, and (for a remote node) its link is `connected`.
+    is_healthy: bool,
+    /// The master is importing at least one slot (`[slot-<-id]`).
+    imports_slots: bool,
     /// True when this replica has a resolvable master id.
     has_master: bool,
     master_id: NodeId,
@@ -1025,7 +1026,7 @@ fn parse_node_line(line: &str, my_node_id: &NodeId) -> Option<ParsedNodeLine> {
     // Skip ping-sent/pong-recv/config-epoch and require link-state, so a line
     // with fewer than 8 fields is rejected just as the indexed form did.
     let mut fields = fields.skip(3);
-    fields.next()?;
+    let link_state = fields.next()?;
 
     if id_field.len() != VALKEYMODULE_NODE_ID_LEN as usize {
         return None;
@@ -1036,12 +1037,14 @@ fn parse_node_line(line: &str, my_node_id: &NodeId) -> Option<ParsedNodeLine> {
     let mut is_replica = false;
     let mut is_myself = false;
     let mut noaddr = false;
+    let mut failed = false;
     for flag in flags_field.split(',') {
         match flag {
             "master" => is_master = true,
             "slave" | "replica" => is_replica = true,
             "myself" => is_myself = true,
             "noaddr" => noaddr = true,
+            "fail" | "fail?" => failed = true,
             _ => {}
         }
     }
@@ -1050,6 +1053,8 @@ fn parse_node_line(line: &str, my_node_id: &NodeId) -> Option<ParsedNodeLine> {
         return None;
     }
     let is_local = is_myself || &id == my_node_id;
+    // The local node is reachable by definition; a remote one only over a live link.
+    let is_healthy = !failed && (is_local || link_state == "connected");
 
     let socket_address = parse_node_address(addr_field, noaddr, is_local);
 
@@ -1061,10 +1066,12 @@ fn parse_node_line(line: &str, my_node_id: &NodeId) -> Option<ParsedNodeLine> {
     };
 
     let mut slot_ranges = SlotRangeBuf::new();
+    let mut imports_slots = false;
     if is_master {
         for spec in fields {
-            // Skip importing/migrating markers like "[12000-<-<id>]".
+            // Importing/migrating markers like "[12000-<-<id>]" settle no ownership.
             if spec.starts_with('[') {
+                imports_slots |= spec.contains("-<-");
                 continue;
             }
             if let Some((a, b)) = spec.split_once('-') {
@@ -1082,6 +1089,8 @@ fn parse_node_line(line: &str, my_node_id: &NodeId) -> Option<ParsedNodeLine> {
         socket_address,
         is_master,
         is_local,
+        is_healthy,
+        imports_slots,
         has_master,
         master_id,
         slot_ranges,
@@ -1098,6 +1107,7 @@ fn parse_node_address(field: &str, noaddr: bool, is_local: bool) -> Option<Socke
     let addr = field.split(',').next().unwrap_or(field);
     let host_port = addr.split('@').next().unwrap_or(addr);
     // Split at the last ':' so IPv6 addresses (which contain ':') parse.
+    // Port 0 (or one that does not parse) can never be dialled.
     let (ip_str, port) = match host_port.rsplit_once(':') {
         Some((ip, port)) => (ip, port.parse::<u16>().unwrap_or(0)),
         None => (host_port, 0),
@@ -1110,7 +1120,7 @@ fn parse_node_address(field: &str, noaddr: bool, is_local: bool) -> Option<Socke
         })
     };
 
-    if noaddr || ip_str.is_empty() {
+    if noaddr || ip_str.is_empty() || port == 0 {
         return local_placeholder();
     }
     match ip_str.parse::<IpAddr>() {
@@ -1391,5 +1401,167 @@ mod tests {
         assert!(map.i_own_slot(5460));
         assert!(!map.i_own_slot(5461));
         assert!(map.get_shard_by_id(M1).unwrap().is_local);
+    }
+
+    /// Ids of every node `mode` selected across `draws` independent selections.
+    fn selected_ids(map: &ClusterMap, mode: FanoutTarget, draws: usize) -> BTreeSet<NodeId> {
+        (0..draws)
+            .flat_map(|_| {
+                map.get_targets(mode.clone())
+                    .iter()
+                    .map(|n| n.id)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn ids(nodes: &[&str]) -> BTreeSet<NodeId> {
+        nodes.iter().map(|n| id(n)).collect()
+    }
+
+    #[test]
+    fn test_failed_slotless_former_primary_is_not_a_shard() {
+        // R1 took over M1's slots; M1 stays listed as a failed, slot-less master.
+        let after_failover = format!(
+            "\
+{R1} 127.0.0.1:7101@17101 myself,master - 0 0 4 connected 0-8191\n\
+{M1} 127.0.0.1:7001@17001 master,fail - 0 0 1 disconnected\n\
+{M2} 127.0.0.1:7002@17002 master - 0 0 2 connected 8192-16383\n"
+        );
+        let map = ClusterMap::from_cluster_nodes(&after_failover, &id(R1));
+
+        assert!(map.is_consistent);
+        assert_eq!(map.all_shards().len(), 2);
+        assert!(map.get_shard_by_id(M1).is_none());
+        assert_eq!(selected_ids(&map, FanoutTarget::Primary, 1), ids(&[R1, M2]));
+        assert_eq!(
+            selected_ids(&map, FanoutTarget::Random, 100),
+            ids(&[R1, M2])
+        );
+        assert_eq!(selected_ids(&map, FanoutTarget::All, 1), ids(&[R1, M2]));
+
+        // Nodes that have and have not forgotten M1 agree on the fingerprint.
+        let forgotten = format!(
+            "\
+{R1} 127.0.0.1:7101@17101 myself,master - 0 0 4 connected 0-8191\n\
+{M2} 127.0.0.1:7002@17002 master - 0 0 2 connected 8192-16383\n"
+        );
+        let forgotten = ClusterMap::from_cluster_nodes(&forgotten, &id(R1));
+        assert_eq!(
+            map.cluster_slots_fingerprint(),
+            forgotten.cluster_slots_fingerprint()
+        );
+    }
+
+    #[test]
+    fn test_slotless_master_and_its_replica_are_ignored() {
+        // A freshly met empty master with a replica holds no data.
+        let text = format!(
+            "\
+{M1} 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-16383\n\
+{M3} 127.0.0.1:7003@17003 master - 0 0 3 connected\n\
+{R3} 127.0.0.1:7103@17103 slave {M3} 0 0 3 connected\n"
+        );
+        let map = ClusterMap::from_cluster_nodes(&text, &id(M1));
+        assert!(map.is_consistent);
+        assert_eq!(map.all_shards().len(), 1);
+        assert_eq!(selected_ids(&map, FanoutTarget::All, 1), ids(&[M1]));
+
+        let alone = format!("{M1} 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-16383\n");
+        let alone = ClusterMap::from_cluster_nodes(&alone, &id(M1));
+        assert_eq!(
+            map.cluster_slots_fingerprint(),
+            alone.cluster_slots_fingerprint()
+        );
+    }
+
+    #[test]
+    fn test_importing_master_without_slots_stays_a_shard() {
+        // Keys already migrated to M3 live only there until the slot settles.
+        let text = format!(
+            "\
+{M1} 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-16383 [100->-{M3}]\n\
+{M3} 127.0.0.1:7003@17003 master - 0 0 3 connected [100-<-{M1}]\n"
+        );
+        let map = ClusterMap::from_cluster_nodes(&text, &id(M1));
+        assert!(map.is_consistent);
+        assert_eq!(selected_ids(&map, FanoutTarget::Primary, 1), ids(&[M1, M3]));
+        // It owns nothing yet, so slot routing still goes to M1.
+        assert_eq!(map.get_shard_by_slot(100).unwrap().id, id(M1));
+    }
+
+    #[test]
+    fn test_unhealthy_replicas_are_not_selected() {
+        let text = format!(
+            "\
+{M1} 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-16383\n\
+{R1} 127.0.0.1:7101@17101 slave,fail {M1} 0 0 1 disconnected\n\
+{R2} 127.0.0.1:7102@17102 slave {M1} 0 0 1 disconnected\n\
+{R3} 127.0.0.1:7103@17103 slave,fail? {M1} 0 0 1 connected\n\
+{R4} 127.0.0.1:7104@17104 slave {M1} 0 0 1 connected\n",
+            R4 = "dddddddddddddddddddddddddddddddddddddddd"
+        );
+        let map = ClusterMap::from_cluster_nodes(&text, &id(M1));
+        assert!(map.is_consistent);
+        let r4 = "dddddddddddddddddddddddddddddddddddddddd";
+        assert_eq!(
+            selected_ids(&map, FanoutTarget::Random, 200),
+            ids(&[M1, r4])
+        );
+        assert_eq!(
+            selected_ids(&map, FanoutTarget::HashTags(vec!["a".into()]), 200),
+            ids(&[M1, r4])
+        );
+        assert_eq!(
+            selected_ids(&map, FanoutTarget::ReplicaPerShard, 50),
+            ids(&[r4])
+        );
+    }
+
+    #[test]
+    fn test_shard_with_no_healthy_node_still_targets_its_primary() {
+        // Omitting the shard would silently drop its data; failing is correct.
+        let text = format!(
+            "\
+{M1} 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-8191\n\
+{M2} 127.0.0.1:7002@17002 master,fail? - 0 0 2 connected 8192-16383\n\
+{R2} 127.0.0.1:7102@17102 slave,fail {M2} 0 0 2 disconnected\n"
+        );
+        let map = ClusterMap::from_cluster_nodes(&text, &id(M1));
+        assert_eq!(
+            selected_ids(&map, FanoutTarget::Random, 100),
+            ids(&[M1, M2])
+        );
+        assert_eq!(
+            selected_ids(&map, FanoutTarget::ReplicaPerShard, 50),
+            ids(&[M1, M2])
+        );
+    }
+
+    #[test]
+    fn test_failed_primary_with_healthy_replica() {
+        let text = format!(
+            "\
+{M1} 127.0.0.1:7001@17001 master,fail? - 0 0 1 connected 0-16383\n\
+{R1} 127.0.0.1:7101@17101 myself,slave {M1} 0 0 1 connected\n"
+        );
+        let map = ClusterMap::from_cluster_nodes(&text, &id(R1));
+        // Primary-only routing must not substitute a replica.
+        assert_eq!(selected_ids(&map, FanoutTarget::Primary, 1), ids(&[M1]));
+        assert_eq!(selected_ids(&map, FanoutTarget::Random, 100), ids(&[R1]));
+    }
+
+    #[test]
+    fn test_remote_port_zero_is_unusable() {
+        let text = format!(
+            "\
+{M1} 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-8191\n\
+{M2} 127.0.0.1:0@0 master - 0 0 2 connected 8192-16383\n\
+{R1} 127.0.0.1:x@17101 slave {M1} 0 0 1 connected\n"
+        );
+        let map = ClusterMap::from_cluster_nodes(&text, &id(M1));
+        // M2 owns slots it cannot be asked about.
+        assert!(!map.is_consistent);
+        assert!(map.get_shard_by_id(M1).unwrap().replicas.is_empty());
     }
 }

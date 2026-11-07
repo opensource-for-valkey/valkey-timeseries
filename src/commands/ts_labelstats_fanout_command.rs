@@ -208,6 +208,7 @@ mod tests {
             },
             role: NodeRole::Primary,
             location: Default::default(),
+            healthy: true,
         }
     }
 
