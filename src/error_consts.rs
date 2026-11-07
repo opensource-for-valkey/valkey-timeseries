@@ -148,6 +148,10 @@ pub const COMMAND_DESERIALIZATION_ERROR: &str = "TSDB: command deserialization e
 pub const CLUSTER_MODE_ERROR: &str = "TSDB: cluster mode not supported";
 pub const FANOUT_WRITE_ON_REPLICA: &str = "TSDB: refusing to apply a fanout write on a replica";
 pub const NO_CLUSTER_NODES_AVAILABLE: &str = "TSDB: no cluster nodes available";
+/// The ACL user a request (or a peer's share of one) runs as was deleted or disabled. A fixed
+/// text, so the fanout can classify it as a permission failure on the shard that raised it.
+pub const ACL_USER_UNAVAILABLE: &str =
+    "TSDB: the ACL user this request runs as does not exist or is disabled";
 pub const WITH_LABELS_AND_SELECTED_LABELS_SPECIFIED: &str =
     "TSDB: cannot accept WITHLABELS and SELECT_LABELS together";
 pub const EMPTY_SELECTED_LABELS: &str = "TSDB: SELECT_LABELS should have at least 1 parameter";

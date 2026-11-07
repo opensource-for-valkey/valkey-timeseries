@@ -1,4 +1,4 @@
-use super::fanout_error::{ErrorKind, FanoutError, NO_CLUSTER_NODES_AVAILABLE};
+use super::fanout_error::{ErrorKind, FANOUT_BLOCKING_DENIED, FanoutError};
 use super::fanout_message::{
     FanoutMessage, FanoutMessageHeader, has_unsupported_features, serialize_request_message,
 };
@@ -13,6 +13,7 @@ use crate::common::pool::get_pooled_buffer;
 use crate::common::sync::lock;
 use crate::common::threads::LockGil;
 use crate::config::FANOUT_COMMAND_TIMEOUT;
+use crate::error_consts;
 use crate::fanout::cluster_map::{CURRENT_NODE_ID, NodeId, NodeRole, SocketAddress};
 use crate::fanout::fanout_command::FanoutResponseCallback;
 use crate::fanout::fanout_context::FanoutContext;
@@ -348,7 +349,7 @@ fn validate_cluster_exec(ctx: &Context) -> ValkeyResult<()> {
         return Err(ValkeyError::Str("Cluster mode is not enabled"));
     }
     if is_multi_or_lua(ctx) {
-        return Err(ValkeyError::Str("Cannot execute in MULTI or Lua context"));
+        return Err(ValkeyError::Str(FANOUT_BLOCKING_DENIED));
     }
     Ok(())
 }
@@ -419,7 +420,7 @@ pub(super) fn send_cluster_request(
         .collect();
 
     if remote_targets.is_empty() {
-        return Err(ValkeyError::Str(NO_CLUSTER_NODES_AVAILABLE));
+        return Err(ValkeyError::Str(error_consts::NO_CLUSTER_NODES_AVAILABLE));
     }
 
     let node_count = remote_targets.len();

@@ -5,14 +5,12 @@ use crate::common::sync::lock;
 use crate::fanout::FanoutCommandResult;
 use crate::fanout::blocked_client::FanoutBlockedClient;
 use crate::fanout::cluster_rpc::get_cluster_command_timeout;
+use crate::fanout::fanout_error::FANOUT_BLOCKING_DENIED;
 use crate::fanout::serialization::Serializable;
 use crate::fanout::{FanoutCommand, FanoutContext, FanoutResult, FanoutTarget, NodeInfo};
 use metered::Counter;
 use std::sync::{Arc, Mutex};
 use valkey_module::{Context, Status, ValkeyError, ValkeyResult, ValkeyValue};
-
-/// Same text as the remote path's `validate_cluster_exec` refusal.
-const FANOUT_BLOCKING_DENIED: &str = "Cannot execute in MULTI or Lua context";
 
 /// A trait for cluster-mode commands which send results back to clients after receiving responses from other nodes.
 /// This is a higher-level abstraction over `FanoutCommand` that includes client response handling logic.

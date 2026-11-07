@@ -84,9 +84,8 @@ impl ThreadAclScope {
         // under the caller's lock, whatever context that lock came from. Built from the
         // bytes, so a name with a NUL in it is an unknown user, not a panic.
         let name = ValkeyString::create_from_slice(ptr::null_mut(), user.as_bytes());
-        let module_user = ModuleUser::from_name(&name).ok_or_else(|| {
-            ValkeyError::String(format!("ACL user '{user}' does not exist or is disabled"))
-        })?;
+        let module_user = ModuleUser::from_name(&name)
+            .ok_or(ValkeyError::Str(error_consts::ACL_USER_UNAVAILABLE))?;
         Self::enter_with_identity(AclIdentity {
             user: Some(Rc::new(module_user)),
             name,

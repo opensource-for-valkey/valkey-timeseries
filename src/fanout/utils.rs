@@ -1,6 +1,6 @@
 use crate::fanout::FanoutTarget;
+use crate::fanout::cluster_map::NUM_SLOTS;
 use valkey_module::{Context, ContextFlags, ValkeyResult};
-pub(crate) const SLOT_SIZE: u16 = 16384;
 
 const VALKEYMODULE_CLIENT_INFO_FLAG_READONLY: u64 = 1 << 6; /* Valkey 9 */
 
@@ -75,7 +75,7 @@ pub fn calculate_hash_slot(key: &[u8]) -> u16 {
 }
 
 pub(crate) fn slot(key: &[u8]) -> u16 {
-    crc16::State::<crc16::XMODEM>::calculate(key) % SLOT_SIZE
+    crc16::State::<crc16::XMODEM>::calculate(key) % NUM_SLOTS
 }
 
 /// Finds the hash tag boundaries in a key.
