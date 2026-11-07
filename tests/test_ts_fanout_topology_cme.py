@@ -1,9 +1,11 @@
-# tests/test_ts_failover_cme.py
-"""Fanout after a primary failover.
+# tests/test_ts_fanout_topology_cme.py
+"""Fanout target selection on a cluster with replicas.
 
-After a failover the old primary stays in `CLUSTER NODES` as a slot-less `master` until it
-rejoins or is forgotten. Fanout used to treat every master as a shard, so that dead node was
-selected on every multi-shard command and each one failed with the generic aggregate error.
+* After a failover the old primary stays in `CLUSTER NODES` as a slot-less `master` until it
+  rejoins or is forgotten. Fanout used to treat every master as a shard, so that dead node was
+  selected on every multi-shard command and each one failed with the generic aggregate error.
+* HASHTAG routing used to pick a node per *slot*, so two tags on one shard could select its
+  primary and its replica and count that shard twice.
 """
 import os
 import signal
@@ -14,7 +16,7 @@ from valkeytestframework.util.waiters import wait_for_true
 from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCaseDebugMode
 
 
-class TestTsFanoutAfterFailover(ValkeyTimeSeriesClusterTestCaseDebugMode):
+class TestTsFanoutTopology(ValkeyTimeSeriesClusterTestCaseDebugMode):
     CLUSTER_SIZE = 3
     REPLICAS_COUNT = 1
 
@@ -30,6 +32,39 @@ class TestTsFanoutAfterFailover(ValkeyTimeSeriesClusterTestCaseDebugMode):
             if self._shard_index_for_slot(int(client.execute_command("CLUSTER KEYSLOT", tag))) == shard_index:
                 return tag
         raise AssertionError(f"no hash tag found for shard {shard_index}")
+
+    def _hash_tags_for_shard(self, client: Valkey, shard_index: int, count: int) -> list:
+        """`count` hash tags with distinct slots, all owned by `shard_index`."""
+        tags, slots = [], set()
+        for i in range(0, 4096):
+            tag = f"t{i}"
+            slot = int(client.execute_command("CLUSTER KEYSLOT", tag))
+            if self._shard_index_for_slot(slot) == shard_index and slot not in slots:
+                tags.append(tag)
+                slots.add(slot)
+                if len(tags) == count:
+                    return tags
+        raise AssertionError(f"not enough hash tags found for shard {shard_index}")
+
+    def test_hashtags_on_one_shard_count_it_once(self):
+        cluster = self.new_cluster_client()
+        probe = self.client_for_primary(0)
+        tags = self._hash_tags_for_shard(probe, 0, 2)
+        cluster.execute_command("TS.CREATE", f"hashtags:{{{tags[0]}}}", "LABELS", "suite", "hashtags")
+        group = self.replication_groups[0]
+        group.wait_for_replica_offset_to_sync_up(0)
+
+        # READONLY connections may route to replicas; with a node chosen per slot, the two tags
+        # picked the primary and the replica half the time.
+        readonly = [group.get_primary_connection(), group.get_replica_connection(0)]
+        for client in readonly:
+            client.execute_command("READONLY")
+        for client in readonly:
+            for _ in range(30):
+                reply = client.execute_command(
+                    "TS.CARD", "HASHTAG", ",".join(tags), "FILTER", "suite=hashtags"
+                )
+                assert reply == 1
 
     @staticmethod
     def _nodes(client: Valkey) -> list:

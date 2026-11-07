@@ -551,30 +551,58 @@ impl ClusterMap {
             FanoutTarget::All => self.all_targets(),
             FanoutTarget::ReplicaPerShard => self.random_one_replica_per_shard(),
             FanoutTarget::Random => self.random_one_per_shard(),
-            FanoutTarget::Slots(slots) => self.random_for_slots(&slots),
+            FanoutTarget::Slots(slots) => self.targets_for_slots(slots, false),
             FanoutTarget::HashTags(hash_tags) => {
-                let mut slots = SmallVec::<[u16; 4]>::new();
-                for tag in hash_tags {
-                    let slot = calculate_hash_slot(tag.as_ref());
-                    if !slots.contains(&slot) {
-                        slots.push(slot);
-                    }
-                }
-                self.random_for_slots(&slots)
+                let slots = hash_tags
+                    .iter()
+                    .map(|tag| calculate_hash_slot(tag.as_ref()));
+                self.targets_for_slots(slots, false)
             }
             FanoutTarget::HashTagsPrimary(hash_tags) => {
-                let mut targets = HashSet::new();
-                for tag in hash_tags {
-                    let slot = calculate_hash_slot(tag.as_ref());
-                    if let Some(shard) = self.get_shard_by_slot(slot)
-                        && let Some(primary) = shard.primary
-                    {
-                        targets.insert(primary);
-                    }
-                }
-                Arc::new(targets)
+                let slots = hash_tags
+                    .iter()
+                    .map(|tag| calculate_hash_slot(tag.as_ref()));
+                self.targets_for_slots(slots, true)
             }
         }
+    }
+
+    /// One node for each distinct shard owning `slots`.
+    ///
+    /// Slots are resolved to shards *before* a node is chosen, so two slots of
+    /// one shard cannot pick its primary and a replica and count the shard
+    /// twice. A slot with no owner yields an empty set, which fails the fanout
+    /// (`no cluster nodes available`) instead of returning the owned shards'
+    /// answer as if it were complete.
+    fn targets_for_slots(
+        &self,
+        slots: impl IntoIterator<Item = u16>,
+        primary_only: bool,
+    ) -> Arc<HashSet<NodeInfo>> {
+        let mut shards: SmallVec<[&ShardInfo; 4]> = SmallVec::new();
+        for slot in slots {
+            let Some(shard) = self.get_shard_by_slot(slot) else {
+                return Arc::default();
+            };
+            if !shards.iter().any(|known| known.id == shard.id) {
+                shards.push(shard);
+            }
+        }
+
+        let mut rng_ = rng();
+        let mut targets = HashSet::with_capacity(shards.len());
+        for shard in shards {
+            let node = if primary_only {
+                shard.primary
+            } else {
+                shard.pick_target(&mut rng_, false)
+            };
+            let Some(node) = node else {
+                return Arc::default();
+            };
+            targets.insert(node);
+        }
+        Arc::new(targets)
     }
 
     fn random_one_from_local(&self) -> Arc<HashSet<NodeInfo>> {
@@ -608,21 +636,6 @@ impl ClusterMap {
             targets.extend(shard.pick_target(&mut rng_, true));
         }
         Arc::new(targets)
-    }
-
-    fn random_for_slots(&self, slots: &[u16]) -> Arc<HashSet<NodeInfo>> {
-        let mut targets = HashSet::new();
-        for &slot in slots {
-            self.random_one_from_slot(slot, &mut targets);
-        }
-        Arc::new(targets)
-    }
-
-    fn random_one_from_slot(&self, slot: u16, targets: &mut HashSet<NodeInfo>) {
-        if let Some(shard) = self.get_shard_by_slot(slot) {
-            let mut rng_ = rng();
-            targets.extend(shard.pick_target(&mut rng_, false));
-        }
     }
 
     #[inline]
@@ -1549,6 +1562,83 @@ mod tests {
         // Primary-only routing must not substitute a replica.
         assert_eq!(selected_ids(&map, FanoutTarget::Primary, 1), ids(&[M1]));
         assert_eq!(selected_ids(&map, FanoutTarget::Random, 100), ids(&[R1]));
+    }
+
+    /// `count` distinct hash tags whose slots are distinct and lie in `range`.
+    fn tags_in(range: std::ops::RangeInclusive<u16>, count: usize) -> Vec<String> {
+        let mut slots = Vec::new();
+        let mut tags = Vec::new();
+        for i in 0.. {
+            let tag = format!("t{i}");
+            let slot = calculate_hash_slot(tag.as_bytes());
+            if range.contains(&slot) && !slots.contains(&slot) {
+                slots.push(slot);
+                tags.push(tag);
+                if tags.len() == count {
+                    break;
+                }
+            }
+        }
+        tags
+    }
+
+    #[test]
+    fn test_hash_tags_on_one_shard_select_one_node() {
+        let text = format!(
+            "\
+{M1} 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-16383\n\
+{R1} 127.0.0.1:7101@17101 slave {M1} 0 0 1 connected\n\
+{R2} 127.0.0.1:7102@17102 slave {M1} 0 0 1 connected\n"
+        );
+        let map = ClusterMap::from_cluster_nodes(&text, &id(M1));
+        let mut tags = tags_in(0..=16383, 4);
+        tags.push(tags[0].clone());
+        let mut seen = BTreeSet::new();
+        for _ in 0..200 {
+            let targets = map.get_targets(FanoutTarget::HashTags(tags.clone()));
+            assert_eq!(targets.len(), 1);
+            seen.extend(targets.iter().map(|n| n.id));
+        }
+        // Still a random choice among the shard's nodes.
+        assert_eq!(seen, ids(&[M1, R1, R2]));
+    }
+
+    #[test]
+    fn test_hash_tags_across_shards_select_one_node_per_shard() {
+        let map = ClusterMap::from_cluster_nodes(&three_shard_nodes(), &id(M1));
+        let mut tags = tags_in(0..=5460, 3);
+        tags.extend(tags_in(10923..=16383, 2));
+        for _ in 0..100 {
+            let targets = map.get_targets(FanoutTarget::HashTags(tags.clone()));
+            let shards: BTreeSet<_> = targets.iter().map(|n| n.shard_id).collect();
+            assert_eq!(targets.len(), 2);
+            assert_eq!(shards, ids(&[M1, M3]));
+        }
+        let primaries = map.get_targets(FanoutTarget::HashTagsPrimary(tags));
+        let primaries: BTreeSet<_> = primaries.iter().map(|n| n.id).collect();
+        assert_eq!(primaries, ids(&[M1, M3]));
+    }
+
+    #[test]
+    fn test_hash_tag_on_unowned_slot_selects_nothing() {
+        // Slots 8192-16383 have no owner.
+        let text = format!("{M1} 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-8191\n");
+        let map = ClusterMap::from_cluster_nodes(&text, &id(M1));
+        assert!(!map.is_consistent);
+        let mut tags = tags_in(0..=8191, 1);
+        assert_eq!(
+            map.get_targets(FanoutTarget::HashTags(tags.clone())).len(),
+            1
+        );
+        tags.extend(tags_in(8192..=16383, 1));
+        assert!(
+            map.get_targets(FanoutTarget::HashTags(tags.clone()))
+                .is_empty()
+        );
+        assert!(
+            map.get_targets(FanoutTarget::HashTagsPrimary(tags))
+                .is_empty()
+        );
     }
 
     #[test]
