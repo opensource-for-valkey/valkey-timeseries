@@ -107,7 +107,9 @@ impl Hash for KahanSum {
 
 #[derive(Clone, Copy, Debug, Default, GetSize, PartialEq)]
 pub struct KahanAvg {
-    count: u32,
+    /// `u64`, like the partial reducer's: a `u32` saturated and then inflated the mean. Free in
+    /// size, since the `u32` was padded to 8 bytes anyway.
+    count: u64,
     sum: KahanSum,
     /// The plain sum of every term times [`AVG_SHADOW_SCALE`]; see [`mean_of`].
     shadow: f64,
@@ -151,13 +153,13 @@ impl AddAssign<f64> for KahanAvg {
 impl RdbSerializable for KahanAvg {
     fn rdb_save(&self, rdb: *mut RedisModuleIO) {
         self.sum.rdb_save(rdb);
-        raw::save_unsigned(rdb, self.count as u64);
+        raw::save_unsigned(rdb, self.count);
         raw::save_double(rdb, self.shadow);
     }
 
     fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self> {
         let sum = KahanSum::rdb_load(rdb)?;
-        let count = raw::load_unsigned(rdb)? as u32;
+        let count = raw::load_unsigned(rdb)?;
         let shadow = rdb_load_f64(rdb)?;
         Ok(Self { count, sum, shadow })
     }
@@ -211,6 +213,22 @@ fn kahan_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bucket past `u32::MAX` samples keeps counting: a saturated count kept adding to the
+    /// sum and inflated the mean.
+    #[test]
+    fn test_avg_count_does_not_saturate_at_u32() {
+        let n = u32::MAX as f64;
+        let mut avg = KahanAvg {
+            count: u32::MAX as _,
+            sum: KahanSum::from_parts(2.0 * n, 0.0),
+            shadow: 2.0 * n * AVG_SHADOW_SCALE,
+        };
+        for _ in 0..3 {
+            avg.add(2.0);
+        }
+        assert_eq!(avg.value(), Some(2.0));
+    }
 
     #[test]
     fn test_add_and_add_assign_f64() {
