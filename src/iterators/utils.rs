@@ -39,7 +39,8 @@ where
 ///
 /// Used to look *outside* the queried window, which is why it takes the series rather than the
 /// (clipped) sample stream. Unfiltered queries answer from the series' own extent without
-/// reading a chunk; only a filtered one has to scan, and then only until its first hit.
+/// reading a chunk. `FILTER_BY_TS` looks up only the timestamps it names; `FILTER_BY_VALUE` alone
+/// has to scan, stopping at its first hit.
 fn has_passing_sample(
     series: &TimeSeries,
     options: &RangeOptions,
@@ -58,24 +59,20 @@ fn has_passing_sample(
         return false;
     }
 
-    if options.value_filter.is_none() && options.timestamp_filter.is_none() {
+    let value_filter = options.value_filter;
+    let value_passes =
+        |sample: Sample| value_filter.is_none_or(|filter| filter.is_match(sample.value));
+
+    if let Some(timestamps) = options.timestamp_filter.as_deref() {
+        return TimestampFilterIterator::new(series, timestamps, from, to, false).any(value_passes);
+    }
+    if value_filter.is_none() {
         return true;
     }
-
-    let ts_filter = options
-        .timestamp_filter
-        .as_deref()
-        .map(TimestampFilter::new);
-    let value_filter = options.value_filter;
-    SeriesSampleIterator::new(series, from.max(first), to, false).any(|sample| {
-        ts_filter
-            .as_ref()
-            .is_none_or(|filter| filter.matches(sample.timestamp))
-            && value_filter.is_none_or(|filter| filter.is_match(sample.value))
-    })
+    SeriesSampleIterator::new(series, from.max(first), to, false).any(value_passes)
 }
 
-/// The last sample before `to` that passes the query's filters, scanning backwards from it.
+/// The last sample before `to` that passes the query's filters, searching backwards from it.
 /// `None` when there is none.
 fn last_passing_sample_before(
     series: &TimeSeries,
@@ -89,17 +86,15 @@ fn last_passing_sample_before(
         return None;
     }
 
-    let ts_filter = options
-        .timestamp_filter
-        .as_deref()
-        .map(TimestampFilter::new);
     let value_filter = options.value_filter;
-    SeriesSampleIterator::new(series, first, to, true).find(|sample| {
-        ts_filter
-            .as_ref()
-            .is_none_or(|filter| filter.matches(sample.timestamp))
-            && value_filter.is_none_or(|filter| filter.is_match(sample.value))
-    })
+    let value_passes =
+        |sample: &Sample| value_filter.is_none_or(|filter| filter.is_match(sample.value));
+
+    if let Some(timestamps) = options.timestamp_filter.as_deref() {
+        return TimestampFilterIterator::new(series, timestamps, first, to, true)
+            .find(value_passes);
+    }
+    SeriesSampleIterator::new(series, first, to, true).find(value_passes)
 }
 
 /// How far this query's `EMPTY` fill may run past the samples it sees — see
