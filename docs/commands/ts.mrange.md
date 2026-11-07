@@ -247,7 +247,7 @@ GROUPBY region REDUCE sum
 
 **Supported reducers:**
 
-Supports all aggregators except `rate` (e.g., `avg`, `sum`, `count`, `max`, `min`, etc.)
+Supports all aggregators except `first`, `last`, `rate`, `irate`, and `increase` (e.g., `avg`, `sum`, `count`, `max`, `min`, etc.)
 
 #### Inline condition: reducerop value
 

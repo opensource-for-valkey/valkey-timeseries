@@ -39,7 +39,7 @@ GROUP_REDUCERS = (
     "var.s",
 )
 
-NON_REDUCERS = ("first", "last", "twa")
+NON_REDUCERS = ("first", "last", "twa", "irate", "increase", "rate")
 
 
 @pytest.fixture(params=MRANGE_COMMANDS)

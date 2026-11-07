@@ -648,16 +648,18 @@ fn validate_align_against_bounds(
 
 /// Whether an aggregator may be used as a `GROUPBY ... REDUCE` reducer.
 ///
-/// Rejects the scan-order-dependent aggregators (`first`/`last`) and `Rate` (it
-/// needs a time window), matching RedisTimeSeries, which reports "Invalid
-/// reducer type" for them. Everything else `AggregationType` recognizes stays
+/// Rejects the scan-order-dependent aggregators (`first`/`last`) and the counter
+/// family (`rate`, `irate`, `increase`), matching RedisTimeSeries, which reports
+/// "Invalid reducer type" for them: a reducer sees every member at one timestamp,
+/// where `irate` has no time delta and `increase` would depend on member order.
+/// Everything else `AggregationType` recognizes stays
 /// valid — including this engine's filtered-reducer extensions (`countif`,
 /// `sumif`, …), which RTS lacks but which are out of scope for parity and must
 /// keep working (tests/test_ts_mrange.py). Unknown names never reach here: they
 /// fail `AggregationType::try_from` and are rejected on the same path.
 fn is_valid_reducer(agg: &AggregationType) -> bool {
     use AggregationType::*;
-    !matches!(agg, First | Last | Rate)
+    !matches!(agg, First | Last | Rate | IRate | Increase)
 }
 
 pub(super) fn parse_grouping_params(
@@ -1734,6 +1736,17 @@ fn parse_limit_value(val: &str) -> ValkeyResult<Option<usize>> {
 mod tests {
     use super::*;
     use strum::IntoEnumIterator;
+
+    #[test]
+    fn reducers_exclude_order_and_time_dependent_aggregators() {
+        use AggregationType::*;
+        for rejected in [First, Last, Rate, IRate, Increase] {
+            assert!(!is_valid_reducer(&rejected), "{rejected:?}");
+        }
+        for accepted in [Sum, Avg, Min, Max, Count, Range, StdP, CountIf, Share, All] {
+            assert!(is_valid_reducer(&accepted), "{accepted:?}");
+        }
+    }
 
     /// DIV-0014. Built directly rather than through `RepeatedOptions::new()` so
     /// the two modes are exercised without touching the process-wide config,
