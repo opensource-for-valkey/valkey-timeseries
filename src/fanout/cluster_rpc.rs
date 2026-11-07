@@ -65,6 +65,9 @@ struct InFlightRequest {
     outstanding: AtomicU64,
     timer_id: u64,
     timed_out: AtomicBool,
+    /// The fanout completed before every remote target answered (a share's error
+    /// aborted it); the rest are no longer wanted.
+    fanout_done: AtomicBool,
     /// Remote targets that have answered (a response, an error, or a send failure). A target
     /// answers once: anything more from it, or anything from a node that is not a remote
     /// target, is dropped rather than counted.
@@ -132,13 +135,16 @@ impl InFlightRequest {
         let handled = panic::catch_unwind(AssertUnwindSafe(|| {
             (self.response_handler)(resp, target_node)
         }));
-        if handled.is_err() {
+        let still_waiting = handled.unwrap_or_else(|_| {
             log_error(format!(
                 "cluster rpc: processing the answer to {} request {} from {sender} panicked",
                 self.command, self.id
             ));
             let err = FanoutError::custom("failed to process the node's answer");
-            (self.response_handler)(Err(err), target_node);
+            (self.response_handler)(Err(err), target_node)
+        });
+        if !still_waiting {
+            self.fanout_done.store(true, Ordering::Relaxed);
         }
         true
     }
@@ -154,7 +160,7 @@ impl InFlightRequest {
     /// blocked-client timeout. A timeout ends the whole fanout regardless of the
     /// node it is reported against.
     fn deliver_timeout(&self) {
-        (self.response_handler)(Err(FanoutError::timeout()), &placeholder_node());
+        let _ = (self.response_handler)(Err(FanoutError::timeout()), &placeholder_node());
     }
 }
 
@@ -333,14 +339,26 @@ fn dispatch_send_failure(ctx: &Context, request_id: u64, target_node_id: *const 
 }
 
 fn finish_inflight_request(ctx: &Context, request: &InFlightRequest) {
-    if let Ok(v) = request.rpc_done()
-        && v == 1
-    {
+    let last = matches!(request.rpc_done(), Ok(1));
+    if last {
         // Every shard answered before the deadline: the timer is still pending
-        // and this is the one place it is stopped.
+        // and this is one of the two places it is stopped.
         request.cancel_timer(ctx);
-        let map = INFLIGHT_REQUESTS.pin();
-        map.remove(&request.id);
+        INFLIGHT_REQUESTS.pin().remove(&request.id);
+        return;
+    }
+    // The fanout completed early (a share's error aborted it). Tell the shares
+    // still running to stop, stop waiting for them, and forget the request so
+    // their late answers are dropped unread. `timed_out` claims the request
+    // against a timer firing at the same moment; this runs from a message
+    // callback, never from the timer's own, so stopping the timer here is safe.
+    if request.fanout_done.load(Ordering::Relaxed)
+        && !request.timed_out.swap(true, Ordering::AcqRel)
+    {
+        metrics::FANOUT_EARLY_COMPLETIONS.incr();
+        send_cancels(ctx, request);
+        request.cancel_timer(ctx);
+        INFLIGHT_REQUESTS.pin().remove(&request.id);
     }
 }
 
@@ -429,6 +447,7 @@ pub(super) fn send_cluster_request(
         timer_id,
         outstanding: AtomicU64::new(node_count as u64),
         timed_out: AtomicBool::new(false),
+        fanout_done: AtomicBool::new(false),
         targets: targets.clone(),
         responded: Mutex::new(HashSet::default()),
     };
@@ -1169,11 +1188,15 @@ mod tests {
             targets: Arc::new(HashSet::from_iter([target])),
             response_handler: Box::new(move |res, _| match res {
                 Ok(_) => panic!("command code panicked"),
-                Err(e) => lock(&seen).push(e.to_string()),
+                Err(e) => {
+                    lock(&seen).push(e.to_string());
+                    true
+                }
             }),
             outstanding: AtomicU64::new(1),
             timer_id: 0,
             timed_out: AtomicBool::new(false),
+            fanout_done: AtomicBool::new(false),
             responded: Mutex::new(HashSet::default()),
         };
 

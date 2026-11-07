@@ -462,6 +462,40 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         assert sum(errors.values()) >= 1
         assert stats['fanout_errors_total'] == sum(errors.values())
 
+    def test_an_aborted_fanout_cancels_the_shares_still_running(self):
+        """One peer denies its share while another sleeps: the denial completes the fanout,
+        and the sleeping peer is told to stop instead of being waited for."""
+        tags = self.populate()
+        for client in self.primaries():
+            client.execute_command('ACL', 'SETUSER', 'fo_partial', 'on', 'nopass',
+                                   f'~fo:{{{tags[0]}}}:*', f'~fo:{{{tags[1]}}}:*', '+@all')
+        self.reset_all()
+        coordinator, sleeping, denying = self.primaries()
+        limited = self.new_client_for_primary(0)
+        limited.execute_command('AUTH', 'fo_partial', 'any')
+
+        sleeper = threading.Thread(
+            target=lambda: self.new_client_for_primary(1).execute_command('DEBUG', 'SLEEP', 2))
+        sleeper.start()
+        try:
+            time.sleep(0.2)
+            started = time.monotonic()
+            with pytest.raises(ResponseError):
+                limited.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
+            # Answered on the denial, not after the sleeping peer.
+            assert time.monotonic() - started < 1.5
+        finally:
+            sleeper.join()
+
+        stats = debug_metrics(coordinator, 'fanout')
+        assert stats['fanout_aborts_total'] == 1
+        assert stats['fanout_early_completions_total'] == 1
+        assert stats['fanout_cancels_sent_total'] == 1
+        assert stats['fanout_rpc_timeouts_total'] == 0
+        assert stats['fanout_inflight'] == 0
+        wait_for_true(
+            lambda: debug_metrics(sleeping, 'fanout')['fanout_cancels_received_total'] == 1)
+
     def test_timeouts(self):
         """A sleeping peer runs the fanout into both deadlines; its late answer is dropped."""
         self.populate()

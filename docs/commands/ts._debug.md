@@ -253,7 +253,8 @@ As coordinator:
 | `fanout_generic_error_replies_total` | counter | Operations answered with the generic "Internal error in fanout operation" reply after a shard failed with another kind |
 | `fanout_client_timeouts_total` | counter | Blocked clients answered with the timeout error |
 | `fanout_rpc_timeouts_total` | counter | RPCs whose timer fired with remote shares outstanding |
-| `fanout_cancels_sent_total` | counter | Cancel messages sent to shares still outstanding when an RPC's timer fired |
+| `fanout_cancels_sent_total` | counter | Cancel messages sent to shares still outstanding when an RPC's timer fired or its fanout completed early |
+| `fanout_early_completions_total` | counter | Fanout RPCs abandoned with remote shares outstanding because a share's error had already completed the fanout |
 | `fanout_setup_failures_total` | counter | Operations that failed before any remote request was sent |
 | `fanout_blocking_denied_total` | counter | Commands refused because the client could not be blocked (MULTI, a script, a module call) |
 | `fanout_send_failures_total` | counter | Requests the cluster bus refused to send |

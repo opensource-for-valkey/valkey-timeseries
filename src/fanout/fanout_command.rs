@@ -14,11 +14,16 @@ use crate::fanout::{
 };
 use metered::Counter;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use valkey_module::{Context, ValkeyResult};
 
-pub(super) type FanoutResponseCallback = Box<dyn Fn(FanoutResult<&[u8]>, &NodeInfo) + Send + Sync>;
+/// Delivers one remote share's answer. Returns whether the fanout still wants
+/// answers: `false` once it has completed, so the RPC layer can stop waiting on
+/// (and cancel) the shares still running.
+pub(super) type FanoutResponseCallback =
+    Box<dyn Fn(FanoutResult<&[u8]>, &NodeInfo) -> bool + Send + Sync>;
 
 pub type FanoutCommandResult<T = ()> = Result<T, FanoutError>;
 
@@ -151,21 +156,18 @@ where
 
     let rpc_state = state.clone();
     let response_handler = move |res: Result<&[u8], FanoutError>, target: &NodeInfo| {
-        let buf = match res {
-            Ok(buf) => buf,
-            Err(err) => {
-                rpc_state.on_error(err, target);
-                return;
-            }
-        };
-        match OP::Response::deserialize(buf) {
-            Ok(resp) => rpc_state.on_response(resp, target),
-            Err(e) => {
-                let err =
-                    FanoutError::serialization(format!("Failed to deserialize response: {e}"));
-                rpc_state.on_error(err, target);
-            }
+        match res {
+            Ok(buf) => match OP::Response::deserialize(buf) {
+                Ok(resp) => rpc_state.on_response(resp, target),
+                Err(e) => {
+                    let err =
+                        FanoutError::serialization(format!("Failed to deserialize response: {e}"));
+                    rpc_state.on_error(err, target);
+                }
+            },
+            Err(err) => rpc_state.on_error(err, target),
         }
+        !rpc_state.is_completed()
     };
 
     if let Err(e) = invoke_rpc(
@@ -239,6 +241,8 @@ where
     /// per-shard error aggregation.
     abort_error: Option<FanoutError>,
     callback: Option<F>,
+    /// Set on completion, so a local share still reading stops at its next batch.
+    cancelled: Arc<AtomicBool>,
     /// When the operation started, for `fanout_duration_seconds`.
     started: Instant,
 }
@@ -349,6 +353,7 @@ where
             return;
         }
         self.lifecycle = FanoutLifecycleState::Completed;
+        self.cancelled.store(true, Ordering::Relaxed);
 
         let Some(callback) = self.callback.take() else {
             // we've already responded
@@ -423,6 +428,7 @@ where
                 timed_out: false,
                 first_error: None,
                 abort_error: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
                 callback: Some(f),
                 started,
             }),
@@ -436,6 +442,10 @@ where
 
     fn is_completed(&self) -> bool {
         lock(&self.inner).lifecycle == FanoutLifecycleState::Completed
+    }
+
+    fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&lock(&self.inner).cancelled)
     }
 
     fn on_response(&self, resp: OP::Response, target: &NodeInfo) {
@@ -484,6 +494,9 @@ where
                 return;
             }
             fanout_ctx.set_deadline(deadline);
+            // A fanout that completes while this share is reading (another
+            // share failed it, or it timed out) stops the read at its next batch.
+            fanout_ctx.set_cancel_flag(state.cancel_flag());
         }
         // A panic in the handler would otherwise unwind past the share and leave
         // the fanout waiting on it; make it this share's failure instead.
