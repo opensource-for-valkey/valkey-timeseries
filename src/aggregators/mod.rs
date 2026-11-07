@@ -211,6 +211,16 @@ impl AggregationType {
         matches!(self, AggregationType::Count | AggregationType::Sum)
     }
 
+    /// Whether a bucket's value depends on the sample before it: the counter aggregators carry
+    /// their last sample across [`AggregationHandler::reset`]. Recomputing one of their buckets
+    /// in isolation must seed it with that sample, and changing a bucket can change the next.
+    pub fn carries_baseline(&self) -> bool {
+        matches!(
+            self,
+            AggregationType::Increase | AggregationType::Rate | AggregationType::IRate
+        )
+    }
+
     /// What this aggregator reports for a group it accepted nothing from — `true` for 0,
     /// `false` for NaN. Reached when every member value is NaN, which `EMPTY` makes routine:
     /// the per-series fill contributes a NaN to the reduce.

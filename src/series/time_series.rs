@@ -818,6 +818,21 @@ impl TimeSeries {
         SeriesSampleIterator::new(self, start, end, false)
     }
 
+    /// The last non-NaN sample stored in `[min_ts, before)`: the baseline a counter rule carries
+    /// into the bucket that starts at `before`.
+    pub(super) fn last_value_before(&self, before: Timestamp, min_ts: Timestamp) -> Option<Sample> {
+        if before <= min_ts {
+            return None;
+        }
+        SeriesSampleIterator::new(self, min_ts, before - 1, true).find(|s| !s.value.is_nan())
+    }
+
+    /// The first non-NaN sample stored after `after`.
+    pub(super) fn first_value_after(&self, after: Timestamp) -> Option<Sample> {
+        let start = after.checked_add(1)?;
+        SeriesSampleIterator::new(self, start, Timestamp::MAX, false).find(|s| !s.value.is_nan())
+    }
+
     pub fn overlaps(&self, start_ts: Timestamp, end_ts: Timestamp) -> bool {
         !self.is_empty() && self.last_timestamp() >= start_ts && self.first_timestamp <= end_ts
     }

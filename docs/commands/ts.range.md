@@ -122,8 +122,13 @@ Control bucket alignment:
 | Aggregator | Description                                      | Notes                                                                 |
 |------------|--------------------------------------------------|-----------------------------------------------------------------------|
 | `increase` | Total increase for monotonic counters            | Handles resets                                                        |
-| `rate`     | Rate of change per second over the bucket window | —                                                                     |
+| `rate`     | Rate of change per second over the bucket window | `increase` divided by the bucket duration in seconds                  |
 | `irate`    | Instantaneous rate from the last two samples     | Requires ≥ 2 samples and positive time delta; returns `NaN` otherwise |
+
+The last sample of each bucket is the starting point of the next, across empty buckets too, so the delta between
+two buckets counts in the later one and the per-bucket `increase` values add up to the counter's whole increase. A
+drop in value is a counter reset and adds nothing. The first bucket in the queried range has no earlier sample: when it
+holds only one sample, all three report `NaN`. Compaction rules (`TS.CREATERULE`) carry the same way.
 
 ### Filtered Aggregators
 

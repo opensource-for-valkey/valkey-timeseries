@@ -350,9 +350,9 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         """
         Test INCREASE aggregator.
 
-        Data models a counter that increases, then resets (drops), then increases again.
-        We aggregate with a bucket size that ensures each non-empty bucket contains 2 samples,
-        so INCREASE can compute a delta within the bucket.
+        Data models a counter that increases, then resets (drops), then increases again. The
+        last sample of each bucket is the next bucket's baseline, so the delta crossing a bucket
+        boundary counts in the later bucket.
         """
         self.client.execute_command('TS.CREATE', 'counter_inc')
 
@@ -373,27 +373,50 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
             'BUCKETTIMESTAMP', 'START'
         )
 
-        # Expect 3 buckets (start timestamps 0, 2000, 4000), but note:
-        # bucket with only 1 sample yields INCREASE=0 (no prior point inside the bucket)
+        # Expect 3 buckets (start timestamps 0, 2000, 4000). The first holds one sample and
+        # has no earlier one, so it observed no delta and reports NaN.
         assert len(result) == 3
         assert result[0][0] == 0
-        assert float(result[0][1]) == pytest.approx(0.0)
+        assert math.isnan(float(result[0][1]))
         assert result[1][0] == 2000
-        assert float(result[1][1]) == pytest.approx(10.0)  # 20 - 10
+        assert float(result[1][1]) == pytest.approx(20.0)  # 0 -> 10 -> 20
         assert result[2][0] == 4000
-        assert float(result[2][1]) == pytest.approx(10.0)  # reset ignored, 15 - 5
+        assert float(result[2][1]) == pytest.approx(10.0)  # 20 -> 5 is a reset, then 15 - 5
+
+    def test_counter_aggregators_carry_across_buckets(self):
+        """The delta crossing a bucket boundary lands in the later bucket, so the per-bucket
+        increases of 1..9 add up to the whole increase, 8."""
+        for ts in range(1, 10):
+            self.client.execute_command('TS.ADD', 'carry', ts, ts)
+
+        def rows(agg):
+            result = self.client.execute_command('TS.RANGE', 'carry', '-', '+',
+                                                 'AGGREGATION', agg, 3)
+            return [(ts, float(value)) for ts, value in result]
+
+        assert rows('increase') == [(0, 1.0), (3, 3.0), (6, 3.0), (9, 1.0)]
+        assert rows('rate') == [(0, pytest.approx(1 / 0.003)), (3, pytest.approx(1000.0)),
+                                (6, pytest.approx(1000.0)), (9, pytest.approx(1 / 0.003))]
+        assert rows('irate') == [(0, 1000.0), (3, 1000.0), (6, 1000.0), (9, 1000.0)]
+
+    def test_counter_aggregators_agree_on_a_lone_first_sample(self):
+        self.client.execute_command('TS.ADD', 'lone', 5, 7)
+        for agg in ('increase', 'rate', 'irate'):
+            result = self.client.execute_command('TS.RANGE', 'lone', '-', '+',
+                                                 'AGGREGATION', agg, 10)
+            assert len(result) == 1 and math.isnan(float(result[0][1])), agg
 
     def test_increase_aggregation_monotonic(self):
         """
-        INCREASE on a monotonic counter: per-bucket increase should be last - first
-        (and 0 for buckets with <2 samples).
+        INCREASE on a monotonic counter: each bucket's increase runs from the previous
+        bucket's last sample to its own last (NaN for the first bucket's single sample).
         """
         self.client.execute_command('TS.CREATE', 'counter_inc_mono')
 
         # Buckets of 2000ms with ALIGN 0:
         # [0,2000): 1000 (single sample)
-        # [2000,4000): 2000,3000 (10->25 => +15)
-        # [4000,6000): 4000,5000 (25->60 => +35)
+        # [2000,4000): 2000,3000 (0->10->25 => +25)
+        # [4000,6000): 4000,5000 (25->25->60 => +35)
         self.client.execute_command('TS.ADD', 'counter_inc_mono', 1000, 0)
         self.client.execute_command('TS.ADD', 'counter_inc_mono', 2000, 10)
         self.client.execute_command('TS.ADD', 'counter_inc_mono', 3000, 25)
@@ -409,9 +432,9 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
 
         assert len(result) == 3
         assert result[0][0] == 0
-        assert float(result[0][1]) == pytest.approx(0.0)
+        assert math.isnan(float(result[0][1]))
         assert result[1][0] == 2000
-        assert float(result[1][1]) == pytest.approx(15.0)
+        assert float(result[1][1]) == pytest.approx(25.0)
         assert result[2][0] == 4000
         assert float(result[2][1]) == pytest.approx(35.0)
 
@@ -443,7 +466,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         assert by_ts[1000] == pytest.approx(3.0)  # 8 - 5
         assert math.isnan(by_ts[2000]), "Expected Nan"  # empty
         assert math.isnan(by_ts[3000]), "Expected Nan"  # empty
-        assert by_ts[4000] == pytest.approx(7.0)  # 17 - 10
+        assert by_ts[4000] == pytest.approx(9.0)  # 17 - 8, carried across the empty buckets
 
     def test_increase_aggregation_resets_within_bucket(self):
         """
@@ -516,7 +539,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
 
         Uses the same data as the INCREASE test, but validates that RATE is:
           RATE = INCREASE / bucket_duration_seconds
-        With bucket=2000ms => 2 seconds, so expected RATE is 10/2 = 5 in the buckets that have +10 increase.
+        With bucket=2000ms => 2 seconds: increases of 20 and 10 give rates of 10 and 5.
         """
         self.client.execute_command('TS.CREATE', 'counter_rate')
 
@@ -533,12 +556,11 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
             'BUCKETTIMESTAMP', 'START'
         )
 
-        print("result:", result)
         assert len(result) == 3
         assert result[0][0] == 0
-        assert float(result[0][1]) == pytest.approx(0.0)
+        assert math.isnan(float(result[0][1]))
         assert result[1][0] == 2000
-        assert float(result[1][1]) == pytest.approx(5.0)  # 10 increase / 2s
+        assert float(result[1][1]) == pytest.approx(10.0)  # 20 increase / 2s
         assert result[2][0] == 4000
         assert float(result[2][1]) == pytest.approx(5.0)  # 10 increase / 2s
 

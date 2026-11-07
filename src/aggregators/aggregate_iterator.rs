@@ -306,6 +306,17 @@ impl AggregationHelper {
         bucket
     }
 
+    /// Give each counter aggregator `seed` as the sample before its first bucket, without the
+    /// bucket counting it: the state a stream that started earlier would have carried in.
+    fn seed_baseline(&mut self, seed: Sample) {
+        for aggregator in self.aggregators.iter_mut() {
+            if aggregator.carries_baseline() {
+                AggregationHandler::update(aggregator, seed.timestamp, seed.value);
+                AggregationHandler::reset(aggregator);
+            }
+        }
+    }
+
     fn update(&mut self, sample: Sample) {
         for (aggregator, accepted) in self.aggregators.iter_mut().zip(self.accepted.iter_mut()) {
             *accepted |= aggregator.update(sample.timestamp, sample.value);
@@ -482,6 +493,16 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
             pending: VecDeque::new(),
             ready: 0,
         }
+    }
+
+    /// Start the counter aggregators from `baseline`, the last sample before this stream that
+    /// a read from further back would have fed them. Must be earlier than every sample the
+    /// stream yields.
+    pub fn with_baseline(mut self, baseline: Option<Sample>) -> Self {
+        if let Some(seed) = baseline {
+            self.aggregator.seed_baseline(seed);
+        }
+        self
     }
 
     #[inline]
@@ -745,6 +766,15 @@ impl<T: Iterator<Item = Sample>> AggregateIterator<T> {
                 aligned_timestamp,
                 empty_fill,
             ),
+        }
+    }
+}
+
+impl<T: Iterator<Item = Sample>> AggregateIterator<T> {
+    /// See [`MultiAggregateIterator::with_baseline`].
+    pub fn with_baseline(self, baseline: Option<Sample>) -> Self {
+        Self {
+            inner: self.inner.with_baseline(baseline),
         }
     }
 }

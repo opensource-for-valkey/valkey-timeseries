@@ -25,7 +25,14 @@ type Timestamp = i64;
 #[enum_dispatch]
 pub trait AggregationHandler: RdbSerializable + Default + GetSize {
     fn update(&mut self, timestamp: Timestamp, value: Value) -> bool;
+    /// Ends the bucket: what the next bucket's value depends on stays. Only the counter
+    /// aggregators keep anything, their last sample, so a delta crossing the boundary is counted.
     fn reset(&mut self);
+    /// Starts over, as a fresh aggregator: unlike [`Self::reset`] it also drops the counters'
+    /// carried sample.
+    fn clear(&mut self) {
+        self.reset();
+    }
     fn current(&self) -> Option<Value>;
     fn empty_value(&self) -> Value {
         f64::NAN
@@ -758,21 +765,28 @@ impl RdbSerializable for StdSAggregator {
     }
 }
 
-/// State for rate/increase calculations of monotonically increasing counters.
-/// It also properly handles resets
+/// State for rate/increase calculations of monotonically increasing counters, with resets.
+///
+/// The last value is carried across bucket boundaries ([`AggregationHandler::reset`] keeps it),
+/// so the delta between one bucket's last sample and the next bucket's first belongs to the
+/// later bucket and the per-bucket increases add up to the whole increase. A bucket observes a
+/// delta only once a sample arrives with a value before it; until then it has nothing to report.
 #[derive(Debug, Default, Clone, PartialEq, GetSize)]
 pub struct CounterAggregatorState {
     /// Accumulated deltas, compensated like every other sum in the module: a counter that
     /// resets often adds small deltas to a large total.
     sum_deltas: KahanSum,
-    // last raw value we saw
+    /// Last raw value seen, in this bucket or an earlier one.
     last_value: Option<f64>,
+    /// Whether this bucket observed a delta: a sample arrived with `last_value` set.
+    has_delta: bool,
 }
 
 impl Hash for CounterAggregatorState {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.sum_deltas.hash(state);
         hash_f64(self.last_value.unwrap_or(f64::NAN), state);
+        self.has_delta.hash(state);
     }
 }
 
@@ -780,6 +794,7 @@ impl RdbSerializable for CounterAggregatorState {
     fn rdb_save(&self, rdb: *mut RedisModuleIO) {
         rdb_save_optional_f64(rdb, self.last_value);
         self.sum_deltas.rdb_save(rdb);
+        rdb_save_bool(rdb, self.has_delta);
     }
 
     fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self>
@@ -788,9 +803,11 @@ impl RdbSerializable for CounterAggregatorState {
     {
         let last_value = rdb_load_optional_f64(rdb)?;
         let sum_deltas = KahanSum::rdb_load(rdb)?;
+        let has_delta = rdb_load_bool(rdb)?;
         Ok(CounterAggregatorState {
             sum_deltas,
             last_value,
+            has_delta,
         })
     }
 }
@@ -800,15 +817,27 @@ impl CounterAggregatorState {
         if v.is_nan() {
             return false;
         }
-        let delta = self.last_value.map_or(0.0, |last| (v - last).max(0.0));
+        if let Some(last) = self.last_value {
+            self.sum_deltas += (v - last).max(0.0);
+            self.has_delta = true;
+        }
         self.last_value = Some(v);
-        self.sum_deltas += delta;
         true
     }
 
-    fn clear(&mut self) {
+    /// The deltas this bucket observed, if any.
+    fn increase(&self) -> Option<f64> {
+        self.has_delta.then(|| self.sum_deltas.value())
+    }
+
+    /// Ends the bucket, keeping the last value as the next bucket's baseline.
+    fn end_bucket(&mut self) {
         self.sum_deltas.reset();
-        self.last_value = None;
+        self.has_delta = false;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -822,11 +851,13 @@ impl AggregationHandler for IncreaseAggregator {
         self.0.update(timestamp, value)
     }
     fn reset(&mut self) {
+        self.0.end_bucket();
+    }
+    fn clear(&mut self) {
         self.0.clear();
     }
     fn current(&self) -> Option<Value> {
-        self.0.last_value?;
-        Some(self.0.sum_deltas.value())
+        self.0.increase()
     }
 }
 
@@ -874,10 +905,6 @@ impl RateAggregator {
     pub fn set_window_ms(&mut self, window: u64) {
         self.0.window_ms = window;
     }
-
-    fn clear(&mut self) {
-        self.0.counter.clear();
-    }
 }
 
 impl RdbSerializable for RateAggregator {
@@ -913,16 +940,15 @@ impl AggregationHandler for RateAggregator {
         self.0.counter.update(timestamp, value)
     }
     fn reset(&mut self) {
-        self.clear();
+        self.0.counter.end_bucket();
+    }
+    fn clear(&mut self) {
+        self.0.counter.clear();
     }
     fn current(&self) -> Option<Value> {
         let state = &self.0;
-        state.counter.last_value?;
-        if state.window_ms > 0 {
-            Some(state.counter.sum_deltas.value() / (state.window_ms as f64 / 1000.0))
-        } else {
-            None
-        }
+        let increase = state.counter.increase()?;
+        (state.window_ms > 0).then(|| increase / (state.window_ms as f64 / 1000.0))
     }
 }
 
@@ -955,11 +981,11 @@ impl IRateAggregatorState {
         if let Some(prev) = self.last_sample {
             // Detect reset: counter dropped instead of increased.
             if current.value < prev.value {
-                // Treat as reset: keep current as the new baseline, but no rate.
+                // Treat as reset: keep current as the new baseline, but no rate. The sample
+                // still counts as taken, as it does for `increase` and `rate`.
                 self.dv = 0.0;
                 self.dt = 0;
                 self.last_sample = Some(current);
-                return false;
             } else {
                 self.dt = current.timestamp - prev.timestamp;
                 if self.dt > 0 {
@@ -974,10 +1000,14 @@ impl IRateAggregatorState {
         true
     }
 
-    fn reset(&mut self) {
+    /// Ends the bucket, keeping the last sample as the next bucket's baseline.
+    fn end_bucket(&mut self) {
         self.dt = 0;
         self.dv = 0.0;
-        self.last_sample = None;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -1043,7 +1073,11 @@ impl AggregationHandler for IRateAggregator {
     }
 
     fn reset(&mut self) {
-        self.0.reset();
+        self.0.end_bucket();
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
     }
 
     fn current(&self) -> Option<Value> {
@@ -1193,6 +1227,11 @@ impl RdbSerializable for Aggregator {
 }
 
 impl Aggregator {
+    /// See [`AggregationType::carries_baseline`].
+    pub fn carries_baseline(&self) -> bool {
+        self.aggregation_type().carries_baseline()
+    }
+
     pub fn aggregation_type(&self) -> AggregationType {
         match self {
             Aggregator::All(_) => AggregationType::All,

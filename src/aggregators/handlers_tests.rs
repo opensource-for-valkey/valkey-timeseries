@@ -240,7 +240,7 @@ mod tests {
 
         // Monotonically increasing counter
         agg.update(1000, 100.0);
-        assert_eq!(agg.current(), Some(0.0)); // First point: no increase yet
+        assert_eq!(agg.current(), None); // First point: no baseline, no increase yet
 
         agg.update(2000, 110.0);
         assert_eq!(agg.current(), Some(10.0)); // Increased by 10
@@ -377,6 +377,89 @@ mod tests {
 
         agg.update(3000, 70.0);
         assert_eq!(agg.current(), Some(20.0)); // 20 over 1 second
+    }
+
+    /// Feeds `buckets` through one aggregator, finalizing after each, as the bucket engine does.
+    fn per_bucket<A: AggregationHandler>(mut agg: A, buckets: &[&[(i64, f64)]]) -> Vec<f64> {
+        buckets
+            .iter()
+            .map(|bucket| {
+                for &(ts, value) in *bucket {
+                    assert!(agg.update(ts, value), "every non-NaN sample is accepted");
+                }
+                agg.finalize()
+            })
+            .collect()
+    }
+
+    /// The counter aggregators carry their last sample across a bucket boundary, so the delta
+    /// that crosses it lands in the later bucket and the per-bucket increases sum to the total.
+    #[test]
+    fn test_counter_aggregators_carry_the_baseline() {
+        let buckets: &[&[(i64, f64)]] = &[
+            &[(1, 1.0), (2, 2.0)],
+            &[(3, 3.0), (4, 4.0), (5, 5.0)],
+            &[(6, 6.0), (7, 7.0), (8, 8.0)],
+            &[(9, 9.0)],
+        ];
+        let increase = per_bucket(IncreaseAggregator::default(), buckets);
+        assert_eq!(increase, [1.0, 3.0, 3.0, 1.0]);
+        assert_eq!(increase.iter().sum::<f64>(), 8.0);
+
+        let mut rate = RateAggregator::default();
+        rate.set_window_ms(1000);
+        assert_eq!(per_bucket(rate, buckets), [1.0, 3.0, 3.0, 1.0]);
+
+        assert_eq!(
+            per_bucket(IRateAggregator::default(), buckets),
+            [1000.0, 1000.0, 1000.0, 1000.0]
+        );
+    }
+
+    /// One sample and no earlier one: no delta was observed, and all three agree on it.
+    #[test]
+    fn test_counter_aggregators_agree_without_a_baseline() {
+        let mut rate = RateAggregator::default();
+        rate.set_window_ms(1000);
+        let only: &[&[(i64, f64)]] = &[&[(5, 7.0)]];
+        assert!(per_bucket(IncreaseAggregator::default(), only)[0].is_nan());
+        assert!(per_bucket(rate, only)[0].is_nan());
+        assert!(per_bucket(IRateAggregator::default(), only)[0].is_nan());
+    }
+
+    /// A bucket whose only sample is a counter reset relative to the carried baseline is still a
+    /// bucket the counter took a sample from: `increase` and `rate` report 0, `irate` no rate.
+    #[test]
+    fn test_counter_reset_at_a_bucket_boundary() {
+        let buckets: &[&[(i64, f64)]] = &[&[(1, 10.0), (2, 20.0)], &[(3, 5.0)], &[(4, 8.0)]];
+        assert_eq!(
+            per_bucket(IncreaseAggregator::default(), buckets),
+            [10.0, 0.0, 3.0]
+        );
+        let irate = per_bucket(IRateAggregator::default(), buckets);
+        assert_eq!(irate[0], 10_000.0);
+        assert!(irate[1].is_nan());
+        assert_eq!(irate[2], 3000.0);
+    }
+
+    /// `clear` starts over, dropping the carried baseline that `reset` keeps.
+    #[test]
+    fn test_counter_clear_drops_the_baseline() {
+        let mut agg = IncreaseAggregator::default();
+        agg.update(1, 1.0);
+        agg.update(2, 4.0);
+        agg.reset();
+        agg.update(3, 6.0);
+        assert_eq!(agg.current(), Some(2.0));
+        agg.clear();
+        agg.update(4, 9.0);
+        assert_eq!(agg.current(), None);
+
+        let mut irate = IRateAggregator::default();
+        irate.update(1, 1.0);
+        irate.clear();
+        irate.update(2, 2.0);
+        assert_eq!(irate.current(), None);
     }
 
     #[test]

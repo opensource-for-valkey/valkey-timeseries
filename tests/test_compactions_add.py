@@ -619,7 +619,40 @@ class TestCompactionAdd(ValkeyTimeSeriesTestCaseBase):
         c.execute_command("DEBUG", "RELOAD")
         for ts, value in ((900, 15), (1100, 20)):
             c.execute_command("TS.ADD", "rate:src", ts, value)
-        assert c.execute_command("TS.RANGE", "rate:dst", "-", "+") == [[0, b"10"], [500, b"10"]]
+        # Bucket 500 runs from the carried 5 (bucket 0's last sample) to 15: also a baseline
+        # that has to survive the reload.
+        assert c.execute_command("TS.RANGE", "rate:dst", "-", "+") == [[0, b"10"], [500, b"20"]]
+
+    def test_increase_rule_matches_a_range_over_the_source(self):
+        """A counter rule carries the last sample into the next bucket, as TS.RANGE does, and
+        keeps doing so when a back-fill or a delete changes the sample a bucket starts from."""
+        c = self.client
+        c.execute_command("TS.CREATE", "cnt:src", "DUPLICATE_POLICY", "LAST")
+        c.execute_command("TS.CREATE", "cnt:dst")
+        c.execute_command("TS.CREATERULE", "cnt:src", "cnt:dst", "AGGREGATION", "increase", 1000)
+
+        def check():
+            closed = c.execute_command("TS.RANGE", "cnt:dst", "-", "+")
+            expected = c.execute_command("TS.RANGE", "cnt:src", "-", "+",
+                                         "AGGREGATION", "increase", 1000)
+            # The source's last bucket is still open in the rule.
+            assert closed == expected[:-1]
+
+        for ts, value in ((0, 1), (500, 3), (1200, 7), (1800, 8), (2100, 10), (3000, 15)):
+            c.execute_command("TS.ADD", "cnt:src", ts, value)
+        check()
+        assert c.execute_command("TS.RANGE", "cnt:dst", "-", "+") == [
+            [0, b"2"], [1000, b"5"], [2000, b"2"]]
+
+        # Raising bucket 1000's last sample moves bucket 2000's starting point.
+        c.execute_command("TS.ADD", "cnt:src", 1800, 9)
+        check()
+        assert c.execute_command("TS.RANGE", "cnt:dst", "-", "+")[2] == [2000, b"1"]
+
+        # Emptying bucket 1000 makes bucket 2000 start from bucket 0's last sample.
+        c.execute_command("TS.DEL", "cnt:src", 1000, 1999)
+        check()
+        assert c.execute_command("TS.RANGE", "cnt:dst", "-", "+") == [[0, b"2"], [2000, b"7"]]
 
     def test_incrby_at_the_last_timestamp_recalculates_the_bucket(self):
         """Review focus 3: an in-place increment of the last sample is an upsert; streaming it
