@@ -20,6 +20,10 @@ class TestTsFanoutTopology(ValkeyTimeSeriesClusterTestCaseDebugMode):
     CLUSTER_SIZE = 3
     REPLICAS_COUNT = 1
 
+    def get_config_file_lines(self, test_dir, port):
+        # Detect a dead node in seconds rather than the default 15 s.
+        return super().get_config_file_lines(test_dir, port) + ["cluster-node-timeout 2000"]
+
     def _shard_index_for_slot(self, slot: int) -> int:
         for idx, (start, end) in enumerate(self._split_range_pairs(0, 16384, self.CLUSTER_SIZE)):
             if start <= slot < end:
@@ -45,6 +49,40 @@ class TestTsFanoutTopology(ValkeyTimeSeriesClusterTestCaseDebugMode):
                 if len(tags) == count:
                     return tags
         raise AssertionError(f"not enough hash tags found for shard {shard_index}")
+
+    def test_a_failed_replica_is_not_selected(self):
+        cluster = self.new_cluster_client()
+        probe = self.client_for_primary(0)
+        for shard_index in range(self.CLUSTER_SIZE):
+            tag = self._hash_tag_for_shard(probe, shard_index)
+            cluster.execute_command("TS.CREATE", f"failedreplica:{{{tag}}}", "LABELS", "suite", "failedreplica")
+        for rg in self.replication_groups:
+            rg.wait_for_replica_offset_to_sync_up(0)
+
+        group = self.replication_groups[0]
+        replica_id = group.get_replica_connection(0).execute_command("CLUSTER MYID")
+        if isinstance(replica_id, bytes):
+            replica_id = replica_id.decode()
+        os.kill(group.replicas[0].server.pid(), signal.SIGKILL)
+        group.replicas[0].server.server.wait()
+
+        live = [rg.get_primary_connection() for rg in self.replication_groups]
+        wait_for_true(
+            lambda: all(
+                any(nid == replica_id and "fail" in flags for nid, flags, _ in self._nodes(c))
+                for c in live
+            ),
+            timeout=30,
+        )
+        for client in live:
+            client.execute_command("TS._DEBUG", "REFRESH_CLUSTERMAP")
+
+        # READONLY routing may pick a replica; with the dead one still a candidate, about half
+        # of these failed with the generic fanout error.
+        coordinator = self.new_client_for_primary(0)
+        coordinator.execute_command("READONLY")
+        for _ in range(20):
+            assert coordinator.execute_command("TS.CARD", "FILTER", "suite=failedreplica") == 3
 
     def test_hashtags_on_one_shard_count_it_once(self):
         cluster = self.new_cluster_client()
