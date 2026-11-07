@@ -14,7 +14,7 @@
 //! back to per-series bucket transport (Phase 1).
 
 use crate::aggregators::AggregationType;
-use crate::aggregators::kahan::KahanSum;
+use crate::aggregators::kahan::{AVG_SHADOW_SCALE, KahanSum, mean_of};
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::series::request_types::{AggregatorConfig, ValueComparisonFilter};
 use smallvec::SmallVec;
@@ -39,7 +39,8 @@ pub enum PartialReducerKind {
     Max,
     /// acc1 = min, acc2 = max; finalize max - min
     Range,
-    /// acc1 = sum; finalize sum / count
+    /// acc1 = sum, acc2 = the sum scaled by `kahan::AVG_SHADOW_SCALE`, read only when acc1
+    /// overflowed; finalize sum / count
     Avg,
     /// acc1 = running mean, acc2 = M2 (Welford); finalize per variant
     StdP,
@@ -154,10 +155,16 @@ impl PartialReducer {
         let first_value = s.count == 0;
         s.count += 1;
         match self.kind {
-            PartialReducerKind::Sum | PartialReducerKind::SumIf | PartialReducerKind::Avg => {
+            PartialReducerKind::Sum | PartialReducerKind::SumIf => {
                 let mut sum = KahanSum::from_parts(s.acc1, s.acc1_c);
                 sum += value;
                 (s.acc1, s.acc1_c) = sum.into_parts();
+            }
+            PartialReducerKind::Avg => {
+                let mut sum = KahanSum::from_parts(s.acc1, s.acc1_c);
+                sum += value;
+                (s.acc1, s.acc1_c) = sum.into_parts();
+                s.acc2 += value * AVG_SHADOW_SCALE;
             }
             PartialReducerKind::Count | PartialReducerKind::CountIf => {}
             PartialReducerKind::Min => {
@@ -217,10 +224,16 @@ impl PartialReducer {
         let (n_a, n_b) = (into.count as f64, other.count as f64);
         into.count += other.count;
         match kind {
-            PartialReducerKind::Sum | PartialReducerKind::SumIf | PartialReducerKind::Avg => {
+            PartialReducerKind::Sum | PartialReducerKind::SumIf => {
                 let mut sum = KahanSum::from_parts(into.acc1, into.acc1_c);
                 sum += KahanSum::from_parts(other.acc1, other.acc1_c);
                 (into.acc1, into.acc1_c) = sum.into_parts();
+            }
+            PartialReducerKind::Avg => {
+                let mut sum = KahanSum::from_parts(into.acc1, into.acc1_c);
+                sum += KahanSum::from_parts(other.acc1, other.acc1_c);
+                (into.acc1, into.acc1_c) = sum.into_parts();
+                into.acc2 += other.acc2;
             }
             PartialReducerKind::Count | PartialReducerKind::CountIf => {}
             PartialReducerKind::Min => into.acc1 = into.acc1.min(other.acc1),
@@ -267,11 +280,17 @@ impl PartialReducer {
             PartialReducerKind::Min | PartialReducerKind::Max => state.acc1,
             PartialReducerKind::Count | PartialReducerKind::CountIf => n,
             PartialReducerKind::Range => state.acc2 - state.acc1,
-            PartialReducerKind::Avg => (state.acc1 + state.acc1_c) / n,
+            PartialReducerKind::Avg => mean_of(
+                &KahanSum::from_parts(state.acc1, state.acc1_c),
+                state.acc2,
+                n,
+            ),
             // acc2 is the Welford M2 — the same statistic AggStd
             // (handlers.rs) accumulates, so push-down matches the
-            // single-node dispersion aggregators. M2 is 0.0 for count == 1
-            // by construction.
+            // single-node dispersion aggregators. One sample has no spread,
+            // as `AggStd::variance` reports it — including an infinite one,
+            // whose M2 is NaN rather than 0.
+            PartialReducerKind::VarP | PartialReducerKind::StdP if state.count == 1 => 0.0,
             PartialReducerKind::VarP => state.acc2 / n,
             PartialReducerKind::VarS => {
                 if state.count == 1 {
@@ -586,6 +605,89 @@ mod tests {
                 expected,
                 &format!("{ty} around large offset"),
             );
+        }
+    }
+
+    /// Reduces `shards` through partials merged in order, and through the ordinary aggregator
+    /// over the concatenation; returns both.
+    fn both_paths(ty: AggregationType, shards: &[&[f64]]) -> (f64, f64) {
+        let config = AggregatorConfig::new(ty, None).unwrap();
+        let template = PartialReducer::for_config(&config).unwrap();
+        let kind = template.kind();
+        let mut merged = PartialState::default();
+        for part in shards {
+            let mut reducer = template.clone();
+            for &value in *part {
+                reducer.update(value);
+            }
+            PartialReducer::merge(kind, &mut merged, &reducer.take_state());
+        }
+        let samples = shards
+            .iter()
+            .flat_map(|part| part.iter())
+            .map(|&value| Sample {
+                timestamp: 1000,
+                value,
+            });
+        let ordinary = SampleReducer::new(samples, config.create_aggregator())
+            .next()
+            .unwrap()
+            .value;
+        (PartialReducer::finalize(kind, &merged), ordinary)
+    }
+
+    /// The mean of finite values is representable even when their sum is not.
+    #[test]
+    fn test_avg_survives_an_overflowing_sum() {
+        let max = f64::MAX;
+        let cases: &[(&[&[f64]], f64)] = &[
+            (&[&[max, max]], max),
+            (&[&[max], &[max]], max),
+            (&[&[max, max, max, max], &[]], max),
+            (&[&[max, max], &[-max]], max / 3.0),
+            // One side already scaled, the other not.
+            (&[&[max, max], &[1.0, 1.0]], max / 2.0),
+            (&[&[-max, -max], &[-max, -max]], -max),
+            // An infinite input still yields infinity, and opposite ones NaN.
+            (&[&[f64::INFINITY, 1.0]], f64::INFINITY),
+            (&[&[max, max], &[f64::INFINITY]], f64::INFINITY),
+        ];
+        for &(shards, expected) in cases {
+            let (partial, ordinary) = both_paths(AggregationType::Avg, shards);
+            assert_eq!(partial, expected, "partial {shards:?}");
+            assert_eq!(ordinary, expected, "ordinary {shards:?}");
+        }
+        let (partial, ordinary) = both_paths(
+            AggregationType::Avg,
+            &[&[f64::INFINITY], &[f64::NEG_INFINITY]],
+        );
+        assert!(partial.is_nan() && ordinary.is_nan());
+    }
+
+    /// Without overflow the shadow sum is never read, so ordinary means are unchanged.
+    #[test]
+    fn test_avg_without_overflow_is_the_plain_mean() {
+        let (partial, ordinary) = both_paths(AggregationType::Avg, &[&[1.0, 2.0], &[6.0]]);
+        assert_eq!((partial, ordinary), (3.0, 3.0));
+        // Far below where the shadow sum goes subnormal: the mean still comes from the exact sum.
+        let tiny = (1e-310, 3e-310);
+        let (partial, ordinary) = both_paths(AggregationType::Avg, &[&[tiny.0], &[tiny.1]]);
+        assert_eq!((partial, ordinary), (2e-310, 2e-310));
+    }
+
+    /// One infinite sample has no spread to report on either path.
+    #[test]
+    fn test_population_dispersion_of_one_infinity_agrees() {
+        for ty in [
+            AggregationType::VarP,
+            AggregationType::StdP,
+            AggregationType::VarS,
+            AggregationType::StdS,
+        ] {
+            for value in [f64::INFINITY, f64::NEG_INFINITY] {
+                let (partial, ordinary) = both_paths(ty, &[&[value]]);
+                assert_eq!((partial, ordinary), (0.0, 0.0), "{ty} over {value}");
+            }
         }
     }
 

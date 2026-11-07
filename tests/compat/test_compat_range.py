@@ -299,6 +299,20 @@ class TestBucketBoundaries:
             diff(range_cmd, "r:wide2", "-", "+", "AGGREGATION", "sum", 2**63)
 
 
+F64_MAX = 1.7976931348623157e308
+
+
+class TestExtremeValues:
+    @pytest.mark.parametrize("values", (
+        (F64_MAX, F64_MAX),
+        (F64_MAX, F64_MAX, -F64_MAX),
+        (-F64_MAX, -F64_MAX, -F64_MAX),
+    ))
+    def test_avg_of_values_whose_sum_overflows(self, diff, range_cmd, values):
+        mk_populated(diff, "r:huge", list(enumerate(values)))
+        diff(range_cmd, "r:huge", "-", "+", "AGGREGATION", "avg", 10)
+
+
 class TestEmpty:
     @pytest.mark.parametrize("agg", AGGREGATORS)
     def test_empty_gap_bucket_value_per_aggregator(self, diff, range_cmd, agg):

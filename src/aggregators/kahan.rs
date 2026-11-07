@@ -109,20 +109,23 @@ impl Hash for KahanSum {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, GetSize, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, GetSize, PartialEq)]
 pub struct KahanAvg {
     count: u32,
     sum: KahanSum,
+    /// The plain sum of every term times [`AVG_SHADOW_SCALE`]; see [`mean_of`].
+    shadow: f64,
 }
 
 impl KahanAvg {
     pub fn reset(&mut self) {
-        self.count = 0;
-        self.sum = KahanSum::new();
+        *self = Self::default();
     }
 
+    #[inline]
     pub fn add(&mut self, inc: f64) {
         self.sum += inc;
+        self.shadow += inc * AVG_SHADOW_SCALE;
         self.count = self.count.saturating_add(1);
     }
 
@@ -130,10 +133,19 @@ impl KahanAvg {
         if self.count == 0 {
             None
         } else {
-            Some(self.sum.value() / (self.count as f64))
+            Some(mean_of(&self.sum, self.shadow, self.count as f64))
         }
     }
 }
+
+impl Hash for KahanAvg {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.count.hash(state);
+        self.sum.hash(state);
+        hash_f64(self.shadow, state);
+    }
+}
+
 impl AddAssign<f64> for KahanAvg {
     fn add_assign(&mut self, rhs: f64) {
         self.add(rhs);
@@ -144,12 +156,33 @@ impl RdbSerializable for KahanAvg {
     fn rdb_save(&self, rdb: *mut RedisModuleIO) {
         self.sum.rdb_save(rdb);
         raw::save_unsigned(rdb, self.count as u64);
+        raw::save_double(rdb, self.shadow);
     }
 
     fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self> {
         let sum = KahanSum::rdb_load(rdb)?;
         let count = raw::load_unsigned(rdb)? as u32;
-        Ok(Self { count, sum })
+        let shadow = rdb_load_f64(rdb)?;
+        Ok(Self { count, sum, shadow })
+    }
+}
+
+/// `2^-32`. AVG also sums its terms scaled by this, in a plain shadow sum read only when the
+/// compensated sum overflowed: finite values then still have a representable mean (up to
+/// `2^32` terms of `f64::MAX`). Scaling by a power of two is exact, and the shadow is an
+/// independent chain, so the common path pays an extra multiply-add and nothing else.
+pub(crate) const AVG_SHADOW_SCALE: f64 = 1.0 / 4_294_967_296.0;
+
+/// The mean of `count` values, from their compensated sum and their [`AVG_SHADOW_SCALE`]d
+/// shadow. A finite sum is used as is, so results without overflow are unchanged. An infinite
+/// or NaN one is used too when the shadow agrees, which means an input was infinite.
+#[inline]
+pub(crate) fn mean_of(sum: &KahanSum, shadow: f64, count: f64) -> f64 {
+    let total = sum.value();
+    if total.is_finite() || !shadow.is_finite() {
+        total / count
+    } else {
+        shadow / count / AVG_SHADOW_SCALE
     }
 }
 
