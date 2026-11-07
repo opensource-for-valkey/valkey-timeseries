@@ -1344,7 +1344,7 @@
 # DIV-0062 came with the fix for bucket arithmetic near i64::MAX, black-box probed against the
 # reference.
 #
-# ⚠️ `behavior`-kind: needs owner sign-off in the PR that adds it.
+# `behavior`-kind: signed off by the owner (ccollie), 2026-11-07.
 
 - id: DIV-0062
   command: TS.RANGE
