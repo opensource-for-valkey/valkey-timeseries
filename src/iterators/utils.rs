@@ -200,45 +200,6 @@ pub(crate) fn create_range_iterator_for_reply<'a>(
     // Derived from the series, before the stream is clipped to the query window.
     let empty_fill = empty_fill_bounds(series, options, reply_reverse);
 
-    // Helper to handle the "latest sample" chaining logic which depends on direction
-    // and avoids boxing by using generics.
-    #[allow(clippy::too_many_arguments)]
-    fn chain_latest<'a, I>(
-        base: I,
-        latest: Option<Sample>,
-        opts: &RangeOptions,
-        grp: &Option<RangeGroupingOptions>,
-        reverse_aggr: bool,
-        should_reverse_iter: bool,
-        empty_fill: EmptyFillBounds,
-    ) -> Box<dyn Iterator<Item = Sample> + 'a>
-    where
-        I: Iterator<Item = Sample> + 'a,
-    {
-        if let Some(sample) = latest {
-            let latest_iter = std::iter::once(sample);
-            if should_reverse_iter && opts.aggregation.is_none() {
-                create_sample_iterator_adapter(
-                    latest_iter.chain(base),
-                    opts,
-                    grp,
-                    reverse_aggr,
-                    empty_fill,
-                )
-            } else {
-                create_sample_iterator_adapter(
-                    base.chain(latest_iter),
-                    opts,
-                    grp,
-                    reverse_aggr,
-                    empty_fill,
-                )
-            }
-        } else {
-            create_sample_iterator_adapter(base, opts, grp, reverse_aggr, empty_fill)
-        }
-    }
-
     if let Some(ts_filter) = options.timestamp_filter.as_ref() {
         let (start_ts, end_ts) = options.get_timestamp_range();
         let base_iter =
@@ -252,26 +213,68 @@ pub(crate) fn create_range_iterator_for_reply<'a>(
             value_filter: options.value_filter,
             timestamp_filter: None,
         };
-        chain_latest(
-            base_iter,
-            latest_sample,
-            &opts,
+        let output = SampleOutput {
+            options: &opts,
             grouping,
-            should_reverse_aggr,
-            is_reverse,
+            is_reverse: should_reverse_aggr,
             empty_fill,
-        )
+        };
+        output.chain_latest(base_iter, latest_sample, should_reverse_iter)
     } else {
         let base_iter =
             SeriesSampleIterator::from_range_options(series, options, should_reverse_iter);
-        chain_latest(
-            base_iter,
-            latest_sample,
+        let output = SampleOutput {
             options,
             grouping,
-            should_reverse_aggr,
-            is_reverse,
+            is_reverse: should_reverse_aggr,
             empty_fill,
+        };
+        output.chain_latest(base_iter, latest_sample, should_reverse_iter)
+    }
+}
+
+/// What happens to a series' samples once they have been read.
+struct SampleOutput<'o> {
+    options: &'o RangeOptions,
+    grouping: &'o Option<RangeGroupingOptions>,
+    /// Reverse the *finished* output. Distinct from reading the series newest-first, which is
+    /// what aggregation cannot do.
+    is_reverse: bool,
+    empty_fill: EmptyFillBounds,
+}
+
+impl SampleOutput<'_> {
+    /// Add LATEST's open bucket to the stream, which comes after every stored sample in time:
+    /// `read_newest_first` is the order `base` was read in, and has nothing to do with the order
+    /// of the reply, since an aggregated stream is read ascending whichever way the reply runs.
+    ///
+    /// Generic over `base` so that the common case, no LATEST sample, adds no adapter at all.
+    fn chain_latest<'a, I>(
+        &self,
+        base: I,
+        latest: Option<Sample>,
+        read_newest_first: bool,
+    ) -> Box<dyn Iterator<Item = Sample> + 'a>
+    where
+        I: Iterator<Item = Sample> + 'a,
+    {
+        match latest {
+            None => self.adapt(base),
+            Some(sample) if read_newest_first => self.adapt(std::iter::once(sample).chain(base)),
+            Some(sample) => self.adapt(base.chain(std::iter::once(sample))),
+        }
+    }
+
+    fn adapt<'a, I>(&self, stream: I) -> Box<dyn Iterator<Item = Sample> + 'a>
+    where
+        I: Iterator<Item = Sample> + 'a,
+    {
+        create_sample_iterator_adapter(
+            stream,
+            self.options,
+            self.grouping,
+            self.is_reverse,
+            self.empty_fill,
         )
     }
 }
@@ -645,6 +648,88 @@ mod tests {
             .map(|r| (r.timestamp, r.values[0]))
             .collect();
         assert_eq!(rows, expected);
+    }
+
+    /// LATEST's open bucket belongs after every stored sample in time, so it goes last on an
+    /// ascending stream and first on a stream read newest-first. Aggregation always reads
+    /// ascending and reverses afterwards, so there it goes last whichever way the reply runs.
+    #[test]
+    fn test_latest_sample_position_in_the_reply() {
+        let series = series_with(&[(0, 1.0), (1000, 2.0), (2000, 3.0)]);
+        let latest = Sample::new(3000, 9.0);
+        let filter = Some(vec![1000, 2000, 3000]);
+        let aggregation = Some(AggregationOptions {
+            aggregations: smallvec::smallvec![AggregationType::Sum.into()],
+            bucket_duration: 1000,
+            ..Default::default()
+        });
+        let options = |timestamp_filter: Option<Vec<i64>>,
+                       aggregation: Option<AggregationOptions>| {
+            RangeOptions {
+                date_range: TimestampRange::from_timestamps(0, 5000).unwrap(),
+                timestamp_filter,
+                aggregation,
+                ..Default::default()
+            }
+        };
+        let replied = |options: &RangeOptions, is_reverse: bool| -> Vec<(i64, f64)> {
+            create_range_iterator(&series, options, &None, Some(latest), is_reverse)
+                .map(|s| (s.timestamp, s.value))
+                .collect()
+        };
+
+        let raw = options(None, None);
+        let ascending = vec![(0, 1.0), (1000, 2.0), (2000, 3.0), (3000, 9.0)];
+        let descending: Vec<(i64, f64)> = ascending.iter().rev().copied().collect();
+        assert_eq!(replied(&raw, false), ascending);
+        assert_eq!(replied(&raw, true), descending);
+
+        let aggregated = options(None, aggregation.clone());
+        assert_eq!(replied(&aggregated, false), ascending);
+        assert_eq!(replied(&aggregated, true), descending);
+
+        let filtered_ascending = vec![(1000, 2.0), (2000, 3.0), (3000, 9.0)];
+        let filtered_descending: Vec<(i64, f64)> =
+            filtered_ascending.iter().rev().copied().collect();
+
+        let filtered = options(filter.clone(), None);
+        assert_eq!(replied(&filtered, false), filtered_ascending);
+        assert_eq!(replied(&filtered, true), filtered_descending);
+
+        let filtered_aggregated = options(filter, aggregation);
+        assert_eq!(replied(&filtered_aggregated, false), filtered_ascending);
+        assert_eq!(replied(&filtered_aggregated, true), filtered_descending);
+
+        let rows = |is_reverse: bool| -> Vec<(i64, f64)> {
+            create_row_iterator(&series, &aggregated, Some(latest), is_reverse)
+                .map(|r| (r.timestamp, r.values[0]))
+                .collect()
+        };
+        assert_eq!(rows(false), ascending);
+        assert_eq!(rows(true), descending);
+    }
+
+    /// A LATEST sample inside an existing bucket has to reach the aggregator in time order, or it
+    /// opens a bucket of its own ahead of the stored samples.
+    #[test]
+    fn test_latest_sample_joins_its_bucket_on_a_reverse_aggregation() {
+        let series = series_with(&[(0, 1.0), (1000, 2.0)]);
+        let options = RangeOptions {
+            date_range: TimestampRange::from_timestamps(0, 5000).unwrap(),
+            aggregation: Some(AggregationOptions {
+                aggregations: smallvec::smallvec![AggregationType::Sum.into()],
+                bucket_duration: 1000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let replied: Vec<(i64, f64)> =
+            create_range_iterator(&series, &options, &None, Some(Sample::new(1500, 5.0)), true)
+                .map(|s| (s.timestamp, s.value))
+                .collect();
+
+        assert_eq!(replied, vec![(1000, 7.0), (0, 1.0)]);
     }
 
     fn last_empty_rows(samples: &[(i64, f64)], start: i64, end: i64) -> Vec<(i64, Option<f64>)> {

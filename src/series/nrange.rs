@@ -88,7 +88,7 @@ fn per_key_range_options(options: &NRangeOptions, index: usize) -> RangeOptions 
 /// The destination's still-open bucket, when `LATEST` asks for it. Mirrors TS.MRANGE: the
 /// shared single-key helper decides, and a sample the value filter rejects is not reported.
 fn get_latest(ctx: &Context, series: &TimeSeries, range: &RangeOptions) -> Option<Sample> {
-    get_range_latest_sample(Some(ctx), series, range)
+    get_range_latest_sample(ctx, series, range)
         .filter(|s| range.value_filter.is_none_or(|vf| vf.is_match(s.value)))
 }
 

@@ -1,6 +1,8 @@
 use crate::commands::command_parser::parse_range_options;
 use crate::common::replies::{reply_with_multi_samples, reply_with_samples};
-use crate::iterators::{TimeSeriesRangeIterator, TimeSeriesRangeRowIterator};
+use crate::iterators::{
+    TimeSeriesRangeIterator, TimeSeriesRangeRowIterator, get_range_latest_sample,
+};
 use crate::series::get_timeseries;
 use valkey_module::{
     AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
@@ -67,11 +69,13 @@ fn range_internal(ctx: &Context, args: Vec<ValkeyString>, is_reverse: bool) -> V
 
     let series = get_timeseries(ctx, &key, Some(AclPermissions::ACCESS))?;
 
+    let latest = get_range_latest_sample(ctx, &series, &options);
+
     if options.aggregation.as_ref().is_some_and(|a| a.is_multi()) {
-        let iter = TimeSeriesRangeRowIterator::new(Some(ctx), &series, &options, is_reverse);
+        let iter = TimeSeriesRangeRowIterator::new(&series, &options, latest, is_reverse);
         reply_with_multi_samples(ctx, iter);
     } else {
-        let iter = TimeSeriesRangeIterator::new(Some(ctx), &series, &options, is_reverse);
+        let iter = TimeSeriesRangeIterator::new(&series, &options, latest, is_reverse);
         reply_with_samples(ctx, iter);
     }
     Ok(ValkeyValue::NoReply)

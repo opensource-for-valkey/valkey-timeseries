@@ -299,7 +299,7 @@ fn process_mrange(
 /// that TS.RANGE — and the reference — both omit, so the engine disagreed with itself
 /// (found by the Tier C fuzzer). Keeping one implementation is what stops that recurring.
 fn get_latest(options: &RangeOptions, ctx: &Context, series: &TimeSeries) -> Option<Sample> {
-    get_range_latest_sample(Some(ctx), series, options)
+    get_range_latest_sample(ctx, series, options)
         .filter(|s| options.value_filter.is_none_or(|vf| vf.is_match(s.value)))
 }
 
