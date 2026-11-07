@@ -149,6 +149,21 @@ pub(super) const BUSY_ERROR: &str =
     "A multi-shard command failed because a node has too many fanout requests queued; retry later";
 
 impl ErrorKind {
+    /// An outcome the client sees and can act on (a denial, a busy or swapped
+    /// shard, a deadline, a topology change), as opposed to a fault. A client can
+    /// cause one per shard on every command it issues, so these log at debug.
+    pub fn is_client_visible(self) -> bool {
+        matches!(
+            self,
+            Self::KeyPermissions
+                | Self::Permissions
+                | Self::Busy
+                | Self::DatabaseSwapped
+                | Self::Timeout
+                | Self::ClusterMapMismatch
+        )
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::InvalidMessage => INVALID_MESSAGE_ERROR,

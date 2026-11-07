@@ -83,21 +83,6 @@ pub trait FanoutCommand: Default + Send + 'static {
     fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult;
 }
 
-/// Error kinds that describe an outcome the client sees and can act on (a denial,
-/// a busy or swapped shard, a deadline, a topology change), as opposed to a fault.
-/// Logged at debug: a client can produce one per shard on every command it issues.
-fn is_client_visible(kind: ErrorKind) -> bool {
-    matches!(
-        kind,
-        ErrorKind::KeyPermissions
-            | ErrorKind::Permissions
-            | ErrorKind::Busy
-            | ErrorKind::DatabaseSwapped
-            | ErrorKind::Timeout
-            | ErrorKind::ClusterMapMismatch
-    )
-}
-
 /// The reply for a fanout that failed on some share with an error that does not
 /// abort it. Names the first such share, so the client sees more than that it failed.
 fn generic_error_reply(name: &str, first_error: Option<&(String, FanoutError)>) -> FanoutError {
@@ -292,7 +277,7 @@ where
             OP::name(),
             describe_target(target)
         );
-        if is_client_visible(error.kind) {
+        if error.kind.is_client_visible() {
             log_debug(msg);
         } else {
             log_warning(msg);
