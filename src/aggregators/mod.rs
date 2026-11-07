@@ -380,14 +380,29 @@ pub fn calc_bucket_start(
     align_timestamp: Timestamp,
     bucket_duration: u64,
 ) -> Timestamp {
-    let diff = ts - align_timestamp;
-    let delta = bucket_duration as i64;
-    0.max(ts - ((diff % delta + delta) % delta))
+    bucket_start_for(ts, align_timestamp, bucket_duration).max(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calc_bucket_start_handles_the_largest_duration() {
+        let duration = i64::MAX as u64;
+        assert_eq!(calc_bucket_start(Timestamp::MAX - 1, 0, duration), 0);
+        assert_eq!(calc_bucket_start(1, 0, duration), 0);
+        assert_eq!(
+            calc_bucket_start(Timestamp::MAX, 0, duration),
+            Timestamp::MAX
+        );
+    }
+
+    #[test]
+    fn calc_bucket_start_clamps_a_negative_start() {
+        assert_eq!(calc_bucket_start(100, 250, 1000), 0);
+        assert_eq!(calc_bucket_start(250, 250, 1000), 250);
+    }
 
     #[test]
     fn bucket_timestamp_calculates_correctly_for_start() {

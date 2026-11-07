@@ -1340,3 +1340,24 @@
     RESTORE would silently stop a rollup whenever a slot moves. Pinned by
     TestRestoreKeepsRules::test_rule_survives_restore_under_the_same_key.
   since: 0.1.0
+
+# DIV-0062 came with the fix for bucket arithmetic near i64::MAX, black-box probed against the
+# reference.
+#
+# ⚠️ `behavior`-kind: needs owner sign-off in the PR that adds it.
+
+- id: DIV-0062
+  command: TS.RANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    A bucket duration close to i64::MAX buckets samples correctly. RTS 8.10 accepts the same
+    durations but its bucket arithmetic wraps: at 9223372036854775807, samples at
+    9223372036854775805 and 9223372036854775806 come back as two rows at timestamp 0, and samples
+    at 1 and 2 as one row at timestamp 2. Durations up to 2^61 + 1 agree on both engines.
+  rationale: >
+    The reference's reply is an overflow artifact, not a behavior to reproduce: it puts two
+    samples of one bucket in separate rows and reports a bucket start after the sample in it.
+    Rejecting these durations instead would add an error the reference does not have. Pinned by
+    TestTimeSeriesRange::test_largest_duration_is_one_bucket.
+  since: 0.1.0

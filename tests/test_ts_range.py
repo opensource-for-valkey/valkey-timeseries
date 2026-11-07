@@ -157,6 +157,31 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         assert result == [[50000, b'510'], [60000, b'610'], [70000, b'710'], [80000, b'810'], [90000, b'910']]
         # Bucket 3 (6000-...) No values
 
+    def test_largest_duration_is_one_bucket(self):
+        """DIV-0062: the reference's bucket arithmetic wraps here and splits the bucket."""
+        top = 2**63 - 1
+        self.client.execute_command('TS.ADD', 'high', top - 2, 1)
+        self.client.execute_command('TS.ADD', 'high', top - 1, 2)
+        self.client.execute_command('TS.ADD', 'low', 1, 1)
+        self.client.execute_command('TS.ADD', 'low', 2, 2)
+
+        for key in ('high', 'low'):
+            result = self.client.execute_command('TS.RANGE', key, '-', '+',
+                                                 'AGGREGATION', 'sum', top)
+            assert result == [[0, b'3']]
+
+    def test_compaction_with_the_largest_duration_stays_open(self):
+        """A rule accepts any positive i64 duration; its one bucket never closes."""
+        top = 2**63 - 1
+        self.client.execute_command('TS.CREATE', 'src')
+        self.client.execute_command('TS.CREATE', 'dst')
+        self.client.execute_command('TS.CREATERULE', 'src', 'dst', 'AGGREGATION', 'sum', top)
+        self.client.execute_command('TS.ADD', 'src', 1, 1)
+        self.client.execute_command('TS.ADD', 'src', top - 1, 2)
+
+        assert self.client.execute_command('TS.RANGE', 'dst', '-', '+') == []
+        assert self.client.execute_command('TS.RANGE', 'dst', '-', '+', 'LATEST') == [[0, b'3']]
+
     def test_range_empty_series(self):
         """Test TS.RANGE on an existing but empty series"""
 

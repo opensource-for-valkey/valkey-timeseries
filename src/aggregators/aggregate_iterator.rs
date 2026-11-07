@@ -166,7 +166,9 @@ struct AggregationHelper {
     bucket_duration: u64,
     bucket_ts: BucketTimestamp,
     bucket_range_start: Timestamp,
-    bucket_range_end: Timestamp,
+    /// Last timestamp of the bucket, inclusive: the final representable bucket has no
+    /// exclusive end, and a saturated one would push a sample at `i64::MAX` out of it.
+    bucket_range_last: Timestamp,
     align_timestamp: Timestamp,
     /// Whether the current bucket received any sample at all, NaN or not. A bucket every
     /// aggregator ignored still counts as started, and the trailing one must not be dropped
@@ -191,7 +193,7 @@ impl AggregationHelper {
             bucket_duration: options.bucket_duration,
             bucket_ts: options.timestamp_output,
             bucket_range_start: 0,
-            bucket_range_end: 0,
+            bucket_range_last: 0,
             align_timestamp,
             saw_sample: false,
             report_empty: options.report_empty,
@@ -295,10 +297,9 @@ impl AggregationHelper {
 
         if self.report_empty
             && let Some(last_ts) = last_ts
-            && last_ts >= self.bucket_range_end
+            && let Some(next_bucket) = self.next_bucket_start()
         {
-            let start = self.bucket_range_end + 1;
-            self.add_empty_buckets_between_timestamps(empty_buckets, start, last_ts);
+            self.add_empty_buckets_between_timestamps(empty_buckets, next_bucket, last_ts);
         }
 
         self.saw_sample = false;
@@ -314,14 +315,19 @@ impl AggregationHelper {
 
     #[inline]
     fn should_finalize_bucket(&self, timestamp: Timestamp) -> bool {
-        timestamp >= self.bucket_range_end
+        timestamp > self.bucket_range_last
+    }
+
+    /// Start of the bucket after the current one; `None` when the current one is the last.
+    fn next_bucket_start(&self) -> Option<Timestamp> {
+        self.bucket_range_last.checked_add(1)
     }
 
     fn update_bucket_timestamps(&mut self, timestamp: Timestamp) {
         self.bucket_range_start = self.calc_bucket_start(timestamp);
-        self.bucket_range_end = self
+        self.bucket_range_last = self
             .bucket_range_start
-            .saturating_add_unsigned(self.bucket_duration);
+            .saturating_add_unsigned(self.bucket_duration - 1);
     }
 
     /// True (unclamped) bucket start: may be negative when the alignment offset
@@ -345,14 +351,21 @@ impl AggregationHelper {
 /// `align_timestamp`. Negative when the alignment offset places the bucket before 0; only the
 /// *reported* timestamp is clamped. Shared with the callers that have to reason about the
 /// grid without an iterator in hand (see `iterators::empty_fill_bounds`).
+///
+/// Unsigned so that the whole accepted domain is safe: a signed `(diff % d + d) % d` overflows
+/// once `d` nears `i64::MAX`, which is a valid duration. `bucket_duration` must be nonzero.
 pub(crate) fn bucket_start_for(
     ts: Timestamp,
     align_timestamp: Timestamp,
     bucket_duration: u64,
 ) -> Timestamp {
-    let diff = ts - align_timestamp;
-    let delta = bucket_duration as i64;
-    ts - ((diff % delta + delta) % delta)
+    let distance = ts.abs_diff(align_timestamp) % bucket_duration;
+    let offset = if ts >= align_timestamp || distance == 0 {
+        distance
+    } else {
+        bucket_duration - distance
+    };
+    ts.saturating_sub_unsigned(offset)
 }
 
 pub fn aggregate(
@@ -506,6 +519,8 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
     }
 
     /// One past the last bucket of `ts`, for the exclusive end `add_empty_bucket_internal` takes.
+    /// Saturating cannot lose a bucket: only a bucket starting at `i64::MAX` would need the end
+    /// to be larger, and a fill bound implies passing data beyond `ts`, so `ts < i64::MAX`.
     fn bucket_end_exclusive(&self, ts: Timestamp) -> Timestamp {
         self.aggregator
             .calc_bucket_start(ts)
@@ -611,11 +626,12 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
 
         if self.aggregator.report_empty
             && let Some(query_end) = self.empty_fill.end
+            && let Some(next_bucket) = self.aggregator.next_bucket_start()
         {
             let end_exclusive = self.bucket_end_exclusive(query_end);
             self.aggregator.add_empty_bucket_internal(
                 &mut self.empty_buckets,
-                self.aggregator.bucket_range_end,
+                next_bucket,
                 end_exclusive,
             );
         }
@@ -793,6 +809,157 @@ mod tests {
         assert_eq!(result[4].value, 6.0);
         assert_eq!(result[5].timestamp, 60);
         assert_eq!(result[5].value, 7.0);
+    }
+
+    fn sum_options(bucket_duration: u64, report_empty: bool) -> AggregationOptions {
+        AggregationOptions {
+            bucket_duration,
+            report_empty,
+            ..create_options(AggregationType::Sum)
+        }
+    }
+
+    fn sum_rows(
+        samples: &[(Timestamp, f64)],
+        bucket_duration: u64,
+        report_empty: bool,
+    ) -> Vec<(Timestamp, f64)> {
+        let options = sum_options(bucket_duration, report_empty);
+        let samples = samples.iter().map(|&(ts, value)| Sample::new(ts, value));
+        AggregateIterator::new(samples, &options, 0)
+            .map(|sample| (sample.timestamp, sample.value))
+            .collect()
+    }
+
+    #[test]
+    fn test_empty_at_duration_one_reports_every_missing_bucket() {
+        assert_eq!(
+            sum_rows(&[(0, 1.0), (3, 2.0)], 1, true),
+            [(0, 1.0), (1, 0.0), (2, 0.0), (3, 2.0)]
+        );
+        assert_eq!(
+            sum_rows(&[(0, 1.0), (2, 2.0)], 1, true),
+            [(0, 1.0), (1, 0.0), (2, 2.0)]
+        );
+    }
+
+    #[test]
+    fn test_empty_at_duration_one_multi_output() {
+        let options = AggregationOptions {
+            aggregations: smallvec::smallvec![
+                AggregationType::Sum.into(),
+                AggregationType::Max.into()
+            ],
+            ..sum_options(1, true)
+        };
+        let samples = [Sample::new(0, 1.0), Sample::new(2, 2.0)];
+        let timestamps: Vec<Timestamp> =
+            MultiAggregateIterator::new(samples.into_iter(), &options, 0)
+                .map(|row| row.timestamp)
+                .collect();
+        assert_eq!(timestamps, [0, 1, 2]);
+    }
+
+    const TERMINAL_BUCKET: Timestamp = 9223372036854775800;
+
+    #[test]
+    fn test_final_representable_bucket_holds_i64_max() {
+        let samples = [(Timestamp::MAX - 1, 1.0), (Timestamp::MAX, 2.0)];
+        for report_empty in [false, true] {
+            assert_eq!(
+                sum_rows(&samples, 10, report_empty),
+                [(TERMINAL_BUCKET, 3.0)]
+            );
+        }
+    }
+
+    #[test]
+    fn test_final_bucket_at_duration_one_is_distinct_from_the_one_before() {
+        let samples = [(Timestamp::MAX - 1, 1.0), (Timestamp::MAX, 2.0)];
+        assert_eq!(
+            sum_rows(&samples, 1, true),
+            [(Timestamp::MAX - 1, 1.0), (Timestamp::MAX, 2.0)]
+        );
+    }
+
+    #[test]
+    fn test_empty_fills_up_to_the_final_bucket() {
+        let samples = [(TERMINAL_BUCKET - 15, 1.0), (Timestamp::MAX, 2.0)];
+        assert_eq!(
+            sum_rows(&samples, 10, true),
+            [
+                (TERMINAL_BUCKET - 20, 1.0),
+                (TERMINAL_BUCKET - 10, 0.0),
+                (TERMINAL_BUCKET, 2.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_trailing_fill_past_the_final_bucket_stops() {
+        let options = sum_options(10, true);
+        let samples = [Sample::new(Timestamp::MAX, 2.0)];
+        let bounds = EmptyFillBounds::new(None, Some(Timestamp::MAX));
+        let rows: Vec<MultiSample> =
+            MultiAggregateIterator::with_empty_fill(samples.into_iter(), &options, 0, bounds)
+                .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].timestamp, TERMINAL_BUCKET);
+    }
+
+    #[test]
+    fn test_largest_accepted_duration_is_a_single_bucket() {
+        let samples = [(Timestamp::MAX - 2, 1.0), (Timestamp::MAX - 1, 2.0)];
+        assert_eq!(sum_rows(&samples, i64::MAX as u64, false), [(0, 3.0)]);
+        assert_eq!(
+            sum_rows(&[(1, 1.0), (2, 2.0)], i64::MAX as u64, false),
+            [(0, 3.0)]
+        );
+    }
+
+    #[test]
+    fn test_bucket_start_matches_wide_euclidean_oracle() {
+        let oracle = |ts: Timestamp, align: Timestamp, duration: u64| -> Timestamp {
+            let (ts, align, duration) = (ts as i128, align as i128, duration as i128);
+            (ts - (ts - align).rem_euclid(duration)) as Timestamp
+        };
+        let timestamps = [
+            0,
+            1,
+            2,
+            249,
+            250,
+            999,
+            1000,
+            1 << 61,
+            Timestamp::MAX - 2,
+            Timestamp::MAX - 1,
+            Timestamp::MAX,
+        ];
+        let aligns = [0, 1, 250, 1 << 61, Timestamp::MAX - 1, Timestamp::MAX];
+        let durations = [
+            1,
+            2,
+            3,
+            7,
+            10,
+            1000,
+            1 << 61,
+            (1 << 61) + 1,
+            (i64::MAX as u64) - 1,
+            i64::MAX as u64,
+        ];
+        for &ts in &timestamps {
+            for &align in &aligns {
+                for &duration in &durations {
+                    assert_eq!(
+                        bucket_start_for(ts, align, duration),
+                        oracle(ts, align, duration),
+                        "ts={ts} align={align} duration={duration}"
+                    );
+                }
+            }
+        }
     }
 
     // Reference-verified ALIGN semantics (RTS 8.6, compat finding #2): with

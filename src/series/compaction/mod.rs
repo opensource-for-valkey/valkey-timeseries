@@ -204,8 +204,8 @@ fn validate_restored_rule_parameters(
         return Err(ValkeyError::Str(error_consts::BUCKET_DURATION_TOO_SMALL));
     }
 
-    // calc_bucket_start converts the duration to i64 for its modulo
-    // arithmetic. Reject values that would become negative after that cast.
+    // Durations are i64 everywhere they are reported (TS.INFO, the digest), and the
+    // command path cannot produce a larger one.
     if bucket_duration > i64::MAX as u64 {
         return Err(ValkeyError::String(format!(
             "TSDB: compaction rule bucket duration is too large: {bucket_duration}"
