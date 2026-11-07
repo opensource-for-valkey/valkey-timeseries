@@ -1,6 +1,6 @@
 use crate::aggregators::{AggregationHandler, AggregationType, Aggregator, BucketTimestamp};
 use crate::common::{MultiSample, Sample, Timestamp};
-use crate::series::request_types::AggregationOptions;
+use crate::series::request_types::{AggregationOptions, MAX_AGGREGATIONS};
 use smallvec::SmallVec;
 use std::collections::VecDeque;
 
@@ -160,9 +160,10 @@ impl LastCarry {
 #[derive(Debug)]
 struct AggregationHelper {
     aggregators: SmallVec<[Aggregator; 2]>,
-    /// Per-aggregator: did it accept at least one sample from the current bucket? Parallel
-    /// to `aggregators`. Drives whether the bucket is emitted — see `complete_bucket`.
-    accepted: SmallVec<[bool; 2]>,
+    /// Bit `i`: did aggregator `i` accept at least one sample from the current bucket? Drives
+    /// whether the bucket is emitted — see `complete_bucket`. A clause holds at most
+    /// `MAX_AGGREGATIONS` (16) aggregators, so the bits fit.
+    accepted: u16,
     bucket_duration: u64,
     bucket_ts: BucketTimestamp,
     bucket_range_start: Timestamp,
@@ -181,6 +182,10 @@ struct AggregationHelper {
 impl AggregationHelper {
     pub(crate) fn new(options: &AggregationOptions, align_timestamp: Timestamp) -> Self {
         let mut aggregators = options.create_aggregators();
+        debug_assert!(
+            aggregators.len() <= MAX_AGGREGATIONS,
+            "the accepted bitmap holds MAX_AGGREGATIONS aggregators"
+        );
         for aggregator in aggregators.iter_mut() {
             if let Aggregator::Rate(r) = aggregator {
                 r.set_window_ms(options.bucket_duration);
@@ -188,7 +193,7 @@ impl AggregationHelper {
         }
 
         Self {
-            accepted: smallvec::smallvec![false; aggregators.len()],
+            accepted: 0,
             aggregators,
             bucket_duration: options.bucket_duration,
             bucket_ts: options.timestamp_output,
@@ -265,7 +270,7 @@ impl AggregationHelper {
         //
         // With several aggregations (an extension; RTS permits one) a row is all-or-nothing,
         // so it is emitted once any aggregator accepted a sample and the rest take their fill.
-        let any_accepted = self.accepted.iter().any(|&accepted| accepted);
+        let any_accepted = self.accepted != 0;
 
         // `finalize` resets each aggregator it reads; a bucket nobody accepted from is reset
         // here instead, so every path leaves the aggregators ready for the next bucket.
@@ -295,7 +300,7 @@ impl AggregationHelper {
         if let (Some(row), Some(carry)) = (bucket.as_mut(), self.last_carry.as_mut()) {
             carry.apply_to_bucket_with_samples(&mut row.values);
         }
-        self.accepted.fill(false);
+        self.accepted = 0;
 
         if self.report_empty
             && let Some(last_ts) = last_ts
@@ -320,8 +325,8 @@ impl AggregationHelper {
     }
 
     fn update(&mut self, sample: Sample) {
-        for (aggregator, accepted) in self.aggregators.iter_mut().zip(self.accepted.iter_mut()) {
-            *accepted |= aggregator.update(sample.timestamp, sample.value);
+        for (i, aggregator) in self.aggregators.iter_mut().enumerate() {
+            self.accepted |= u16::from(aggregator.update(sample.timestamp, sample.value)) << i;
         }
         self.saw_sample = true;
     }
@@ -1594,67 +1599,79 @@ mod tests {
                 BucketTimestamp::End,
             ] {
                 for input in &inputs {
-                    // one multi clause containing every type at once
-                    let aggregations: SmallVec<[AggregatorConfig; 2]> =
-                        all_types.iter().map(|&ty| ty.into()).collect();
-                    let multi_options = AggregationOptions {
-                        aggregations,
-                        bucket_duration: 10,
-                        timestamp_output,
-                        alignment: BucketAlignment::Start,
-                        report_empty,
-                    };
-                    let rows: Vec<MultiSample> =
-                        MultiAggregateIterator::new(input.clone().into_iter(), &multi_options, 0)
-                            .collect();
-
-                    for (column, &ty) in all_types.iter().enumerate() {
-                        let single_options = AggregationOptions {
-                            aggregations: smallvec::smallvec![ty.into()],
+                    // as few multi clauses as the MAX_AGGREGATIONS cap allows
+                    for group in all_types.chunks(MAX_AGGREGATIONS) {
+                        let aggregations: SmallVec<[AggregatorConfig; 2]> =
+                            group.iter().map(|&ty| ty.into()).collect();
+                        let multi_options = AggregationOptions {
+                            aggregations,
                             bucket_duration: 10,
                             timestamp_output,
                             alignment: BucketAlignment::Start,
                             report_empty,
                         };
-                        let singles: Vec<Sample> =
-                            AggregateIterator::new(input.clone().into_iter(), &single_options, 0)
-                                .collect();
+                        let rows: Vec<MultiSample> = MultiAggregateIterator::new(
+                            input.clone().into_iter(),
+                            &multi_options,
+                            0,
+                        )
+                        .collect();
 
-                        let context = format!(
-                            "type={ty:?} empty={report_empty} ts_out={timestamp_output:?} input_len={}",
-                            input.len()
-                        );
-                        if report_empty {
-                            assert_eq!(rows.len(), singles.len(), "row count mismatch: {context}");
-                        } else {
-                            assert!(
-                                rows.len() >= singles.len(),
-                                "multi dropped a bucket the single iterator emitted: \
+                        for (column, &ty) in group.iter().enumerate() {
+                            let single_options = AggregationOptions {
+                                aggregations: smallvec::smallvec![ty.into()],
+                                bucket_duration: 10,
+                                timestamp_output,
+                                alignment: BucketAlignment::Start,
+                                report_empty,
+                            };
+                            let singles: Vec<Sample> = AggregateIterator::new(
+                                input.clone().into_iter(),
+                                &single_options,
+                                0,
+                            )
+                            .collect();
+
+                            let context = format!(
+                                "type={ty:?} empty={report_empty} ts_out={timestamp_output:?} input_len={}",
+                                input.len()
+                            );
+                            if report_empty {
+                                assert_eq!(
+                                    rows.len(),
+                                    singles.len(),
+                                    "row count mismatch: {context}"
+                                );
+                            } else {
+                                assert!(
+                                    rows.len() >= singles.len(),
+                                    "multi dropped a bucket the single iterator emitted: \
                                  multi={} single={} ({context})",
-                                rows.len(),
-                                singles.len(),
-                            );
-                        }
+                                    rows.len(),
+                                    singles.len(),
+                                );
+                            }
 
-                        for single in singles.iter() {
-                            let row = rows
-                                .iter()
-                                .find(|r| r.timestamp == single.timestamp)
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "multi is missing bucket {} emitted by the single \
+                            for single in singles.iter() {
+                                let row = rows
+                                    .iter()
+                                    .find(|r| r.timestamp == single.timestamp)
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                            "multi is missing bucket {} emitted by the single \
                                          iterator ({context})",
-                                        single.timestamp
-                                    )
-                                });
-                            let multi_value = row.values[column];
-                            assert!(
-                                (multi_value.is_nan() && single.value.is_nan())
-                                    || multi_value == single.value,
-                                "value mismatch at ts {}: multi={multi_value} single={} ({context})",
-                                row.timestamp,
-                                single.value,
-                            );
+                                            single.timestamp
+                                        )
+                                    });
+                                let multi_value = row.values[column];
+                                assert!(
+                                    (multi_value.is_nan() && single.value.is_nan())
+                                        || multi_value == single.value,
+                                    "value mismatch at ts {}: multi={multi_value} single={} ({context})",
+                                    row.timestamp,
+                                    single.value,
+                                );
+                            }
                         }
                     }
                 }
