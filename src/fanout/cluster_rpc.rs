@@ -92,7 +92,7 @@ impl InFlightRequest {
     }
 
     fn get_target_node_opt(&self, sender_id: *const c_char) -> Option<&NodeInfo> {
-        let sender = NodeId::from_raw(sender_id);
+        let sender = node_id_of(sender_id);
         self.targets.get(&sender)
     }
 
@@ -105,7 +105,7 @@ impl InFlightRequest {
     /// this request's and the fan-out's bookkeeping, completing the fan-out while real shards
     /// were still outstanding.
     fn handle_response(&self, resp: FanoutResult<&[u8]>, sender_id: *const c_char) -> bool {
-        let sender = NodeId::from_raw(sender_id);
+        let sender = node_id_of(sender_id);
         let Some(target_node) = self
             .get_target_node_opt(sender_id)
             .filter(|node| !node.is_local())
@@ -155,6 +155,15 @@ impl InFlightRequest {
     fn deliver_timeout(&self) {
         (self.response_handler)(Err(FanoutError::timeout()), &placeholder_node());
     }
+}
+
+/// The node id behind a sender pointer. Every such pointer in this module is
+/// either a cluster-message receiver's `sender_id` argument, which the server
+/// guarantees is null or a 40-byte hex id for the duration of the callback, or
+/// [`NodeId::raw_ptr`] of an id we hold.
+fn node_id_of(sender_id: *const c_char) -> NodeId {
+    // SAFETY: see above.
+    unsafe { NodeId::from_raw(sender_id) }
 }
 
 /// Stand-in target for a callback that has no real sender (an unknown sender, or
@@ -520,7 +529,7 @@ fn parse_fanout_message<'a>(
     match FanoutMessage::new(buffer) {
         Ok(msg) => Some(msg),
         Err(err) => {
-            let node = NodeId::from_raw(sender_id);
+            let node = node_id_of(sender_id);
             log_warning(format!(
                 "Failed to parse fanout message from node {node}: {err}"
             ));
@@ -779,7 +788,7 @@ fn request_received(
         let msg = format!(
             "Rejecting fanout request {} from node {}: unsupported required_features {:#06x}",
             header.request_id,
-            NodeId::from_raw(sender_id),
+            node_id_of(sender_id),
             header.required_features
         );
         log_warning(msg);
@@ -800,7 +809,7 @@ fn request_received(
         return;
     };
 
-    let sender = NodeId::from_raw(sender_id);
+    let sender = node_id_of(sender_id);
 
     let mut buf = get_pooled_buffer(len as usize);
     buf.extend_from_slice(request_buf);
@@ -873,7 +882,7 @@ extern "C" fn on_cancel_received(
             return;
         };
         metrics::FANOUT_CANCELS_RECEIVED.incr();
-        cancel_peer_request(NodeId::from_raw(sender_id), message.header.request_id);
+        cancel_peer_request(node_id_of(sender_id), message.header.request_id);
     });
 }
 
@@ -983,7 +992,7 @@ fn error_received(
                 metrics::FANOUT_ERROR_DECODE_FAILURES.incr();
                 log_warning(format!(
                     "Failed to deserialize error response from node {}",
-                    NodeId::from_raw(sender_id)
+                    node_id_of(sender_id)
                 ));
                 let err = FanoutError::invalid_message();
                 request.handle_response(Err(err), sender_id)
@@ -1134,7 +1143,7 @@ mod tests {
 
     /// `from_raw` reads a full node id, however short a string it is handed.
     fn node_id(hex_digit: u8) -> NodeId {
-        NodeId::from_raw([hex_digit; 41].as_ptr().cast())
+        node_id_of([hex_digit; 41].as_ptr().cast())
     }
 
     #[test]

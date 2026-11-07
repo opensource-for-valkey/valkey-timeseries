@@ -63,24 +63,20 @@ impl ClusterNodesSource for DetachedContext {
 pub const NUM_SLOTS: u16 = 16384;
 
 /// Enumeration for fanout target modes
-// The full targeting vocabulary is matched in target selection; not every mode has a caller yet.
+// `Slots` has no command caller yet; the hash-tag modes are built on it.
 #[allow(dead_code)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum FanoutTarget {
-    /// Select only the local node
-    Local,
     /// Default: randomly select one node per shard
     #[default]
     Random,
-    /// Select only replicas, one per shard
-    ReplicasOnly,
     /// Select one replica per shard (if available), otherwise primary
     ReplicaPerShard,
     /// Select all primary (master) nodes
     Primary,
     /// Select all nodes (both primary and replica)
     All,
-    /// Randomly select one node per slot
+    /// Randomly select one node per shard owning any of the slots
     Slots(SmallVec<[u16; 4]>),
     /// Select a random node from each of the slots corresponding to the hash tags provided
     HashTags(Vec<String>),
@@ -224,7 +220,7 @@ impl NodeId {
     ///
     /// This function is safe to call from any thread — it performs no
     /// synchronisation and only reads from the caller-provided pointer.
-    pub fn from_raw(node_id_ptr: *const std::os::raw::c_char) -> Self {
+    pub unsafe fn from_raw(node_id_ptr: *const std::os::raw::c_char) -> Self {
         let mut buf: NodeIdBuf = [0; (VALKEYMODULE_NODE_ID_LEN as usize) + 1];
 
         if node_id_ptr.is_null() {
@@ -263,17 +259,11 @@ impl NodeId {
         self.0.as_ptr() as *const std::os::raw::c_char
     }
 
+    /// The id as text; `""` for an empty id. Ids are hex, so the checked
+    /// conversion only fails on bytes no well-behaved server sends, and those
+    /// read as empty rather than as undefined behaviour.
     pub fn as_str(&self) -> &str {
-        if self.is_empty() {
-            return "";
-        }
-        // SAFETY: self.0 is always valid UTF-8 as it is copied from valid node ID strings
-        let buf = &self.0[..VALKEYMODULE_NODE_ID_LEN as usize];
-        debug_assert!(
-            std::str::from_utf8(buf).is_ok(),
-            "NodeId::as_str: node id bytes are not valid UTF-8"
-        );
-        unsafe { std::str::from_utf8_unchecked(buf) }
+        std::str::from_utf8(self.as_bytes()).unwrap_or("")
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -291,19 +281,13 @@ impl NodeId {
 
 impl AsRef<str> for NodeId {
     fn as_ref(&self) -> &str {
-        // SAFETY: self.0 is always valid UTF-8 as it is copied from valid node ID strings
-        let buf = &self.0[..VALKEYMODULE_NODE_ID_LEN as usize];
-        debug_assert!(
-            std::str::from_utf8(buf).is_ok(),
-            "NodeId::as_ref: node id bytes are not valid UTF-8"
-        );
-        unsafe { std::str::from_utf8_unchecked(buf) }
+        self.as_str()
     }
 }
 
 impl AsRef<[u8]> for NodeId {
     fn as_ref(&self) -> &[u8] {
-        &self.0[..VALKEYMODULE_NODE_ID_LEN as usize]
+        self.as_bytes()
     }
 }
 
@@ -339,10 +323,12 @@ impl Default for NodeId {
 
 /// Static buffer holding the current node's ID
 pub static CURRENT_NODE_ID: LazyLock<NodeId> = LazyLock::new(|| {
-    let node_id = unsafe {
-        ValkeyModule_GetMyClusterID.expect("ValkeyModule_GetMyClusterID function is unavailable")()
-    };
-    NodeId::from_raw(node_id)
+    // SAFETY: the server returns null or its own 40-byte hex node id.
+    unsafe {
+        let node_id = ValkeyModule_GetMyClusterID
+            .expect("ValkeyModule_GetMyClusterID function is unavailable")();
+        NodeId::from_raw(node_id)
+    }
 });
 
 /// Information about a cluster node
@@ -373,18 +359,6 @@ impl NodeInfo {
     }
 }
 
-impl PartialOrd for NodeInfo {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for NodeInfo {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.id.cmp(&other.id)
-    }
-}
-
 impl Hash for NodeInfo {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
@@ -410,21 +384,33 @@ impl Borrow<NodeId> for NodeInfo {
     }
 }
 
-/// Information about a shard in the cluster
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// Information about a shard in the cluster.
+///
+/// Equality and ordering are by `id` alone, so a `BTreeSet<ShardInfo>` can be
+/// searched by id; [`ShardInfo::same_content`] compares everything else.
+#[derive(Debug, Default, Clone)]
 pub struct ShardInfo {
     /// id is the primary node id
     pub id: NodeId,
     /// the primary node can be None
     pub primary: Option<NodeInfo>,
+    /// Ordered by node id, so equal membership compares equal.
     pub replicas: Vec<NodeInfo>,
     pub owned_slots: SlotRangeSet,
     /// Whether this shard is local
     pub is_local: bool,
-    pub is_consistent: bool,
 }
 
 impl ShardInfo {
+    /// Same shard, nodes (with addresses, roles and health) and slots.
+    fn same_content(&self, other: &ShardInfo) -> bool {
+        self.id == other.id
+            && self.primary == other.primary
+            && self.replicas == other.replicas
+            && self.owned_slots == other.owned_slots
+            && self.is_local == other.is_local
+    }
+
     /// Pick one node to serve the shard, uniformly among its healthy nodes.
     ///
     /// With `prefer_replica`, a healthy replica wins over the primary when one
@@ -452,6 +438,14 @@ impl ShardInfo {
             .or_else(|| self.replicas.first().copied())
     }
 }
+
+impl PartialEq for ShardInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for ShardInfo {}
 
 impl PartialOrd<ShardInfo> for ShardInfo {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -490,8 +484,6 @@ type LazyTargets = OnceLock<Arc<HashSet<NodeInfo>>>;
 /// Main cluster map structure
 #[derive(Debug, Default)]
 pub struct ClusterMap {
-    /// The id of the local shard (for easy access without dereferencing CURRENT_NODE_ID all the time)
-    local_node_id: NodeId,
     /// Slot set for slots owned by the cluster
     owned_slots: SlotRangeSet,
     shards: BTreeSet<ShardInfo>,
@@ -501,7 +493,6 @@ pub struct ClusterMap {
     cluster_slots_fingerprint: u64,
     /// (Lazily) pre-computed target lists
     primary_targets: LazyTargets,
-    replica_targets: LazyTargets,
     all_targets: LazyTargets,
     /// Expiration timestamp in ms (since epoch). Atomic so a refresh that
     /// finds the topology unchanged can extend the published map's lifetime
@@ -548,16 +539,10 @@ impl ClusterMap {
         self.cluster_slots_fingerprint
     }
 
-    pub fn get_local_shard(&self) -> Option<&ShardInfo> {
-        self.shards.get(&self.local_node_id)
-    }
-
     /// Helper function to refresh targets in CreateNewClusterMap
     pub fn get_targets(&self, target_mode: FanoutTarget) -> Arc<HashSet<NodeInfo>> {
         match target_mode {
-            FanoutTarget::Local => self.random_one_from_local(),
             FanoutTarget::Primary => self.primary_targets(),
-            FanoutTarget::ReplicasOnly => self.replica_targets(),
             FanoutTarget::All => self.all_targets(),
             FanoutTarget::ReplicaPerShard => self.random_one_replica_per_shard(),
             FanoutTarget::Random => self.random_one_per_shard(),
@@ -615,20 +600,6 @@ impl ClusterMap {
         Arc::new(targets)
     }
 
-    fn random_one_from_local(&self) -> Arc<HashSet<NodeInfo>> {
-        let mut targets = HashSet::new();
-        match self.get_local_shard() {
-            Some(local_shard) => {
-                let mut rng_ = rng();
-                targets.extend(local_shard.pick_target(&mut rng_, false));
-            }
-            None => {
-                log_warning("No local shard found in cluster map");
-            }
-        }
-        Arc::new(targets)
-    }
-
     fn random_one_per_shard(&self) -> Arc<HashSet<NodeInfo>> {
         let mut rng_ = rng();
         let mut targets = HashSet::with_capacity(self.shards.len());
@@ -674,21 +645,6 @@ impl ClusterMap {
                 for shard in self.shards.iter() {
                     if let Some(primary) = shard.primary {
                         targets.insert(primary);
-                    }
-                }
-                Arc::new(targets)
-            })
-            .clone()
-    }
-
-    #[inline]
-    fn replica_targets(&self) -> Arc<HashSet<NodeInfo>> {
-        self.replica_targets
-            .get_or_init(|| {
-                let mut targets = HashSet::new();
-                for shard in self.shards.iter() {
-                    for replica in shard.replicas.iter() {
-                        targets.insert(*replica);
                     }
                 }
                 Arc::new(targets)
@@ -902,13 +858,15 @@ impl ClusterMap {
             for replica in shard.replicas.iter_mut() {
                 replica.shard_id = shard.id;
             }
+            // Line order is not topology: two replies listing the same replicas
+            // in a different order must compare equal.
+            shard.replicas.sort_unstable_by_key(|replica| replica.id);
             shard_set.insert(shard);
         }
         new_map.shards = shard_set;
 
         // Build slot-to-shard map
-        new_map.build_slot_to_shard_map(&slot_ranges_parsed);
-        new_map.local_node_id = *my_node_id;
+        new_map.is_consistent &= new_map.build_slot_to_shard_map(&slot_ranges_parsed);
 
         // Check if a cluster map is full
         new_map.is_consistent &= new_map.check_cluster_map_full();
@@ -940,11 +898,16 @@ impl ClusterMap {
     }
 
     /// True when `other` describes the same topology: same shards with the
-    /// same primaries, replicas, addresses, roles, and slot assignments.
+    /// same primaries, replicas, addresses, roles, health and slot assignments.
     /// `slot_to_shard_map` and `owned_slots` are derived from the shard set,
     /// so comparing the shards covers them.
     pub fn same_topology(&self, other: &ClusterMap) -> bool {
-        self.shards == other.shards
+        self.shards.len() == other.shards.len()
+            && self
+                .shards
+                .iter()
+                .zip(other.shards.iter())
+                .all(|(a, b)| a.same_content(b))
     }
 
     fn check_cluster_map_full(&self) -> bool {
@@ -977,16 +940,33 @@ impl ClusterMap {
         expected_next == NUM_SLOTS
     }
 
-    fn build_slot_to_shard_map(&mut self, slot_ranges: &[SlotRangeInfo]) {
+    /// Route each claimed slot range to its shard. Returns false when the
+    /// claims conflict: slots claimed by more than one master are left
+    /// unrouted rather than given to whichever claim came last, so slot-based
+    /// routing fails for them instead of silently picking one owner.
+    fn build_slot_to_shard_map(&mut self, slot_ranges: &[SlotRangeInfo]) -> bool {
+        let mut claimed = RangeSetBlaze::new();
+        let mut contested = RangeSetBlaze::new();
+        let mut consistent = true;
         for r in slot_ranges {
-            // sanity: shard must exist
-            assert!(
-                self.shards.contains(&r.shard_id),
-                "Shard not found when building slot map"
-            );
+            if !self.shards.contains(&r.shard_id) {
+                consistent = false;
+                continue;
+            }
+            let range = RangeSetBlaze::from_iter([r.start_slot..=r.end_slot]);
+            contested |= &claimed & &range;
+            claimed |= range;
             self.slot_to_shard_map
                 .ranges_insert(r.start_slot..=r.end_slot, r.shard_id);
         }
+        if !contested.is_empty() {
+            log_warning(format!(
+                "cluster-map: slots {contested} are claimed by more than one master"
+            ));
+            self.slot_to_shard_map = &self.slot_to_shard_map - &contested;
+            consistent = false;
+        }
+        consistent
     }
 
     /// Hash of the slot -> owner assignment alone. Two nodes agree on it exactly
@@ -1662,6 +1642,64 @@ mod tests {
             map.get_targets(FanoutTarget::HashTagsPrimary(tags))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn test_conflicting_slot_claims_are_not_routed() {
+        let text = format!(
+            "\
+{M1} 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-16383\n\
+{M2} 127.0.0.1:7002@17002 master - 0 0 2 connected 1 100-200\n"
+        );
+        let map = ClusterMap::from_cluster_nodes(&text, &id(M1));
+        assert!(!map.is_consistent);
+        assert!(map.get_shard_by_slot(1).is_none());
+        assert!(map.get_shard_by_slot(150).is_none());
+        assert_eq!(map.get_shard_by_slot(0).unwrap().id, id(M1));
+        assert_eq!(map.get_shard_by_slot(2).unwrap().id, id(M1));
+        assert_eq!(map.get_shard_by_slot(201).unwrap().id, id(M1));
+    }
+
+    #[test]
+    fn test_same_topology_independent_of_replica_order() {
+        let a = format!(
+            "\
+{M1} 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-16383\n\
+{R1} 127.0.0.1:7101@17101 slave {M1} 0 0 1 connected\n\
+{R2} 127.0.0.1:7102@17102 slave {M1} 0 0 1 connected\n"
+        );
+        let b = format!(
+            "\
+{R2} 127.0.0.1:7102@17102 slave {M1} 0 0 1 connected\n\
+{M1} 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-16383\n\
+{R1} 127.0.0.1:7101@17101 slave {M1} 0 0 1 connected\n"
+        );
+        let a = ClusterMap::from_cluster_nodes(&a, &id(M1));
+        let b = ClusterMap::from_cluster_nodes(&b, &id(M1));
+        assert!(a.same_topology(&b));
+    }
+
+    #[test]
+    fn test_same_topology_detects_health_and_address_changes() {
+        let base = ClusterMap::from_cluster_nodes(&three_shard_nodes(), &id(M1));
+        let failed = three_shard_nodes().replace(
+            &format!("{R2} 127.0.0.1:7102@17102 slave {M2} 0 0 2 connected"),
+            &format!("{R2} 127.0.0.1:7102@17102 slave,fail {M2} 0 0 2 disconnected"),
+        );
+        let moved = three_shard_nodes().replace("127.0.0.1:7103@17103", "127.0.0.1:7203@17203");
+        assert!(!base.same_topology(&ClusterMap::from_cluster_nodes(&failed, &id(M1))));
+        assert!(!base.same_topology(&ClusterMap::from_cluster_nodes(&moved, &id(M1))));
+    }
+
+    #[test]
+    fn test_empty_node_id_accessors_agree() {
+        let empty = NodeId::default();
+        assert_eq!(empty.as_str(), "");
+        assert_eq!(AsRef::<str>::as_ref(&empty), "");
+        assert!(empty.as_bytes().is_empty());
+        assert!(AsRef::<[u8]>::as_ref(&empty).is_empty());
+        assert_eq!(id(M1).as_str(), M1);
+        assert_eq!(AsRef::<str>::as_ref(&id(M1)), M1);
     }
 
     #[test]
