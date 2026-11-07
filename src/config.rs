@@ -468,6 +468,9 @@ pub fn is_debug_mode_enabled() -> bool {
 /// back through the older coordinator-side aggregation path without a module
 /// rollback — useful to mitigate a latent push-down bug or a pathological
 /// resource case, or to A/B isolate whether an issue lives in push-down.
+///
+/// The exception is a query with `EMPTY`, which pushes down regardless: its answer depends on what
+/// lies outside the query window, and the coordinator cannot see that.
 pub static FANOUT_AGGREGATION_PUSHDOWN: AtomicBool = AtomicBool::new(true);
 
 pub fn is_fanout_aggregation_pushdown_enabled() -> bool {

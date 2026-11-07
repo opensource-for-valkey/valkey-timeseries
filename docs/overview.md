@@ -240,4 +240,6 @@ special configuration; a lagging node only costs extra transfer and coordinator 
 Push-down is controlled by the boolean config `ts-fanout-aggregation-pushdown` (default `yes`, changeable at runtime
 via `CONFIG SET`). Only the coordinator consults it; shards obey the request. It is not a mixed-version safety knob —
 version skew is handled automatically by the handshake above — but an emergency/diagnostic escape hatch: flipping it
-off reverts every query to coordinator-side aggregation without a module rollback.
+off reverts queries to coordinator-side aggregation without a module rollback. The exception is
+a query with `EMPTY`, which pushes down regardless: how far it fills depends on what each series
+holds outside the query window, which only its shard can see.

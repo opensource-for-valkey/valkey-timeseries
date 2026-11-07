@@ -217,6 +217,50 @@ class TestTimeSeriesMultiAggregationClustered(ValkeyTimeSeriesClusterTestCase):
                                             'FILTER', 'k=carry')
             assert result[0][2] == expected, f'pushdown={pushdown}'
 
+    @pytest.mark.parametrize('command, window, aggregation, expected', [
+        pytest.param('TS.MRANGE', (50, 75), ('last', 25),
+                     [[50, b'1'], [75, b'1']], id='edge-fill-and-seed'),
+        pytest.param('TS.MRANGE', (150, 250), ('sum', 25),
+                     [[150, b'0'], [175, b'0'], [200, b'0'], [225, b'0'], [250, b'0']],
+                     id='window-inside-a-gap'),
+        pytest.param('TS.MREVRANGE', (50, 75), ('last', 25),
+                     [[75, b'1'], [50, b'1']], id='reverse-edge-fill'),
+        pytest.param('TS.MRANGE', (150, 250), ('last,sum', 25),
+                     [[150, b'2', b'0'], [175, b'2', b'0'], [200, b'2', b'0'], [225, b'2', b'0'],
+                      [250, b'2', b'0']],
+                     id='multi-aggregation'),
+    ])
+    def test_empty_reaches_past_the_window_with_pushdown_off(self, command, window, aggregation,
+                                                             expected):
+        """EMPTY needs what lies outside the window, which only shards can see.
+
+        With the config off, a query that does not need that still aggregates on the
+        coordinator, but one with EMPTY has to be answered as on a standalone server.
+        """
+        cluster_client = self.new_cluster_client()
+        for timestamp, value in ((0, 1), (100, 2), (300, 3)):
+            cluster_client.execute_command('TS.ADD', 'ts:{slot1}:edge', timestamp, value,
+                                           'LABELS', 'k', 'edge')
+
+        self.set_pushdown('no')
+        result = self.new_client_for_primary(0).execute_command(
+            command, *window, 'AGGREGATION', *aggregation, 'EMPTY', 'FILTER', 'k=edge')
+
+        assert result[0][2] == expected
+
+    def test_aggregation_without_empty_still_honors_pushdown_off(self):
+        """The config keeps its meaning elsewhere: shards send raw samples."""
+        cluster_client = self.new_cluster_client()
+        for timestamp, value in ((0, 1), (10, 2), (100, 3)):
+            cluster_client.execute_command('TS.ADD', 'ts:{slot1}:raw', timestamp, value,
+                                           'LABELS', 'k', 'raw')
+
+        self.set_pushdown('no')
+        result = self.new_client_for_primary(0).execute_command(
+            'TS.MRANGE', 0, 100, 'AGGREGATION', 'sum', 25, 'FILTER', 'k=raw')
+
+        assert result[0][2] == [[0, b'3'], [100, b'3']]
+
     def test_multi_aggregation_pushdown_on_off_equivalence(self):
         """Push-down on and off must produce identical results. Toggling the
         coordinator config off restores the legacy raw-sample flow where the

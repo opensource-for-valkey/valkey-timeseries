@@ -62,7 +62,15 @@ impl MRangeFanoutCommand {
         // as one chunk per aggregation column (SeriesRangeResponse.columns),
         // and group partials carry `column_count` states per bucket
         // (GroupPartialSeries), reduced column-wise with the same REDUCE type.
-        let pushdown = config_enabled && options.range.aggregation.is_some();
+        //
+        // EMPTY always pushes down, config or not. How far it fills depends on what the series
+        // holds outside the query window, which only the shard holding it can see: bucketing the
+        // raw samples here would lose every row and `last` value that depends on that.
+        let pushdown = options
+            .range
+            .aggregation
+            .as_ref()
+            .is_some_and(|aggregation| config_enabled || aggregation.report_empty);
         let pushdown_group = config_enabled
             && options
                 .grouping
