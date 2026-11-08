@@ -336,7 +336,7 @@ impl RegexMatcher {
             {
                 return false;
             }
-            return is_empty_regex_matcher(&self.regex);
+            return self.regex.is_match("");
         }
         // Fast-path: if a literal prefix is known, reject immediately without
         // running the full regex engine. The compiled regex already encodes the
@@ -450,11 +450,12 @@ impl PredicateMatch {
     pub fn is_empty(&self) -> bool {
         match self {
             PredicateMatch::Equal(value) | PredicateMatch::NotEqual(value) => value.is_empty(),
-            PredicateMatch::MatchAll => false,
-            PredicateMatch::MatchNone => false,
-            PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re) => {
-                re.regex.as_str().is_empty()
-            }
+            // A regex matcher's pattern is never empty: an empty pattern
+            // decomposes to `=""`, and the compiled form is always anchored.
+            PredicateMatch::MatchAll
+            | PredicateMatch::MatchNone
+            | PredicateMatch::RegexEqual(_)
+            | PredicateMatch::RegexNotEqual(_) => false,
             PredicateMatch::StartsWith(value) => value.is_empty(),
             PredicateMatch::NotStartsWith(value) => value.is_empty(),
             PredicateMatch::Contains(value) => value.is_empty(),
@@ -803,20 +804,6 @@ impl Hash for LabelFilter {
         self.label.hash(state);
         self.matcher.hash(state);
     }
-}
-
-fn is_empty_regex_matcher(re: &Regex) -> bool {
-    // cheap check
-    let value = re.as_str();
-    let matches_empty = match value.len() {
-        0 => true,
-        1 => value == "^" || value == "$",
-        2 => value == ".*" || value == "^$" || value == "?:",
-        3 => value == "^.*" || value == ".*$",
-        4 => value == "^.*$" || value == "^?:$",
-        _ => false,
-    };
-    matches_empty || re.is_match("")
 }
 
 fn get_metric_name(filters: &[LabelFilter]) -> Option<&str> {

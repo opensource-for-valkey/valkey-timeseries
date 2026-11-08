@@ -77,8 +77,13 @@ fn decomposed_regex_to_predicate_match(
             }
         }
         RegexDecomposition::Contains(needle) => {
-            validate_contains_value(&needle)
-                .expect("contains decomposition must reject empty values");
+            // `extract_contains_value`, the only producer, validates before
+            // returning. A panic here would abort the server, so only debug
+            // builds check it again.
+            debug_assert!(
+                validate_contains_value(&needle).is_ok(),
+                "contains decomposition must reject empty values"
+            );
             if is_equal {
                 PredicateMatch::Contains(needle)
             } else {

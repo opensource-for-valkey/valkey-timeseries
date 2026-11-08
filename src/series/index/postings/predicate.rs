@@ -50,10 +50,6 @@ impl<'a> Terms<'a> {
             }
             PredicateMatch::MatchAll => Cow::Borrowed(&*EMPTY_BITMAP),
             PredicateMatch::MatchNone => Cow::Borrowed(self.all()),
-            // If the matcher being inverted is =~"", we just want all the values.
-            PredicateMatch::RegexEqual(re) if matches!(re.regex.as_str(), "" | ".*") => {
-                self.postings_for_all_label_values(&filter.label)
-            }
             // A series has at most one value per label, so "has the label, minus has a matching
             // value" is the series whose value doesn't match: one scan, no difference.
             PredicateMatch::StartsWith(prefix) => {
