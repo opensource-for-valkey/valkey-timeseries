@@ -1,3 +1,7 @@
+//! The cluster map: which shard owns each slot and which nodes serve it, built
+//! from `CLUSTER NODES` ([`parse`]) over the node model in [`node`], and the
+//! fanout target selection that reads it.
+
 use crate::common::hash::DeterministicHasher;
 use crate::common::logging::{log_debug, log_warning};
 use crate::common::threads::LockGil;
@@ -5,23 +9,24 @@ use crate::common::time::current_time_millis;
 use crate::config::CLUSTER_MAP_EXPIRATION_MS;
 use crate::fanout::calculate_hash_slot;
 use ahash::{AHashMap, HashSet, HashSetExt};
-use rand::{Rng, RngExt, rng};
-use range_set_blaze::{RangeMapBlaze, RangeSetBlaze, RangesIter};
+use rand::rng;
+use range_set_blaze::{RangeMapBlaze, RangeSetBlaze};
 use smallvec::SmallVec;
-use std::borrow::Borrow;
-use std::cmp::Ordering;
 use std::collections::BTreeSet;
-use std::fmt;
-use std::fmt::{Display, Formatter};
-use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv4Addr};
-use std::ops::Deref;
+use std::hash::Hasher;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, LazyLock, OnceLock};
-use valkey_module::{
-    CallOptionsBuilder, CallReply, CallResult, Context, DetachedContext, VALKEYMODULE_NODE_ID_LEN,
-    ValkeyModule_GetMyClusterID,
+use std::sync::{Arc, OnceLock};
+use valkey_module::{CallOptionsBuilder, CallReply, CallResult, Context, DetachedContext};
+
+mod node;
+mod parse;
+
+#[cfg(test)]
+pub use node::NodeLocation;
+pub use node::{
+    CURRENT_NODE_ID, NodeId, NodeInfo, NodeRole, ShardInfo, SlotRangeSet, SocketAddress,
 };
+use parse::{ParsedNodeLine, SlotRangeBuf, parse_node_line};
 
 /// Where [`ClusterMap::create`] gets its `CLUSTER NODES` reply from.
 ///
@@ -82,393 +87,6 @@ pub enum FanoutTarget {
     HashTags(Vec<String>),
     /// Select the primary node for each slot corresponding to the hash tags provided
     HashTagsPrimary(Vec<String>),
-}
-
-/// Node role enumeration
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeRole {
-    Primary,
-    Replica,
-}
-
-impl Display for NodeRole {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            NodeRole::Primary => write!(f, "Primary"),
-            NodeRole::Replica => write!(f, "Replica"),
-        }
-    }
-}
-
-/// Node location enumeration
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum NodeLocation {
-    #[default]
-    Local,
-    Remote,
-}
-
-impl Display for NodeLocation {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            NodeLocation::Local => write!(f, "Local"),
-            NodeLocation::Remote => write!(f, "Remote"),
-        }
-    }
-}
-
-/// Socket address for a node. Derived Eq/Hash so it can be used as a map key.
-#[derive(Copy, Clone, Debug, Eq)]
-pub struct SocketAddress {
-    pub primary_endpoint: IpAddr,
-    pub port: u16,
-}
-
-impl PartialEq for SocketAddress {
-    fn eq(&self, other: &Self) -> bool {
-        self.primary_endpoint == other.primary_endpoint && self.port == other.port
-    }
-}
-
-impl Display for SocketAddress {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.primary_endpoint, self.port)
-    }
-}
-
-impl Hash for SocketAddress {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.primary_endpoint.hash(state);
-        self.port.hash(state);
-    }
-}
-
-#[derive(Debug, Default, Clone, Hash, PartialEq, Eq)]
-pub struct SlotRangeSet {
-    ranges: RangeSetBlaze<u16>,
-}
-
-impl SlotRangeSet {
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.ranges.len() as usize
-    }
-
-    #[cfg(test)]
-    pub fn contains(&self, slot: u16) -> bool {
-        self.ranges.contains(slot)
-    }
-
-    pub fn insert_range(&mut self, start: u16, end: u16) {
-        debug_assert!(start <= end, "Invalid range: start ({start}) > end ({end})");
-        self.ranges.ranges_insert(start..=end);
-    }
-
-    pub fn range_iter(&self) -> RangesIter<'_, u16> {
-        self.ranges.ranges()
-    }
-
-    pub fn append(&mut self, other: &SlotRangeSet) {
-        for range in other.range_iter() {
-            self.ranges.ranges_insert(range.clone());
-        }
-    }
-}
-
-impl Display for SlotRangeSet {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        self.ranges.fmt(f)
-    }
-}
-
-impl Deref for SlotRangeSet {
-    type Target = RangeSetBlaze<u16>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.ranges
-    }
-}
-
-pub type NodeIdBuf = [u8; (VALKEYMODULE_NODE_ID_LEN as usize) + 1]; // +1 for null terminator
-
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
-pub struct NodeId(NodeIdBuf);
-
-impl NodeId {
-    /// Construct a [`NodeId`] from a raw `*const c_char` pointer returned by the
-    /// Valkey C API (e.g., [`ValkeyModule_GetMyClusterID`], cluster-message
-    /// sender IDs, or `CLUSTER SLOTS` reply fields).
-    ///
-    /// This is the **only** place in the codebase that converts a raw pointer
-    /// into a [`NodeId`].  All other code should obtain [`NodeId`] values
-    /// through this constructor or via [`NodeId::from_bytes`].
-    ///
-    /// # Null pointers
-    ///
-    /// If `node_id_ptr` is null, an empty (all-zero) [`NodeId`] is returned
-    /// silently.  This is intentional: several call-sites receive possibly-null
-    /// pointers from Valkey and rely on the resulting empty [`NodeId`] to
-    /// represent "no node" without an additional null-check at every call-site.
-    ///
-    /// # Safety
-    ///
-    /// When `node_id_ptr` is **non-null**, the caller must ensure it points to
-    /// a buffer of at least [`VALKEYMODULE_NODE_ID_LEN`] bytes (40) holding a
-    /// hex-encoded, null-terminated node ID string, e.g.
-    /// `"07c37dfeb235213a872192d90877d0cd55635b91"`.  The pointer is only read;
-    /// the bytes are copied into an owned buffer and the pointer is not retained.
-    ///
-    /// This function is safe to call from any thread — it performs no
-    /// synchronisation and only reads from the caller-provided pointer.
-    pub unsafe fn from_raw(node_id_ptr: *const std::os::raw::c_char) -> Self {
-        let mut buf: NodeIdBuf = [0; (VALKEYMODULE_NODE_ID_LEN as usize) + 1];
-
-        if node_id_ptr.is_null() {
-            return NodeId(buf);
-        }
-
-        // SAFETY: caller guarantees node_id_ptr is non-null and points to at
-        // least VALKEYMODULE_NODE_ID_LEN bytes of initialized memory.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(node_id_ptr as *const u8, VALKEYMODULE_NODE_ID_LEN as usize)
-        };
-
-        // In debug builds, verify the bytes look like a hex node ID.
-        debug_assert!(
-            bytes.iter().all(|b| b.is_ascii_hexdigit() || *b == 0),
-            "NodeId::from_raw: non-null pointer contains non-hex bytes"
-        );
-
-        let len = bytes.len().min(VALKEYMODULE_NODE_ID_LEN as usize);
-        buf[..len].copy_from_slice(&bytes[..len]);
-        NodeId(buf)
-    }
-
-    pub(super) fn from_bytes(bytes: &[u8]) -> Self {
-        let mut buf: NodeIdBuf = [0; (VALKEYMODULE_NODE_ID_LEN as usize) + 1];
-        let len = bytes.len().min(VALKEYMODULE_NODE_ID_LEN as usize);
-        buf[..len].copy_from_slice(&bytes[..len]);
-        NodeId(buf)
-    }
-
-    pub fn raw_ptr(&self) -> *const std::os::raw::c_char {
-        if self.is_empty() {
-            return std::ptr::null();
-        }
-        // SAFETY: self.0 is a null-terminated byte array
-        self.0.as_ptr() as *const std::os::raw::c_char
-    }
-
-    /// The id as text; `""` for an empty id. Ids are hex, so the checked
-    /// conversion only fails on bytes no well-behaved server sends, and those
-    /// read as empty rather than as undefined behaviour.
-    pub fn as_str(&self) -> &str {
-        std::str::from_utf8(self.as_bytes()).unwrap_or("")
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        if self.is_empty() {
-            return &[];
-        }
-        &self.0[..VALKEYMODULE_NODE_ID_LEN as usize]
-    }
-
-    #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        self.0[0] == 0
-    }
-}
-
-impl AsRef<str> for NodeId {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl AsRef<[u8]> for NodeId {
-    fn as_ref(&self) -> &[u8] {
-        self.as_bytes()
-    }
-}
-
-impl PartialOrd for NodeId {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for NodeId {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.as_str().cmp(other.as_str())
-    }
-}
-
-impl Display for NodeId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl Borrow<str> for NodeId {
-    fn borrow(&self) -> &str {
-        self.as_ref()
-    }
-}
-
-impl Default for NodeId {
-    fn default() -> Self {
-        NodeId([0; VALKEYMODULE_NODE_ID_LEN as usize + 1])
-    }
-}
-
-/// Static buffer holding the current node's ID
-pub static CURRENT_NODE_ID: LazyLock<NodeId> = LazyLock::new(|| {
-    // SAFETY: the server returns null or its own 40-byte hex node id.
-    unsafe {
-        let node_id = ValkeyModule_GetMyClusterID
-            .expect("ValkeyModule_GetMyClusterID function is unavailable")();
-        NodeId::from_raw(node_id)
-    }
-});
-
-/// Information about a cluster node
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub struct NodeInfo {
-    pub id: NodeId,
-    pub shard_id: NodeId,
-    pub socket_address: SocketAddress,
-    pub role: NodeRole,
-    pub location: NodeLocation,
-    /// False when `CLUSTER NODES` flags the node `fail`/`fail?` or reports its
-    /// bus link down. Target selection prefers healthy nodes within a shard but
-    /// never drops a shard because none of its nodes is healthy.
-    pub healthy: bool,
-}
-
-impl NodeInfo {
-    pub fn address(&self) -> String {
-        if self.location == NodeLocation::Local {
-            String::new()
-        } else {
-            self.socket_address.to_string()
-        }
-    }
-
-    pub fn is_local(&self) -> bool {
-        self.location == NodeLocation::Local
-    }
-}
-
-impl Hash for NodeInfo {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-    }
-}
-
-impl fmt::Debug for NodeInfo {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("NodeInfo")
-            .field("id", &format_args!("{}", self.id))
-            .field("shard_id", &format_args!("{}", self.shard_id))
-            .field("socket_address", &self.socket_address)
-            .field("role", &self.role)
-            .field("location", &self.location)
-            .field("healthy", &self.healthy)
-            .finish()
-    }
-}
-
-impl Borrow<NodeId> for NodeInfo {
-    fn borrow(&self) -> &NodeId {
-        &self.id
-    }
-}
-
-/// Information about a shard in the cluster.
-///
-/// Equality and ordering are by `id` alone, so a `BTreeSet<ShardInfo>` can be
-/// searched by id; [`ShardInfo::same_content`] compares everything else.
-#[derive(Debug, Default, Clone)]
-pub struct ShardInfo {
-    /// id is the primary node id
-    pub id: NodeId,
-    /// the primary node can be None
-    pub primary: Option<NodeInfo>,
-    /// Ordered by node id, so equal membership compares equal.
-    pub replicas: Vec<NodeInfo>,
-    pub owned_slots: SlotRangeSet,
-    /// Whether this shard is local
-    pub is_local: bool,
-}
-
-impl ShardInfo {
-    /// Same shard, nodes (with addresses, roles and health) and slots.
-    fn same_content(&self, other: &ShardInfo) -> bool {
-        self.id == other.id
-            && self.primary == other.primary
-            && self.replicas == other.replicas
-            && self.owned_slots == other.owned_slots
-            && self.is_local == other.is_local
-    }
-
-    /// Pick one node to serve the shard, uniformly among its healthy nodes.
-    ///
-    /// With `prefer_replica`, a healthy replica wins over the primary when one
-    /// exists. When no node is healthy the primary (or, lacking one, a replica)
-    /// is still returned, so the fanout fails on the dead node rather than
-    /// silently omitting the shard's data. `None` only for a shard with no nodes.
-    fn pick_target<R: Rng + ?Sized>(&self, rng: &mut R, prefer_replica: bool) -> Option<NodeInfo> {
-        fn pick_healthy<'a, R: Rng + ?Sized>(
-            rng: &mut R,
-            nodes: impl Iterator<Item = &'a NodeInfo> + Clone,
-        ) -> Option<NodeInfo> {
-            let healthy = nodes.filter(|node| node.healthy);
-            let count = healthy.clone().count();
-            if count == 0 {
-                return None;
-            }
-            healthy.clone().nth(rng.random_range(0..count)).copied()
-        }
-
-        if prefer_replica && let Some(replica) = pick_healthy(rng, self.replicas.iter()) {
-            return Some(replica);
-        }
-        pick_healthy(rng, self.primary.iter().chain(self.replicas.iter()))
-            .or(self.primary)
-            .or_else(|| self.replicas.first().copied())
-    }
-}
-
-impl PartialEq for ShardInfo {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-
-impl Eq for ShardInfo {}
-
-impl PartialOrd<ShardInfo> for ShardInfo {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ShardInfo {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.id.cmp(&other.id)
-    }
-}
-
-impl Borrow<NodeId> for ShardInfo {
-    fn borrow(&self) -> &NodeId {
-        &self.id
-    }
-}
-
-impl Borrow<str> for ShardInfo {
-    fn borrow(&self) -> &str {
-        self.id.as_ref()
-    }
 }
 
 /// Helper describing a parsed slot range before building the slot -> shard map.
@@ -993,165 +611,11 @@ fn reply_as_string(call_reply: CallResult) -> Option<String> {
     }
 }
 
-/// Inline-capacity buffer for a master's slot ranges: a settled cluster has
-/// one contiguous range per shard, so four covers all but heavily fragmented
-/// topologies without a heap allocation per line.
-type SlotRangeBuf = SmallVec<[(u16, u16); 4]>;
-
-/// A single parsed line of `CLUSTER NODES` output.
-struct ParsedNodeLine {
-    id: NodeId,
-    /// `None` when the node has no usable address (dropped for remote nodes).
-    socket_address: Option<SocketAddress>,
-    is_master: bool,
-    is_local: bool,
-    /// Not flagged `fail`/`fail?`, and (for a remote node) its link is `connected`.
-    is_healthy: bool,
-    /// The master is importing at least one slot (`[slot-<-id]`).
-    imports_slots: bool,
-    /// True when this replica has a resolvable master id.
-    has_master: bool,
-    master_id: NodeId,
-    /// Owned slot ranges (masters only); import/export markers are excluded.
-    slot_ranges: SlotRangeBuf,
-}
-
-impl ParsedNodeLine {
-    fn location(&self) -> NodeLocation {
-        if self.is_local {
-            NodeLocation::Local
-        } else {
-            NodeLocation::Remote
-        }
-    }
-}
-
-/// Parse one `CLUSTER NODES` line:
-/// `<id> <ip:port@cport[,aux]> <flags> <master> <ping> <pong> <epoch> <link> [slots...]`
-///
-/// Returns `None` when the line is too malformed to trust (too few fields,
-/// unparseable node id, or no single clear role).
-fn parse_node_line(line: &str, my_node_id: &NodeId) -> Option<ParsedNodeLine> {
-    // Walk the fields without collecting them: only the first four and the
-    // trailing slot specs carry information.
-    let mut fields = line.split_ascii_whitespace();
-    let id_field = fields.next()?;
-    let addr_field = fields.next()?;
-    let flags_field = fields.next()?;
-    let master_field = fields.next()?;
-    // Skip ping-sent/pong-recv/config-epoch and require link-state, so a line
-    // with fewer than 8 fields is rejected just as the indexed form did.
-    let mut fields = fields.skip(3);
-    let link_state = fields.next()?;
-
-    if id_field.len() != VALKEYMODULE_NODE_ID_LEN as usize {
-        return None;
-    }
-    let id = NodeId::from_bytes(id_field.as_bytes());
-
-    let mut is_master = false;
-    let mut is_replica = false;
-    let mut is_myself = false;
-    let mut noaddr = false;
-    let mut failed = false;
-    for flag in flags_field.split(',') {
-        match flag {
-            "master" => is_master = true,
-            "slave" | "replica" => is_replica = true,
-            "myself" => is_myself = true,
-            "noaddr" => noaddr = true,
-            "fail" | "fail?" => failed = true,
-            _ => {}
-        }
-    }
-    // Exactly one role must be declared (rejects handshake/unknown lines).
-    if is_master == is_replica {
-        return None;
-    }
-    let is_local = is_myself || &id == my_node_id;
-    // The local node is reachable by definition; a remote one only over a live link.
-    let is_healthy = !failed && (is_local || link_state == "connected");
-
-    let socket_address = parse_node_address(addr_field, noaddr, is_local);
-
-    let has_master = is_replica && master_field.len() == VALKEYMODULE_NODE_ID_LEN as usize;
-    let master_id = if has_master {
-        NodeId::from_bytes(master_field.as_bytes())
-    } else {
-        NodeId::default()
-    };
-
-    let mut slot_ranges = SlotRangeBuf::new();
-    let mut imports_slots = false;
-    if is_master {
-        for spec in fields {
-            // Importing/migrating markers like "[12000-<-<id>]" settle no ownership.
-            if spec.starts_with('[') {
-                imports_slots |= spec.contains("-<-");
-                continue;
-            }
-            if let Some((a, b)) = spec.split_once('-') {
-                if let (Ok(a), Ok(b)) = (a.parse::<u16>(), b.parse::<u16>()) {
-                    slot_ranges.push((a, b));
-                }
-            } else if let Ok(n) = spec.parse::<u16>() {
-                slot_ranges.push((n, n));
-            }
-        }
-    }
-
-    Some(ParsedNodeLine {
-        id,
-        socket_address,
-        is_master,
-        is_local,
-        is_healthy,
-        imports_slots,
-        has_master,
-        master_id,
-        slot_ranges,
-    })
-}
-
-/// Parse the `ip:port@cport[,aux...]` address field.
-///
-/// Returns `None` for a remote node with no usable address (it can't be
-/// targeted). The local node keeps a placeholder address instead, since a
-/// node never dials itself but must still appear in its own map.
-fn parse_node_address(field: &str, noaddr: bool, is_local: bool) -> Option<SocketAddress> {
-    // Drop the optional ",hostname"/aux fields, then the "@cport" bus suffix.
-    let addr = field.split(',').next().unwrap_or(field);
-    let host_port = addr.split('@').next().unwrap_or(addr);
-    // Split at the last ':' so IPv6 addresses (which contain ':') parse.
-    // Port 0 (or one that does not parse) can never be dialled.
-    let (ip_str, port) = match host_port.rsplit_once(':') {
-        Some((ip, port)) => (ip, port.parse::<u16>().unwrap_or(0)),
-        None => (host_port, 0),
-    };
-
-    let local_placeholder = || {
-        is_local.then_some(SocketAddress {
-            primary_endpoint: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            port,
-        })
-    };
-
-    if noaddr || ip_str.is_empty() || port == 0 {
-        return local_placeholder();
-    }
-    match ip_str.parse::<IpAddr>() {
-        Ok(primary_endpoint) => Some(SocketAddress {
-            primary_endpoint,
-            port,
-        }),
-        Err(_) => local_placeholder(),
-    }
-}
-
 // Unit tests
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
 
     // 40-char hex node ids.
     const M1: &str = "1111111111111111111111111111111111111111";
@@ -1288,17 +752,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ipv6_and_hostname_address() {
-        let line = format!("{M1} ::1:7001@17001,host.example.com master - 0 0 1 connected 0-16383");
-        let rec = parse_node_line(&line, &id(M2)).unwrap();
-        let addr = rec.socket_address.unwrap();
-        assert_eq!(addr.primary_endpoint, "::1".parse::<IpAddr>().unwrap());
-        assert_eq!(addr.port, 7001);
-        assert!(rec.is_master);
-        assert!(!rec.is_local);
-    }
-
-    #[test]
     fn test_replica_before_master_line_ordering() {
         // Replica line appears before its master; two-pass assembly must still
         // attach it.
@@ -1311,23 +764,6 @@ mod tests {
         let shard = map.get_shard_by_id(M1).unwrap();
         assert_eq!(shard.replicas.len(), 1);
         assert_eq!(shard.replicas[0].id, id(R1));
-    }
-
-    #[test]
-    fn test_parse_node_line_rejects_malformed() {
-        // Too few fields.
-        assert!(parse_node_line("too short line here", &id(M1)).is_none());
-        // Node id of the wrong length.
-        assert!(
-            parse_node_line(
-                "short 127.0.0.1:7001@17001 master - 0 0 1 connected",
-                &id(M1)
-            )
-            .is_none()
-        );
-        // No clear role flag.
-        let line = format!("{M1} 127.0.0.1:7001@17001 handshake - 0 0 1 connected");
-        assert!(parse_node_line(&line, &id(M2)).is_none());
     }
 
     #[test]
@@ -1689,17 +1125,6 @@ mod tests {
         let moved = three_shard_nodes().replace("127.0.0.1:7103@17103", "127.0.0.1:7203@17203");
         assert!(!base.same_topology(&ClusterMap::from_cluster_nodes(&failed, &id(M1))));
         assert!(!base.same_topology(&ClusterMap::from_cluster_nodes(&moved, &id(M1))));
-    }
-
-    #[test]
-    fn test_empty_node_id_accessors_agree() {
-        let empty = NodeId::default();
-        assert_eq!(empty.as_str(), "");
-        assert_eq!(AsRef::<str>::as_ref(&empty), "");
-        assert!(empty.as_bytes().is_empty());
-        assert!(AsRef::<[u8]>::as_ref(&empty).is_empty());
-        assert_eq!(id(M1).as_str(), M1);
-        assert_eq!(AsRef::<str>::as_ref(&id(M1)), M1);
     }
 
     #[test]
