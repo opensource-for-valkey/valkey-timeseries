@@ -267,6 +267,8 @@ impl AggregationHelper {
         // so it is emitted once any aggregator accepted a sample and the rest take their fill.
         let any_accepted = self.accepted.iter().any(|&accepted| accepted);
 
+        // `finalize` resets each aggregator it reads; a bucket nobody accepted from is reset
+        // here instead, so every path leaves the aggregators ready for the next bucket.
         let mut bucket = if any_accepted {
             Some(MultiSample::new(
                 self.output_timestamp(),
@@ -275,23 +277,23 @@ impl AggregationHelper {
                     .map(AggregationHandler::finalize)
                     .collect(),
             ))
-        } else if self.report_empty {
-            Some(MultiSample::new(
-                self.output_timestamp(),
-                self.aggregators
-                    .iter()
-                    .map(AggregationHandler::empty_value)
-                    .collect(),
-            ))
         } else {
-            None
+            for aggregator in self.aggregators.iter_mut() {
+                AggregationHandler::reset(aggregator);
+            }
+            // Not `empty_row`: that applies the gap carry, and this bucket did see samples.
+            self.report_empty.then(|| {
+                MultiSample::new(
+                    self.output_timestamp(),
+                    self.aggregators
+                        .iter()
+                        .map(AggregationHandler::empty_value)
+                        .collect(),
+                )
+            })
         };
         if let (Some(row), Some(carry)) = (bucket.as_mut(), self.last_carry.as_mut()) {
             carry.apply_to_bucket_with_samples(&mut row.values);
-        }
-
-        for aggregator in self.aggregators.iter_mut() {
-            AggregationHandler::reset(aggregator);
         }
         self.accepted.fill(false);
 
