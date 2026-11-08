@@ -1,7 +1,7 @@
 # Legacy Gorilla streams
 
 These fixtures were generated from this repository's encoder at
-`3d2dc61c555f53dffaccc5c7af87c332da9ef164`, before the Gorilla changes.
+`106088e57`, before the Gorilla changes.
 They contain no RedisTimeSeries source or test data.
 
 Each input is 32 samples from `generate_dataset`, using the named workload,

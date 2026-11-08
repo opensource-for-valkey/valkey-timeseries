@@ -1,8 +1,8 @@
-Provenance: probes ran against commit `f6e446a35` on 2026-10-29 from standalone sources that were in `/tmp/valkey-chimp-review` (not retained); CSV columns are as the notes' *Method and limitations* section describes.
+Provenance: probes ran against commit `7d5a3d058` on 2026-10-29 from standalone sources that were in `/tmp/valkey-chimp-review` (not retained); CSV columns are as the notes' *Method and limitations* section describes.
 
 # Chimp review experiments
 
-Reviewed repository commit `f6e446a359a30d8748d99a3a7f39dc4a62d66ae2` on 2026-10-29. No tracked files were changed.
+Reviewed repository commit `7d5a3d058` on 2026-10-29. No tracked files were changed.
 
 ## Most promising latency change: bypass ELF for simple binary fractions
 

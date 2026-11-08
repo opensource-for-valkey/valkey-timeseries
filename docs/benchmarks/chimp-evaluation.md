@@ -1,8 +1,12 @@
 # Chimp encoder evaluation
 
 2026-10-29. Branch: `perf/chimp-encoder`.
-Baseline: `f6e446a359a30d8748d99a3a7f39dc4a62d66ae2` (branch start).
-Candidate: `114f171c02cdebc7dbbde63f1be42b7eda8cb324`.
+Baseline: `7d5a3d058` (branch start).
+Candidate: `f0c7429e6`.
+
+The runs used the same changes on a development branch, at `f6e446a35` and `114f171c0`, which are
+not in this repository. The commits named here have identical codec files, report tools and data
+generators, so they reproduce the same measurements.
 
 ## Decision
 
@@ -95,7 +99,7 @@ plan's background table.
 Setup:
 - Both binaries were built in release with LTO, `enable-system-alloc,test-utils`,
   `--locked` and the same `Cargo.lock`.
-- The baseline was built in a worktree at `f6e446a35`, with the candidate's tool copied in
+- The baseline was built in a worktree at `7d5a3d058`, with the candidate's tool copied in
   as `examples/gorilla_report.rs`.
 - Environment: macOS 15.3.1, Apple M2, Rust 1.96.0.
 - A browser and system daemons were running (load average about 4). No builds or tests ran
@@ -318,7 +322,7 @@ a cap that no unshifted row may grow by more than 0.5 %:
 
 ## Validation
 
-These results are from the branch-final validation run at `114f171c0`.
+These results are from the branch-final validation run at `f0c7429e6`.
 - 1,776 unit tests passed, 0 failed, 2 ignored. 12 doctests passed, 5 ignored.
 - `cargo fmt --check` and Clippy (`--profile release --all-targets -D clippy::all`)
   passed, as did the production release build with `RUSTFLAGS="-D warnings"`.
@@ -354,7 +358,7 @@ cargo build --release --locked --features enable-system-alloc,test-utils \
   --bin gorilla_report --jobs 1
 cp target/release/gorilla_report /tmp/chimp-candidate
 
-git worktree add --detach /tmp/chimp-base f6e446a35
+git worktree add --detach /tmp/chimp-base 7d5a3d058
 mkdir -p /tmp/chimp-base/examples
 cp tools/gorilla_report.rs /tmp/chimp-base/examples/gorilla_report.rs
 cp Cargo.lock /tmp/chimp-base/

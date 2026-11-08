@@ -28,7 +28,7 @@ fn assert_bit_exact(got: &[Sample], want: &[Sample]) {
     }
 }
 
-/// Captured from 3d2dc61c5 before changing the encoder. These independently pin
+/// Captured before changing the encoder (the codec as of 106088e57). These independently pin
 /// legacy stream readability, including a full-width XOR and an unset window.
 #[test]
 fn legacy_streams_can_be_loaded_and_appended_to() {

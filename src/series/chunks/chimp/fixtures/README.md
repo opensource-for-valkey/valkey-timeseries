@@ -1,8 +1,8 @@
 # Chimp golden streams
 
 These fixtures were generated from this repository's encoder at
-`e2f28ab680d0dd1186c1ccead87bcdca5e9b97a7` (branch `perf/chimp-encoder`), the
-Chimp grammar as that branch left it. They carry no module encoding version: the
+`9b0499227`, the
+Chimp grammar as that commit left it. They carry no module encoding version: the
 grammar changed in place before any release. They contain no RedisTimeSeries
 source or test data.
 

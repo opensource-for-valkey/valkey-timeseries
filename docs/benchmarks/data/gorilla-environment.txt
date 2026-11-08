@@ -1,5 +1,6 @@
 macOS-15.3.1-arm64-arm-64bit
 rustc 1.96.0 (ac68faa20 2026-05-25)
-baseline: 3d2dc61c555f53dffaccc5c7af87c332da9ef164
+baseline: 106088e57
+note: measured at development-branch commit 3d2dc61c5; 106088e57 in this repository has identical codec, tools and generators
 features: enable-system-alloc,test-utils
 architecture: arm64

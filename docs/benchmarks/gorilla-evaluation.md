@@ -1,7 +1,11 @@
 # Gorilla encoder evaluation
 
 2026-10-28. Branch: `perf/gorilla-codec-evaluation`.
-Baseline: `3d2dc61c555f53dffaccc5c7af87c332da9ef164`.
+Baseline: `106088e57`.
+
+The runs used `3d2dc61c5`, a development-branch commit that is not in this repository.
+`106088e57` has identical codec files, report tools and data generators, so it reproduces the
+same measurements.
 
 ## Decision
 
