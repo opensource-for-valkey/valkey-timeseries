@@ -355,13 +355,16 @@ These results are from the branch-final validation run at `f0c7429e6`.
 Build the candidate and the baseline:
 
 ```sh
-cargo build --release --locked --features enable-system-alloc,test-utils \
-  --bin gorilla_report --jobs 1
-cp target/release/gorilla_report /tmp/chimp-candidate
+git worktree add --detach /tmp/chimp-cand f0c7429e6
+cp Cargo.lock /tmp/chimp-cand/
+(cd /tmp/chimp-cand && CARGO_TARGET_DIR="$PWD/../chimp-cand-target" \
+  cargo build --release --locked --features enable-system-alloc,test-utils \
+  --bin gorilla_report --jobs 1)
+cp /tmp/chimp-cand-target/release/gorilla_report /tmp/chimp-candidate
 
 git worktree add --detach /tmp/chimp-base 7d5a3d058
 mkdir -p /tmp/chimp-base/examples
-cp tools/gorilla_report.rs /tmp/chimp-base/examples/gorilla_report.rs
+cp /tmp/chimp-cand/tools/gorilla_report.rs /tmp/chimp-base/examples/gorilla_report.rs
 cp Cargo.lock /tmp/chimp-base/
 (cd /tmp/chimp-base && CARGO_TARGET_DIR="$PWD/../chimp-base-target" \
   cargo build --release --locked --features enable-system-alloc,test-utils \
@@ -369,10 +372,12 @@ cp Cargo.lock /tmp/chimp-base/
 cp /tmp/chimp-base-target/release/examples/gorilla_report /tmp/chimp-baseline
 cp /tmp/chimp-baseline /tmp/chimp-baseline2
 git worktree remove /tmp/chimp-base
+git worktree remove /tmp/chimp-cand
 ```
 
-The tool uses only APIs present at the baseline. `Cargo.lock` is untracked, so copy it into
-the worktree. Then run each arm three times per sample count, rotating the order, with
+Both builds come from worktrees at the recorded commits, so later changes on the branch
+don't leak in, and the baseline uses the candidate's copy of the tool, which uses only APIs
+present at the baseline. `Cargo.lock` is untracked, so copy it into each worktree. Then run each arm three times per sample count, rotating the order, with
 nothing else compiling:
 
 ```sh

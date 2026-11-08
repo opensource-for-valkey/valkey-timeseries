@@ -2,10 +2,11 @@
 
 2026-10-28. Branch: `perf/gorilla-codec-evaluation`.
 Baseline: `106088e57`.
+Candidate: `7d5a3d058`.
 
-The runs used `3d2dc61c5`, a development-branch commit that is not in this repository.
-`106088e57` has identical codec files, report tools and data generators, so it reproduces the
-same measurements.
+The runs used `3d2dc61c5` as the baseline, a development-branch commit that is not in this
+repository. `106088e57` has identical codec files, report tools and data generators, so it
+reproduces the same measurements.
 
 ## Decision
 
@@ -163,25 +164,29 @@ mixed read/write benchmarks. The prototype and seek-state APIs are gated by
 
 ## Reproduction and data
 
-Build the current reports:
+Build the candidate's reports from a worktree at the candidate commit, so later changes on
+the branch don't leak in (`Cargo.lock` is untracked, so copy it in):
 
 ```sh
-cargo build --release --features enable-system-alloc,test-utils \
-  --bin gorilla_report --bin gorilla_seek_report --jobs 1
-cp target/release/gorilla_report /tmp/gorilla-candidate
+git worktree add --detach /tmp/gorilla-cand 7d5a3d058
+cp Cargo.lock /tmp/gorilla-cand/
+(cd /tmp/gorilla-cand && CARGO_TARGET_DIR="$PWD/../gorilla-cand-target" \
+  cargo build --release --features enable-system-alloc,test-utils \
+  --bin gorilla_report --bin gorilla_seek_report --jobs 1)
+cp /tmp/gorilla-cand-target/release/gorilla_report /tmp/gorilla-candidate
 /tmp/gorilla-candidate --samples 1000 --iterations 1000 --out /tmp/candidate-1000.csv
 /tmp/gorilla-candidate --samples 10000 --iterations 300 --out /tmp/candidate-10000.csv
-target/release/gorilla_seek_report > /tmp/checkpoints.csv
+/tmp/gorilla-cand-target/release/gorilla_seek_report > /tmp/checkpoints.csv
 ```
 
-For the original encoder, create a worktree at the baseline commit, copy
+For the original encoder, create a worktree at the baseline commit, copy the candidate's
 `tools/gorilla_report.rs` into its `examples/gorilla_report.rs`, and build that
 example with the same release features. The report uses only APIs present in
 the baseline. Keep the resulting baseline and candidate executables, alternate
 their order across three rounds, and avoid concurrent compilation/testing.
 `--jobs 1` avoids memory contention from multiple fat-LTO links on this host.
-`--encoding chimp` runs the same measurements on the Chimp codec; the default is
-`gorilla`, so the commands above are unchanged.
+`--encoding chimp`, added after this evaluation (`604277e28`), runs the same measurements on
+the Chimp codec; the default is `gorilla`, so the commands above are unchanged.
 
 [1,000-sample medians](data/gorilla-1000.csv),
 [10,000-sample medians](data/gorilla-10000.csv),
