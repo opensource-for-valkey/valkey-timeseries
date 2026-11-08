@@ -588,6 +588,38 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         wait_for_true(lambda: coordinator.execute_command('TS._DEBUG', 'INFLIGHT') == [])
         assert debug_metrics(coordinator, 'fanout')['fanout_inflight'] == 0
 
+    def assert_serving_nothing(self, node):
+        assert node.execute_command('TS._DEBUG', 'PEER_REQUESTS') == 0
+        assert node.execute_command('TS._DEBUG', 'PEER_REQUESTS', 'VERBOSE') == []
+        assert debug_metrics(node, 'fanout')['fanout_serving'] == 0
+
+    def test_peer_requests_drains_once_peers_have_answered(self):
+        """TS._DEBUG PEER_REQUESTS counts the requests a node is serving for its peers, reads
+        and writes alike. A request leaves once it is answered, so an idle node reports none,
+        before and after serving a read (MRANGE) and a write (MDEL)."""
+        self.populate()
+        self.reset_all()
+        coordinator, *peers = self.primaries()
+        for node in self.primaries():
+            self.assert_serving_nothing(node)
+
+        coordinator.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
+        coordinator.execute_command('TS.MDEL', 'FILTER', 'env=prod')
+
+        for peer in peers:
+            wait_for_true(lambda: debug_metrics(peer, 'fanout')['fanout_served_ok_total'] == 2)
+            wait_for_true(lambda: peer.execute_command('TS._DEBUG', 'PEER_REQUESTS') == 0)
+            self.assert_serving_nothing(peer)
+        self.assert_serving_nothing(coordinator)
+
+    def test_peer_requests_rejects_unknown_arguments(self):
+        node = self.primaries()[0]
+        assert node.execute_command('TS._DEBUG', 'PEER_REQUESTS', 'verbose') == []
+        with pytest.raises(ResponseError, match="expected VERBOSE"):
+            node.execute_command('TS._DEBUG', 'PEER_REQUESTS', 'bogus')
+        with pytest.raises(ResponseError, match="wrong number of arguments"):
+            node.execute_command('TS._DEBUG', 'PEER_REQUESTS', 'VERBOSE', 'extra')
+
     def test_cluster_map_metrics(self):
         coordinator = self.primaries()[0]
         coordinator.execute_command('TS._DEBUG', 'INDEXMEMORY', 'CLUSTER')

@@ -11,7 +11,7 @@
 //! They usually both fire for one timed-out fanout, so don't add them up.
 
 use super::duration_histogram;
-use crate::fanout::{ErrorKind, inflight_request_count};
+use crate::fanout::{ErrorKind, inflight_request_count, peer_request_count};
 use metered::entry::{counter, counter_value, gauge_value, metric};
 use metered::{BucketHistogram, Counter, Registry};
 use std::sync::LazyLock;
@@ -392,6 +392,11 @@ pub(super) fn register(registry: &mut Registry<'static>) {
                 .help(
                     "Fanout RPCs with remote shares outstanding (local-only operations have none)",
                 ),
+        )
+        .register(
+            gauge_value("serving")
+                .read(|_: &()| peer_request_count())
+                .help("Peer requests this node is serving, queued or running, writes included"),
         )
         .register(
             metric("duration_seconds")

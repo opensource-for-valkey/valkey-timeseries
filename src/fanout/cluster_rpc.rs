@@ -635,7 +635,10 @@ fn process_request_message(
         fanout_ctx.set_deadline(deadline);
     }
     if let Some(registration) = &registration {
-        fanout_ctx.set_cancel_flag(registration.cancelled.clone());
+        registration.entry.running.store(true, Ordering::Relaxed);
+        if operation.cancellable {
+            fanout_ctx.set_cancel_flag(registration.entry.cancelled.clone());
+        }
     }
     if fanout_ctx.expired() {
         // Cancelled, or past a deadline which, counted from arrival, is never earlier than the
@@ -842,11 +845,16 @@ fn request_received(
     let (request_id, db) = (header.request_id, header.db);
 
     // A blocking thread: the handler takes the GIL (R1 in `common::threads`).
-    let registration = operation
-        .cancellable
-        .then(|| PeerRequest::register(sender, request_id));
+    let registration = PeerRequest::register(sender, request_id, &operation, received);
     let queued = PEER_REQUEST_EXECUTOR.try_spawn(move || {
-        process_request_message(header, operation, &buf, sender, received, registration);
+        process_request_message(
+            header,
+            operation,
+            &buf,
+            sender,
+            received,
+            Some(registration),
+        );
     });
     if queued.is_err() {
         metrics::FANOUT_REJECTED_BUSY.incr();
@@ -858,24 +866,83 @@ fn request_received(
     }
 }
 
-/// Peer requests being served that their requester may cancel, by requester and request id.
-/// Request ids are only unique per requester.
-static PEER_REQUESTS: LazyLock<HashMap<(NodeId, u64), Arc<AtomicBool>>> =
+/// Every peer request this node is serving, queued or running, by requester and request id.
+/// Request ids are only unique per requester. Writes are tracked too, for observability
+/// (`TS._DEBUG PEER_REQUESTS`, `fanout_serving`), but only a cancellable entry can be cancelled.
+static PEER_REQUESTS: LazyLock<HashMap<(NodeId, u64), Arc<PeerRequestEntry>>> =
     LazyLock::new(HashMap::new);
+
+/// What [`PEER_REQUESTS`] knows about one request.
+struct PeerRequestEntry {
+    command: &'static str,
+    received: Instant,
+    /// [`RegisteredOperation::cancellable`]. A write is not: abandoning it part-way would leave
+    /// it half applied, so a cancel never marks it and its handler never sees the flag.
+    cancellable: bool,
+    /// Set once a worker has picked the request up; until then it waits in the lane's queue.
+    running: AtomicBool,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// How many peer requests this node is serving, queued or running, writes included.
+pub(crate) fn peer_request_count() -> usize {
+    PEER_REQUESTS.pin().len()
+}
+
+/// One peer request being served, as `TS._DEBUG PEER_REQUESTS VERBOSE` reports it.
+pub(crate) struct PeerRequestSummary {
+    pub sender: NodeId,
+    pub id: u64,
+    pub command: &'static str,
+    pub age: Duration,
+    pub running: bool,
+    pub cancellable: bool,
+    pub cancelled: bool,
+}
+
+/// The peer requests this node is serving, oldest first.
+pub(crate) fn peer_requests() -> Vec<PeerRequestSummary> {
+    let mut requests: Vec<_> = PEER_REQUESTS
+        .pin()
+        .iter()
+        .map(|(&(sender, id), entry)| PeerRequestSummary {
+            sender,
+            id,
+            command: entry.command,
+            age: entry.received.elapsed(),
+            running: entry.running.load(Ordering::Relaxed),
+            cancellable: entry.cancellable,
+            cancelled: entry.cancelled.load(Ordering::Relaxed),
+        })
+        .collect();
+    requests.sort_by_key(|request| std::cmp::Reverse(request.age));
+    requests
+}
 
 /// A peer request's entry in [`PEER_REQUESTS`], for as long as the request is queued or running.
 /// Dropping it removes the entry, so a request that never ran (the queue was full) leaves none.
 struct PeerRequest {
     key: (NodeId, u64),
-    cancelled: Arc<AtomicBool>,
+    entry: Arc<PeerRequestEntry>,
 }
 
 impl PeerRequest {
-    fn register(sender: NodeId, request_id: u64) -> Self {
+    fn register(
+        sender: NodeId,
+        request_id: u64,
+        operation: &RegisteredOperation,
+        received: Instant,
+    ) -> Self {
         let key = (sender, request_id);
-        let cancelled = Arc::new(AtomicBool::new(false));
-        PEER_REQUESTS.pin().insert(key, cancelled.clone());
-        Self { key, cancelled }
+        let entry = Arc::new(PeerRequestEntry {
+            command: operation.name,
+            received,
+            cancellable: operation.cancellable,
+            running: AtomicBool::new(false),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        PEER_REQUESTS.pin().insert(key, entry.clone());
+        Self { key, entry }
     }
 }
 
@@ -886,10 +953,13 @@ impl Drop for PeerRequest {
 }
 
 /// Marks a request as no longer wanted. A request that has finished has no entry, which is fine:
-/// its answer has gone already.
+/// its answer has gone already. A write is left alone: a requester never cancels one, and a
+/// cancel that names one anyway must not stop it part-way.
 fn cancel_peer_request(sender: NodeId, request_id: u64) {
-    if let Some(cancelled) = PEER_REQUESTS.pin().get(&(sender, request_id)) {
-        cancelled.store(true, Ordering::Relaxed);
+    if let Some(entry) = PEER_REQUESTS.pin().get(&(sender, request_id))
+        && entry.cancellable
+    {
+        entry.cancelled.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1081,6 +1151,7 @@ mod tests {
 
     fn operation(cancellable: bool) -> RegisteredOperation {
         RegisteredOperation {
+            name: "test",
             run: never_called,
             cancellable,
         }
@@ -1218,22 +1289,96 @@ mod tests {
     fn a_cancel_marks_only_the_request_it_names() {
         let sender = node_id(b'a');
         let other = node_id(b'b');
-        let request = PeerRequest::register(sender, 7);
-        let same_id_elsewhere = PeerRequest::register(other, 7);
-        let another_id = PeerRequest::register(sender, 8);
+        let request = register_read(sender, 7);
+        let same_id_elsewhere = register_read(other, 7);
+        let another_id = register_read(sender, 8);
 
         cancel_peer_request(sender, 7);
 
-        assert!(request.cancelled.load(Ordering::Relaxed));
-        assert!(!same_id_elsewhere.cancelled.load(Ordering::Relaxed));
-        assert!(!another_id.cancelled.load(Ordering::Relaxed));
+        assert!(request.entry.cancelled.load(Ordering::Relaxed));
+        assert!(!same_id_elsewhere.entry.cancelled.load(Ordering::Relaxed));
+        assert!(!another_id.entry.cancelled.load(Ordering::Relaxed));
+    }
+
+    fn register_read(sender: NodeId, request_id: u64) -> PeerRequest {
+        PeerRequest::register(sender, request_id, &operation(true), Instant::now())
+    }
+
+    fn listed(sender: NodeId, request_id: u64) -> Option<PeerRequestSummary> {
+        peer_requests()
+            .into_iter()
+            .find(|request| request.sender == sender && request.id == request_id)
+    }
+
+    /// A write is tracked like a read, but a cancel that names it leaves it alone.
+    #[test]
+    fn a_write_is_tracked_but_never_cancelled() {
+        let sender = node_id(b'f');
+        let request = PeerRequest::register(sender, 13, &operation(false), Instant::now());
+
+        let summary = listed(sender, 13).expect("a write is tracked");
+        assert_eq!(summary.command, "test");
+        assert!(!summary.cancellable && !summary.running && !summary.cancelled);
+        assert!(peer_request_count() >= 1);
+
+        cancel_peer_request(sender, 13);
+        assert!(!request.entry.cancelled.load(Ordering::Relaxed));
+        assert!(!listed(sender, 13).unwrap().cancelled);
+
+        drop(request);
+        assert!(listed(sender, 13).is_none());
+    }
+
+    static WRITE_RAN: AtomicBool = AtomicBool::new(false);
+
+    fn reports_running_then_gives_up(
+        ctx: &FanoutContext,
+        _: &[u8],
+        _: &mut Vec<u8>,
+    ) -> FanoutResult {
+        let summary = listed(node_id(b'2'), 15).expect("tracked while it runs");
+        assert!(summary.running);
+        assert!(
+            !ctx.expired(),
+            "a write's handler must not see its cancel flag"
+        );
+        WRITE_RAN.store(true, Ordering::Relaxed);
+        Err(ValkeyError::Str(error_consts::FANOUT_REQUESTER_GAVE_UP).into())
+    }
+
+    /// A request is queued until a worker picks it up, running from then on, and gone once
+    /// it has been served. A write runs even if its cancel flag is somehow set: its handler
+    /// never sees the flag.
+    #[test]
+    fn a_request_runs_and_is_forgotten_and_a_write_ignores_its_flag() {
+        let sender = node_id(b'2');
+        let write = RegisteredOperation {
+            name: "test",
+            run: reports_running_then_gives_up,
+            cancellable: false,
+        };
+        let registration = PeerRequest::register(sender, 15, &write, Instant::now());
+        assert!(!listed(sender, 15).unwrap().running);
+        registration.entry.cancelled.store(true, Ordering::Relaxed);
+
+        process_request_message(
+            header(None),
+            write,
+            &[],
+            sender,
+            Instant::now(),
+            Some(registration),
+        );
+
+        assert!(WRITE_RAN.load(Ordering::Relaxed));
+        assert!(listed(sender, 15).is_none());
     }
 
     /// A cancel can arrive after the answer has gone, and a finished request leaves no entry.
     #[test]
     fn a_finished_request_is_forgotten() {
         let sender = node_id(b'c');
-        let request = PeerRequest::register(sender, 9);
+        let request = register_read(sender, 9);
         assert!(PEER_REQUESTS.pin().contains_key(&(sender, 9)));
 
         drop(request);
@@ -1247,7 +1392,7 @@ mod tests {
     fn a_cancelled_request_is_dropped_unrun() {
         let before = metrics::FANOUT_DROPPED_EXPIRED.load(Ordering::Relaxed);
         let sender = node_id(b'd');
-        let registration = PeerRequest::register(sender, 11);
+        let registration = register_read(sender, 11);
         cancel_peer_request(sender, 11);
 
         process_request_message(
@@ -1279,13 +1424,14 @@ mod tests {
         process_request_message(
             header(Some(Duration::from_secs(60))),
             RegisteredOperation {
+                name: "test",
                 run: cancelled_while_running,
                 cancellable: true,
             },
             &[],
             sender,
             Instant::now(),
-            Some(PeerRequest::register(sender, 1)),
+            Some(register_read(sender, 1)),
         );
 
         assert_eq!(
@@ -1309,6 +1455,7 @@ mod tests {
         process_request_message(
             header(Some(Duration::from_secs(60))),
             RegisteredOperation {
+                name: "test",
                 run: gives_up_mid_read,
                 cancellable: true,
             },

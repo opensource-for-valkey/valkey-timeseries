@@ -34,6 +34,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         assert b'TS._DEBUG METRICS RESET [LOCAL|PRIMARY|CLUSTER|HASHTAG <tags>]' in commands
         assert b'TS._DEBUG INFLIGHT' in commands
         assert b'TS._DEBUG REFRESH_CLUSTERMAP' in commands
+        assert b'TS._DEBUG PEER_REQUESTS [VERBOSE]' in commands
         # Every advertised subcommand is implemented: HELP once listed a SHOW_INFO that wasn't,
         # and LIST_CONFIGS arguments it rejects.
         assert not any(b'SHOW_INFO' in cmd for cmd in commands)
@@ -283,6 +284,17 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         with pytest.raises(ResponseError, match="wrong number of arguments"):
             self.client.execute_command('TS._DEBUG', 'REFRESH_CLUSTERMAP', 'extra')
 
+    def test_debug_peer_requests_needs_cluster_mode(self):
+        """PEER_REQUESTS is refused outside cluster mode and takes only VERBOSE"""
+        self.set_debug_mode()
+        for args in ((), ('VERBOSE',)):
+            with pytest.raises(ResponseError, match="PEER_REQUESTS requires cluster mode"):
+                self.client.execute_command('TS._DEBUG', 'PEER_REQUESTS', *args)
+        with pytest.raises(ResponseError, match="expected VERBOSE"):
+            self.client.execute_command('TS._DEBUG', 'PEER_REQUESTS', 'bogus')
+        with pytest.raises(ResponseError, match="wrong number of arguments"):
+            self.client.execute_command('TS._DEBUG', 'PEER_REQUESTS', 'VERBOSE', 'extra')
+
     def test_debug_unknown_subcommand(self):
         """Test TS._DEBUG with an unknown subcommand"""
         with pytest.raises(ResponseError, match="Unknown subcommand.*try HELP"):
@@ -373,6 +385,8 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
                 ('METRICS',),
                 ('METRICS', 'RESET'),
                 ('REFRESH_CLUSTERMAP',),
+                ('PEER_REQUESTS',),
+                ('PEER_REQUESTS', 'VERBOSE'),
                 ('INVALID_SUBCOMMAND',),
                 (),
             ):

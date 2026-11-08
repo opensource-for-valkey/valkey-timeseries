@@ -17,6 +17,8 @@ pub(super) type RequestHandlerCallback = fn(&FanoutContext, &[u8], &mut Vec<u8>)
 /// A registered operation, as a receiving node runs it.
 #[derive(Clone, Copy)]
 pub(super) struct RegisteredOperation {
+    /// [`FanoutCommand::name`], the key it is registered under.
+    pub name: &'static str,
     pub run: RequestHandlerCallback,
     /// [`FanoutCommand::cancellable`]: whether a request past its time budget may be
     /// dropped unrun, or stopped between read batches.
@@ -82,6 +84,7 @@ impl FanoutOperationRegistry {
         map.insert(
             name,
             RegisteredOperation {
+                name,
                 run: request_handler::<OP>,
                 cancellable: OP::cancellable(),
             },
