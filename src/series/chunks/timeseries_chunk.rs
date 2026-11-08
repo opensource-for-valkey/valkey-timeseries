@@ -5,6 +5,7 @@ use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
 use crate::iterators::SampleIter;
 use crate::series::chunks::chimp::ChimpChunk;
+use crate::series::series_data_type::MIN_CHIMP_GRAMMAR_ENCODING_VERSION;
 use crate::series::{
     DuplicatePolicy, SampleAddResult,
     chunks::{Chunk, ChunkEncoding, ChunkOps, GorillaChunk, UncompressedChunk},
@@ -14,7 +15,7 @@ use enum_dispatch::enum_dispatch;
 use get_size2::GetSize;
 use std::cmp::Ordering;
 use valkey_module::digest::Digest;
-use valkey_module::{RedisModuleIO, ValkeyResult};
+use valkey_module::{RedisModuleIO, ValkeyError, ValkeyResult};
 
 #[derive(Debug, Clone, Hash, PartialEq, GetSize)]
 #[enum_dispatch(ChunkOps)]
@@ -235,7 +236,16 @@ impl Chunk for TimeSeriesChunk {
         let chunk = match chunk_type {
             ChunkEncoding::Uncompressed => Uncompressed(UncompressedChunk::load_rdb(rdb, enc_ver)?),
             ChunkEncoding::Gorilla => Gorilla(GorillaChunk::load_rdb(rdb, enc_ver)?),
-            ChunkEncoding::Chimp => Chimp(ChimpChunk::load_rdb(rdb, enc_ver)?),
+            ChunkEncoding::Chimp => {
+                if enc_ver < MIN_CHIMP_GRAMMAR_ENCODING_VERSION {
+                    return Err(ValkeyError::String(format!(
+                        "TSDB: cannot load a Chimp chunk from encoding version {enc_ver}: it uses \
+                         an older Chimp grammar that this build cannot read. Re-ingest the series \
+                         from its source data"
+                    )));
+                }
+                Chimp(ChimpChunk::load_rdb(rdb, enc_ver)?)
+            }
         };
         Ok(chunk)
     }

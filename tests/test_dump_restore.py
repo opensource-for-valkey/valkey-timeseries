@@ -87,10 +87,12 @@ class TestTimeseriesDumpRestore(ValkeyTimeSeriesTestCaseBase):
         assert client.execute_command('EXISTS', f'bad{encver}') == 0
         assert client.ping()
 
-    def test_restore_accepts_the_oldest_readable_encoding_version(self):
-        """The gate's lower bound: a payload labelled version 1 still loads."""
+    @pytest.mark.parametrize('encoding', ['GORILLA', 'UNCOMPRESSED'])
+    def test_restore_accepts_the_oldest_readable_encoding_version(self, encoding):
+        """The gate's lower bound: a Gorilla or uncompressed payload labelled version 1
+        still loads."""
         client = self.client
-        client.execute_command('TS.CREATE', 'cur', 'ENCODING', 'CHIMP')
+        client.execute_command('TS.CREATE', 'cur', 'ENCODING', encoding)
         for i in range(100):
             client.execute_command('TS.ADD', 'cur', 1000 + i, 1.5 + i / 100)
         payload = client.execute_command('DUMP', 'cur')
@@ -98,6 +100,20 @@ class TestTimeseriesDumpRestore(ValkeyTimeSeriesTestCaseBase):
         assert client.execute_command('RESTORE', 'old1', 0, _with_encver(payload, 1)) == b'OK'
         assert client.execute_command('TS.RANGE', 'old1', '-', '+') == \
             client.execute_command('TS.RANGE', 'cur', '-', '+')
+
+    def test_restore_refuses_chimp_chunks_from_encoding_version_1(self):
+        """Every build that wrote version 1 used the old Chimp grammar, so a version 1
+        payload holding a Chimp chunk is refused instead of decoding into wrong samples."""
+        client = self.client
+        client.execute_command('TS.CREATE', 'cur', 'ENCODING', 'CHIMP')
+        for i in range(100):
+            client.execute_command('TS.ADD', 'cur', 1000 + i, 1.5 + i / 100)
+        payload = client.execute_command('DUMP', 'cur')
+
+        with pytest.raises(ResponseError, match='Bad data format'):
+            client.execute_command('RESTORE', 'old1', 0, _with_encver(payload, 1))
+        assert client.execute_command('EXISTS', 'old1') == 0
+        assert client.ping()
 
     @pytest.mark.parametrize('offset', [1 << 30, 1 << 40, 1 << 50])
     def test_gorilla_large_counter_dump_restore_and_append(self, offset):
