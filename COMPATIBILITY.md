@@ -119,20 +119,14 @@ Smaller reads, `TS.CARD` without `FILTER_BY_RANGE`, and any of these commands is
 
 **What differs.** The persistence format used to store series state (across RDB, AOF, and any internal format) does not match RedisTimeSeries's.
 
-Within Valkey TimeSeries, this build writes module encoding version 2 and reads
-versions 1–2. Version 2 adds Gorilla extended XOR windows; existing version 1
-Gorilla and uncompressed chunks remain readable and writable after loading. A
-Chimp chunk in a version 1 payload is refused at load, because the Chimp grammar
-changed before release. Older module builds reject new version 2 payloads,
-including RDB, DUMP/RESTORE, and rewritten AOF state. For persisted data, upgrade
-readers before writers; downgrading persisted version 2 data requires exporting
-logical samples and recreating the series. Details and measured gains:
-[the Gorilla evaluation](docs/benchmarks/gorilla-evaluation.md).
+Within Valkey TimeSeries, the module writes and reads encoding version 1. Until
+the first release, formats change in place, without a version bump: RDB, DUMP
+and AOF data written by an older build may fail to load or decode incorrectly.
+Re-ingest it from source data instead (see the README).
 
 In a cluster, run every node on the same build, upgrading all of them together.
-Nodes exchange encoded chunks during fan-out, and builds older than this one do
-not check the chunk wire version, so a mixed-build cluster can return wrong
-query results instead of an error.
+Nodes exchange encoded chunks during fan-out, so a mixed-build cluster can
+return wrong query results instead of an error.
 
 
 **Why.** The on-disk format is an internal implementation detail and is not part of the compatibility contract. Fixing it would constrain Valkey TimeSeries's ability to evolve its storage, chunk-encoding, and recovery strategies independently of RedisTimeSeries.

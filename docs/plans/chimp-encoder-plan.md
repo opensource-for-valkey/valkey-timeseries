@@ -36,9 +36,9 @@ with `--encoding`), pytest integration suite via `./build.sh`.
   `TIMESERIES_TYPE_ENCODING_VERSION` is currently `2` (`src/series/series_data_type.rs:36`),
   `MIN_…` is `1` (`:39`). Phase C sets both to `3` (decision point 1 below). Local
   `dump.rdb`/AOF files from older builds stop loading and must be deleted.
-  **Outcome:** the bump to `3` was reverted in `bebd629c3`. The module writes version `2`
-  and reads `1`–`2`, the Chimp grammar changed in place, and a Chimp chunk in a version `1`
-  payload is refused at load (`MIN_CHIMP_GRAMMAR_ENCODING_VERSION`).
+  **Outcome:** the bump to `3` was reverted in `bebd629c3`, and the bump to `2` in
+  `301a26725`. The module writes and reads version `1`; every format changes in place until
+  the first release.
 - Wire encoding for fan-out stays decided in `samples_to_chunk[_lossless]`
   (`src/series/chunks/serialization.rs:26-44`); no new encoding-selection tier.
 - Any change under `src/series/chunks/{stream,gorilla,chimp}` is re-profiled before it lands:
@@ -57,15 +57,14 @@ with `--encoding`), pytest integration suite via `./build.sh`.
    makes it fail loudly. Consequence: the Gorilla v1 RDB read path becomes unreachable from
    persistence (its golden fixture tests still exercise the stream reader). Alternative:
    keep `2` and accept silent misdecode of stale local dumps.
-   **Outcome:** version `2` was kept, with minimum `1`. Instead of raising the minimum, the
-   loader refuses only Chimp chunks from version `1` payloads, so stale Chimp dumps fail
-   loudly while version `1` Gorilla and uncompressed chunks still load.
+   **Outcome:** neither. The module went back to version `1` (`301a26725`): before the
+   first release, stale local dumps are not supported and no version distinguishes them.
 2. **Fan-out wire guard (Task 14, optional).** The probe notes point out that an RDB
    version bump does not protect a mixed-version cluster coordinator. For an unreleased
    product the rule "all nodes run the same build" may suffice; Task 14 adds a cheap
    version check to the fan-out contract if you want it.
-   **Outcome:** done in `39215071f`. `SampleData.version` is now `2` and a mismatch fails the
-   reply; coordinators from before the check still ignore it, so the same-build rule stays.
+   **Outcome:** not done. A version check was added and then reverted (`9d86c80cc`): before
+   the first release every node runs the same build, so the rule suffices.
 3. **Leading-zero code width (Task 10).** Data-driven inside the task: 3-bit re-spread vs
    4-bit code, chosen by total bytes over the 45-case matrix with a no-regression bound on
    the 36 base cases.

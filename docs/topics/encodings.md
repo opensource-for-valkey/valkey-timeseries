@@ -14,13 +14,11 @@ changes and their fixed-sample A/B results, see
 encoder changes, measured the same way, see
 [the Chimp evaluation](../benchmarks/chimp-evaluation.md).
 
-**Persistence.** New RDB, DUMP and rewritten AOF payloads use module encoding
-version **2**, and this build reads versions 1 and 2 (the Gorilla extended-window
-change, see [Gorilla](#2-gorilla)). The Chimp bit grammar was changed in place
-(see [Chimp](#3-chimp-elf-on-chimp-default)) **without a version bump**, because
-nothing has been released. Every build that wrote version 1 used the old Chimp
-grammar, so a Chimp chunk in a version 1 payload is refused at load; version 1
-Gorilla and uncompressed chunks still load.
+**Persistence.** RDB, DUMP and rewritten AOF payloads use module encoding
+version **1**. Until the first release, the chunk grammars change in place,
+**without a version bump**: the Chimp grammar and Gorilla's timestamp buckets
+and XOR windows described below are the current ones, and data written by older
+builds is not supported.
 
 ---
 
@@ -86,11 +84,6 @@ range 64 B – 1 MiB, must be a multiple of 8).
 
 The Gorilla evaluation and its measured tradeoffs are recorded in
 [the benchmark report](../benchmarks/gorilla-evaluation.md).
-
-New persistence payloads use module encoding version **2**. This build reads
-versions 1 and 2, including legacy Gorilla windows mixed with new windows after
-an append. Older module builds reject version 2 RDB/DUMP/AOF payloads. Upgrade
-readers before writers; a downgrade requires rebuilding data from logical samples.
 
 **Algorithm:** Two-stage compression based on the Facebook Gorilla paper
 (Pelkonen et al., 2015).

@@ -21,6 +21,10 @@ to every new RDB/DUMP payload and rewritten AOF, including series using other
 encodings, because the version belongs to the module type. Upgrade readers
 before writers; downgrade by exporting logical samples and recreating series.
 
+**Later change:** the version bump was reverted before release. The module stays at
+encoding version 1 and formats change in place until the first release, so neither
+the version gate nor the version 1 read path described here applies.
+
 ## Changes retained
 
 - **Timestamp buckets:** keep existing prefixes and payload widths, but widen

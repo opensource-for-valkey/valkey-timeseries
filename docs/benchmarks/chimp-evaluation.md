@@ -342,7 +342,8 @@ These results are from the branch-final validation run at `f0c7429e6`.
 - Genuine DUMP payloads relabelled as versions 0 and 3 (with a valid CRC) are refused with
   `Bad data format`; no key is created and the server stays up. `TS._RESTORE` rejects
   versions 0, 3, 99, −1 and `x`. The version gate is unchanged from before the branch
-  (versions 1–2 load).
+  (versions 1–2 load). The module version was later reverted to 1, so the gate now
+  loads only version 1.
 - Full integration suite: **1,573 passed, 0 failed** (run before the version gate was reverted to 2).
 - Compatibility suite: **2,854 passed, 0 failed, 2 skipped, 13 expected divergences** (same caveat).
   These are the previously registered ids; none is new. The 2 skips are the opt-in fuzzer.
