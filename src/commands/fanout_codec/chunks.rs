@@ -12,8 +12,11 @@ use crate::series::request_types::{MRangeSeriesResult, SeriesResultData};
 use smallvec::SmallVec;
 use valkey_module::{ValkeyError, ValkeyResult};
 
-// for future compatibility
-const VERSION: u32 = 1;
+/// Wire version of a `SampleData` chunk. Version 2 is the current Chimp and Gorilla grammar;
+/// version 1 shards sent the old Chimp grammar. A mismatch is refused rather than decoded
+/// into wrong samples. Coordinators from before this check ignore the field, so a cluster
+/// still needs every node on the same build.
+const VERSION: u32 = 2;
 
 fn get_compression_type(chunk: &TimeSeriesChunk) -> CompressionType {
     chunk.get_encoding().into()
@@ -36,6 +39,13 @@ pub fn serialize_chunk(chunk: TimeSeriesChunk) -> ValkeyResult<SampleData> {
 
 /// Deserializes TimeSeriesChunk coming from a cluster node.
 pub fn deserialize_chunk(chunk: &SampleData) -> ValkeyResult<TimeSeriesChunk> {
+    if chunk.version != VERSION {
+        return Err(ValkeyError::String(format!(
+            "TSDB: a cluster node sent chunk wire version {}, but this node reads version \
+             {VERSION}; every cluster node must run the same build",
+            chunk.version
+        )));
+    }
     let data = &chunk.data;
 
     let encoding = CompressionType::try_from(chunk.compression)
@@ -455,6 +465,27 @@ mod tests {
             "series 'b'",
         ] {
             assert!(msg.contains(needle), "missing '{needle}' in: {msg}");
+        }
+    }
+
+    #[test]
+    fn deserialize_refuses_other_wire_versions() {
+        let samples: Vec<Sample> = (0..32)
+            .map(|i| Sample::new(1000 + i * 10, 1.5 + i as f64 / 100.0))
+            .collect();
+        // 32 samples: at or above the wire compression threshold, so this is a Chimp chunk.
+        let chunk = samples_to_chunk_lossless(samples.clone());
+        assert_eq!(chunk.get_encoding(), ChunkEncoding::Chimp);
+        let mut wire = serialize_chunk(chunk).unwrap();
+        assert_eq!(wire.version, VERSION);
+        assert_eq!(
+            deserialize_chunk(&wire).unwrap().iter().collect::<Vec<_>>(),
+            samples
+        );
+        for version in [0, 1, VERSION + 1] {
+            wire.version = version;
+            let err = deserialize_chunk(&wire).unwrap_err().to_string();
+            assert!(err.contains("same build"), "{version}: {err}");
         }
     }
 
