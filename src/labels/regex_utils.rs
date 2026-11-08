@@ -6,7 +6,7 @@ use crate::labels::filters::{
     PredicateMatch, PredicateValue, RegexMatcher, validate_contains_value,
     validate_starts_with_value,
 };
-use crate::labels::regex::build_with_repeat_fallback;
+use crate::labels::regex::{build_with_repeat_fallback, try_escape_for_repeat_re};
 use crate::parser::{ParseError, ParseResult};
 use regex::Error as RegexError;
 use regex::Regex;
@@ -298,14 +298,18 @@ fn is_any_char_class(class: &Class) -> bool {
     }
 }
 
-/// Parse `pattern` with the same flags `compile_regex` compiles it with, so the
-/// decomposition and the compiled regex agree on what `.` matches.
+/// Parse `pattern` the way `compile_regex` compiles it, so the decomposition
+/// and the compiled regex agree: the same flags (what `.` matches), and the
+/// same retry with Go-style literal braces (`abc{def}`) escaped.
 fn build_hir(pattern: &str) -> Result<Hir, RegexError> {
-    ParserBuilder::new()
-        .dot_matches_new_line(true)
-        .build()
-        .parse(pattern)
-        .map_err(|err| RegexError::Syntax(err.to_string()))
+    let parse = |p: &str| {
+        ParserBuilder::new()
+            .dot_matches_new_line(true)
+            .build()
+            .parse(p)
+            .map_err(|err| RegexError::Syntax(err.to_string()))
+    };
+    parse(pattern).or_else(|err| parse(&try_escape_for_repeat_re(pattern)).map_err(|_| err))
 }
 
 /// Result of decomposing a regex for postings-index optimization.
@@ -1405,8 +1409,8 @@ mod test {
         }
     }
 
-    /// Every decomposition must accept exactly what the fully anchored pattern
-    /// accepts, compiled with the same flags the production builder uses.
+    /// Every decomposition must accept exactly what the whole pattern accepts
+    /// when compiled by `compile_regex`, without decomposition.
     #[test]
     fn test_decomposition_agrees_with_direct_regex() {
         let patterns = [
@@ -1456,6 +1460,14 @@ mod test {
             r"(foo)bar",
             r"^pro(d)uction$",
             r"(foo)(bar).*",
+            // Go-style braces that are not a repeat are literals.
+            r"abc{def}",
+            r"x{,2}",
+            r"a{}",
+            r"{",
+            r"^foo.+{bar}$",
+            r"node{1,2}x{y}",
+            r".*{a}.*",
         ];
         let values = [
             "prod",
@@ -1511,12 +1523,22 @@ mod test {
             "foobarx",
             "production",
             "productionx",
+            "abc{def}",
+            "abcdef",
+            "x{,2}",
+            "xx",
+            "a{}",
+            "{",
+            "fooX{bar}",
+            "foo{bar}",
+            "nodex{y}",
+            "nodeex{y}",
+            "nodeeex{y}",
+            "Q{a}Q",
         ];
 
         for pattern in patterns {
-            let direct = regex::RegexBuilder::new(&format!("^(?:{pattern})$"))
-                .dot_matches_new_line(true)
-                .build()
+            let direct = super::compile_regex(pattern)
                 .unwrap_or_else(|e| panic!("reference regex {pattern:?} failed: {e}"));
             let equal = parse_regex_matcher(pattern, true).unwrap();
             let not_equal = parse_regex_matcher(pattern, false).unwrap();
@@ -1664,5 +1686,27 @@ mod test {
             decompose_regex("(foo)(bar).*").unwrap(),
             RegexDecomposition::Prefix(PredicateValue::String("foobar".into()))
         );
+    }
+
+    #[test]
+    fn test_parse_regex_matcher_accepts_go_style_literal_braces() {
+        assert_eq!(
+            parse_regex_matcher("abc{def}", true).unwrap(),
+            PredicateMatch::Equal(PredicateValue::String("abc{def}".into()))
+        );
+        assert_eq!(
+            parse_regex_matcher(".*{a}.*", true).unwrap(),
+            PredicateMatch::Contains(PredicateValue::String("{a}".into()))
+        );
+        // A valid repeat next to literal braces keeps its meaning.
+        let PredicateMatch::RegexEqual(matcher) =
+            parse_regex_matcher("node{1,2}x{y}", true).unwrap()
+        else {
+            panic!("expected a regex matcher");
+        };
+        assert!(matcher.is_match("nodeex{y}"));
+        assert!(!matcher.is_match("nodeeex{y}"));
+        // Patterns that are invalid for another reason still fail.
+        assert!(parse_regex_matcher("a{b}(", true).is_err());
     }
 }
