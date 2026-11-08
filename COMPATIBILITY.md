@@ -179,6 +179,14 @@ Two properties bound the difference. It is confined to buckets that mix magnitud
 
 **Migration impact.** Applications summing or averaging series that mix magnitudes within a bucket — a large baseline with small increments, counters at epoch-nanosecond scale, or any series where large positive and negative values cancel — should expect Valkey TimeSeries to report the small residual that RedisTimeSeries absorbed, most visibly as a non-zero value where RedisTimeSeries returned exactly `0`. As with the variance family, values already materialized into a compaction destination under RedisTimeSeries are not recomputed, so a destination spanning the cutover can show a step change at the boundary. Series whose samples stay within a few orders of magnitude of each other are unaffected.
 
+### Bucket durations close to the 64-bit limit
+
+**What differs.** With a bucket duration close to `9223372036854775807`, Valkey TimeSeries puts samples in the correct bucket (DIV-0062). RedisTimeSeries accepts the same durations, but its bucket arithmetic overflows: samples at `9223372036854775805` and `9223372036854775806` with that duration come back as two rows at timestamp `0`, and samples at `1` and `2` as one row at timestamp `2`. Durations up to `2^61 + 1` were checked and agree.
+
+**Why.** The RedisTimeSeries reply is an overflow artifact. Rejecting these durations would add an error that RedisTimeSeries does not return.
+
+**Migration impact.** None in practice: such a duration spans about 292 million years.
+
 ### Log messages
 
 **What differs.** The content, format, severity, and frequency of log messages emitted by Valkey TimeSeries do not match those emitted by RedisTimeSeries. Individual log strings, the events that trigger them, and the structured fields (if any) they carry should all be considered Valkey-TimeSeries-specific.

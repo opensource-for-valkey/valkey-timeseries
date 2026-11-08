@@ -8,8 +8,49 @@ use crate::common::rdb::{
 use crate::series::request_types::ValueComparisonFilter;
 use get_size2::GetSize;
 use std::hash::Hash;
-use valkey_module::RedisModuleIO;
 use valkey_module::ValkeyResult;
+use valkey_module::{RedisModuleIO, raw};
+
+/// COUNTIF's state: an integer tally of matches. A compensated float sum of ones is exact anyway,
+/// and costs the hot loop a Neumaier step and the state a heap allocation.
+#[derive(Debug, Default, Clone, Copy, Hash, PartialEq, GetSize)]
+pub struct ConditionalTally {
+    pub count: u64,
+    pub filter: ValueComparisonFilter,
+}
+
+impl ConditionalTally {
+    pub fn new(op: ComparisonOperator, comparand: f64) -> Self {
+        Self {
+            count: 0,
+            filter: ValueComparisonFilter {
+                operator: op,
+                value: comparand,
+            },
+        }
+    }
+
+    /// NaN is skipped, as by the rest of the filtered family.
+    #[inline]
+    fn update(&mut self, value: f64) -> bool {
+        if value.is_nan() {
+            return false;
+        }
+        self.count += u64::from(self.filter.compare(value));
+        true
+    }
+
+    pub fn save_to_rdb(&self, rdb: *mut RedisModuleIO) {
+        self.filter.save_to_rdb(rdb);
+        raw::save_unsigned(rdb, self.count);
+    }
+
+    pub fn load_from_rdb(rdb: *mut RedisModuleIO) -> ValkeyResult<Self> {
+        let filter = ValueComparisonFilter::load_from_rdb(rdb)?;
+        let count = raw::load_unsigned(rdb)?;
+        Ok(Self { count, filter })
+    }
+}
 
 #[derive(Debug, Clone, Copy, GetSize)]
 pub struct ConditionalCountState {
@@ -64,10 +105,9 @@ impl ConditionalCountState {
         self.has_samples = false;
     }
 
-    // NaN is skipped, as every other aggregator skips it (and as the cluster push-down's
-    // partial reducer does). Passing it to the filter let `!=` match it, so `sumif` over
-    // [1, NaN] returned NaN and `countif` counted it — and a push-down GROUPBY of the same
-    // query answered 1.
+    // NaN is skipped, as by every filtered aggregator (and by the cluster push-down's partial
+    // reducer). Passing it to the filter let `!=` match it, so `sumif` over [1, NaN] returned
+    // NaN and `countif` counted it — and a push-down GROUPBY of the same query answered 1.
     fn update_sum(&mut self, value: f64) -> bool {
         if value.is_nan() {
             return false;
@@ -75,17 +115,6 @@ impl ConditionalCountState {
         if self.filter.compare(value) {
             self.has_samples = true;
             self.sum += value;
-        }
-        true
-    }
-
-    fn update_count(&mut self, value: f64) -> bool {
-        if value.is_nan() {
-            return false;
-        }
-        if self.filter.compare(value) {
-            self.has_samples = true;
-            self.sum += 1.0;
         }
         true
     }
@@ -118,23 +147,19 @@ impl ConditionalCountState {
 }
 
 #[derive(Debug, Default, Clone, Hash, PartialEq, GetSize)]
-pub struct CountIfAggregator(Box<ConditionalCountState>);
+pub struct CountIfAggregator(ConditionalTally);
 
 impl AggregationHandler for CountIfAggregator {
     fn update(&mut self, _timestamp: i64, value: f64) -> bool {
-        self.0.update_count(value)
+        self.0.update(value)
     }
 
     fn reset(&mut self) {
-        self.0.reset();
+        self.0.count = 0;
     }
 
     fn current(&self) -> Option<f64> {
-        if self.0.has_samples {
-            Some(self.0.get_value())
-        } else {
-            None
-        }
+        (self.0.count > 0).then_some(self.0.count as f64)
     }
 
     fn empty_value(&self) -> f64 {
@@ -148,19 +173,12 @@ impl RdbSerializable for CountIfAggregator {
     }
 
     fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self> {
-        let state = ConditionalCountState::load_from_rdb(rdb)?;
-        Ok(Self(Box::new(state)))
+        ConditionalTally::load_from_rdb(rdb).map(Self)
     }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, GetSize)]
 pub struct SumIfAggregator(Box<ConditionalCountState>);
-
-impl SumIfAggregator {
-    pub fn finalize(&self) -> f64 {
-        self.0.get_value()
-    }
-}
 
 impl RdbSerializable for SumIfAggregator {
     fn rdb_save(&self, rdb: *mut RedisModuleIO) {
@@ -221,7 +239,12 @@ impl ShareAggregatorState {
         (self.match_count as f64) / (self.count as f64)
     }
 
+    /// NaN is skipped like everywhere else in the filtered family: under `!=` it would match,
+    /// and under any other operator it would still count against the share.
     pub fn update(&mut self, value: f64) -> bool {
+        if value.is_nan() {
+            return false;
+        }
         self.count = self.count.saturating_add(1);
         if self.filter.compare(value) {
             self.match_count = self.match_count.saturating_add(1);
@@ -252,22 +275,18 @@ impl RdbSerializable for ShareAggregatorState {
 /// An Aggregator that computes the share of values matching a condition.
 /// The share is defined as the percentage (in the range [0..1)) of raw values matching the condition
 #[derive(Debug, Default, Clone, GetSize, Hash, PartialEq)]
-pub struct ShareAggregator(Box<ShareAggregatorState>);
+pub struct ShareAggregator(ShareAggregatorState);
 
 impl ShareAggregator {
     pub fn new(op: ComparisonOperator, comparand: f64) -> Self {
-        Self(Box::new(ShareAggregatorState {
+        Self(ShareAggregatorState {
             count: 0,
             match_count: 0,
             filter: ValueComparisonFilter {
                 operator: op,
                 value: comparand,
             },
-        }))
-    }
-
-    pub fn reset(&mut self) {
-        self.0.reset();
+        })
     }
 
     pub fn share(&self) -> f64 {
@@ -285,8 +304,7 @@ impl RdbSerializable for ShareAggregator {
     }
 
     fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self> {
-        let state = ShareAggregatorState::rdb_load(rdb)?;
-        Ok(Self(Box::new(state)))
+        ShareAggregatorState::rdb_load(rdb).map(Self)
     }
 }
 
@@ -308,7 +326,7 @@ impl AggregationHandler for ShareAggregator {
     }
 }
 
-// Support for ALL and NONE
+// Support for ALL, ANY and NONE. Each update skips NaN, like the rest of the filtered family.
 #[derive(Debug, Default, Clone, Copy, Hash, PartialEq, GetSize)]
 struct AllNoneAggregatorState {
     matches: Option<bool>,
@@ -317,6 +335,9 @@ struct AllNoneAggregatorState {
 
 impl AllNoneAggregatorState {
     fn update_all(&mut self, value: f64) -> bool {
+        if value.is_nan() {
+            return false;
+        }
         match self.matches {
             Some(false) => { // already failed
             }
@@ -329,6 +350,9 @@ impl AllNoneAggregatorState {
     }
 
     fn update_none(&mut self, value: f64) -> bool {
+        if value.is_nan() {
+            return false;
+        }
         match self.matches {
             Some(false) => (), // already false
             _ => {
@@ -339,6 +363,9 @@ impl AllNoneAggregatorState {
     }
 
     fn update_any(&mut self, value: f64) -> bool {
+        if value.is_nan() {
+            return false;
+        }
         match self.matches {
             Some(true) => (), // already matched
             _ => {
@@ -386,7 +413,7 @@ impl AllNoneAggregatorState {
 
 /// Aggregator that returns a 1.0 if all values match a condition
 #[derive(Debug, Default, Clone, Hash, PartialEq, GetSize)]
-pub struct AllAggregator(Box<AllNoneAggregatorState>);
+pub struct AllAggregator(AllNoneAggregatorState);
 
 impl RdbSerializable for AllAggregator {
     fn rdb_save(&self, rdb: *mut RedisModuleIO) {
@@ -394,8 +421,7 @@ impl RdbSerializable for AllAggregator {
     }
 
     fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self> {
-        let state = AllNoneAggregatorState::load_from_rdb(rdb)?;
-        Ok(Self(Box::new(state)))
+        AllNoneAggregatorState::load_from_rdb(rdb).map(Self)
     }
 }
 
@@ -415,7 +441,7 @@ impl AggregationHandler for AllAggregator {
 
 /// Aggregator that checks returns a 1.0 if none of the values match a condition
 #[derive(Debug, Default, Clone, Hash, PartialEq, GetSize)]
-pub struct NoneAggregator(Box<AllNoneAggregatorState>);
+pub struct NoneAggregator(AllNoneAggregatorState);
 
 impl AggregationHandler for NoneAggregator {
     fn update(&mut self, _timestamp: i64, value: f64) -> bool {
@@ -437,14 +463,13 @@ impl RdbSerializable for NoneAggregator {
     }
 
     fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self> {
-        let state = AllNoneAggregatorState::load_from_rdb(rdb)?;
-        Ok(Self(Box::new(state)))
+        AllNoneAggregatorState::load_from_rdb(rdb).map(Self)
     }
 }
 
 /// Any aggregator that checks if any of the values match a condition
 #[derive(Debug, Default, Clone, Hash, PartialEq, GetSize)]
-pub struct AnyAggregator(Box<AllNoneAggregatorState>);
+pub struct AnyAggregator(AllNoneAggregatorState);
 impl AggregationHandler for AnyAggregator {
     fn update(&mut self, _timestamp: i64, value: f64) -> bool {
         self.0.update_any(value)
@@ -465,24 +490,25 @@ impl RdbSerializable for AnyAggregator {
     }
 
     fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self> {
-        let state = AllNoneAggregatorState::load_from_rdb(rdb)?;
-        Ok(Self(Box::new(state)))
+        AllNoneAggregatorState::load_from_rdb(rdb).map(Self)
     }
 }
 
 macro_rules! impl_conditional_aggregator {
     ($name:ident, $state:ty) => {
+        impl_conditional_aggregator!($name, $state, |state| state);
+    };
+    ($name:ident, $state:ty, boxed) => {
+        impl_conditional_aggregator!($name, $state, Box::new);
+    };
+    ($name:ident, $state:ty, $wrap:expr) => {
         impl $name {
             pub fn new(op: ComparisonOperator, comparand: f64) -> Self {
-                Self(Box::new(<$state>::new(op, comparand)))
+                Self($wrap(<$state>::new(op, comparand)))
             }
 
             pub fn condition(&self) -> ValueComparisonFilter {
                 self.0.filter
-            }
-
-            pub fn reset(&mut self) {
-                self.0.reset();
             }
 
             pub fn save_to_rdb(&self, rdb: *mut RedisModuleIO) {
@@ -491,14 +517,15 @@ macro_rules! impl_conditional_aggregator {
 
             pub fn load_from_rdb(rdb: *mut RedisModuleIO) -> ValkeyResult<Self> {
                 let state = <$state>::load_from_rdb(rdb)?;
-                Ok(Self(Box::new(state)))
+                Ok(Self($wrap(state)))
             }
         }
     };
 }
 
-impl_conditional_aggregator!(CountIfAggregator, ConditionalCountState);
-impl_conditional_aggregator!(SumIfAggregator, ConditionalCountState);
+impl_conditional_aggregator!(CountIfAggregator, ConditionalTally);
+// 40 bytes, past the `Aggregator` payload: inlining it would grow every aggregator.
+impl_conditional_aggregator!(SumIfAggregator, ConditionalCountState, boxed);
 impl_conditional_aggregator!(AllAggregator, AllNoneAggregatorState);
 impl_conditional_aggregator!(NoneAggregator, AllNoneAggregatorState);
 impl_conditional_aggregator!(AnyAggregator, AllNoneAggregatorState);
@@ -519,7 +546,7 @@ mod tests {
         // `NaN != 5` is true, so NaN used to pass the filter: `sumif` returned NaN and
         // `countif` counted it.
         let mut sum_if = SumIfAggregator(not_equal_5());
-        let mut count_if = CountIfAggregator(not_equal_5());
+        let mut count_if = CountIfAggregator::new(ComparisonOperator::NotEqual, 5.0);
         for value in [1.0, f64::NAN, 5.0, 2.0] {
             sum_if.update(0, value);
             count_if.update(0, value);

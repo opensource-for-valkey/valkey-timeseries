@@ -680,7 +680,10 @@ mod tests {
         // Check AVG rule
         assert!(rules.contains_key("temperature_AVG_60000"));
         let (avg_rule, avg_retention) = &rules["temperature_AVG_60000"];
-        assert_eq!(avg_rule.aggregator, AggregationType::Avg.into());
+        assert_eq!(
+            avg_rule.aggregator,
+            crate::aggregators::Aggregator::try_from(AggregationType::Avg).unwrap()
+        );
         assert_eq!(avg_rule.bucket_duration, 60000);
         assert_eq!(avg_rule.align_timestamp, 0);
         assert_eq!(*avg_retention, 7200000); // 2h in ms
@@ -688,7 +691,10 @@ mod tests {
         // Check SUM rule
         assert!(rules.contains_key("temperature_SUM_30000"));
         let (sum_rule, sum_retention) = &rules["temperature_SUM_30000"];
-        assert_eq!(sum_rule.aggregator, AggregationType::Sum.into());
+        assert_eq!(
+            sum_rule.aggregator,
+            crate::aggregators::Aggregator::try_from(AggregationType::Sum).unwrap()
+        );
         assert_eq!(sum_rule.bucket_duration, 30000);
         assert_eq!(sum_rule.align_timestamp, 0);
         assert_eq!(*sum_retention, 3600000); // 1h in ms
@@ -711,7 +717,10 @@ mod tests {
         let rule_key = "temperature_sensor_MAX_60000_2000";
         assert!(rules.contains_key(rule_key));
         let (rule, retention) = &rules[rule_key];
-        assert_eq!(rule.aggregator, AggregationType::Max.into());
+        assert_eq!(
+            rule.aggregator,
+            crate::aggregators::Aggregator::try_from(AggregationType::Max).unwrap()
+        );
         assert_eq!(*retention, 3600000);
     }
 
@@ -846,7 +855,10 @@ mod tests {
 
         // Check all rule properties
         assert_eq!(rule.dest, SeriesLink::from_key(rule_key.as_bytes()));
-        assert_eq!(rule.aggregator, AggregationType::StdP.into());
+        assert_eq!(
+            rule.aggregator,
+            crate::aggregators::Aggregator::try_from(AggregationType::StdP).unwrap()
+        );
         assert_eq!(rule.bucket_duration, 45000); // 45s in ms
         assert_eq!(rule.align_timestamp, 5000);
         assert!(rule.bucket_start.is_none()); // Should be None initially

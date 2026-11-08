@@ -774,7 +774,7 @@ mod tests {
     fn test_rule(dest_key: &[u8]) -> CompactionRule {
         CompactionRule {
             dest: SeriesLink::from_key(dest_key),
-            aggregator: AggregationType::Sum.into(),
+            aggregator: crate::aggregators::Aggregator::try_from(AggregationType::Sum).unwrap(),
             bucket_duration: 1000,
             align_timestamp: 0,
             bucket_start: None,

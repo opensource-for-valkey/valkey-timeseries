@@ -170,6 +170,16 @@ class TestTimeSeriesMRange(ValkeyTimeSeriesTestCaseBase):
                 'FILTER', 'sensor=temp',
                 'GROUPBY', 'sensor', 'REDUCE', 'avg>0')
 
+    @pytest.mark.parametrize('reducer', ['first', 'last', 'rate', 'irate', 'increase'])
+    def test_mrange_groupby_rejects_order_and_time_dependent_reducers(self, reducer):
+        self.setup_data()
+
+        with pytest.raises(ResponseError, match="TSDB: Invalid reducer type"):
+            self.client.execute_command(
+                'TS.MRANGE', self.start_ts, self.start_ts + 100,
+                'FILTER', 'sensor=temp',
+                'GROUPBY', 'sensor', 'REDUCE', reducer)
+
     def test_mrange_empty(self):
 
         self.setup_data()

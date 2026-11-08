@@ -122,8 +122,13 @@ Control bucket alignment:
 | Aggregator | Description                                      | Notes                                                                 |
 |------------|--------------------------------------------------|-----------------------------------------------------------------------|
 | `increase` | Total increase for monotonic counters            | Handles resets                                                        |
-| `rate`     | Rate of change per second over the bucket window | —                                                                     |
-| `irate`    | Instantaneous rate from the last two samples     | Requires ≥ 2 samples and positive time delta; returns `NaN` otherwise |
+| `rate`     | Rate of change per second over the bucket window | `increase` divided by the bucket duration in seconds                  |
+| `irate`    | Instantaneous rate from the bucket's last sample and the one before it, which may be in an earlier bucket | `NaN` when there is no earlier sample, the time delta is not positive, or the counter reset |
+
+The last sample of each bucket is the starting point of the next, across empty buckets too, so the delta between
+two buckets counts in the later one and the per-bucket `increase` values add up to the counter's whole increase. A
+drop in value is a counter reset and adds nothing. The first bucket in the queried range has no earlier sample: when it
+holds only one sample, all three report `NaN`. Compaction rules (`TS.CREATERULE`) carry the same way.
 
 ### Filtered Aggregators
 
@@ -137,6 +142,9 @@ Control bucket alignment:
 | `all`      | `1.0` if all samples match, `0.0` otherwise           | `NaN`              |
 | `any`      | `1.0` if any sample matches, `0.0` otherwise          | `NaN`              |
 | `none`     | `1.0` if no samples match, `0.0` otherwise            | `NaN`              |
+
+`NaN` samples never match a condition and are not counted: `share!=5` over `[NaN, 10, NaN, 20]` is
+`1.0`, not `0.5`, and a bucket holding only `NaN` gives these aggregators no value.
 
 `count` and `sum` also accept an *optional* inline condition (`count>5`, `sum<=2`) to count or
 sum only matching samples; without one they operate over every sample in the bucket as usual.

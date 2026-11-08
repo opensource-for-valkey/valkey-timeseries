@@ -1,4 +1,4 @@
-use crate::aggregators::{AggregationType, BucketAlignment, BucketTimestamp};
+use crate::aggregators::{AggregationType, BucketAlignment, BucketTimestamp, ReducerSupport};
 use crate::common::Timestamp;
 use crate::common::binop::ComparisonOperator;
 use crate::common::rounding::{
@@ -646,18 +646,11 @@ fn validate_align_against_bounds(
     Ok(())
 }
 
-/// Whether an aggregator may be used as a `GROUPBY ... REDUCE` reducer.
-///
-/// Rejects the scan-order-dependent aggregators (`first`/`last`) and `Rate` (it
-/// needs a time window), matching RedisTimeSeries, which reports "Invalid
-/// reducer type" for them. Everything else `AggregationType` recognizes stays
-/// valid — including this engine's filtered-reducer extensions (`countif`,
-/// `sumif`, …), which RTS lacks but which are out of scope for parity and must
-/// keep working (tests/test_ts_mrange.py). Unknown names never reach here: they
-/// fail `AggregationType::try_from` and are rejected on the same path.
+/// Whether an aggregator may be used as a `GROUPBY ... REDUCE` reducer. Matches
+/// RedisTimeSeries' "Invalid reducer type" on the shared surface; the filtered extensions
+/// (`countif`, `sumif`, ...) stay valid (tests/test_ts_mrange.py).
 fn is_valid_reducer(agg: &AggregationType) -> bool {
-    use AggregationType::*;
-    !matches!(agg, First | Last | Rate)
+    agg.reducer_support() != ReducerSupport::Invalid
 }
 
 pub(super) fn parse_grouping_params(
@@ -1734,6 +1727,17 @@ fn parse_limit_value(val: &str) -> ValkeyResult<Option<usize>> {
 mod tests {
     use super::*;
     use strum::IntoEnumIterator;
+
+    #[test]
+    fn reducers_exclude_order_and_time_dependent_aggregators() {
+        use AggregationType::*;
+        for rejected in [First, Last, Rate, IRate, Increase] {
+            assert!(!is_valid_reducer(&rejected), "{rejected:?}");
+        }
+        for accepted in [Sum, Avg, Min, Max, Count, Range, StdP, CountIf, Share, All] {
+            assert!(is_valid_reducer(&accepted), "{accepted:?}");
+        }
+    }
 
     /// DIV-0014. Built directly rather than through `RepeatedOptions::new()` so
     /// the two modes are exercised without touching the process-wide config,

@@ -122,6 +122,18 @@ impl From<Timestamp> for BucketAlignment {
     }
 }
 
+/// How an aggregator can serve as a `GROUPBY ... REDUCE` reducer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReducerSupport {
+    /// Rejected by the parser. `first`/`last` depend on scan order; a reducer sees every member
+    /// at one timestamp, where the counter family has no time delta or depends on member order.
+    Invalid,
+    /// Shards pre-reduce into a mergeable state (`PartialReducer`).
+    Decomposable,
+    /// Valid, but the coordinator reduces finalized member values itself.
+    FallbackOnly,
+}
+
 /// The discriminants are persisted: compaction rules write them to RDB (`Aggregator::rdb_save`)
 /// and read them back through `TryFrom<u8>`. They are pinned explicitly so reordering or
 /// inserting a variant cannot silently change the on-disk meaning — new variants take new
@@ -199,9 +211,14 @@ impl AggregationType {
         matches!(self, AggregationType::Count | AggregationType::Sum)
     }
 
-    /// Returns true if the aggregation type can be used for GroupBy Reduce operations
-    pub fn is_groupable(&self) -> bool {
-        !self.is_filtered()
+    /// Whether a bucket's value depends on the sample before it: the counter aggregators carry
+    /// their last sample across [`AggregationHandler::reset`]. Recomputing one of their buckets
+    /// in isolation must seed it with that sample, and changing a bucket can change the next.
+    pub fn carries_baseline(&self) -> bool {
+        matches!(
+            self,
+            AggregationType::Increase | AggregationType::Rate | AggregationType::IRate
+        )
     }
 
     /// What this aggregator reports for a group it accepted nothing from — `true` for 0,
@@ -225,32 +242,9 @@ impl AggregationType {
         )
     }
 
-    // In the aggregation logic where Last/First are handled:
-    // When is_reverse is true, swap the behavior of First and Last
-    pub fn apply_reverse_adjusted(&self, is_reverse: bool) -> AggregationType {
-        if is_reverse {
-            match self {
-                AggregationType::First => AggregationType::Last,
-                AggregationType::Last => AggregationType::First,
-                other => *other,
-            }
-        } else {
-            *self
-        }
-    }
-
-    /// Returns true if the reducer can be pre-reduced shard-side into a
-    /// mergeable partial state, i.e. `finalize(merge(states...))` equals the
-    /// single-node result over the concatenated inputs.
-    ///
-    /// `increase`/`irate` reduce over same-timestamp values in merge order, so
-    /// cross-shard merging cannot reproduce a single interleaving. `rate` and
-    /// the filtered types are not accepted as reducers at all.
-    ///
-    /// Must agree with [`PartialReducer::for_config`], which builds the state.
-    ///
-    /// [`PartialReducer::for_config`]: crate::aggregators::partial_reducer::PartialReducer::for_config
-    pub fn is_decomposable(&self) -> bool {
+    /// Whether and how this aggregator serves as a `GROUPBY ... REDUCE` reducer: the one
+    /// definition, used by the parser and pinned against `PartialReducer::for_config`.
+    pub fn reducer_support(&self) -> ReducerSupport {
         match self {
             AggregationType::Sum
             | AggregationType::SumIf
@@ -265,16 +259,16 @@ impl AggregationType {
             | AggregationType::StdP
             | AggregationType::StdS
             | AggregationType::VarP
-            | AggregationType::VarS
-            | AggregationType::First
-            | AggregationType::Last => true,
-            AggregationType::Increase
-            | AggregationType::IRate
-            | AggregationType::Rate
-            | AggregationType::All
+            | AggregationType::VarS => ReducerSupport::Decomposable,
+            AggregationType::All
             | AggregationType::Any
             | AggregationType::None
-            | AggregationType::Share => false,
+            | AggregationType::Share => ReducerSupport::FallbackOnly,
+            AggregationType::First
+            | AggregationType::Last
+            | AggregationType::Rate
+            | AggregationType::IRate
+            | AggregationType::Increase => ReducerSupport::Invalid,
         }
     }
 }
@@ -380,14 +374,29 @@ pub fn calc_bucket_start(
     align_timestamp: Timestamp,
     bucket_duration: u64,
 ) -> Timestamp {
-    let diff = ts - align_timestamp;
-    let delta = bucket_duration as i64;
-    0.max(ts - ((diff % delta + delta) % delta))
+    bucket_start_for(ts, align_timestamp, bucket_duration).max(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calc_bucket_start_handles_the_largest_duration() {
+        let duration = i64::MAX as u64;
+        assert_eq!(calc_bucket_start(Timestamp::MAX - 1, 0, duration), 0);
+        assert_eq!(calc_bucket_start(1, 0, duration), 0);
+        assert_eq!(
+            calc_bucket_start(Timestamp::MAX, 0, duration),
+            Timestamp::MAX
+        );
+    }
+
+    #[test]
+    fn calc_bucket_start_clamps_a_negative_start() {
+        assert_eq!(calc_bucket_start(100, 250, 1000), 0);
+        assert_eq!(calc_bucket_start(250, 250, 1000), 250);
+    }
 
     #[test]
     fn bucket_timestamp_calculates_correctly_for_start() {
@@ -658,102 +667,6 @@ mod tests {
             assert_eq!(byte as usize, discriminant, "{aggregation:?}");
             assert_eq!(AggregationType::try_from(byte).unwrap(), *aggregation);
         }
-    }
-
-    #[test]
-    fn aggregation_type_from_u8_conversion() {
-        assert_eq!(
-            AggregationType::try_from(0u8).unwrap(),
-            AggregationType::All
-        );
-        assert_eq!(
-            AggregationType::try_from(1u8).unwrap(),
-            AggregationType::Any
-        );
-        assert_eq!(
-            AggregationType::try_from(2u8).unwrap(),
-            AggregationType::Avg
-        );
-        assert_eq!(
-            AggregationType::try_from(3u8).unwrap(),
-            AggregationType::Count
-        );
-        assert_eq!(
-            AggregationType::try_from(4u8).unwrap(),
-            AggregationType::CountAll
-        );
-        assert_eq!(
-            AggregationType::try_from(5u8).unwrap(),
-            AggregationType::CountIf
-        );
-        assert_eq!(
-            AggregationType::try_from(6u8).unwrap(),
-            AggregationType::CountNan
-        );
-        assert_eq!(
-            AggregationType::try_from(7u8).unwrap(),
-            AggregationType::First
-        );
-        assert_eq!(
-            AggregationType::try_from(8u8).unwrap(),
-            AggregationType::Increase
-        );
-        assert_eq!(
-            AggregationType::try_from(9u8).unwrap(),
-            AggregationType::IRate
-        );
-        assert_eq!(
-            AggregationType::try_from(10u8).unwrap(),
-            AggregationType::Last
-        );
-        assert_eq!(
-            AggregationType::try_from(11u8).unwrap(),
-            AggregationType::Max
-        );
-        assert_eq!(
-            AggregationType::try_from(12u8).unwrap(),
-            AggregationType::Min
-        );
-        assert_eq!(
-            AggregationType::try_from(13u8).unwrap(),
-            AggregationType::None
-        );
-        assert_eq!(
-            AggregationType::try_from(14u8).unwrap(),
-            AggregationType::Range
-        );
-        assert_eq!(
-            AggregationType::try_from(15u8).unwrap(),
-            AggregationType::Rate
-        );
-        assert_eq!(
-            AggregationType::try_from(16u8).unwrap(),
-            AggregationType::Share
-        );
-        assert_eq!(
-            AggregationType::try_from(17u8).unwrap(),
-            AggregationType::StdP
-        );
-        assert_eq!(
-            AggregationType::try_from(18u8).unwrap(),
-            AggregationType::StdS
-        );
-        assert_eq!(
-            AggregationType::try_from(19u8).unwrap(),
-            AggregationType::Sum
-        );
-        assert_eq!(
-            AggregationType::try_from(20u8).unwrap(),
-            AggregationType::SumIf
-        );
-        assert_eq!(
-            AggregationType::try_from(21u8).unwrap(),
-            AggregationType::VarP
-        );
-        assert_eq!(
-            AggregationType::try_from(22u8).unwrap(),
-            AggregationType::VarS
-        );
     }
 
     #[test]

@@ -218,11 +218,11 @@ computed shard-side: shards return aggregated buckets instead of raw samples, cu
 CPU roughly by the ratio of samples per bucket. Results are exact for every aggregator type.
 
 `GROUPBY`/`REDUCE` queries are additionally pre-reduced shard-side when the reducer is decomposable (`sum`, `count`,
-`countall`, `countnan`, `min`, `max`, `range`, `avg`, `std.p`, `std.s`, `var.p`, `var.s`, `first`, `last`, including
-their filtered variants such as `countif`/`sumif` with an inline condition): each shard ships one partial-state series
-per (group, shard), and the coordinator merges and finalizes them per bucket. Order-sensitive reducers (`increase`,
-`irate`) automatically fall back to per-series bucket transport. `COUNT` and reversal (`TS.MREVRANGE`) are always
-applied at the coordinator.
+`countall`, `countnan`, `min`, `max`, `range`, `avg`, `std.p`, `std.s`, `var.p`, `var.s`, including their filtered
+variants such as `countif`/`sumif` with an inline condition): each shard ships one partial-state series per (group,
+shard), and the coordinator merges and finalizes them per bucket. The remaining reducers (`share`, `all`, `any`,
+`none`) fall back to per-series bucket transport; `first`, `last`, `rate`, `irate` and `increase` are not accepted as
+reducers. `COUNT` and reversal (`TS.MREVRANGE`) are always applied at the coordinator.
 
 Multi-aggregation queries (`AGGREGATION avg,max,count …`) participate in both push-downs: per-series buckets travel as
 one compressed chunk per aggregation column, and group partials carry one reducer state per column per bucket, reduced

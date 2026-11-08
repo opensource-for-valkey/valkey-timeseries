@@ -839,8 +839,6 @@ pub struct ReducePartialState {
     pub acc1: f64,
     #[prost(double, tag = "3")]
     pub acc2: f64,
-    #[prost(int64, tag = "4")]
-    pub ts: i64,
     #[prost(double, tag = "5")]
     pub acc1_compensation: f64,
 }

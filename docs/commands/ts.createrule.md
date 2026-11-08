@@ -26,8 +26,8 @@ storage and analysis.
     - `share` — Ratio of values satisfying a condition to total values
     - `none` — 1 if no values satisfy a condition, else 0
     - `first` — First value in the bucket
-    - `increase` — Counter increase over the bucket (handles resets)
-    - `irate` — Instantaneous rate from the last two values in the bucket (handles resets)
+    - `increase` — Counter increase over the bucket, from the previous bucket's last sample (handles resets)
+    - `irate` — Instantaneous rate from the bucket's last value and the one before it (handles resets)
     - `last` — Last value in the bucket
     - `sum` — Sum of values
     - `min` — Minimum value
@@ -41,7 +41,7 @@ storage and analysis.
     - `stds` — Sample standard deviation
     - `var_p` — Population variance
     - `var_s` — Sample variance
-    - `rate` — Rate of change per second (handles resets)
+    - `rate` — `increase` per second of bucket (handles resets)
 - **bucketDuration**: The duration of each aggregation bucket (e.g., `1h`, `30m`, `5000ms`).
 - **op value**: Inline comparison condition attached directly to `aggregator` with no separator,
   e.g. `countif>100`. `op` is one of `==`, `!=`, `>=`, `<=`, `<`, `>`; `aggregator` and `op value`

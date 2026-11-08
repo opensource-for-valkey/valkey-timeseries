@@ -271,6 +271,48 @@ class TestBucketTimestamp:
         )
 
 
+I64_MAX = 2**63 - 1
+
+
+class TestBucketBoundaries:
+    def test_empty_at_duration_one_reports_every_missing_bucket(self, diff, range_cmd):
+        mk_populated(diff, "r:unit", [(0, 1.0), (3, 2.0)])
+        diff(range_cmd, "r:unit", "-", "+", "AGGREGATION", "sum", 1, "EMPTY")
+
+    @pytest.mark.parametrize("extra", ((), ("EMPTY",)))
+    def test_final_bucket_holds_i64_max(self, diff, range_cmd, extra):
+        mk_populated(diff, "r:top", [(I64_MAX - 1, 1.0), (I64_MAX, 2.0)])
+        diff(range_cmd, "r:top", "-", "+", "AGGREGATION", "sum", 10, *extra)
+
+    def test_empty_fills_up_to_the_final_bucket(self, diff, range_cmd):
+        mk_populated(diff, "r:topgap", [(I64_MAX - 30, 1.0), (I64_MAX, 2.0)])
+        diff(range_cmd, "r:topgap", "-", "+", "AGGREGATION", "sum", 10, "EMPTY")
+
+    @pytest.mark.parametrize("duration", (2**61, 2**61 + 1))
+    def test_large_duration(self, diff, range_cmd, duration):
+        mk_populated(diff, "r:wide", [(I64_MAX - 2, 1.0), (I64_MAX - 1, 2.0)])
+        diff(range_cmd, "r:wide", "-", "+", "AGGREGATION", "sum", duration)
+
+    def test_duration_above_i64_rejected(self, diff, range_cmd):
+        mk_populated(diff, "r:wide2", [(1, 1.0)])
+        with pytest.raises(ResponseError):
+            diff(range_cmd, "r:wide2", "-", "+", "AGGREGATION", "sum", 2**63)
+
+
+F64_MAX = 1.7976931348623157e308
+
+
+class TestExtremeValues:
+    @pytest.mark.parametrize("values", (
+        (F64_MAX, F64_MAX),
+        (F64_MAX, F64_MAX, -F64_MAX),
+        (-F64_MAX, -F64_MAX, -F64_MAX),
+    ))
+    def test_avg_of_values_whose_sum_overflows(self, diff, range_cmd, values):
+        mk_populated(diff, "r:huge", list(enumerate(values)))
+        diff(range_cmd, "r:huge", "-", "+", "AGGREGATION", "avg", 10)
+
+
 class TestEmpty:
     @pytest.mark.parametrize("agg", AGGREGATORS)
     def test_empty_gap_bucket_value_per_aggregator(self, diff, range_cmd, agg):

@@ -14,7 +14,7 @@
 //! back to per-series bucket transport (Phase 1).
 
 use crate::aggregators::AggregationType;
-use crate::aggregators::kahan::KahanSum;
+use crate::aggregators::kahan::{AVG_SHADOW_SCALE, KahanSum, mean_of};
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::series::request_types::{AggregatorConfig, ValueComparisonFilter};
 use smallvec::SmallVec;
@@ -39,17 +39,15 @@ pub enum PartialReducerKind {
     Max,
     /// acc1 = min, acc2 = max; finalize max - min
     Range,
-    /// acc1 = sum; finalize sum / count
+    /// acc1 = sum, acc2 = the sum scaled by `kahan::AVG_SHADOW_SCALE`, read only when acc1
+    /// overflowed; finalize sum / count
     Avg,
-    /// acc1 = running mean, acc2 = M2 (Welford); finalize per variant
+    /// acc1 = running mean of `value - acc1_c`, acc2 = M2 (Welford), acc1_c = the shift (the
+    /// first value), as `AggStd` keeps them; finalize per variant
     StdP,
     StdS,
     VarP,
     VarS,
-    /// acc1 = value, ts = contributing timestamp; keep min ts
-    First,
-    /// acc1 = value, ts = contributing timestamp; keep max ts
-    Last,
 }
 
 /// Mergeable accumulator for one bucket timestamp.
@@ -61,12 +59,12 @@ pub struct PartialState {
     pub count: u64,
     pub acc1: f64,
     pub acc2: f64,
-    /// Neumaier compensation for `acc1` (Sum/SumIf/Avg only, 0.0 elsewhere).
+    /// Neumaier compensation for `acc1` (Sum/SumIf/Avg); the dispersion kinds'
+    /// shift; 0.0 elsewhere.
     /// Folded into the finalized value; carried separately so merges stay
     /// compensated. A partial without one (e.g. an older peer) is exactly
     /// "a sum with no accumulated error".
     pub acc1_c: f64,
-    pub ts: Timestamp,
 }
 
 /// Accumulates one timestamp group shard-side. Created per group via
@@ -121,12 +119,10 @@ impl PartialReducer {
             At::StdS => (PartialReducerKind::StdS, NanAcceptance::Reject),
             At::VarP => (PartialReducerKind::VarP, NanAcceptance::Reject),
             At::VarS => (PartialReducerKind::VarS, NanAcceptance::Reject),
-            At::First => (PartialReducerKind::First, NanAcceptance::Reject),
-            At::Last => (PartialReducerKind::Last, NanAcceptance::Reject),
-            // Order-sensitive across series: not decomposable.
-            At::Increase | At::IRate => return None,
-            // Not valid reducers (rejected by the parser) — never pushed down.
-            At::All | At::Any | At::None | At::Share | At::Rate => return None,
+            // The coordinator reduces these itself, or the parser rejected them; see
+            // `AggregationType::reducer_support`, which a test pins against this match.
+            At::All | At::Any | At::None | At::Share => return None,
+            At::First | At::Last | At::Rate | At::IRate | At::Increase => return None,
         };
         Some(Self {
             kind,
@@ -153,7 +149,7 @@ impl PartialReducer {
         }
     }
 
-    pub fn update(&mut self, ts: Timestamp, value: f64) {
+    pub fn update(&mut self, value: f64) {
         if !self.accepts(value) {
             return;
         }
@@ -161,10 +157,16 @@ impl PartialReducer {
         let first_value = s.count == 0;
         s.count += 1;
         match self.kind {
-            PartialReducerKind::Sum | PartialReducerKind::SumIf | PartialReducerKind::Avg => {
+            PartialReducerKind::Sum | PartialReducerKind::SumIf => {
                 let mut sum = KahanSum::from_parts(s.acc1, s.acc1_c);
                 sum += value;
                 (s.acc1, s.acc1_c) = sum.into_parts();
+            }
+            PartialReducerKind::Avg => {
+                let mut sum = KahanSum::from_parts(s.acc1, s.acc1_c);
+                sum += value;
+                (s.acc1, s.acc1_c) = sum.into_parts();
+                s.acc2 += value * AVG_SHADOW_SCALE;
             }
             PartialReducerKind::Count | PartialReducerKind::CountIf => {}
             PartialReducerKind::Min => {
@@ -197,22 +199,15 @@ impl PartialReducer {
                 // Welford: acc1 = running mean, acc2 = M2. Unlike the
                 // sum-of-squares form this cannot cancel catastrophically and
                 // M2 is nonnegative by construction. `count` was already
-                // incremented above.
-                let delta = value - s.acc1;
+                // incremented above. Accumulated relative to the first value, as
+                // `AggStd` does, so the mean keeps the data's precision.
+                if first_value {
+                    s.acc1_c = value;
+                }
+                let x = value - s.acc1_c;
+                let delta = x - s.acc1;
                 s.acc1 += delta / s.count as f64;
-                s.acc2 += delta * (value - s.acc1);
-            }
-            PartialReducerKind::First => {
-                if first_value || ts < s.ts {
-                    s.acc1 = value;
-                    s.ts = ts;
-                }
-            }
-            PartialReducerKind::Last => {
-                if first_value || ts >= s.ts {
-                    s.acc1 = value;
-                    s.ts = ts;
-                }
+                s.acc2 += delta * (x - s.acc1);
             }
         }
     }
@@ -236,10 +231,16 @@ impl PartialReducer {
         let (n_a, n_b) = (into.count as f64, other.count as f64);
         into.count += other.count;
         match kind {
-            PartialReducerKind::Sum | PartialReducerKind::SumIf | PartialReducerKind::Avg => {
+            PartialReducerKind::Sum | PartialReducerKind::SumIf => {
                 let mut sum = KahanSum::from_parts(into.acc1, into.acc1_c);
                 sum += KahanSum::from_parts(other.acc1, other.acc1_c);
                 (into.acc1, into.acc1_c) = sum.into_parts();
+            }
+            PartialReducerKind::Avg => {
+                let mut sum = KahanSum::from_parts(into.acc1, into.acc1_c);
+                sum += KahanSum::from_parts(other.acc1, other.acc1_c);
+                (into.acc1, into.acc1_c) = sum.into_parts();
+                into.acc2 += other.acc2;
             }
             PartialReducerKind::Count | PartialReducerKind::CountIf => {}
             PartialReducerKind::Min => into.acc1 = into.acc1.min(other.acc1),
@@ -252,23 +253,12 @@ impl PartialReducer {
             | PartialReducerKind::StdS
             | PartialReducerKind::VarP
             | PartialReducerKind::VarS => {
-                // Chan's parallel combine of two Welford states.
+                // Chan's parallel combine of two Welford states, `other`'s mean
+                // re-expressed relative to `into`'s shift first.
                 let n = n_a + n_b;
-                let delta = other.acc1 - into.acc1;
+                let delta = ((other.acc1_c - into.acc1_c) + other.acc1) - into.acc1;
                 into.acc1 += delta * (n_b / n);
                 into.acc2 += other.acc2 + delta * delta * (n_a * n_b / n);
-            }
-            PartialReducerKind::First => {
-                if other.ts < into.ts {
-                    into.acc1 = other.acc1;
-                    into.ts = other.ts;
-                }
-            }
-            PartialReducerKind::Last => {
-                if other.ts >= into.ts {
-                    into.acc1 = other.acc1;
-                    into.ts = other.ts;
-                }
             }
         }
     }
@@ -295,17 +285,20 @@ impl PartialReducer {
             PartialReducerKind::Sum | PartialReducerKind::SumIf => state.acc1 + state.acc1_c,
             // Selector kinds return acc1 untouched (acc1_c is always 0.0
             // here, and e.g. min must preserve a -0.0).
-            PartialReducerKind::Min
-            | PartialReducerKind::Max
-            | PartialReducerKind::First
-            | PartialReducerKind::Last => state.acc1,
+            PartialReducerKind::Min | PartialReducerKind::Max => state.acc1,
             PartialReducerKind::Count | PartialReducerKind::CountIf => n,
             PartialReducerKind::Range => state.acc2 - state.acc1,
-            PartialReducerKind::Avg => (state.acc1 + state.acc1_c) / n,
+            PartialReducerKind::Avg => mean_of(
+                &KahanSum::from_parts(state.acc1, state.acc1_c),
+                state.acc2,
+                n,
+            ),
             // acc2 is the Welford M2 — the same statistic AggStd
             // (handlers.rs) accumulates, so push-down matches the
-            // single-node dispersion aggregators. M2 is 0.0 for count == 1
-            // by construction.
+            // single-node dispersion aggregators. One sample has no spread,
+            // as `AggStd::variance` reports it — including an infinite one,
+            // whose M2 is NaN rather than 0.
+            PartialReducerKind::VarP | PartialReducerKind::StdP if state.count == 1 => 0.0,
             PartialReducerKind::VarP => state.acc2 / n,
             PartialReducerKind::VarS => {
                 if state.count == 1 {
@@ -364,11 +357,11 @@ where
         };
 
         let timestamp = first.timestamp;
-        self.reducer.update(first.timestamp, first.value);
+        self.reducer.update(first.value);
 
         for next in self.inner.by_ref() {
             if next.timestamp == timestamp {
-                self.reducer.update(next.timestamp, next.value);
+                self.reducer.update(next.value);
             } else {
                 self.buffer = Some(next);
                 break;
@@ -411,7 +404,7 @@ where
 fn update_columns(reducers: &mut [PartialReducer], row: &MultiSample) {
     debug_assert_eq!(row.values.len(), reducers.len());
     for (reducer, value) in reducers.iter_mut().zip(row.values.iter()) {
-        reducer.update(row.timestamp, *value);
+        reducer.update(*value);
     }
 }
 
@@ -492,8 +485,6 @@ mod tests {
             At::StdS,
             At::VarP,
             At::VarS,
-            At::First,
-            At::Last,
         ]
         .iter()
         .map(|&ty| AggregatorConfig::new(ty, None).unwrap())
@@ -553,7 +544,7 @@ mod tests {
                     for part in [&values[..cut1], &values[cut1..cut2], &values[cut2..]] {
                         let mut reducer = template.clone();
                         for &value in part {
-                            reducer.update(TS, value);
+                            reducer.update(value);
                         }
                         PartialReducer::merge(kind, &mut merged, &reducer.take_state());
                     }
@@ -577,7 +568,6 @@ mod tests {
     /// recovers the exact 2.0.
     #[test]
     fn test_sum_partials_survive_catastrophic_cancellation() {
-        const TS: Timestamp = 1;
         let config = AggregatorConfig::new(AggregationType::Sum, None).unwrap();
         let template = PartialReducer::for_config(&config).unwrap();
         let kind = template.kind();
@@ -587,7 +577,7 @@ mod tests {
         for part in shards {
             let mut reducer = template.clone();
             for &value in part {
-                reducer.update(TS, value);
+                reducer.update(value);
             }
             PartialReducer::merge(kind, &mut merged, &reducer.take_state());
         }
@@ -599,7 +589,6 @@ mod tests {
     /// Welford accumulation + Chan merge keep it exact.
     #[test]
     fn test_variance_partials_survive_large_offset() {
-        const TS: Timestamp = 1;
         for (ty, expected) in [
             (AggregationType::VarP, 2.0 / 3.0),
             (AggregationType::VarS, 1.0),
@@ -615,7 +604,7 @@ mod tests {
             for part in shards {
                 let mut reducer = template.clone();
                 for &value in part {
-                    reducer.update(TS, value);
+                    reducer.update(value);
                 }
                 PartialReducer::merge(kind, &mut merged, &reducer.take_state());
             }
@@ -624,6 +613,123 @@ mod tests {
                 expected,
                 &format!("{ty} around large offset"),
             );
+        }
+    }
+
+    /// Reduces `shards` through partials merged in order, and through the ordinary aggregator
+    /// over the concatenation; returns both.
+    fn both_paths(ty: AggregationType, shards: &[&[f64]]) -> (f64, f64) {
+        let config = AggregatorConfig::new(ty, None).unwrap();
+        let template = PartialReducer::for_config(&config).unwrap();
+        let kind = template.kind();
+        let mut merged = PartialState::default();
+        for part in shards {
+            let mut reducer = template.clone();
+            for &value in *part {
+                reducer.update(value);
+            }
+            PartialReducer::merge(kind, &mut merged, &reducer.take_state());
+        }
+        let samples = shards
+            .iter()
+            .flat_map(|part| part.iter())
+            .map(|&value| Sample {
+                timestamp: 1000,
+                value,
+            });
+        let ordinary = SampleReducer::new(samples, config.create_aggregator())
+            .next()
+            .unwrap()
+            .value;
+        (PartialReducer::finalize(kind, &merged), ordinary)
+    }
+
+    /// The mean of finite values is representable even when their sum is not.
+    #[test]
+    fn test_avg_survives_an_overflowing_sum() {
+        let max = f64::MAX;
+        let cases: &[(&[&[f64]], f64)] = &[
+            (&[&[max, max]], max),
+            (&[&[max], &[max]], max),
+            (&[&[max, max, max, max], &[]], max),
+            (&[&[max, max], &[-max]], max / 3.0),
+            // One side already scaled, the other not.
+            (&[&[max, max], &[1.0, 1.0]], max / 2.0),
+            (&[&[-max, -max], &[-max, -max]], -max),
+            // An infinite input still yields infinity, and opposite ones NaN.
+            (&[&[f64::INFINITY, 1.0]], f64::INFINITY),
+            (&[&[max, max], &[f64::INFINITY]], f64::INFINITY),
+            // An overflow of the opposite sign doesn't turn it into NaN, on either path.
+            (&[&[-max, -max, f64::INFINITY]], f64::INFINITY),
+            (&[&[-max, -max], &[f64::INFINITY]], f64::INFINITY),
+            (&[&[max, max], &[f64::NEG_INFINITY]], f64::NEG_INFINITY),
+        ];
+        for &(shards, expected) in cases {
+            let (partial, ordinary) = both_paths(AggregationType::Avg, shards);
+            assert_eq!(partial, expected, "partial {shards:?}");
+            assert_eq!(ordinary, expected, "ordinary {shards:?}");
+        }
+        let (partial, ordinary) = both_paths(
+            AggregationType::Avg,
+            &[&[f64::INFINITY], &[f64::NEG_INFINITY]],
+        );
+        assert!(partial.is_nan() && ordinary.is_nan());
+    }
+
+    /// Without overflow the shadow sum is never read, so ordinary means are unchanged.
+    #[test]
+    fn test_avg_without_overflow_is_the_plain_mean() {
+        let (partial, ordinary) = both_paths(AggregationType::Avg, &[&[1.0, 2.0], &[6.0]]);
+        assert_eq!((partial, ordinary), (3.0, 3.0));
+        // Far below where the shadow sum goes subnormal: the mean still comes from the exact sum.
+        let tiny = (1e-310, 3e-310);
+        let (partial, ordinary) = both_paths(AggregationType::Avg, &[&[tiny.0], &[tiny.1]]);
+        assert_eq!((partial, ordinary), (2e-310, 2e-310));
+    }
+
+    /// Two samples 2 apart at 1e16, where the ulp is 2: the running mean, 1e16 + 1, is not
+    /// representable, and updating it in place doubled M2. The exact answers are representable,
+    /// and every partition and both paths must give them.
+    #[test]
+    fn test_dispersion_near_the_precision_limit_is_exact() {
+        let (a, b) = (1e16, 1e16 + 2.0);
+        for (ty, expected) in [
+            (AggregationType::VarP, 1.0),
+            (AggregationType::StdP, 1.0),
+            (AggregationType::VarS, 2.0),
+            (AggregationType::StdS, 2f64.sqrt()),
+        ] {
+            for shards in [
+                &[&[a, b][..]][..],
+                &[&[a][..], &[b][..]][..],
+                &[&[b][..], &[a][..]][..],
+            ] {
+                let (partial, ordinary) = both_paths(ty, shards);
+                assert_eq!(
+                    (partial, ordinary),
+                    (expected, expected),
+                    "{ty} over {shards:?}"
+                );
+            }
+        }
+        // Offsets that differ between partials still merge exactly.
+        let (partial, _) = both_paths(AggregationType::VarP, &[&[1e9, 1e9 + 1.0], &[1e9 + 2.0]]);
+        assert_eq!(partial, 2.0 / 3.0);
+    }
+
+    /// One infinite sample has no spread to report on either path.
+    #[test]
+    fn test_population_dispersion_of_one_infinity_agrees() {
+        for ty in [
+            AggregationType::VarP,
+            AggregationType::StdP,
+            AggregationType::VarS,
+            AggregationType::StdS,
+        ] {
+            for value in [f64::INFINITY, f64::NEG_INFINITY] {
+                let (partial, ordinary) = both_paths(ty, &[&[value]]);
+                assert_eq!((partial, ordinary), (0.0, 0.0), "{ty} over {value}");
+            }
         }
     }
 
@@ -639,34 +745,26 @@ mod tests {
         }
     }
 
-    /// `AggregationType::is_decomposable` is the coordinator's cheap
-    /// eligibility test; `for_config` is what actually builds the state. They
-    /// must never disagree, or the coordinator sets `apply_group_reduce` for a
-    /// reducer no shard can pre-reduce (or forgoes push-down for one it can).
+    /// `reducer_support` is what the parser consults; `for_config` is what actually builds the
+    /// state. If they disagreed the coordinator would forgo push-down for a reducer shards could
+    /// pre-reduce, or keep dead kinds alive for one the parser rejects.
     #[test]
-    fn test_is_decomposable_agrees_with_for_config() {
-        use AggregationType as At;
+    fn test_reducer_support_agrees_with_for_config() {
+        use crate::aggregators::ReducerSupport;
 
-        for config in decomposable_configs() {
-            assert!(
-                config.aggregation.is_decomposable(),
-                "{} is decomposable but is_decomposable() said no",
-                config.aggregation
+        let filter = ValueComparisonFilter {
+            operator: ComparisonOperator::GreaterThan,
+            value: 0.0,
+        };
+        let all = (0..=u8::MAX).filter_map(|byte| AggregationType::try_from(byte).ok());
+        for ty in all {
+            let condition = ty.is_filtered().then_some(filter);
+            let config = AggregatorConfig::new(ty, condition).unwrap();
+            assert_eq!(
+                PartialReducer::for_config(&config).is_some(),
+                ty.reducer_support() == ReducerSupport::Decomposable,
+                "{ty}"
             );
-        }
-
-        for ty in [At::Increase, At::IRate, At::Rate] {
-            let config = AggregatorConfig::new(ty, None).unwrap();
-            assert!(
-                !ty.is_decomposable(),
-                "{ty} is not decomposable but is_decomposable() said yes"
-            );
-            assert!(PartialReducer::for_config(&config).is_none());
-        }
-
-        // Not valid reducers; is_decomposable() must not admit them either.
-        for ty in [At::All, At::Any, At::None, At::Share] {
-            assert!(!ty.is_decomposable(), "{ty} is not a valid reducer");
         }
     }
 

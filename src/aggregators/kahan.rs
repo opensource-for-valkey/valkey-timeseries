@@ -25,12 +25,6 @@ impl KahanSum {
         self.compensation = 0.0;
     }
 
-    pub fn incr(&mut self, inc: f64) {
-        let (new_sum, new_compensation) = kahan_inc(inc, self.sum, self.compensation);
-        self.sum = new_sum;
-        self.compensation = new_compensation;
-    }
-
     /// Reconstitutes a sum from its transported parts (see
     /// `PartialState::acc1`/`acc1_c` in the partial reducer). A plain f64 sum
     /// round-trips as `from_parts(sum, 0.0)`.
@@ -52,10 +46,6 @@ impl KahanSum {
     /// Returns the current error value
     pub fn err(&self) -> f64 {
         self.compensation
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.sum == 0.0 && self.compensation == 0.0
     }
 }
 
@@ -115,20 +105,25 @@ impl Hash for KahanSum {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, GetSize, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, GetSize, PartialEq)]
 pub struct KahanAvg {
-    count: u32,
+    /// `u64`, like the partial reducer's: a `u32` saturated and then inflated the mean. Free in
+    /// size, since the `u32` was padded to 8 bytes anyway.
+    count: u64,
     sum: KahanSum,
+    /// The plain sum of every term times [`AVG_SHADOW_SCALE`]; see [`mean_of`].
+    shadow: f64,
 }
 
 impl KahanAvg {
     pub fn reset(&mut self) {
-        self.count = 0;
-        self.sum = KahanSum::new();
+        *self = Self::default();
     }
 
+    #[inline]
     pub fn add(&mut self, inc: f64) {
         self.sum += inc;
+        self.shadow += inc * AVG_SHADOW_SCALE;
         self.count = self.count.saturating_add(1);
     }
 
@@ -136,10 +131,19 @@ impl KahanAvg {
         if self.count == 0 {
             None
         } else {
-            Some(self.sum.value() / (self.count as f64))
+            Some(mean_of(&self.sum, self.shadow, self.count as f64))
         }
     }
 }
+
+impl Hash for KahanAvg {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.count.hash(state);
+        self.sum.hash(state);
+        hash_f64(self.shadow, state);
+    }
+}
+
 impl AddAssign<f64> for KahanAvg {
     fn add_assign(&mut self, rhs: f64) {
         self.add(rhs);
@@ -149,13 +153,41 @@ impl AddAssign<f64> for KahanAvg {
 impl RdbSerializable for KahanAvg {
     fn rdb_save(&self, rdb: *mut RedisModuleIO) {
         self.sum.rdb_save(rdb);
-        raw::save_unsigned(rdb, self.count as u64);
+        raw::save_unsigned(rdb, self.count);
+        raw::save_double(rdb, self.shadow);
     }
 
     fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self> {
         let sum = KahanSum::rdb_load(rdb)?;
-        let count = raw::load_unsigned(rdb)? as u32;
-        Ok(Self { count, sum })
+        let count = raw::load_unsigned(rdb)?;
+        let shadow = rdb_load_f64(rdb)?;
+        Ok(Self { count, sum, shadow })
+    }
+}
+
+/// `2^-32`. AVG also sums its terms scaled by this, in a plain shadow sum read only when the
+/// compensated sum overflowed: finite values then still have a representable mean (up to
+/// `2^32` terms of `f64::MAX`). Scaling by a power of two is exact, and the shadow is an
+/// independent chain, so the common path pays an extra multiply-add and nothing else.
+///
+/// The shadow is deliberately uncompensated, so after an overflow the mean is only as precise as
+/// a naive sum of the inputs: `[M, M, 1, -M, -M]` (`M = f64::MAX`) averages to `0`, not `0.2`,
+/// since the `1` is far below one ulp of the running total. Compensating it would put a second
+/// Neumaier chain on every AVG sample to recover digits the inputs' magnitude doesn't carry.
+pub(crate) const AVG_SHADOW_SCALE: f64 = 1.0 / 4_294_967_296.0;
+
+/// The mean of `count` values, from their compensated sum and their [`AVG_SHADOW_SCALE`]d
+/// shadow. A finite sum is used as is, so results without overflow are unchanged. Otherwise the
+/// shadow decides: it is non-finite only when an input was, and then it carries the right sign,
+/// whereas the compensated sum can't tell an overflow from an infinite input — `[-M, -M, +inf]`
+/// overflows to `-inf` and then to NaN, where the mean is `+inf`.
+#[inline]
+pub(crate) fn mean_of(sum: &KahanSum, shadow: f64, count: f64) -> f64 {
+    let total = sum.value();
+    if total.is_finite() {
+        total / count
+    } else {
+        shadow / count / AVG_SHADOW_SCALE
     }
 }
 
@@ -168,11 +200,8 @@ impl RdbSerializable for KahanAvg {
 /// Returns (new_sum, new_compensation)
 ///
 /// Copyright (c) 2024-present, OpenData project, and contributors
-#[inline(never)]
-// Important: do NOT inline.
-// Compiler reordering of floating-point operations can cause precision loss.
-// This was observed in Prometheus (issue #16714) and we lock the behavior
-// to maintain IEEE-754 semantics exactly.
+// Safe to inline: Rust has no fast-math, so LLVM may not reassociate these operations.
+#[inline(always)]
 fn kahan_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
     let t = sum + inc;
 
@@ -191,6 +220,22 @@ fn kahan_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bucket past `u32::MAX` samples keeps counting: a saturated count kept adding to the
+    /// sum and inflated the mean.
+    #[test]
+    fn test_avg_count_does_not_saturate_at_u32() {
+        let n = u32::MAX as f64;
+        let mut avg = KahanAvg {
+            count: u32::MAX as _,
+            sum: KahanSum::from_parts(2.0 * n, 0.0),
+            shadow: 2.0 * n * AVG_SHADOW_SCALE,
+        };
+        for _ in 0..3 {
+            avg.add(2.0);
+        }
+        assert_eq!(avg.value(), Some(2.0));
+    }
 
     #[test]
     fn test_add_and_add_assign_f64() {
@@ -259,6 +304,41 @@ mod tests {
         let mut merged2 = b;
         merged2 += &a;
         assert_eq!(merged2.value(), 2.0);
+    }
+
+    #[test]
+    fn test_compensation_survives_inlining() {
+        let mut sum = KahanSum::default();
+        for value in [1e16, 1.0, 1.0, -1e16] {
+            sum += value;
+        }
+        assert_eq!(sum.value(), 2.0);
+
+        let mut sum = KahanSum::default();
+        for value in [1.0, 1e100, 1.0, -1e100] {
+            sum += value;
+        }
+        assert_eq!(sum.value(), 2.0);
+    }
+
+    /// An infinite input after an overflow decides the mean: the compensated sum overflowed to
+    /// the opposite infinity and then to NaN, while the shadow saw only the infinite input.
+    #[test]
+    fn test_avg_infinite_input_after_overflow() {
+        for sign in [1.0, -1.0] {
+            let mut avg = KahanAvg::default();
+            for v in [-f64::MAX, -f64::MAX, f64::INFINITY] {
+                avg.add(sign * v);
+            }
+            assert_eq!(avg.value(), Some(sign * f64::INFINITY), "sign {sign}");
+        }
+
+        // Both infinities: no mean.
+        let mut avg = KahanAvg::default();
+        for v in [f64::MAX, f64::MAX, f64::INFINITY, f64::NEG_INFINITY] {
+            avg.add(v);
+        }
+        assert!(avg.value().unwrap().is_nan());
     }
 
     #[test]

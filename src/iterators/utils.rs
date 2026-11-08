@@ -23,6 +23,7 @@ fn create_aggregate_iterator<I>(
     range: &RangeOptions,
     aggregation: &AggregationOptions,
     empty_fill: EmptyFillBounds,
+    baseline: Option<Sample>,
 ) -> AggregateIterator<I>
 where
     I: Iterator<Item = Sample>,
@@ -33,6 +34,7 @@ where
         .get_aligned_timestamp(start_ts, end_ts);
 
     AggregateIterator::with_empty_fill(iter, aggregation, aligned_timestamp, empty_fill)
+        .with_baseline(baseline)
 }
 
 /// Is this sample data as far as `EMPTY` is concerned? A stored NaN is a sample, but it is not a
@@ -102,6 +104,39 @@ fn last_passing_sample_before(
         return TimestampFilterIterator::new(series, timestamps, first, to, true).find(is_data);
     }
     SeriesSampleIterator::new(series, first, to, true).find(is_data)
+}
+
+/// What a read starting at `read_floor` has to give the counter aggregators
+/// ([`AggregationType::carries_baseline`]) to match one from the start of the window: the last
+/// sample before the floor that the pipeline would have fed them, a non-NaN reading that passes
+/// `FILTER_BY_VALUE`. `None` for an unfloored read, or one with no counter aggregator.
+///
+/// Floors are only planned without `FILTER_BY_TS` ([`ReverseTailRead::plan`]), so that filter
+/// cannot apply here.
+fn counter_baseline(
+    series: &TimeSeries,
+    options: &RangeOptions,
+    read_floor: Option<Timestamp>,
+) -> Option<Sample> {
+    let floor = read_floor?;
+    let aggregation = options.aggregation.as_ref()?;
+    if !aggregation
+        .aggregations
+        .iter()
+        .any(|config| config.aggregation.carries_baseline())
+    {
+        return None;
+    }
+    debug_assert!(options.timestamp_filter.is_none());
+    // The same lower bound as `range_reader`: nothing below it reaches an unfloored read either.
+    let (start, _) = options.get_timestamp_range();
+    let lower = start.max(series.get_min_timestamp());
+    if floor <= lower {
+        return None;
+    }
+    let value_filter = options.value_filter;
+    SeriesSampleIterator::new(series, lower, floor - 1, true)
+        .find(|sample| is_empty_fill_data(sample, value_filter))
 }
 
 /// How far this query's `EMPTY` fill may run past the samples it sees — see
@@ -182,9 +217,10 @@ pub fn create_range_iterator<'a>(
 /// Reverse COUNT over buckets, without aggregating the whole range.
 ///
 /// Buckets are always built forward, so a newest-first reply has to read ahead of what it returns.
-/// But buckets do not depend on each other, so COUNT `n` only needs enough of the range to hold
-/// `n` of them: this runs the ordinary pipeline over the newest `n` possible buckets, and widens
-/// when filters or gaps leave it short. Anything else about the pipeline stays as it is, including
+/// But a bucket depends on nothing before it except, for the counter aggregators, the one sample
+/// it carries in ([`counter_baseline`]), so COUNT `n` only needs enough of the range to hold `n`
+/// of them: this runs the ordinary pipeline over the newest `n` possible buckets, seeded with that
+/// sample, and widens when filters or gaps leave it short. Anything else about the pipeline stays as it is, including
 /// how each aggregator reads its samples in time order.
 ///
 /// `EMPTY` is not handled here, since its buckets depend on the whole series, and `FILTER_BY_TS`
@@ -387,6 +423,7 @@ fn range_pipeline<'a>(
             options: &opts,
             is_reverse: should_reverse_aggr,
             empty_fill,
+            baseline: None,
         };
         output.chain_latest(base_iter, latest_sample, should_reverse_iter)
     } else {
@@ -395,6 +432,7 @@ fn range_pipeline<'a>(
             options,
             is_reverse: should_reverse_aggr,
             empty_fill,
+            baseline: counter_baseline(series, options, read_floor),
         };
         output.chain_latest(base_iter, latest_sample, should_reverse_iter)
     }
@@ -421,6 +459,8 @@ struct SampleOutput<'o> {
     /// what aggregation cannot do.
     is_reverse: bool,
     empty_fill: EmptyFillBounds,
+    /// See [`counter_baseline`].
+    baseline: Option<Sample>,
 }
 
 impl SampleOutput<'_> {
@@ -449,7 +489,13 @@ impl SampleOutput<'_> {
     where
         I: Iterator<Item = Sample> + 'a,
     {
-        create_sample_iterator_adapter(stream, self.options, self.is_reverse, self.empty_fill)
+        sample_iterator_adapter(
+            stream,
+            self.options,
+            self.is_reverse,
+            self.empty_fill,
+            self.baseline,
+        )
     }
 }
 
@@ -588,7 +634,8 @@ fn row_pipeline<'a>(
         aggregation,
         aligned_timestamp,
         empty_fill,
-    );
+    )
+    .with_baseline(counter_baseline(series, options, read_floor));
 
     finalize(aggr_iter, is_reverse, options.count)
 }
@@ -621,6 +668,18 @@ pub(crate) fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a
     is_reverse: bool,
     empty_fill: EmptyFillBounds,
 ) -> Box<dyn Iterator<Item = Sample> + 'a> {
+    sample_iterator_adapter(base_iter, options, is_reverse, empty_fill, None)
+}
+
+/// [`create_sample_iterator_adapter`] for a stream read from a floor, with the counter
+/// aggregators' [`counter_baseline`].
+fn sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
+    base_iter: T,
+    options: &RangeOptions,
+    is_reverse: bool,
+    empty_fill: EmptyFillBounds,
+    baseline: Option<Sample>,
+) -> Box<dyn Iterator<Item = Sample> + 'a> {
     // Apply Filters (Timestamp & Value)
     let ts_filter = options
         .timestamp_filter
@@ -646,7 +705,7 @@ pub(crate) fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a
 
     match &options.aggregation {
         Some(agg) => {
-            let aggr_iter = create_aggregate_iterator(filtered, options, agg, empty_fill);
+            let aggr_iter = create_aggregate_iterator(filtered, options, agg, empty_fill, baseline);
             finalize(aggr_iter, is_reverse, count)
         }
         None => finalize(filtered, is_reverse, count),
@@ -920,6 +979,54 @@ mod tests {
         assert_eq!(floors, vec![Some(100_000), None]);
     }
 
+    /// The counter aggregators read from a floor too, carrying in the last reading before it that
+    /// the full read would have fed them: not a NaN, not one the value filter drops, and nothing
+    /// from before the window.
+    #[test]
+    fn test_reverse_tail_read_seeds_counters_from_before_the_floor() {
+        let series = series_with(&[
+            (50, 1.0),
+            (150, 3.0),
+            (250, 20.0),
+            (260, f64::NAN),
+            (350, 5.0),
+        ]);
+        let options = |aggregation: AggregationType, start, value_filter| RangeOptions {
+            date_range: TimestampRange::from_timestamps(start, 10_000).unwrap(),
+            value_filter,
+            aggregation: Some(AggregationOptions {
+                aggregations: smallvec::smallvec![aggregation.into()],
+                bucket_duration: 100,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for aggregation in [
+            AggregationType::Increase,
+            AggregationType::Rate,
+            AggregationType::IRate,
+        ] {
+            let plain = options(aggregation, 0, None);
+            assert!(ReverseTailRead::plan(&series, &plain, None, 1).is_some());
+            assert_eq!(
+                counter_baseline(&series, &plain, Some(300)),
+                Some(Sample::new(250, 20.0))
+            );
+
+            let filtered = options(aggregation, 0, Some(ValueFilter { min: 0.0, max: 9.0 }));
+            assert_eq!(
+                counter_baseline(&series, &filtered, Some(300)),
+                Some(Sample::new(150, 3.0))
+            );
+
+            let late_window = options(aggregation, 100, Some(ValueFilter { min: 0.0, max: 2.0 }));
+            assert_eq!(counter_baseline(&series, &late_window, Some(300)), None);
+        }
+
+        let sum = options(AggregationType::Sum, 0, None);
+        assert_eq!(counter_baseline(&series, &sum, Some(300)), None);
+    }
+
     /// Past half the window, another partial pass stops being worth it: the total a failed search
     /// reads stays below 1.7 times the window, however the windows land.
     #[test]
@@ -1118,6 +1225,18 @@ mod tests {
     #[test]
     fn test_reverse_count_matches_the_full_reversed_result() {
         use crate::aggregators::{BucketAlignment, BucketTimestamp};
+        use crate::common::binop::ComparisonOperator;
+        use crate::series::request_types::{AggregatorConfig, ValueComparisonFilter};
+
+        // all, any and none take a condition; without one there is nothing to build.
+        let config = |aggregator: AggregationType| {
+            let condition = ValueComparisonFilter {
+                operator: ComparisonOperator::GreaterThan,
+                value: 5.0,
+            };
+            AggregatorConfig::new(aggregator, aggregator.is_filtered().then_some(condition))
+                .unwrap()
+        };
 
         let aggregators = [
             AggregationType::All,
@@ -1176,7 +1295,7 @@ mod tests {
                                         .unwrap(),
                                     value_filter,
                                     aggregation: Some(AggregationOptions {
-                                        aggregations: smallvec::smallvec![aggregator.into()],
+                                        aggregations: smallvec::smallvec![config(aggregator)],
                                         bucket_duration,
                                         alignment,
                                         timestamp_output: BucketTimestamp::End,

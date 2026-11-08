@@ -298,6 +298,7 @@ fn handle_mixed_batch_compaction(
             recalculate_current_bucket(ctx, bucket_start, bucket_last, min_ts)?;
         } else {
             recalculate_bucket(ctx, bucket_start, bucket_last, min_ts, null_ts_filter)?;
+            refresh_successor(ctx, bucket_last, min_ts)?;
         }
     }
 
@@ -328,13 +329,15 @@ fn handle_sample_compaction(ctx: &mut CompactionContext, sample: Sample) -> Tsdb
         Ordering::Less => {
             let bucket_last = ctx.rule.bucket_last(sample_bucket_start);
             // Sample is in an older bucket (shouldn't happen for new samples, but handle gracefully)
+            let min_ts = ctx.parent.get_min_timestamp();
             recalculate_bucket(
                 ctx,
                 sample_bucket_start,
                 bucket_last,
-                ctx.parent.get_min_timestamp(),
+                min_ts,
                 null_ts_filter,
             )?;
+            refresh_successor(ctx, bucket_last, min_ts)?;
         }
     }
 
@@ -405,9 +408,8 @@ fn recalculate_bucket<F>(
 where
     F: Fn(Timestamp) -> bool,
 {
-    // Create a new aggregator for this bucket
+    // A new aggregator for this bucket (`calculate_range` starts it over)
     let mut bucket_aggregator = ctx.rule.aggregator.clone();
-    AggregationHandler::reset(&mut bucket_aggregator);
 
     // Aggregate all samples in this bucket
     let has_samples = calculate_range(
@@ -454,7 +456,12 @@ fn handle_compaction_range_removal(
     if let Some(last) = ctx.parent.last_sample {
         let open_start = ctx.rule.calc_bucket_start(last.timestamp);
         if first_bucket_start < open_start {
-            recompute_closed_buckets(ctx, first_bucket_start, span_end.min(open_start - 1))?;
+            let to = span_end.min(open_start - 1);
+            recompute_closed_buckets(ctx, first_bucket_start, to)?;
+            let min_ts = ctx.parent.get_min_timestamp();
+            if let Some((_, successor_last)) = refresh_successor(ctx, to, min_ts)? {
+                ctx.rewritten = Some((first_bucket_start, span_end.max(successor_last)));
+            }
         }
     }
 
@@ -485,6 +492,8 @@ fn recompute_closed_buckets(
     let parent = ctx.parent;
     let min_ts = parent.get_min_timestamp();
     let mut aggregator = ctx.rule.aggregator.clone();
+    // Seeded once: the per-bucket resets below carry a counter's baseline through the span.
+    begin_bucket(&mut aggregator, parent, from, min_ts);
     // The bucket being aggregated, and whether any of its samples counted.
     let mut current: Option<(Timestamp, bool)> = None;
     for sample in parent.stored_range_iter(from.max(min_ts), to) {
@@ -534,7 +543,7 @@ fn resync_open_bucket_after_removal(
     let Some(last_sample) = ctx.parent.last_sample else {
         // Source is empty, so no bucket can ever have closed: the destination holds nothing
         // valid and there is no aggregation in progress.
-        ctx.rule.reset();
+        ctx.rule.clear();
         let removed = if ctx.dest.is_empty() {
             0
         } else {
@@ -555,7 +564,12 @@ fn resync_open_bucket_after_removal(
     };
 
     let mut aggregator = ctx.rule.aggregator.clone();
-    AggregationHandler::reset(&mut aggregator);
+    begin_bucket(
+        &mut aggregator,
+        ctx.parent,
+        open_start,
+        ctx.parent.get_min_timestamp(),
+    );
 
     let mut has_samples = false;
     for sample in ctx.parent.range_iter(open_start, open_last) {
@@ -571,12 +585,73 @@ fn resync_open_bucket_after_removal(
     Ok((removed > 0).then_some(open_start))
 }
 
+/// Start accumulating the bucket that begins at `bucket_start` from scratch. A counter
+/// aggregator carries its baseline across buckets ([`Aggregator::carries_baseline`]), so it is
+/// seeded with the sample a streaming rule would have carried in: the last counted one before the
+/// bucket, at or above `min_ts`. With a retention window shorter than a bucket, the stream may
+/// still hold a baseline that has since fallen below `min_ts`; the recalculation then starts
+/// without it, just as it drops the bucket's own expired samples for every aggregator (see
+/// `rebuild_open_bucket_as_of`).
+pub(super) fn begin_bucket(
+    aggregator: &mut Aggregator,
+    parent: &TimeSeries,
+    bucket_start: Timestamp,
+    min_ts: Timestamp,
+) {
+    AggregationHandler::clear(aggregator);
+    if aggregator.carries_baseline()
+        && let Some(seed) = parent.last_value_before(bucket_start, min_ts)
+    {
+        AggregationHandler::update(aggregator, seed.timestamp, seed.value);
+        AggregationHandler::reset(aggregator);
+    }
+}
+
+/// A counter bucket's value depends on the sample before it, so rewriting the bucket that ends at
+/// `bucket_last` can change the next bucket holding a counted sample: recompute that one too. Its
+/// own samples are unchanged, so nothing after it moves. Returns the span of a closed successor
+/// it rewrote; an open one is only re-aggregated.
+///
+/// With no counted sample after the bucket, an open bucket past it still carries the baseline the
+/// rewrite may have changed — it holds only NaNs, which `first_value_after` skips — so it is
+/// re-aggregated too.
+fn refresh_successor(
+    ctx: &mut CompactionContext,
+    bucket_last: Timestamp,
+    min_ts: Timestamp,
+) -> TsdbResult<Option<(Timestamp, Timestamp)>> {
+    if !ctx.rule.aggregator.carries_baseline() {
+        return Ok(None);
+    }
+    let Some(open) = ctx.rule.bucket_start else {
+        return Ok(None);
+    };
+    let start = match ctx.parent.first_value_after(bucket_last) {
+        Some(next) => ctx.rule.calc_bucket_start(next.timestamp),
+        None if open > bucket_last => open,
+        None => return Ok(None),
+    };
+    let last = ctx.rule.bucket_last(start);
+    match start.cmp(&open) {
+        Ordering::Less => {
+            recalculate_bucket(ctx, start, last, min_ts, null_ts_filter)?;
+            Ok(Some((start, last)))
+        }
+        Ordering::Equal => {
+            recalculate_current_bucket(ctx, start, last, min_ts)?;
+            Ok(None)
+        }
+        // Past the open bucket: an append still to stream in.
+        Ordering::Greater => Ok(None),
+    }
+}
+
 /// Write one aggregated bucket to the destination.
 ///
 /// The write replaces whatever the destination holds for the bucket — including with NaN, which
 /// a recalculated bucket can finalize to: `std.p`/`std.s`/`var.p`/`var.s` when their
-/// accumulation overflows on values near `f64::MAX`, and `irate`/`rate`/`increase` over a counter
-/// reset. The duplicate policy cannot express that: every non-`BLOCK` policy, `LAST` included,
+/// accumulation overflows on values near `f64::MAX`, `irate` over a counter reset, and the counters
+/// over a lone sample with nothing before it. The duplicate policy cannot express that: every non-`BLOCK` policy, `LAST` included,
 /// keeps the old value when the new one is NaN (`DuplicatePolicy::duplicate_value`), yet `add`
 /// still reports the NaN as written. A back-fill that turned a published bucket's aggregate into
 /// NaN therefore left the stale value in the destination while cascading the NaN downstream. So a
@@ -627,7 +702,7 @@ where
     F: Fn(Timestamp) -> bool,
 {
     let mut has_samples = false;
-    aggregator.reset();
+    begin_bucket(aggregator, series, start, min_ts);
     for sample in series
         .stored_range_iter(start.max(min_ts), end)
         .filter(|sample| filter(sample.timestamp))
@@ -643,7 +718,8 @@ where
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
 pub fn bench_rule(agg: crate::aggregators::AggregationType, bucket_ms: u64) -> CompactionRule {
-    let mut aggregator: crate::aggregators::Aggregator = agg.into();
+    let mut aggregator =
+        crate::aggregators::Aggregator::try_from(agg).expect("a rule type needs no condition");
     if let crate::aggregators::Aggregator::Rate(r) = &mut aggregator {
         r.set_window_ms(bucket_ms);
     }
@@ -710,7 +786,7 @@ mod tests {
     ];
 
     fn fresh_rule(agg: AggregationType, bucket: u64) -> CompactionRule {
-        let mut aggregator: Aggregator = agg.into();
+        let mut aggregator = crate::aggregators::Aggregator::try_from(agg).unwrap();
         if let Aggregator::Rate(r) = &mut aggregator {
             r.set_window_ms(bucket);
         }
@@ -911,41 +987,45 @@ mod tests {
     /// What a rule over `parent` must hold, without retention: the destination holds exactly the
     /// buckets strictly older than the one containing the parent's last sample that received at
     /// least one counted sample, each the aggregate of the parent's samples in timestamp order,
-    /// and the open bucket is the aggregate of the newest bucket.
+    /// and the open bucket is the aggregate of the newest bucket. One aggregator streams the whole
+    /// parent, reset at each bucket boundary, so a counter's bucket starts from the sample before
+    /// it exactly as a streaming rule's does.
     fn recompute(parent: &TimeSeries, agg: AggregationType, bucket: u64) -> RuleView {
         let rule = fresh_rule(agg, bucket);
         let Some(last) = parent.last_sample else {
             return (Vec::new(), (None, false, None));
         };
-        let mut by_bucket: BTreeMap<Timestamp, (Aggregator, bool)> = BTreeMap::new();
+        let open = rule.calc_bucket_start(last.timestamp);
+        let mut aggregator = fresh_rule(agg, bucket).aggregator;
+        let mut expected = Vec::new();
+        // The bucket being aggregated, and whether any of its samples counted.
+        let mut current: Option<(Timestamp, bool)> = None;
         for sample in parent.iter() {
             let start = rule.calc_bucket_start(sample.timestamp);
-            let (aggregator, counted) = by_bucket
-                .entry(start)
-                .or_insert_with(|| (fresh_rule(agg, bucket).aggregator, false));
-            if AggregationHandler::update(aggregator, sample.timestamp, sample.value) {
-                *counted = true;
-            }
-        }
-        let open = rule.calc_bucket_start(last.timestamp);
-        let mut expected = Vec::new();
-        let mut open_expected = (Some(open), false, None);
-        for (start, (mut aggregator, counted)) in by_bucket {
-            if start < open {
-                if counted {
+            if current.is_none_or(|(open_start, _)| open_start != start) {
+                if let Some((closed, true)) = current {
                     expected.push((
-                        start,
+                        closed,
                         AggregationHandler::finalize(&mut aggregator).to_bits(),
                     ));
                 }
-            } else if counted {
-                open_expected = (
-                    Some(open),
-                    true,
-                    AggregationHandler::current(&aggregator).map(f64::to_bits),
-                );
+                AggregationHandler::reset(&mut aggregator);
+                current = Some((start, false));
+            }
+            if AggregationHandler::update(&mut aggregator, sample.timestamp, sample.value)
+                && let Some((_, counted)) = current.as_mut()
+            {
+                *counted = true;
             }
         }
+        let open_expected = match current {
+            Some((start, true)) if start == open => (
+                Some(open),
+                true,
+                AggregationHandler::current(&aggregator).map(f64::to_bits),
+            ),
+            _ => (Some(open), false, None),
+        };
         (expected, open_expected)
     }
 
@@ -1040,6 +1120,41 @@ mod tests {
                 "dst"
             );
             Ok(())
+        }
+    }
+
+    /// A back-fill into a closed bucket must refresh the baseline the open bucket carries even
+    /// when that bucket holds only NaNs, which `first_value_after` skips. Rewriting 500 from 3 to
+    /// 5 left bucket 1000 counting from 3: 4 instead of 2.
+    #[test]
+    fn backfill_refreshes_the_baseline_of_a_nan_only_open_bucket() {
+        for agg in [
+            AggregationType::Increase,
+            AggregationType::Rate,
+            AggregationType::IRate,
+        ] {
+            let mut parent = TimeSeries::new();
+            let mut dest = TimeSeries::new();
+            let mut rule = fresh_rule(agg, 1000);
+            for (ts, value) in [
+                (0, 1.0),
+                (500, 3.0),
+                (1000, f64::NAN),
+                (500, 5.0),
+                (1500, 7.0),
+                (2000, 7.0),
+            ] {
+                let prev_last = parent.last_sample.map(|s| s.timestamp);
+                let SampleAddResult::Ok(stored) =
+                    parent.add(ts, value, Some(DuplicatePolicy::KeepLast))
+                else {
+                    panic!("sample @{ts} rejected");
+                };
+                ingest_batch_of_one(&parent, &mut dest, &mut rule, stored, prev_last);
+            }
+            // 7 - 5: an increase of 2, over a 1 s bucket (rate) and 1 s between samples (irate).
+            let bucket_1000 = dest.iter().find(|s| s.timestamp == 1000).map(|s| s.value);
+            assert_eq!(bucket_1000, Some(2.0), "{agg:?}");
         }
     }
 

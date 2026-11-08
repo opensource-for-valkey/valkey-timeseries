@@ -93,8 +93,17 @@ impl CompactionRule {
         (start, self.bucket_last(start))
     }
 
+    /// Closes the open bucket. A counter aggregator keeps its last sample as the next bucket's
+    /// baseline.
     pub(super) fn reset(&mut self) {
         AggregationHandler::reset(&mut self.aggregator);
+        self.bucket_start = None;
+        self.has_samples = false;
+    }
+
+    /// Drops the open bucket and everything the aggregator holds, as a new rule.
+    pub(super) fn clear(&mut self) {
+        AggregationHandler::clear(&mut self.aggregator);
         self.bucket_start = None;
         self.has_samples = false;
     }
@@ -150,19 +159,25 @@ impl RdbSerializable for CompactionRule {
 /// below `as_of`. Anything above it is the current write's own append, already stored, which the
 /// engine is about to stream in. `None` means the source was empty: no open bucket.
 ///
-/// An approximation of the state a rule maintains by streaming — exact for every aggregator whose
-/// bucket value depends only on the bucket's samples, but `rate`/`increase` and a retention window
-/// shorter than a bucket can differ — so it runs only to recover a `dirty` rule.
+/// An approximation of the state a rule maintains by streaming — exact for every aggregator, the
+/// counters seeded with the sample before the bucket, except where a retention window shorter
+/// than a bucket hides samples the stream saw — so it runs only to recover a `dirty` rule.
 pub(super) fn rebuild_open_bucket_as_of(
     parent: &TimeSeries,
     rule: &mut CompactionRule,
     as_of: Option<Timestamp>,
 ) {
-    rule.reset();
+    rule.clear();
     let Some(as_of) = as_of else {
         return;
     };
     let (start, last) = rule.get_bucket_range(as_of);
+    engine::begin_bucket(
+        &mut rule.aggregator,
+        parent,
+        start,
+        parent.get_min_timestamp(),
+    );
     rule.bucket_start = Some(start);
     for sample in parent.range_iter(start, last) {
         if sample.timestamp > as_of {
@@ -204,8 +219,8 @@ fn validate_restored_rule_parameters(
         return Err(ValkeyError::Str(error_consts::BUCKET_DURATION_TOO_SMALL));
     }
 
-    // calc_bucket_start converts the duration to i64 for its modulo
-    // arithmetic. Reject values that would become negative after that cast.
+    // Durations are i64 everywhere they are reported (TS.INFO, the digest), and the
+    // command path cannot produce a larger one.
     if bucket_duration > i64::MAX as u64 {
         return Err(ValkeyError::String(format!(
             "TSDB: compaction rule bucket duration is too large: {bucket_duration}"
@@ -317,7 +332,7 @@ mod tests {
     fn rule(agg: AggregationType, bucket: u64) -> CompactionRule {
         CompactionRule {
             dest: SeriesLink::from("dst"),
-            aggregator: agg.into(),
+            aggregator: crate::aggregators::Aggregator::try_from(agg).unwrap(),
             bucket_duration: bucket,
             align_timestamp: 0,
             bucket_start: None,
@@ -343,6 +358,24 @@ mod tests {
         assert_eq!(rebuilt.bucket_start, Some(1000));
         assert!(rebuilt.has_samples);
         assert_eq!(AggregationHandler::current(&rebuilt.aggregator), Some(12.0));
+    }
+
+    /// A counter's open bucket starts from the last sample before it, as the stream left it, and
+    /// not from whatever the dirty rule still held.
+    #[test]
+    fn rebuild_seeds_a_counter_with_the_sample_before_the_bucket() {
+        let series = series_with(&[(500, 10.0), (900, f64::NAN), (1000, 14.0), (1200, 15.0)]);
+        let mut rebuilt = rule(AggregationType::Increase, 1000);
+        rebuilt.update(0, 1000.0);
+        rebuild_open_bucket_as_of(&series, &mut rebuilt, Some(1200));
+        assert_eq!(rebuilt.bucket_start, Some(1000));
+        assert_eq!(AggregationHandler::current(&rebuilt.aggregator), Some(5.0));
+
+        // With nothing before the bucket there is no baseline at all.
+        let mut fresh = rule(AggregationType::Increase, 1000);
+        fresh.update(0, 1000.0);
+        rebuild_open_bucket_as_of(&series, &mut fresh, Some(500));
+        assert_eq!(AggregationHandler::current(&fresh.aggregator), None);
     }
 
     #[test]

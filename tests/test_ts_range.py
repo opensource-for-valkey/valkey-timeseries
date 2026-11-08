@@ -157,6 +157,54 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         assert result == [[50000, b'510'], [60000, b'610'], [70000, b'710'], [80000, b'810'], [90000, b'910']]
         # Bucket 3 (6000-...) No values
 
+    def test_largest_duration_is_one_bucket(self):
+        """DIV-0062: the reference's bucket arithmetic wraps here and splits the bucket."""
+        top = 2**63 - 1
+        self.client.execute_command('TS.ADD', 'high', top - 2, 1)
+        self.client.execute_command('TS.ADD', 'high', top - 1, 2)
+        self.client.execute_command('TS.ADD', 'low', 1, 1)
+        self.client.execute_command('TS.ADD', 'low', 2, 2)
+
+        for key in ('high', 'low'):
+            result = self.client.execute_command('TS.RANGE', key, '-', '+',
+                                                 'AGGREGATION', 'sum', top)
+            assert result == [[0, b'3']]
+
+    def test_filtered_aggregators_skip_nan(self):
+        """NaN never matches a condition and is not counted, whatever the operator."""
+        for ts, value in ((0, 'nan'), (1, 10), (2, 'nan'), (3, 20), (100, 'nan')):
+            self.client.execute_command('TS.ADD', 'f', ts, value)
+
+        expected = {'share!=5': b'1', 'all!=5': b'1', 'any!=5': b'1', 'none!=5': b'0',
+                    'countif!=5': b'2', 'share==5': b'0'}
+        for agg, value in expected.items():
+            result = self.client.execute_command('TS.RANGE', 'f', '-', '+',
+                                                 'AGGREGATION', agg, 100)
+            # The bucket at 100 holds only a NaN, so it has no value to report.
+            assert result == [[0, value]], agg
+
+    def test_dispersion_near_the_precision_limit(self):
+        """At 1e16 the ulp is 2, so the mean of 1e16 and 1e16 + 2 is not representable; the
+        variance is still exactly 1 (DIV-0022: the reference cancels it to 1.8e16)."""
+        self.client.execute_command('TS.ADD', 'prec', 0, '1e16')
+        self.client.execute_command('TS.ADD', 'prec', 1, '10000000000000002')
+        for agg, expected in (('var.p', 1.0), ('std.p', 1.0), ('var.s', 2.0)):
+            result = self.client.execute_command('TS.RANGE', 'prec', '-', '+',
+                                                 'AGGREGATION', agg, 10)
+            assert float(result[0][1]) == expected, agg
+
+    def test_compaction_with_the_largest_duration_stays_open(self):
+        """A rule accepts any positive i64 duration; its one bucket never closes."""
+        top = 2**63 - 1
+        self.client.execute_command('TS.CREATE', 'src')
+        self.client.execute_command('TS.CREATE', 'dst')
+        self.client.execute_command('TS.CREATERULE', 'src', 'dst', 'AGGREGATION', 'sum', top)
+        self.client.execute_command('TS.ADD', 'src', 1, 1)
+        self.client.execute_command('TS.ADD', 'src', top - 1, 2)
+
+        assert self.client.execute_command('TS.RANGE', 'dst', '-', '+') == []
+        assert self.client.execute_command('TS.RANGE', 'dst', '-', '+', 'LATEST') == [[0, b'3']]
+
     def test_range_empty_series(self):
         """Test TS.RANGE on an existing but empty series"""
 
@@ -312,9 +360,9 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         """
         Test INCREASE aggregator.
 
-        Data models a counter that increases, then resets (drops), then increases again.
-        We aggregate with a bucket size that ensures each non-empty bucket contains 2 samples,
-        so INCREASE can compute a delta within the bucket.
+        Data models a counter that increases, then resets (drops), then increases again. The
+        last sample of each bucket is the next bucket's baseline, so the delta crossing a bucket
+        boundary counts in the later bucket.
         """
         self.client.execute_command('TS.CREATE', 'counter_inc')
 
@@ -335,27 +383,50 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
             'BUCKETTIMESTAMP', 'START'
         )
 
-        # Expect 3 buckets (start timestamps 0, 2000, 4000), but note:
-        # bucket with only 1 sample yields INCREASE=0 (no prior point inside the bucket)
+        # Expect 3 buckets (start timestamps 0, 2000, 4000). The first holds one sample and
+        # has no earlier one, so it observed no delta and reports NaN.
         assert len(result) == 3
         assert result[0][0] == 0
-        assert float(result[0][1]) == pytest.approx(0.0)
+        assert math.isnan(float(result[0][1]))
         assert result[1][0] == 2000
-        assert float(result[1][1]) == pytest.approx(10.0)  # 20 - 10
+        assert float(result[1][1]) == pytest.approx(20.0)  # 0 -> 10 -> 20
         assert result[2][0] == 4000
-        assert float(result[2][1]) == pytest.approx(10.0)  # reset ignored, 15 - 5
+        assert float(result[2][1]) == pytest.approx(10.0)  # 20 -> 5 is a reset, then 15 - 5
+
+    def test_counter_aggregators_carry_across_buckets(self):
+        """The delta crossing a bucket boundary lands in the later bucket, so the per-bucket
+        increases of 1..9 add up to the whole increase, 8."""
+        for ts in range(1, 10):
+            self.client.execute_command('TS.ADD', 'carry', ts, ts)
+
+        def rows(agg):
+            result = self.client.execute_command('TS.RANGE', 'carry', '-', '+',
+                                                 'AGGREGATION', agg, 3)
+            return [(ts, float(value)) for ts, value in result]
+
+        assert rows('increase') == [(0, 1.0), (3, 3.0), (6, 3.0), (9, 1.0)]
+        assert rows('rate') == [(0, pytest.approx(1 / 0.003)), (3, pytest.approx(1000.0)),
+                                (6, pytest.approx(1000.0)), (9, pytest.approx(1 / 0.003))]
+        assert rows('irate') == [(0, 1000.0), (3, 1000.0), (6, 1000.0), (9, 1000.0)]
+
+    def test_counter_aggregators_agree_on_a_lone_first_sample(self):
+        self.client.execute_command('TS.ADD', 'lone', 5, 7)
+        for agg in ('increase', 'rate', 'irate'):
+            result = self.client.execute_command('TS.RANGE', 'lone', '-', '+',
+                                                 'AGGREGATION', agg, 10)
+            assert len(result) == 1 and math.isnan(float(result[0][1])), agg
 
     def test_increase_aggregation_monotonic(self):
         """
-        INCREASE on a monotonic counter: per-bucket increase should be last - first
-        (and 0 for buckets with <2 samples).
+        INCREASE on a monotonic counter: each bucket's increase runs from the previous
+        bucket's last sample to its own last (NaN for the first bucket's single sample).
         """
         self.client.execute_command('TS.CREATE', 'counter_inc_mono')
 
         # Buckets of 2000ms with ALIGN 0:
         # [0,2000): 1000 (single sample)
-        # [2000,4000): 2000,3000 (10->25 => +15)
-        # [4000,6000): 4000,5000 (25->60 => +35)
+        # [2000,4000): 2000,3000 (0->10->25 => +25)
+        # [4000,6000): 4000,5000 (25->25->60 => +35)
         self.client.execute_command('TS.ADD', 'counter_inc_mono', 1000, 0)
         self.client.execute_command('TS.ADD', 'counter_inc_mono', 2000, 10)
         self.client.execute_command('TS.ADD', 'counter_inc_mono', 3000, 25)
@@ -371,9 +442,9 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
 
         assert len(result) == 3
         assert result[0][0] == 0
-        assert float(result[0][1]) == pytest.approx(0.0)
+        assert math.isnan(float(result[0][1]))
         assert result[1][0] == 2000
-        assert float(result[1][1]) == pytest.approx(15.0)
+        assert float(result[1][1]) == pytest.approx(25.0)
         assert result[2][0] == 4000
         assert float(result[2][1]) == pytest.approx(35.0)
 
@@ -405,7 +476,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         assert by_ts[1000] == pytest.approx(3.0)  # 8 - 5
         assert math.isnan(by_ts[2000]), "Expected Nan"  # empty
         assert math.isnan(by_ts[3000]), "Expected Nan"  # empty
-        assert by_ts[4000] == pytest.approx(7.0)  # 17 - 10
+        assert by_ts[4000] == pytest.approx(9.0)  # 17 - 8, carried across the empty buckets
 
     def test_increase_aggregation_resets_within_bucket(self):
         """
@@ -478,7 +549,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
 
         Uses the same data as the INCREASE test, but validates that RATE is:
           RATE = INCREASE / bucket_duration_seconds
-        With bucket=2000ms => 2 seconds, so expected RATE is 10/2 = 5 in the buckets that have +10 increase.
+        With bucket=2000ms => 2 seconds: increases of 20 and 10 give rates of 10 and 5.
         """
         self.client.execute_command('TS.CREATE', 'counter_rate')
 
@@ -495,12 +566,11 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
             'BUCKETTIMESTAMP', 'START'
         )
 
-        print("result:", result)
         assert len(result) == 3
         assert result[0][0] == 0
-        assert float(result[0][1]) == pytest.approx(0.0)
+        assert math.isnan(float(result[0][1]))
         assert result[1][0] == 2000
-        assert float(result[1][1]) == pytest.approx(5.0)  # 10 increase / 2s
+        assert float(result[1][1]) == pytest.approx(10.0)  # 20 increase / 2s
         assert result[2][0] == 4000
         assert float(result[2][1]) == pytest.approx(5.0)  # 10 increase / 2s
 

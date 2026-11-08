@@ -126,7 +126,12 @@ mod tests {
     }
 
     fn reduce(rows: Vec<MultiSample>, ty: AggregationType, columns: usize) -> Vec<MultiSample> {
-        RowReducer::new(rows.into_iter(), ty.into(), columns).collect()
+        RowReducer::new(
+            rows.into_iter(),
+            crate::aggregators::Aggregator::try_from(ty).unwrap(),
+            columns,
+        )
+        .collect()
     }
 
     #[test]
