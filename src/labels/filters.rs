@@ -1133,6 +1133,20 @@ mod tests {
     }
 
     #[test]
+    fn test_regex_filter_rejects_trailing_backslash() {
+        for op in [MatchOp::RegexEqual, MatchOp::RegexNotEqual] {
+            for pattern in [r"foo\", r"foo\\\", r"\"] {
+                assert!(
+                    LabelFilter::create(op, "l", pattern).is_err(),
+                    "{op} {pattern:?} should be an invalid regex"
+                );
+            }
+            // An escaped backslash is a literal, not a dangling escape.
+            assert!(LabelFilter::create(op, "l", r"foo\\").is_ok());
+        }
+    }
+
+    #[test]
     fn test_regex_matcher_empty() {
         let matcher = RegexMatcher::create(".*").unwrap();
         assert!(matcher.is_match(""));

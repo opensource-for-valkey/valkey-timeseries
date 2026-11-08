@@ -61,8 +61,10 @@ pub fn try_escape_for_repeat_re(re: &str) -> String {
     while let Some(c) = chars.next() {
         match c {
             '\\' => {
+                // Keep a dangling trailing `\`: dropping it would turn an
+                // invalid pattern into a valid one on the retry.
+                result.push(c);
                 if let Some(cc) = chars.next() {
-                    result.push(c);
                     result.push(cc);
                 }
             }
@@ -136,5 +138,7 @@ mod tests {
         assert_eq!(try_escape_for_repeat_re("abc{1,2a}"), r"abc\{1,2a}");
         assert_eq!(try_escape_for_repeat_re("abc{1,2,3}"), r"abc\{1,2,3}");
         assert_eq!(try_escape_for_repeat_re("abc{1,,2}"), r"abc\{1,,2}");
+        assert_eq!(try_escape_for_repeat_re(r"abc\"), r"abc\");
+        assert_eq!(try_escape_for_repeat_re(r"abc{x}\"), r"abc\{x}\");
     }
 }
