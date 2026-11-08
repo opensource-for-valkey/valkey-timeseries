@@ -18,41 +18,33 @@ use crate::series::chunks::stream::{
 };
 use std::io::{self};
 
-/// Writes an i64 using varbit encoding with a bit bucketing
-/// optimized for the dod's observed in histogram buckets, plus a few additional
-/// buckets for large numbers.
+/// Writes a timestamp delta-of-delta using the existing prefix and payload widths.
+/// Each nonzero bucket uses its symmetric signed range. The most-negative payload
+/// is deliberately excluded: older readers do not sign-extend that exact value.
 ///
 /// Encoding layout (prefix + payload):
 /// - 0:              1 bit   (just bit 0)
-/// - -3..=3:         2+5=7   bits (prefix 0b10 + 5-bit signed payload)
-/// - -31..=31:       3+9=12  bits (prefix 0b110 + 9-bit signed payload)
-/// - -255..=255:     4+13=17 bits (prefix 0b1110 + 13-bit signed payload)
-/// - -2047..=2047:   5+17=22 bits (prefix 0b11110 + 17-bit signed payload)
-/// - -131071..=131071:       6+24=30 bits (prefix 0b111110 + 24-bit signed payload)
-/// - -16777215..=16777215:   7+32=39 bits (prefix 0b1111110 + 32-bit signed payload)
+/// - -15..=15:         2+5=7   bits (prefix 0b10 + 5-bit signed payload)
+/// - -255..=255:       3+9=12  bits (prefix 0b110 + 9-bit signed payload)
+/// - -4095..=4095:     4+13=17 bits (prefix 0b1110 + 13-bit signed payload)
+/// - -65535..=65535:   5+17=22 bits (prefix 0b11110 + 17-bit signed payload)
+/// - -8388607..=8388607:       6+24=30 bits (prefix 0b111110 + 24-bit signed payload)
+/// - -2147483647..=2147483647:   7+32=39 bits (prefix 0b1111110 + 32-bit signed payload)
 /// - -36028797018963967..=36028797018963967: 8+56=64 bits (prefix 0b11111110 + 56-bit signed)
 /// - Everything else: 8+64=72 bits (prefix 0b11111111 + full 64-bit signed)
 ///
-/// For optimal space utilization, each branch didn't need to support any values
-/// of the prior branches, so we could expand the range of each branch. Do
-/// more with fewer bits. It would come at the price of more expensive encoding
-/// and decoding (cutting out and later adding back that center-piece we
-/// skip). With the distributions of values we see in practice, we would reduce
-/// the size by around 1%. A more detailed study would be needed for precise
-/// values, but it appears quite certain that we would end up far below 10%,
-/// which would maybe convince us to invest the increased coding/decoding cost.
 pub(crate) fn write_varbit<W: BitWrite>(writer: &mut W, value: i64) -> io::Result<()> {
     // Prefix and payload go out in one write: every bucket but the last fits in 64 bits.
     // Same bit layout as the two-write form this replaced.
     let v = value as u64;
     match value {
         0 => writer.write_bit(false)?, // Precisely 0, needs 1 bit.
-        -3..=3 => writer.write(7, (0b10u64 << 5) | (v & 0x1F))?,
-        -31..=31 => writer.write(12, (0b110u64 << 9) | (v & 0x1FF))?,
-        -255..=255 => writer.write(17, (0b1110u64 << 13) | (v & 0x1FFF))?,
-        -2047..=2047 => writer.write(22, (0b11110u64 << 17) | (v & 0x1FFFF))?,
-        -131071..=131071 => writer.write(30, (0b111110u64 << 24) | (v & 0x0FF_FFFF))?,
-        -16777215..=16777215 => writer.write(39, (0b1111110u64 << 32) | (v & 0xFFFF_FFFF))?,
+        -15..=15 => writer.write(7, (0b10u64 << 5) | (v & 0x1F))?,
+        -255..=255 => writer.write(12, (0b110u64 << 9) | (v & 0x1FF))?,
+        -4095..=4095 => writer.write(17, (0b1110u64 << 13) | (v & 0x1FFF))?,
+        -65535..=65535 => writer.write(22, (0b11110u64 << 17) | (v & 0x1FFFF))?,
+        -8388607..=8388607 => writer.write(30, (0b111110u64 << 24) | (v & 0x0FF_FFFF))?,
+        -2147483647..=2147483647 => writer.write(39, (0b1111110u64 << 32) | (v & 0xFFFF_FFFF))?,
         -36028797018963967..=36028797018963967 => {
             writer.write(64, (0b11111110u64 << 56) | (v & 0x00FF_FFFF_FFFF_FFFF))?
         }
@@ -70,10 +62,10 @@ pub(crate) fn write_varbit<W: BitWrite>(writer: &mut W, value: i64) -> io::Resul
 /// Decoding layout (reads variable-length prefix + fixed payload):
 /// Prefix is read as a sequence of 1 bits followed by a 0 bit (unary encoding):
 /// - 0 bit alone:    value = 0 (1 bit total)
-/// - 0b10 (10):      5-bit signed payload follows (7 bits total, bucket for -3..=3)
-/// - 0b110 (110):    9-bit signed payload follows (12 bits total, bucket for -31..=31)
-/// - 0b1110 (1110):  13-bit signed payload follows (17 bits total, bucket for -255..=255)
-/// - 0b11110:        17-bit signed payload follows (22 bits total, bucket for -2047..=2047)
+/// - 0b10 (10):      5-bit signed payload follows (7 bits total, bucket for -15..=15)
+/// - 0b110 (110):    9-bit signed payload follows (12 bits total, bucket for -255..=255)
+/// - 0b1110 (1110):  13-bit signed payload follows (17 bits total, bucket for -4095..=4095)
+/// - 0b11110:        17-bit signed payload follows (22 bits total, bucket for -65535..=65535)
 /// - 0b111110:       24-bit signed payload follows (30 bits total)
 /// - 0b1111110:      32-bit signed payload follows (39 bits total)
 /// - 0b11111110:     56-bit signed payload follows (64 bits total)
@@ -138,6 +130,31 @@ mod tests {
 
     fn put_varbit_int(b: &mut BitStream, val: i64) {
         let _ = write_varbit(b, val);
+    }
+
+    #[test]
+    fn timestamp_buckets_use_their_symmetric_signed_ranges() {
+        for (limit, bits, next_bits) in [
+            (15i64, 7, 12),
+            (255, 12, 17),
+            (4095, 17, 22),
+            (65535, 22, 30),
+            (8388607, 30, 39),
+            (2147483647, 39, 64),
+            (36028797018963967, 64, 72),
+        ] {
+            for sign in [-1, 1] {
+                for (value, expected_bits) in
+                    [(sign * limit, bits), (sign * (limit + 1), next_bits)]
+                {
+                    let mut writer = BitStream::new();
+                    write_varbit(&mut writer, value).unwrap();
+                    assert_eq!(writer.len() * 8 - writer.count as usize, expected_bits);
+                    let mut reader = BitStreamReader::new(writer.bytes());
+                    assert_eq!(read_varbit_int(&mut reader).unwrap(), value);
+                }
+            }
+        }
     }
 
     const VARBIT_INT_BOUNDARY_VALUES: [i64; 33] = [

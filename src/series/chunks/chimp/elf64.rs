@@ -11,8 +11,8 @@ const F: [i32; 21] = [
 
 /// `10^i` for every `i` whose result is finite (`10^308` is the largest). Indexing past the
 /// end is `inf`, which is what parsing `"1.0E309"` gave; the old 21-entry table fell back
-/// to `format!` + `parse` for anything larger, and the significant-digit search below could
-/// take that path 5,000 times for one tiny value (see `get_significant_count`).
+/// to `format!` + `parse` for anything larger, and the old significant-digit search could
+/// take that path 5,000 times for one tiny value.
 const MAP_10IP: [f64; 309] = [
     1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
     1e17, 1e18, 1e19, 1e20, 1e21, 1e22, 1e23, 1e24, 1e25, 1e26, 1e27, 1e28, 1e29, 1e30, 1e31, 1e32,
@@ -94,7 +94,9 @@ pub fn get_f_alpha(alpha: i32) -> i32 {
     }
 }
 
-/// `get10iP`: 10^i for i >= 0 (`inf` once it overflows).
+/// `get10iP`: 10^i for i >= 0 (`inf` once it overflows). Only the frozen reference search
+/// uses it.
+#[cfg(test)]
 #[inline]
 fn get_10ip(i: i32) -> Result<f64, ()> {
     if i < 0 {
@@ -103,13 +105,60 @@ fn get_10ip(i: i32) -> Result<f64, ()> {
     Ok(MAP_10IP.get(i as usize).copied().unwrap_or(f64::INFINITY))
 }
 
-/// `get10iN`: 10^(-i) for i >= 0 (`0.0` once it underflows).
-#[inline]
-pub fn get_10in(i: i32) -> Result<f64, ()> {
-    if i < 0 {
-        return Err(());
+/// `10^k` from the tables, or `None` past either end (`k` above 308 or below -323).
+#[inline(always)]
+fn pow10(k: i32) -> Option<f64> {
+    if k >= 0 {
+        MAP_10IP.get(k as usize).copied()
+    } else {
+        MAP_10IN.get(k.unsigned_abs() as usize).copied()
     }
-    Ok(MAP_10IN.get(i as usize).copied().unwrap_or(0.0))
+}
+
+/// `floor(log10 v)` for a double the table scans do not cover (`v < 1e-10` or `v >= 1e9`),
+/// from its binary exponent and one compare, with no `log10`.
+///
+/// `v` in `[2^E, 2^(E+1))` has `log10 v` in `[E c, (E+1) c)`, `c = log10 2 < 1`, so its scale is
+/// `est = floor(E c)` or `est + 1`, and it is `est + 1` exactly when `v >= 10^(est+1)`. The
+/// compare is against the same correctly rounded table power the scans test, so the answer
+/// agrees with them at every boundary; `log10` does not (for the double just under `10^p` it
+/// can round up to `p`). `E c` is at least 4e-4 from an integer for every nonzero `E` in
+/// -1074..=1023 (closest at -485), so the f64 product cannot floor to the wrong side; the
+/// tests check every exponent.
+///
+/// `E` is exact for subnormals too (the top set bit of the mantissa). The smallest one,
+/// `5e-324`, is below `10^-323`'s table entry and gets -324. Zero, infinity and NaN keep the
+/// values `floor(log10)` saturated to (`i32::MIN`, `i32::MAX`, `0`); the encoder never passes
+/// them. `v` is expected to be non-negative; the sign bit is ignored.
+///
+/// Out of line: the code it replaced called `log10` out of line too, and nothing in the
+/// generator matrix reaches it. When the decoder's `recover` still called `get_sp`, inlining
+/// it there made one decode row (drift, irregular) ~18 % slower in five of six interleaved
+/// rounds; out of line it matched the base.
+#[inline(never)]
+fn scale_from_exponent(v: f64) -> i32 {
+    let bits = v.to_bits() & (u64::MAX >> 1);
+    let biased = (bits >> 52) as i32;
+    let e = if biased == 0 {
+        if bits == 0 {
+            return i32::MIN;
+        }
+        // Subnormal: `v = bits * 2^-1074`, so `floor(log2 v)` is the top set bit's place.
+        63 - bits.leading_zeros() as i32 - 1074
+    } else if biased == 0x7ff {
+        return if bits == f64::INFINITY.to_bits() {
+            i32::MAX
+        } else {
+            0
+        };
+    } else {
+        biased - 1023
+    };
+    let est = (e as f64 * std::f64::consts::LOG10_2).floor() as i32;
+    // `est + 1` is in -323..=308 for every finite nonzero `v`, so the lookup always succeeds;
+    // the fallback only keeps a wrong table from panicking.
+    let next = pow10(est + 1).unwrap_or(f64::INFINITY);
+    est + i32::from(f64::from_bits(bits) >= next)
 }
 
 /// `getSP`: the decimal "scale position" of `|v|` (floor of log10 magnitude).
@@ -117,7 +166,9 @@ pub fn get_10in(i: i32) -> Result<f64, ()> {
 /// A table scan, as in the reference. Deriving the scale from the binary exponent plus one
 /// corrective compare was tried (2026-09-16) and measured 8 % slower on encode, 35 % on
 /// erasable data: for values in the usual magnitudes this loop is one to three predicted
-/// compares, cheaper than the exponent arithmetic and two table loads.
+/// compares, cheaper than the exponent arithmetic and two table loads. Outside the scan's
+/// range (`< 1e-10`, `>= 1e9`) that arithmetic replaces a `log10` call: see
+/// [`scale_from_exponent`].
 #[inline(always)]
 pub fn get_sp(v: f64) -> i32 {
     if v >= 1.0 {
@@ -137,10 +188,17 @@ pub fn get_sp(v: f64) -> i32 {
             i += 1;
         }
     }
-    (v.log10()).floor() as i32
+    scale_from_exponent(v)
 }
 
-/// `getSPAnd10iNFlag`: returns `(sp, is_exact_power_of_10_le_1)`.
+/// `getSPAnd10iNFlag`: returns `(sp, is_exact_power_of_10_le_1)`. The encoder has not used
+/// the flag since the ELF header carries decimal places (`alpha`) instead of `beta_star`; the
+/// frozen reference search still does.
+///
+/// Below one the flag is the scan's (`v == 10^sp`); in `[1, 1e9)` it is `0`, as it always was.
+/// From `1e9` up and below `1e-10` it is `v == 10^sp` too, which is exact; the `log10` it
+/// replaces also flagged the doubles an ulp or two either side of a power of ten.
+#[cfg(test)]
 fn get_sp_and_10in_flag(v: f64) -> (i32, i32) {
     if v >= 1.0 {
         let mut i = 0;
@@ -160,88 +218,283 @@ fn get_sp_and_10in_flag(v: f64) -> (i32, i32) {
             i += 1;
         }
     }
-    let log10v = v.log10();
-    let sp = log10v.floor() as i32;
-    let flag = if log10v == (log10v as i64) as f64 {
-        1
-    } else {
-        0
-    };
-    (sp, flag)
+    let sp = scale_from_exponent(v);
+    (sp, i32::from(pow10(sp) == Some(v)))
 }
 
-/// `getSignificantCount`: number of decimal significant digits of `v`.
-///
-/// Returns `Err` for unsupported magnitudes (negative scale lookup) or if the
-/// search exceeds a safety bound, so the caller can fall back to raw storage.
-fn get_significant_count(v: f64, sp: i32, last_beta_star: i32) -> Result<i32, ()> {
-    let mut i: i32;
-    if last_beta_star != i32::MAX && last_beta_star != 0 {
-        i = (last_beta_star - sp - 1).max(1);
-    } else if last_beta_star == i32::MAX {
-        i = 17 - sp - 1;
-    } else if sp >= 0 {
-        i = 1;
-    } else {
-        i = -sp;
-    }
+/// Most significant decimal digits the ELF layer counts. A value with more is stored raw: from
+/// 16 digits on `beta = alpha + sp + 1` leaves at most 3 erasable bits
+/// (`f(alpha) + E >= 3.32 (alpha + sp) - 1`), short of the `erase_bits > 4` the encoder needs.
+const MAX_SIGNIFICANT_DIGITS: i32 = 15;
 
-    // Once `v * 10^i` is past `i64::MAX` the cast saturates and `temp_long as f64` can
-    // never equal `temp` again (it only grows with `i`), so the search below would run to
-    // its guard for nothing. For a value like `1e-300` that was 5,000 iterations, each one
-    // formatting and parsing a power of ten: ~230 µs of main-thread time per sample, on the
-    // default encoding, from any client. Bail out at once instead; the outcome (`Err`, the
-    // value is stored raw) is what the exhausted guard produced.
-    const SATURATES: f64 = 9_223_372_036_854_775_808.0; // 2^63: `i64::MAX as f64`
-    let mut temp = v * get_10ip(i)?;
-    if temp > SATURATES {
+/// `10^MAX_SIGNIFICANT_DIGITS`: the first scaled value with too many digits.
+const DIGIT_LIMIT: u64 = 1_000_000_000_000_000;
+
+/// `(n / 10^z, z)` for the largest `z` with `10^z | n`; `(0, 0)` for `n == 0`.
+///
+/// Four conditional steps of 10^8, 10^4, 10^2 and 10 instead of a divide-by-ten loop: they
+/// cover every `z` below 16, and `n < DIGIT_LIMIT` keeps `z <= 14`. The divisions are by
+/// constants, so each step is a multiply-high and a select.
+#[inline]
+fn strip_decimal_zeros(n: u64) -> (u64, u32) {
+    #[inline(always)]
+    fn step(n: u64, z: u32, pow: u64, digits: u32) -> (u64, u32) {
+        let q = n / pow;
+        if q * pow == n {
+            (q, z + digits)
+        } else {
+            (n, z)
+        }
+    }
+    if n == 0 {
+        return (0, 0);
+    }
+    let (n, z) = step(n, 0, 100_000_000, 8);
+    let (n, z) = step(n, z, 10_000, 4);
+    let (n, z) = step(n, z, 100, 2);
+    step(n, z, 10, 1)
+}
+
+/// Number of decimal significant digits of `v` (`v > 0`, `sp` its scale position), or `Err`
+/// when it has more than [`MAX_SIGNIFICANT_DIGITS`] or its scale is outside the tables.
+///
+/// Top-down: `v * 10^(14 - sp)` lies below `10^15 < 2^53`, where doubles are an exact
+/// integer grid (spacing at most 1/8), so rounding it gives the 15-digit decimal nearest to
+/// `v`. A division tells whether that decimal reads back as `v`; if so, its trailing zeros
+/// are the digits `v` does not need. The result does not depend on the previous value, and
+/// there is no search loop: the old one climbed from the previous value's digit count one
+/// power of ten at a time and then stripped zeros one by one.
+///
+/// The division is only a correctly rounded `n / 10^i` while `10^i` is exact (`i <= 22`,
+/// i.e. `|v| >= 1e-8`). Past that it misjudges a fifth to a third of the short decimals, so
+/// it is skipped there and `try_recover` in `write_value` is the only exactness check. A value
+/// with more than 15 digits is then erased only if recovery gives it back bit for bit, so the
+/// stream stays lossless; otherwise it is stored raw.
+#[inline]
+fn significant_count(v: f64, sp: i32) -> Result<i32, ()> {
+    /// Largest `i` with `10^i` exactly representable.
+    const EXACT_POW10: i32 = 22;
+    let i = MAX_SIGNIFICANT_DIGITS - 1 - sp;
+    if i < 0 || i as usize >= MAP_10IP.len() {
         return Err(());
     }
-    let mut temp_long = temp as i64;
-    let mut guard = 0u32;
-    while temp_long as f64 != temp {
-        i += 1;
-        guard += 1;
-        if guard > 5000 {
-            return Err(());
+    let scale = MAP_10IP[i as usize];
+    // `v * scale >= 0`; adding one half and truncating rounds it (exactly, below 2^52).
+    let n = (v * scale + 0.5) as u64;
+    if n >= DIGIT_LIMIT || (i <= EXACT_POW10 && n as f64 / scale != v) {
+        return Err(());
+    }
+    let (_, z) = strip_decimal_zeros(n);
+    Ok(MAX_SIGNIFICANT_DIGITS - z as i32)
+}
+
+/// The decimal places `v` needs (`alpha = beta - sp - 1`), from the top-down digit count. The
+/// sign is ignored.
+///
+/// Negative only for a multiple of ten with fewer significant digits than integer places, i.e.
+/// an integer. The encoder erases only for `0..=MAX_ALPHA`.
+pub fn get_alpha(v: f64) -> Result<i32, ()> {
+    let v = v.abs();
+    let sp = get_sp(v);
+    let beta = significant_count(v, sp)?;
+    Ok(beta - sp - 1)
+}
+
+/// Most decimal places the 4-bit ELF header can carry. A value that needs more is stored raw.
+pub const MAX_ALPHA: i32 = 15;
+
+/// `10^alpha` for `alpha` in `0..=MAX_ALPHA`, the scale recovery rounds at; `None` outside.
+#[inline(always)]
+pub fn alpha_scale(alpha: i32) -> Option<f64> {
+    if (0..=MAX_ALPHA).contains(&alpha) {
+        Some(MAP_10IP[alpha as usize])
+    } else {
+        None
+    }
+}
+
+/// The search [`get_alpha`]'s digit count replaced (2026-10-29), kept for the equivalence
+/// tests: a climb from the previous value's digit count, then a strip loop.
+#[cfg(test)]
+mod reference {
+    use super::{get_10ip, get_sp_and_10in_flag};
+
+    /// `getSignificantCount`: number of decimal significant digits of `v`.
+    ///
+    /// Returns `Err` for unsupported magnitudes (negative scale lookup) or if the
+    /// search exceeds a safety bound, so the caller can fall back to raw storage.
+    pub(super) fn get_significant_count(v: f64, sp: i32, last_beta_star: i32) -> Result<i32, ()> {
+        let mut i: i32;
+        if last_beta_star != i32::MAX && last_beta_star != 0 {
+            i = (last_beta_star - sp - 1).max(1);
+        } else if last_beta_star == i32::MAX {
+            i = 17 - sp - 1;
+        } else if sp >= 0 {
+            i = 1;
+        } else {
+            i = -sp;
         }
-        temp = v * get_10ip(i)?;
+
+        // Once `v * 10^i` is past `i64::MAX` the cast saturates and `temp_long as f64` can
+        // never equal `temp` again (it only grows with `i`), so the search below would run to
+        // its guard for nothing. For a value like `1e-300` that was 5,000 iterations, each one
+        // formatting and parsing a power of ten: ~230 µs of main-thread time per sample, on the
+        // default encoding, from any client. Bail out at once instead; the outcome (`Err`, the
+        // value is stored raw) is what the exhausted guard produced.
+        const SATURATES: f64 = 9_223_372_036_854_775_808.0; // 2^63: `i64::MAX as f64`
+        let mut temp = v * get_10ip(i)?;
         if temp > SATURATES {
             return Err(());
         }
-        temp_long = temp as i64;
-    }
-
-    if temp / get_10ip(i)? != v {
-        Ok(17)
-    } else {
-        while i > 0 && temp_long % 10 == 0 {
-            i -= 1;
-            temp_long /= 10;
+        let mut temp_long = temp as i64;
+        let mut guard = 0u32;
+        while temp_long as f64 != temp {
+            i += 1;
+            guard += 1;
+            if guard > 5000 {
+                return Err(());
+            }
+            temp = v * get_10ip(i)?;
+            if temp > SATURATES {
+                return Err(());
+            }
+            temp_long = temp as i64;
         }
-        Ok(sp + i + 1)
+
+        if temp / get_10ip(i)? != v {
+            Ok(17)
+        } else {
+            while i > 0 && temp_long % 10 == 0 {
+                i -= 1;
+                temp_long /= 10;
+            }
+            Ok(sp + i + 1)
+        }
+    }
+
+    /// `getAlphaAndBetaStar`: returns `(alpha, beta_star)`.
+    pub(super) fn get_alpha_and_beta_star(v: f64, last_beta_star: i32) -> Result<(i32, i32), ()> {
+        let v = if v < 0.0 { -v } else { v };
+        let (sp, flag) = get_sp_and_10in_flag(v);
+        let beta = get_significant_count(v, sp, last_beta_star)?;
+        let alpha = beta - sp - 1;
+        let beta_star = if flag == 1 { 0 } else { beta };
+        Ok((alpha, beta_star))
     }
 }
 
-/// `getAlphaAndBetaStar`: returns `(alpha, beta_star)`.
-pub fn get_alpha_and_beta_star(v: f64, last_beta_star: i32) -> Result<(i32, i32), ()> {
-    let v = if v < 0.0 { -v } else { v };
-    let (sp, flag) = get_sp_and_10in_flag(v);
-    let beta = get_significant_count(v, sp, last_beta_star)?;
-    let alpha = beta - sp - 1;
-    let beta_star = if flag == 1 { 0 } else { beta };
-    Ok((alpha, beta_star))
+/// Most fractional mantissa bits a value may have and still skip the ELF digit search.
+///
+/// The bound is a proof, not a tuning knob: the first value ELF does erase has 8 fractional
+/// bits (`17582400172190.2`; see `fraction_bit_limit_is_tight`), and 15 changes bytes.
+const MAX_SHORT_DYADIC_FRACTION_BITS: i32 = 4;
+
+/// Whether `bits` is a normal, nonzero double that ELF can never erase because it has at most
+/// `MAX_SHORT_DYADIC_FRACTION_BITS` (4) fractional mantissa bits, i.e. is a multiple of 1/16:
+/// `52 - tz(mantissa) - (e - 1023) <= 4`, where an all-zero mantissa counts as 52 trailing
+/// zeros. Integers, halves, quarters and so on qualify. Zero, subnormal, infinite and NaN
+/// patterns return `false` and keep their existing paths.
+///
+/// # Why skipping the search is byte-neutral
+///
+/// Let `E` be the unbiased exponent, `tz` the trailing zero bits of the mantissa and
+/// `k = 52 - tz - E` the number of fractional bits, so `v = odd * 2^-k`. A decimal place count
+/// `alpha` makes ELF clear `erase_bits = 52 - f(alpha) - E = k + tz - f(alpha)` low bits
+/// (`f(alpha) = ceil(alpha * log2 10)`, [`get_f_alpha`]). It stores the erased form only if
+/// those bits are not already zero (`delta != 0`), which needs `erase_bits > tz`, i.e.
+/// `f(alpha) < k`, and `erase_bits > 4`. Otherwise `write_value` stores the raw bit pattern,
+/// which is what the bypass writes, and `last_alpha` is untouched on that path.
+///
+/// * `alpha >= 1`: `f(alpha) >= f(1) = 4 >= k`, so `delta == 0`.
+/// * `alpha == 0` and `k <= 0` (an integer): `f(0) = 0` and `52 - E <= tz`, so `delta == 0`.
+/// * `alpha == 0` and `1 <= k <= 4` (a non-integer): every fractional bit is cleared, leaving
+///   `trunc(v) != v`, and a zero-place round-up in the recovery check returns an integer, so
+///   `try_recover` cannot give `v` back and the value is stored raw anyway.
+///
+/// A nonzero `v` with `k <= 4` is at least `2^-4`, so `erase_bits <= 56` and the shift in
+/// `write_value` never wraps. The argument stops at `k = 4`. Nothing with `k` of 5 to 7 has
+/// been seen to erase, but that is not proven; from `k = 8` it happens (`alpha = 1` for a
+/// value near `2^43`, see `fraction_bit_limit_is_tight`). The wider bound of 15 fractional bits
+/// this was first specified with skips values the encoder erases and changes the stream.
+///
+/// The body tests the same condition on the value: it is a multiple of 1/16 (integers included).
+pub(crate) fn is_short_dyadic(bits: u64) -> bool {
+    // Variants that select the same set and measured slower (chimp encode_bulk vs the
+    // search-everything baseline, non-dyadic workloads, geomean of medians of 3, 2026-10-29,
+    // M2): `52 - tz - E <= 4` on the raw fields +5.4 %, an exponent-range mask test +4.8 %,
+    // `(v * 16).trunc()` alone +4.2 %; this +2.9 %. Counter and discrete encode ran at
+    // 0.30-0.40x of the baseline with every one of them.
+    const SCALE: f64 = (1u32 << MAX_SHORT_DYADIC_FRACTION_BITS) as f64;
+    let v = f64::from_bits(bits);
+    v.is_normal() && (v.trunc() == v || (v * SCALE).trunc() == v * SCALE)
 }
 
-/// `roundUp`: recover the original value from an erased `v_prime`.
-#[inline(always)]
-pub fn round_up(v: f64, alpha: i32) -> Result<f64, ()> {
-    let scale = get_10ip(alpha)?;
-    Ok(if v < 0.0 {
-        (v * scale).floor() / scale
-    } else {
-        (v * scale).ceil() / scale
-    })
+/// The 3,150-value set the 2026-10-29 encoder probe used for boundary checks: zero, the
+/// infinities, NaN, the extreme magnitudes, a binary grid around several bases, bit patterns
+/// at the exponent/mantissa edges, and every power of ten. Shared by the Chimp tests.
+#[cfg(test)]
+pub(crate) fn boundary_corpus() -> Vec<f64> {
+    let mut out = vec![
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x7ff8_0000_0000_0001),
+        f64::from_bits(1),
+        f64::MIN_POSITIVE,
+        f64::MAX,
+        -f64::MAX,
+    ];
+    for base in [0.0, 1.0, 1e6, 1e12, 1e14, 1e15, 1e18] {
+        for i in -64..=64 {
+            let step = i as f64 / 16.0;
+            out.push(base + step);
+            out.push(-base + step);
+        }
+    }
+    for exponent in [0u64, 1, 10, 512, 1000, 1023, 1030, 1074, 1075, 2046] {
+        for mantissa in [0u64, 1, 15, 16, 0x000f_ffff_ffff_ffff] {
+            for sign in [0u64, 1 << 63] {
+                out.push(f64::from_bits(sign | (exponent << 52) | mantissa));
+            }
+        }
+    }
+    for p in -308..=308 {
+        let pow: f64 = format!("1e{p}").parse().unwrap();
+        out.push(pow);
+        out.push(-pow);
+    }
+    out.push(1.0);
+    out
+}
+
+/// The predicate `ChimpCompressor::write_value` evaluates before it chooses Elf case `0` or
+/// `11` over the raw case `10`: the same decimal-place count, `0..=MAX_ALPHA` range, erase
+/// mask, `delta != 0 && erase_bits > 4` and recovery check, in the same order (a copy: keep it
+/// in step with `write_value`). Zero and the non-finite patterns never reach it.
+#[cfg(test)]
+pub(crate) fn elf_would_erase(v: f64) -> bool {
+    v != 0.0 && v.is_finite() && erases_with(v, get_alpha(v))
+}
+
+/// `write_value`'s erase decision for `v` given a decimal-place count result.
+#[cfg(test)]
+fn erases_with(v: f64, count: Result<i32, ()>) -> bool {
+    use super::compressor::try_recover;
+
+    let Ok(alpha) = count else {
+        return false;
+    };
+    if !(0..=MAX_ALPHA).contains(&alpha) {
+        return false;
+    }
+    let v_long = v.to_bits();
+    let e = ((v_long >> 52) & 0x7ff) as i32;
+    let erase_bits = 52 - (get_f_alpha(alpha) + e - 1023);
+    let mask = u64::MAX.wrapping_shl(erase_bits as u32);
+    let delta = (!mask) & v_long;
+    let v_prime_long = mask & v_long;
+    delta != 0 && erase_bits > 4 && try_recover(v_prime_long, alpha) == Some(v)
 }
 
 #[cfg(test)]
@@ -260,58 +513,441 @@ mod tests {
             assert_eq!(entry.to_bits(), parsed.to_bits(), "10^-{i}");
         }
         assert_eq!(get_10ip(309), Ok(f64::INFINITY));
-        assert_eq!(get_10in(324), Ok(0.0));
         assert_eq!(get_10ip(-1), Err(()));
-        assert_eq!(get_10in(-1), Err(()));
+        for alpha in 0..=MAX_ALPHA {
+            assert_eq!(alpha_scale(alpha), Some(MAP_10IP[alpha as usize]));
+        }
+        assert_eq!(alpha_scale(-1), None);
+        assert_eq!(alpha_scale(MAX_ALPHA + 1), None);
     }
 
-    /// A search whose product overflows must fail fast (the value is then stored raw), not
-    /// run the 5,000-iteration guard. That is any magnitude below ~1e-292 on a fresh stream
-    /// (`last_beta_star == MAX` starts the search at `10^(16 - sp)`, past `10^308`) and a
-    /// subnormal from any state. Debug build, so the budget is generous: the old path took seconds here.
+    /// `floor(log10 x)` read off the power tables: the largest `k` with `10^k <= x` for
+    /// `x >= 1`, else `-k` for the smallest `k >= 1` with `10^-k <= x`. Exact by construction
+    /// (`log10` itself is not: for `x` one ulp under `10^p` it can round up to `p`). `None`
+    /// for `x < 1e-323`, whose scale (-324) has no table entry.
+    fn table_sp(x: f64) -> Option<i32> {
+        if x >= 1.0 {
+            Some(MAP_10IP.partition_point(|&p| p <= x) as i32 - 1)
+        } else {
+            let k = MAP_10IN.partition_point(|&p| p > x);
+            (k < MAP_10IN.len()).then_some(-(k as i32))
+        }
+    }
+
+    /// The power-of-ten flag `get_sp_and_10in_flag` is specified to return: the table scan's
+    /// (`1` only for `10^-k` below one, never in `[1, 1e9)`), and for `x >= 1e9` whether `x` is
+    /// exactly `10^sp`.
+    fn expected_flag(x: f64, sp: i32) -> i32 {
+        i32::from(if x < 1.0 {
+            x == MAP_10IN[(-sp) as usize]
+        } else if x < 1e9 {
+            false
+        } else {
+            x == MAP_10IP[sp as usize]
+        })
+    }
+
+    /// Every input the scale functions are checked on: each power of ten, its neighbours at
+    /// +-1 ulp and three times it, then both ends of every binary exponent (normal and
+    /// subnormal), then random finite positive bit patterns. Finite, positive, `>= 1e-323`.
+    fn scale_inputs() -> Vec<f64> {
+        let mut bits: Vec<u64> = Vec::new();
+        for p in -323i32..=308 {
+            let v = if p >= 0 {
+                MAP_10IP[p as usize]
+            } else {
+                MAP_10IN[(-p) as usize]
+            };
+            bits.extend([v.to_bits(), v.to_bits() - 1, v.to_bits() + 1]);
+            bits.push((v * 3.0).to_bits());
+        }
+        for biased in 0..=0x7feu64 {
+            for mantissa in [
+                0,
+                1,
+                2,
+                (1 << 51) - 1,
+                1 << 51,
+                (1 << 52) - 2,
+                (1 << 52) - 1,
+            ] {
+                bits.push((biased << 52) | mantissa);
+            }
+        }
+        for bit in 0..52 {
+            bits.push(1 << bit);
+            bits.push((1 << bit) - 1);
+        }
+        // The subnormals at both ends, where the table's powers of ten are coarsest.
+        bits.extend(2..1 << 18);
+        bits.extend((1 << 52) - (1 << 18)..1 << 52);
+        let mut next = xorshift(0x0dd_ba11_f00d_cafe);
+        // Random patterns, and random powers of ten nudged by up to 8 ulps either way.
+        bits.extend((0..200_000).map(|_| next() & !(1 << 63)));
+        for _ in 0..200_000 {
+            let p = (next() % 632) as i32 - 323;
+            let v = if p >= 0 {
+                MAP_10IP[p as usize]
+            } else {
+                MAP_10IN[(-p) as usize]
+            };
+            bits.push((v.to_bits() + next() % 17).saturating_sub(8));
+        }
+        bits.into_iter()
+            .map(f64::from_bits)
+            .filter(|x| x.is_finite() && *x >= 1e-323)
+            .collect()
+    }
+
+    /// `get_sp` is the exact table `floor(log10)` for every finite positive input, including the
+    /// ones just under a power of ten that `log10` rounds up.
+    #[test]
+    fn get_sp_matches_the_table_oracle() {
+        let bad: Vec<String> = scale_inputs()
+            .into_iter()
+            .filter(|&x| Some(get_sp(x)) != table_sp(x))
+            .map(|x| {
+                format!(
+                    "{x:e} ({:#018x}): got {}, want {:?}",
+                    x.to_bits(),
+                    get_sp(x),
+                    table_sp(x)
+                )
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "{} disagreements, first: {:#?}",
+            bad.len(),
+            &bad[..bad.len().min(12)]
+        );
+    }
+
+    /// `get_sp_and_10in_flag` returns the same exact scale, and its flag is exact.
+    #[test]
+    fn get_sp_and_flag_match_the_table_oracle() {
+        let bad: Vec<String> = scale_inputs()
+            .into_iter()
+            .filter(|&x| {
+                let want = table_sp(x).unwrap();
+                get_sp_and_10in_flag(x) != (want, expected_flag(x, want))
+            })
+            .map(|x| {
+                let want = table_sp(x).unwrap();
+                format!(
+                    "{x:e} ({:#018x}): got {:?}, want {:?}",
+                    x.to_bits(),
+                    get_sp_and_10in_flag(x),
+                    (want, expected_flag(x, want))
+                )
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "{} disagreements, first: {:#?}",
+            bad.len(),
+            &bad[..bad.len().min(12)]
+        );
+    }
+
+    /// The smallest subnormal is the one double below `1e-323`; its scale is -324.
+    #[test]
+    fn get_sp_of_the_smallest_subnormal() {
+        assert_eq!(get_sp(5e-324), -324);
+        assert_eq!(get_sp_and_10in_flag(5e-324), (-324, 0));
+    }
+
+    /// Zero, infinity and NaN keep the values `floor(log10)` saturated to.
+    #[test]
+    fn get_sp_of_special_values_is_unchanged() {
+        assert_eq!(get_sp(0.0), i32::MIN);
+        assert_eq!(get_sp(-0.0), i32::MIN);
+        assert_eq!(get_sp(f64::INFINITY), i32::MAX);
+        assert_eq!(get_sp(f64::NAN), 0);
+        assert_eq!(get_sp_and_10in_flag(0.0), (i32::MIN, 0));
+        assert_eq!(get_sp_and_10in_flag(f64::INFINITY), (i32::MAX, 0));
+        assert_eq!(get_sp_and_10in_flag(f64::NAN), (0, 0));
+    }
+
+    /// Magnitudes whose scale needs a power of ten past `MAP_10IP` (|v| below ~1e-294) and
+    /// subnormals fail at once (the value is then stored raw); nothing loops. Debug build, so
+    /// the budget is generous: the pre-2026-09 search took seconds here.
     #[test]
     fn overflowing_searches_fail_fast() {
-        let cases = [
-            (1e-300, i32::MAX),
-            (1e-295, i32::MAX),
-            (f64::MIN_POSITIVE, i32::MAX),
-            (5e-324, i32::MAX),
-            (5e-324, 0),
-            (5e-324, 5),
-            (5e-324, 17),
-        ];
+        let cases = [1e-300, 1e-295, f64::MIN_POSITIVE, 5e-324];
         let start = std::time::Instant::now();
         for _ in 0..5_000 {
-            for (v, last) in cases {
-                assert_eq!(
-                    get_alpha_and_beta_star(v, last),
-                    Err(()),
-                    "{v:e} last {last}"
-                );
+            for v in cases {
+                assert_eq!(get_alpha(v), Err(()), "{v:e}");
             }
         }
         let elapsed = start.elapsed();
         assert!(
             elapsed.as_millis() < 500,
-            "40,000 overflowing searches took {elapsed:?}"
+            "20,000 overflowing searches took {elapsed:?}"
         );
     }
 
-    /// With a known `beta_star` a tiny power of ten is a fast, legitimate erasure: the
-    /// search starts near the right scale and never overflows.
+    /// The count scales `v` to 15 digits with one table power of ten, so the smallest power of
+    /// ten it can still count is `1e-294` (`10^(14 + 294)` is the last table entry). Anything
+    /// smaller fails the count. Both are stored raw: 294 places do not fit the header.
     #[test]
-    fn tiny_powers_of_ten_erase_when_the_scale_is_known() {
-        assert_eq!(get_alpha_and_beta_star(1e-300, 0), Ok((300, 0)));
-        assert_eq!(get_alpha_and_beta_star(1e-300, 5), Ok((300, 0)));
+    fn tiny_powers_of_ten_count_when_the_scale_is_known() {
+        assert_eq!(get_alpha(1e-300), Err(()));
+        assert_eq!(get_alpha(1e-295), Err(()));
+        assert_eq!(get_alpha(1e-294), Ok(294));
+        assert!(!elf_would_erase(1e-294));
     }
 
     /// Values in the range that used to go through the string-parse fallback still get
-    /// the same digit counts.
+    /// the same decimal-place counts; those within the header's 15 places erase.
     #[test]
     fn small_magnitudes_still_erase() {
-        assert_eq!(get_alpha_and_beta_star(1e-5, i32::MAX), Ok((5, 0)));
-        assert_eq!(get_alpha_and_beta_star(1.5e-5, i32::MAX), Ok((6, 2)));
-        assert_eq!(get_alpha_and_beta_star(1e-20, i32::MAX), Ok((20, 0)));
-        assert_eq!(get_alpha_and_beta_star(123.456, i32::MAX), Ok((3, 6)));
+        assert_eq!(get_alpha(1e-5), Ok(5));
+        assert_eq!(get_alpha(-1.5e-5), Ok(6));
+        assert_eq!(get_alpha(1e-20), Ok(20));
+        assert_eq!(get_alpha(123.456), Ok(3));
+        assert_eq!(get_alpha(1e-15), Ok(15));
+        for v in [1e-5, -1.5e-5, 123.456, 1e-15, -1e-15] {
+            assert!(elf_would_erase(v), "{v:e}");
+        }
+        assert!(!elf_would_erase(1e-20));
+    }
+
+    #[test]
+    fn strip_decimal_zeros_exact() {
+        assert_eq!(strip_decimal_zeros(0), (0, 0));
+        assert_eq!(strip_decimal_zeros(7), (7, 0));
+        assert_eq!(strip_decimal_zeros(1_230_000), (123, 4));
+        assert_eq!(strip_decimal_zeros(100_000_000_000_000), (1, 14));
+        assert_eq!(strip_decimal_zeros(123_450_000_000_000), (12_345, 10));
+        assert_eq!(
+            strip_decimal_zeros(999_999_999_999_999),
+            (999_999_999_999_999, 0)
+        );
+        for z in 0..15 {
+            assert_eq!(strip_decimal_zeros(7 * 10u64.pow(z)), (7, z), "7e{z}");
+        }
+    }
+
+    /// The values of every generator workload and timestamp model at 1,000 samples, plus the
+    /// counter workload offset by 2^40 and 2^50 (as `gorilla_report` runs it).
+    fn matrix_values() -> Vec<f64> {
+        use crate::tests::generators::{
+            DatasetKey, TimestampModel, ValueWorkload, dataset_seed, generate_dataset,
+        };
+        let mut out = Vec::new();
+        for &workload in ValueWorkload::workloads() {
+            for &ts in TimestampModel::all() {
+                let key = DatasetKey::new(workload, ts);
+                let samples = generate_dataset(key, 1000, dataset_seed(key));
+                let offsets: &[f64] = if workload == ValueWorkload::Counter {
+                    &[0.0, (1u64 << 40) as f64, (1u64 << 50) as f64]
+                } else {
+                    &[0.0]
+                };
+                for &offset in offsets {
+                    out.extend(samples.iter().map(|s| s.value + offset));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether erasing `v` to `alpha` decimal places with the `write_value` mask leaves a value
+    /// the decoder's recovery turns back into `v`, bit for bit.
+    fn recovers(v: f64, alpha: i32) -> bool {
+        use super::super::compressor::try_recover;
+
+        let v_long = v.to_bits();
+        let e = ((v_long >> 52) & 0x7ff) as i32;
+        let erase_bits = 52 - (get_f_alpha(alpha) + e - 1023);
+        let mask = u64::MAX.wrapping_shl(erase_bits as u32);
+        try_recover(mask & v_long, alpha).map(f64::to_bits) == Some(v_long)
+    }
+
+    #[test]
+    fn top_down_count_never_erases_less_than_the_reference() {
+        // On every value the old search's decimal-place count erases (under today's alpha
+        // header and recovery), the new count finds the same or fewer places, and the erased
+        // value still recovers. Both counts share the scale `sp`, so comparing alpha is
+        // comparing the digit counts beta. (Conditioned on "erases", not on the old beta*:
+        // that includes its beta* = 0 answers for values just below a power of ten >= 1e9,
+        // where `log10` rounds up; those never recovered.)
+        for v in boundary_corpus().into_iter().chain(matrix_values()) {
+            if v == 0.0 || !v.is_finite() {
+                continue; // `write_value` never searches these
+            }
+            for last in [i32::MAX, 0, 3, 5, 15] {
+                let old = reference::get_alpha_and_beta_star(v, last).map(|(alpha, _)| alpha);
+                if let Ok(alpha_old) = old
+                    && erases_with(v, old)
+                {
+                    let Ok(alpha) = get_alpha(v) else {
+                        panic!("{v:e} (last {last}): new count failed");
+                    };
+                    assert!(
+                        alpha <= alpha_old,
+                        "{v:e}: new {alpha} > old {alpha_old} places"
+                    );
+                    assert!(recovers(v, alpha), "{v:e} does not recover");
+                    assert!(elf_would_erase(v), "{v:e} is no longer erased");
+                }
+            }
+        }
+    }
+
+    /// Erasure works on the magnitude: `v` erases exactly when `-v` does.
+    #[test]
+    fn erasure_is_sign_symmetric() {
+        for v in boundary_corpus().into_iter().chain(matrix_values()) {
+            assert_eq!(elf_would_erase(v), elf_would_erase(-v), "{v:e}");
+        }
+    }
+
+    #[test]
+    fn short_dyadic_values_never_erase() {
+        for v in boundary_corpus() {
+            if is_short_dyadic(v.to_bits()) {
+                assert!(!elf_would_erase(v), "{v:e} would erase");
+            }
+        }
+    }
+
+    #[test]
+    fn classifier_accepts_integers_and_binary_grids() {
+        for v in [
+            1.0f64,
+            -7.0,
+            123456789.0,
+            0.5,
+            0.25,
+            0.0625,
+            12.5,
+            1e15 + 0.5,
+        ] {
+            assert!(is_short_dyadic(v.to_bits()), "{v}");
+        }
+        for v in [
+            0.1f64,
+            100.23,
+            2f64.powi(-20),
+            1e-300,
+            f64::MIN_POSITIVE,
+            0.0,
+            f64::NAN,
+        ] {
+            assert!(!is_short_dyadic(v.to_bits()), "{v:e}");
+        }
+    }
+
+    /// A xorshift64 stream: deterministic, no dependency.
+    fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        }
+    }
+
+    /// A random double with exactly `k` fractional mantissa bits at unbiased exponent `e`,
+    /// or `None` when no such double exists.
+    fn dyadic_with_fraction_bits(next: &mut impl FnMut() -> u64, e: i32, k: i32) -> Option<f64> {
+        let tz = 52 - e - k;
+        if !(0..=52).contains(&tz) {
+            return None;
+        }
+        let mantissa = if tz == 52 {
+            0
+        } else {
+            (next() & ((1u64 << 52) - 1) & !((1u64 << tz) - 1)) | (1u64 << tz)
+        };
+        let sign = (next() & 1) << 63;
+        Some(f64::from_bits(
+            sign | (((e + 1023) as u64) << 52) | mantissa,
+        ))
+    }
+
+    /// The corpus above is hand-picked; this walks every fraction-bit count the classifier
+    /// accepts across the exponents where erasure is possible at all.
+    #[test]
+    fn short_dyadic_random_sweep_never_erases() {
+        let mut next = xorshift(0x9e37_79b9_7f4a_7c15);
+        for k in 0..=MAX_SHORT_DYADIC_FRACTION_BITS {
+            for _ in 0..50_000 {
+                let e = (next() % 130) as i32 - 20; // 2^-20 .. 2^109
+                let Some(v) = dyadic_with_fraction_bits(&mut next, e, k) else {
+                    continue;
+                };
+                assert!(is_short_dyadic(v.to_bits()), "{v:e} (k {k})");
+                assert!(!elf_would_erase(v), "{v:e} (k {k})");
+            }
+        }
+    }
+
+    /// Why the limit is 4 and not 15: this value has 8 fractional bits, the search finds one
+    /// decimal place for it, and it is erased. Treating it as "dyadic" changes the stream.
+    #[test]
+    fn fraction_bit_limit_is_tight() {
+        let v = 17582400172190.2_f64;
+        assert!(elf_would_erase(v));
+        assert!(!is_short_dyadic(v.to_bits()));
+
+        // And for every wider fraction-bit count some value is erased and rejected.
+        let mut next = xorshift(0x2545_f491_4f6c_dd1d);
+        for k in (MAX_SHORT_DYADIC_FRACTION_BITS + 1)..=15 {
+            let mut erased = 0;
+            for _ in 0..200_000 {
+                let e = (next() % 40) as i32 + 20;
+                let Some(v) = dyadic_with_fraction_bits(&mut next, e, k) else {
+                    continue;
+                };
+                assert!(!is_short_dyadic(v.to_bits()), "{v:e} (k {k})");
+                erased += usize::from(elf_would_erase(v));
+            }
+            if k >= 8 {
+                assert!(erased > 0, "no erased value found at k = {k}");
+            }
+        }
+    }
+
+    /// The classifier is the fraction-bit definition written out: finite, normal, nonzero, and
+    /// `52 - tz(mantissa) - E <= 4`.
+    #[test]
+    fn classifier_matches_the_fraction_bit_definition() {
+        fn reference(bits: u64) -> bool {
+            let biased = ((bits >> 52) & 0x7ff) as i32;
+            if biased == 0 || biased == 0x7ff {
+                return false;
+            }
+            let mantissa = bits & ((1u64 << 52) - 1);
+            let tz = mantissa.trailing_zeros().min(52) as i32;
+            52 - tz - (biased - 1023) <= MAX_SHORT_DYADIC_FRACTION_BITS
+        }
+
+        let mut next = xorshift(0x1234_5678_9abc_def1);
+        let mut patterns: Vec<u64> = boundary_corpus().iter().map(|v| v.to_bits()).collect();
+        for biased in 0..=0x7ffu64 {
+            for sign in [0u64, 1 << 63] {
+                for mantissa in [0u64, 1, (1 << 52) - 1, 1 << 51, 1 << 47, 1 << 48, 1 << 49] {
+                    patterns.push(sign | (biased << 52) | mantissa);
+                }
+                // A single set bit at every mantissa position.
+                for bit in 0..52 {
+                    patterns.push(sign | (biased << 52) | (1 << bit));
+                }
+            }
+        }
+        patterns.extend((0..200_000).map(|_| next()));
+        for bits in patterns {
+            assert_eq!(
+                is_short_dyadic(bits),
+                reference(bits),
+                "{bits:#018x} ({:e})",
+                f64::from_bits(bits)
+            );
+        }
     }
 }

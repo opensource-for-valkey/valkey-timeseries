@@ -43,10 +43,17 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
     // silently misread data. Migration is via export/re-ingest, not RDB —
     // see COMPATIBILITY.md.
     if !is_supported_encoding_version(enc_ver) {
+        let readable = if MIN_TIMESERIES_TYPE_ENCODING_VERSION == TIMESERIES_TYPE_ENCODING_VERSION {
+            format!("version {TIMESERIES_TYPE_ENCODING_VERSION}")
+        } else {
+            format!(
+                "versions {MIN_TIMESERIES_TYPE_ENCODING_VERSION} to \
+                 {TIMESERIES_TYPE_ENCODING_VERSION}"
+            )
+        };
         return Err(ValkeyError::String(format!(
             "TSDB: cannot load TSDB-TYPE RDB payload with encoding version {enc_ver} \
-             (this module reads versions {MIN_TIMESERIES_TYPE_ENCODING_VERSION} to \
-             {TIMESERIES_TYPE_ENCODING_VERSION}). \
+             (this module reads {readable}). \
              RedisTimeSeries RDB/DUMP payloads are incompatible and cannot be imported; \
              re-ingest via TS.RANGE export -> TS.MADD (see COMPATIBILITY.md)"
         )));

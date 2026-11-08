@@ -1,5 +1,10 @@
 use super::ChimpChunk;
 use crate::common::Sample;
+use crate::common::encoding::{
+    try_read_f64_le, try_read_signed_varint, try_read_uvarint, write_f64_le, write_signed_varint,
+    write_uvarint,
+};
+use crate::error::TsdbError;
 use crate::series::DuplicatePolicy;
 use crate::series::chunks::chunk::Chunk;
 use crate::series::chunks::{ChunkOps, GorillaChunk};
@@ -66,7 +71,7 @@ fn test_clear() {
     assert_eq!(chunk.last_timestamp(), 0);
 
     // A cleared chunk must be usable again, which means the Chimp XOR state and
-    // the ELF `beta_star` were reset along with the bit stream.
+    // the ELF `last_alpha` were reset along with the bit stream.
     let more = generate_samples(50);
     for sample in more.iter() {
         chunk.add_sample(sample).unwrap();
@@ -247,7 +252,7 @@ fn test_serialize_roundtrip() {
 }
 
 /// The codec carries state across samples on both layers: Chimp's previous
-/// value and rounded leading-zero count, and ELF's `beta_star`, plus the
+/// value and rounded leading-zero count, and ELF's `last_alpha`, plus the
 /// timestamp delta. If any of it is lost on the way through `serialize`,
 /// samples appended afterwards decode as garbage — so a restored chunk must
 /// produce the same stream as one that was never persisted.
@@ -285,7 +290,7 @@ fn test_append_after_serialize_roundtrip() {
 }
 
 /// Same contract as above, but across value shapes that keep switching ELF
-/// case: erasable decimals (which move `beta_star`), values ELF stores raw,
+/// case: erasable decimals (which move `last_alpha`), values ELF stores raw,
 /// and non-finite ones.
 #[test]
 fn test_append_after_serialize_roundtrip_mixed_cases() {
@@ -346,6 +351,103 @@ fn test_deserialize_rejects_corrupt_codec_state() {
         let mut corrupt = buf.clone();
         corrupt[i] = corrupt[i].wrapping_add(0x5b);
         let _ = ChimpChunk::deserialize(&corrupt);
+    }
+
+    // Codec state the encoder could never have written is rejected on load, so a later
+    // append cannot write a stream the decoder misreads.
+    let header = CodecHeader::parse(&buf);
+    assert_eq!(ChimpChunk::deserialize(&header.write()).unwrap(), chunk);
+    assert_ne!(header.stored_lz, 64, "the fixture must have an open window");
+    let with = |last_alpha, stored_lz, stored_tz| CodecHeader {
+        last_alpha,
+        stored_lz,
+        stored_tz,
+        ..header.clone()
+    };
+    // Each case breaks one field; the same rewrite with valid values loads.
+    let alpha = header.last_alpha;
+    // (32..=54 are extended windows.)
+    for (a, lz, tz) in [
+        (alpha, 0, 0),
+        (-1, 0, 0),
+        (15, 24, 39),
+        (alpha, 32, 31),
+        (alpha, 54, 9),
+        (alpha, 64, 0),
+    ] {
+        assert!(
+            ChimpChunk::deserialize(&with(a, lz, tz).write()).is_ok(),
+            "{a} {lz} {tz}"
+        );
+    }
+    let mut cases = vec![(-2, 0, 0), (16, 0, 0), (1 << 40, 0, 0)];
+    cases.extend([-1, 1, 25, 63, 65, i64::from(i32::MAX), (1 << 32) + 8].map(|lz| (alpha, lz, 0)));
+    cases.extend([-1, 64, (1 << 32) + 2].map(|tz| (alpha, 0, tz)));
+    cases.extend([31, 55].map(|lz| (alpha, lz, 0)));
+    cases.extend([(24, 40), (8, 56), (54, 10), (64, 1)].map(|(lz, tz)| (alpha, lz, tz)));
+    for (a, lz, tz) in cases {
+        let corrupt = with(a, lz, tz).write();
+        assert!(
+            matches!(
+                ChimpChunk::deserialize(&corrupt),
+                Err(TsdbError::ChunkDecoding)
+            ),
+            "last_alpha {a}, stored_lz {lz}, stored_tz {tz}"
+        );
+    }
+}
+
+/// The serialized Chimp chunk header, field by field, so a test can rewrite one.
+#[derive(Debug, Clone)]
+struct CodecHeader {
+    max_size: u64,
+    count: u64,
+    first_timestamp: i64,
+    last_timestamp: i64,
+    last_delta: i64,
+    last_value: f64,
+    last_alpha: i64,
+    stored_lz: i64,
+    stored_tz: i64,
+    stored_val: u64,
+    first: u64,
+    stream: Vec<u8>,
+}
+
+impl CodecHeader {
+    fn parse(mut buf: &[u8]) -> Self {
+        let buf = &mut buf;
+        Self {
+            max_size: try_read_uvarint(buf).ok().unwrap(),
+            count: try_read_uvarint(buf).ok().unwrap(),
+            first_timestamp: try_read_signed_varint(buf).ok().unwrap(),
+            last_timestamp: try_read_signed_varint(buf).ok().unwrap(),
+            last_delta: try_read_signed_varint(buf).ok().unwrap(),
+            last_value: try_read_f64_le(buf).ok().unwrap(),
+            last_alpha: try_read_signed_varint(buf).ok().unwrap(),
+            stored_lz: try_read_signed_varint(buf).ok().unwrap(),
+            stored_tz: try_read_signed_varint(buf).ok().unwrap(),
+            stored_val: try_read_uvarint(buf).ok().unwrap(),
+            first: try_read_uvarint(buf).ok().unwrap(),
+            stream: buf.to_vec(),
+        }
+    }
+
+    fn write(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_uvarint(&mut out, self.max_size);
+        write_uvarint(&mut out, self.count);
+        write_signed_varint(&mut out, self.first_timestamp);
+        write_signed_varint(&mut out, self.last_timestamp);
+        write_signed_varint(&mut out, self.last_delta);
+        write_f64_le(&mut out, self.last_value);
+        write_signed_varint(&mut out, self.last_alpha);
+        write_signed_varint(&mut out, self.stored_lz);
+        write_signed_varint(&mut out, self.stored_tz);
+        write_uvarint(&mut out, self.stored_val);
+        write_uvarint(&mut out, self.first);
+        out.extend_from_slice(&self.stream);
+        out
     }
 }
 
@@ -512,5 +614,183 @@ mod allocation {
         let right = loaded.split().unwrap();
         assert!(loaded.encoder.get_heap_size() <= max_size + 32);
         assert!(right.encoder.get_heap_size() <= max_size + 32);
+    }
+}
+
+/// Golden streams for the current Chimp grammar. Each fixture pins the encoder (a fresh
+/// encode of its samples must reproduce its bytes) and the decoder (its bytes must decode
+/// to its samples), so any change to the Chimp grammar shows up here and needs regenerated
+/// fixtures (and, once the module is released, a new encoding version).
+mod fixtures {
+    use super::super::ChimpCompressor;
+    use crate::common::Sample;
+    use crate::tests::generators::{
+        DatasetKey, TimestampModel, ValueWorkload, dataset_seed, generate_dataset,
+    };
+
+    const SAMPLES: usize = 32;
+
+    const FIXTURES: [(&str, ValueWorkload, &str); 3] = [
+        (
+            "chimp-drift_q2.txt",
+            ValueWorkload::DriftQuantized,
+            include_str!("fixtures/chimp-drift_q2.txt"),
+        ),
+        (
+            "chimp-counter.txt",
+            ValueWorkload::Counter,
+            include_str!("fixtures/chimp-counter.txt"),
+        ),
+        (
+            "chimp-noisy.txt",
+            ValueWorkload::Noisy,
+            include_str!("fixtures/chimp-noisy.txt"),
+        ),
+    ];
+
+    fn dataset(workload: ValueWorkload) -> Vec<Sample> {
+        let key = DatasetKey::new(workload, TimestampModel::Jitter);
+        generate_dataset(key, SAMPLES, dataset_seed(key))
+    }
+
+    fn encode(samples: &[Sample]) -> ChimpCompressor {
+        let mut compressor = ChimpCompressor::new();
+        for sample in samples {
+            compressor.add(*sample).unwrap();
+        }
+        compressor
+    }
+
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn from_hex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// `(serialized bytes, samples)` from a fixture file.
+    fn parse(fixture: &str) -> (Vec<u8>, Vec<Sample>) {
+        let mut lines = fixture.lines();
+        let wire = from_hex(lines.next().unwrap());
+        let samples = lines
+            .map(|line| {
+                let (ts, bits) = line.split_once(' ').unwrap();
+                Sample::new(
+                    ts.parse().unwrap(),
+                    f64::from_bits(u64::from_str_radix(bits, 16).unwrap()),
+                )
+            })
+            .collect();
+        (wire, samples)
+    }
+
+    fn decode(compressor: &ChimpCompressor) -> Vec<Sample> {
+        compressor.iter().map(Result::unwrap).collect()
+    }
+
+    fn assert_bit_exact(got: &[Sample], want: &[Sample]) {
+        assert_eq!(got.len(), want.len(), "sample count");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert_eq!(g.timestamp, w.timestamp, "timestamp {i}");
+            assert_eq!(g.value.to_bits(), w.value.to_bits(), "value {i}");
+        }
+    }
+
+    /// Regenerates the fixtures from the current encoder. Run only for a deliberate format
+    /// change:
+    /// `cargo test --features enable-system-alloc write_chimp_fixtures -- --ignored`.
+    #[test]
+    #[ignore]
+    fn write_chimp_fixtures() {
+        let dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/series/chunks/chimp/fixtures"
+        );
+        for (name, workload, _) in FIXTURES {
+            let samples = dataset(workload);
+            let compressor = encode(&samples);
+            let mut wire = Vec::new();
+            compressor.serialize(&mut wire);
+            let mut out = to_hex(&wire);
+            out.push('\n');
+            for s in &samples {
+                out.push_str(&format!("{} {:016x}\n", s.timestamp, s.value.to_bits()));
+            }
+            std::fs::write(format!("{dir}/{name}"), out).unwrap();
+            eprintln!("{name}: {:?}", compressor.stats);
+        }
+    }
+
+    /// The fixture samples are still the generator's, so the encode check below compares
+    /// like with like.
+    #[test]
+    fn fixture_samples_match_the_generator() {
+        for (name, workload, fixture) in FIXTURES {
+            let (_, samples) = parse(fixture);
+            let generated = dataset(workload);
+            assert_eq!(samples.len(), SAMPLES, "{name}");
+            assert_bit_exact(&samples, &generated);
+        }
+    }
+
+    /// The golden streams decode bit-exactly, accept appends, and survive another
+    /// serialize/deserialize; a fresh encode reproduces them byte for byte.
+    #[test]
+    fn golden_streams_load_append_and_reencode() {
+        for (name, _, fixture) in FIXTURES {
+            let (wire, mut expected) = parse(fixture);
+
+            // Encoder: the same samples give the same bytes.
+            let mut fresh = Vec::new();
+            encode(&expected).serialize(&mut fresh);
+            assert_eq!(
+                to_hex(&fresh),
+                to_hex(&wire),
+                "{name}: encoder output changed"
+            );
+
+            // Decoder: the bytes give the samples.
+            let mut loaded = ChimpCompressor::deserialize(&wire).unwrap();
+            assert_bit_exact(&decode(&loaded), &expected);
+
+            // Append past the loaded state: a repeat, a quantized step, an integer, a large
+            // counter, a sign change, a NaN, and timestamps that reach the wider dod tiers.
+            let last = *expected.last().unwrap();
+            let extra = [
+                (1_000, last.value),
+                (1_000, ((last.value * 100.0).round() + 25.0) / 100.0),
+                (1_013, 1_000_000.0),
+                (70_000, (1u64 << 50) as f64 + 7.0),
+                (1_000, (1u64 << 50) as f64 + 14.0),
+                (5_000_000, -12.34),
+                (1, f64::NAN),
+                (1_000, 12.345),
+            ];
+            let mut ts = last.timestamp;
+            for (delta, value) in extra {
+                ts += delta;
+                let sample = Sample::new(ts, value);
+                loaded.add(sample).unwrap();
+                expected.push(sample);
+            }
+
+            let mut saved = Vec::new();
+            loaded.serialize(&mut saved);
+            let resumed = ChimpCompressor::deserialize(&saved).unwrap();
+            assert_bit_exact(&decode(&resumed), &expected);
+
+            // A reloaded encoder writes what one that never stopped would have.
+            let mut uninterrupted = Vec::new();
+            encode(&expected).serialize(&mut uninterrupted);
+            assert_eq!(
+                to_hex(&saved),
+                to_hex(&uninterrupted),
+                "{name}: resumed stream"
+            );
+        }
     }
 }

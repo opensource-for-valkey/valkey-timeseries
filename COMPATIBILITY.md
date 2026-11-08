@@ -119,6 +119,16 @@ Smaller reads, `TS.CARD` without `FILTER_BY_RANGE`, and any of these commands is
 
 **What differs.** The persistence format used to store series state (across RDB, AOF, and any internal format) does not match RedisTimeSeries's.
 
+Within Valkey TimeSeries, the module writes and reads encoding version 1. Until
+the first release, formats change in place, without a version bump: RDB, DUMP
+and AOF data written by an older build may fail to load or decode incorrectly.
+Re-ingest it from source data instead (see the README).
+
+In a cluster, run every node on the same build, upgrading all of them together.
+Nodes exchange encoded chunks during fan-out, so a mixed-build cluster can
+return wrong query results instead of an error.
+
+
 **Why.** The on-disk format is an internal implementation detail and is not part of the compatibility contract. Fixing it would constrain Valkey TimeSeries's ability to evolve its storage, chunk-encoding, and recovery strategies independently of RedisTimeSeries.
 
 **Migration impact.** RedisTimeSeries RDB files cannot be loaded directly by Valkey TimeSeries, and vice versa. RDB/DUMP migration is explicitly not on the roadmap: the formats are incompatible and no conversion tooling is planned. Migrations between the two must rebuild series from the underlying data, not by copying persisted data. Two working recipes:

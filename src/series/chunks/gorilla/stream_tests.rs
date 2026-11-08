@@ -128,7 +128,7 @@ fn xor_pattern(lead: u32, sig: u32) -> u64 {
     ones << trailing
 }
 
-/// Every window the 5-bit leading count and 6-bit width can express, each written as a
+/// Every nonzero XOR window, including the extended leading count, written as a
 /// fresh window and then reused by a second sample with the same shape, round-trips
 /// bit-exactly, including the 64-wide payload that the width field encodes as 0.
 #[test]
@@ -136,7 +136,7 @@ fn every_xor_window_round_trips() {
     let mut samples = vec![s(0, 0.0)];
     let mut prev_bits = 0u64;
     let mut ts = 0i64;
-    for lead in 0..=31u32 {
+    for lead in 0..=63u32 {
         for sig in 1..=(64 - lead) {
             let xor = xor_pattern(lead, sig);
             // Two samples per window: one that opens it and one that reuses it. The
@@ -152,7 +152,7 @@ fn every_xor_window_round_trips() {
         }
     }
     // Sanity: the sweep exercised every pair, and the values are not all finite.
-    assert_eq!(samples.len(), 1 + 2 * (32 * 64 - (0..32).sum::<usize>()));
+    assert_eq!(samples.len(), 1 + 2 * (64 * 64 - (0..64).sum::<usize>()));
     assert!(samples.iter().any(|x| x.value.is_nan()));
 
     let mut enc = GorillaEncoder::new();

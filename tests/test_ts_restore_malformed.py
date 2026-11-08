@@ -149,7 +149,7 @@ class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseDebugMode):
         """A payload version this module cannot read is refused before it is parsed."""
         client = self.client
         payload = self._genuine_payload(key='encver_src')
-        for version in (0, 99, -1, 'x'):
+        for version in (0, 2, 99, -1, 'x'):
             with pytest.raises(Exception, match='unsupported TS._RESTORE payload encoding version'):
                 client.execute_command('TS._RESTORE', f'encver{version}', payload, version)
         with pytest.raises(Exception, match='wrong number of arguments'):

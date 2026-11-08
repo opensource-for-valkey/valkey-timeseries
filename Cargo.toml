@@ -112,6 +112,16 @@ path = "tools/latency_report.rs"
 required-features = ["test-utils", "enable-system-alloc"]
 
 [[bin]]
+name = "gorilla_report"
+path = "tools/gorilla_report.rs"
+required-features = ["test-utils", "enable-system-alloc"]
+
+[[bin]]
+name = "gorilla_seek_report"
+path = "tools/gorilla_seek_report.rs"
+required-features = ["test-utils", "enable-system-alloc"]
+
+[[bin]]
 name = "wire_report"
 path = "tools/wire_report.rs"
 required-features = ["test-utils", "enable-system-alloc"]
