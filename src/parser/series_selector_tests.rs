@@ -247,7 +247,8 @@ mod tests {
     fn test_validate_selector_list_rejects_empty_and_empty_matching_filters() {
         // `l=` (label absent) and `l=~".*"` are both satisfied by a missing label, so neither
         // narrows the search. `l=~".+"` requires a non-empty value, so it does.
-        for selector in [r#"{i=""}"#, r#"{i=~".*"}"#, r#"{i!=""}"#] {
+        // `l=~"foo|"` is satisfied by a missing label through its empty alternative.
+        for selector in [r#"{i=""}"#, r#"{i=~".*"}"#, r#"{i!=""}"#, r#"{i=~"foo|"}"#] {
             assert_unbounded_alone(selector);
         }
         let bounded = parse_series_selector(r#"{i=~".+"}"#).unwrap();

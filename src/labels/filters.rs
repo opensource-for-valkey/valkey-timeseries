@@ -102,11 +102,11 @@ impl PredicateValue {
         match self {
             PredicateValue::Empty => value.is_empty(),
             PredicateValue::String(s) => s == value,
+            // An empty list stands for "label absent", so it matches only the
+            // empty value. A non-empty list matches the empty value only when it
+            // holds an empty alternative, e.g. `l=~"foo|"`.
             PredicateValue::List(list) => {
-                if value.is_empty() {
-                    return list.is_empty();
-                }
-                list.iter().any(|x| x.as_str() == value)
+                (value.is_empty() && list.is_empty()) || list.iter().any(|x| x == value)
             }
         }
     }
@@ -1423,5 +1423,23 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_predicate_value_list_matches_empty_alternative() {
+        let with_empty = PredicateValue::from(vec!["foo".to_string(), String::new()]);
+        assert!(with_empty.matches(""));
+        assert!(with_empty.matches("foo"));
+        assert!(!with_empty.matches("bar"));
+
+        let without_empty = PredicateValue::from(vec!["foo".to_string(), "bar".to_string()]);
+        assert!(!without_empty.matches(""));
+
+        assert!(PredicateValue::from(Vec::<String>::new()).matches(""));
+
+        let filter = LabelFilter::create(MatchOp::RegexEqual, "l", "foo|").unwrap();
+        assert!(filter.matches_empty());
+        let filter = LabelFilter::create(MatchOp::RegexNotEqual, "l", "foo|").unwrap();
+        assert!(!filter.matches_empty());
     }
 }
