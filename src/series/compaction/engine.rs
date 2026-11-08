@@ -588,7 +588,10 @@ fn resync_open_bucket_after_removal(
 /// Start accumulating the bucket that begins at `bucket_start` from scratch. A counter
 /// aggregator carries its baseline across buckets ([`Aggregator::carries_baseline`]), so it is
 /// seeded with the sample a streaming rule would have carried in: the last counted one before the
-/// bucket, at or above `min_ts`.
+/// bucket, at or above `min_ts`. With a retention window shorter than a bucket, the stream may
+/// still hold a baseline that has since fallen below `min_ts`; the recalculation then starts
+/// without it, just as it drops the bucket's own expired samples for every aggregator (see
+/// `rebuild_open_bucket_as_of`).
 pub(super) fn begin_bucket(
     aggregator: &mut Aggregator,
     parent: &TimeSeries,
@@ -608,6 +611,10 @@ pub(super) fn begin_bucket(
 /// `bucket_last` can change the next bucket holding a counted sample: recompute that one too. Its
 /// own samples are unchanged, so nothing after it moves. Returns the span of a closed successor
 /// it rewrote; an open one is only re-aggregated.
+///
+/// With no counted sample after the bucket, an open bucket past it still carries the baseline the
+/// rewrite may have changed — it holds only NaNs, which `first_value_after` skips — so it is
+/// re-aggregated too.
 fn refresh_successor(
     ctx: &mut CompactionContext,
     bucket_last: Timestamp,
@@ -616,13 +623,14 @@ fn refresh_successor(
     if !ctx.rule.aggregator.carries_baseline() {
         return Ok(None);
     }
-    let (Some(open), Some(next)) = (
-        ctx.rule.bucket_start,
-        ctx.parent.first_value_after(bucket_last),
-    ) else {
+    let Some(open) = ctx.rule.bucket_start else {
         return Ok(None);
     };
-    let start = ctx.rule.calc_bucket_start(next.timestamp);
+    let start = match ctx.parent.first_value_after(bucket_last) {
+        Some(next) => ctx.rule.calc_bucket_start(next.timestamp),
+        None if open > bucket_last => open,
+        None => return Ok(None),
+    };
     let last = ctx.rule.bucket_last(start);
     match start.cmp(&open) {
         Ordering::Less => {
@@ -1112,6 +1120,41 @@ mod tests {
                 "dst"
             );
             Ok(())
+        }
+    }
+
+    /// A back-fill into a closed bucket must refresh the baseline the open bucket carries even
+    /// when that bucket holds only NaNs, which `first_value_after` skips. Rewriting 500 from 3 to
+    /// 5 left bucket 1000 counting from 3: 4 instead of 2.
+    #[test]
+    fn backfill_refreshes_the_baseline_of_a_nan_only_open_bucket() {
+        for agg in [
+            AggregationType::Increase,
+            AggregationType::Rate,
+            AggregationType::IRate,
+        ] {
+            let mut parent = TimeSeries::new();
+            let mut dest = TimeSeries::new();
+            let mut rule = fresh_rule(agg, 1000);
+            for (ts, value) in [
+                (0, 1.0),
+                (500, 3.0),
+                (1000, f64::NAN),
+                (500, 5.0),
+                (1500, 7.0),
+                (2000, 7.0),
+            ] {
+                let prev_last = parent.last_sample.map(|s| s.timestamp);
+                let SampleAddResult::Ok(stored) =
+                    parent.add(ts, value, Some(DuplicatePolicy::KeepLast))
+                else {
+                    panic!("sample @{ts} rejected");
+                };
+                ingest_batch_of_one(&parent, &mut dest, &mut rule, stored, prev_last);
+            }
+            // 7 - 5: an increase of 2, over a 1 s bucket (rate) and 1 s between samples (irate).
+            let bucket_1000 = dest.iter().find(|s| s.timestamp == 1000).map(|s| s.value);
+            assert_eq!(bucket_1000, Some(2.0), "{agg:?}");
         }
     }
 
