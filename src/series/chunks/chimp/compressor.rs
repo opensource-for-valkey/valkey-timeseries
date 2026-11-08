@@ -501,6 +501,7 @@ impl<'a> ChimpDecompressor<'a> {
 
     /// Read the next sample. Returns `Ok(None)` once all `sample_count`
     /// samples have been read.
+    #[inline]
     pub fn next_sample(&mut self) -> io::Result<Option<Sample>> {
         if self.count == self.sample_count {
             return Ok(None);
@@ -512,6 +513,7 @@ impl<'a> ChimpDecompressor<'a> {
     }
 
     /// Reads the delta-of-delta encoded timestamp of the next sample.
+    #[inline]
     fn read_timestamp(&mut self) -> io::Result<Timestamp> {
         if self.count == 0 {
             let timestamp = self.reader.read_varint()?;
@@ -520,33 +522,30 @@ impl<'a> ChimpDecompressor<'a> {
             return Ok(timestamp);
         }
 
-        // Read up to 4 bits, stopping at the first zero.
-        let mut prefix = 0u64;
-        for _ in 0..4 {
-            let bit = self.reader.read_bit()?;
-            prefix = (prefix << 1) | bit as u64;
-            if !bit {
-                break;
-            }
-        }
-
-        let delta_d = match prefix {
-            0x00 => 0,
-            0x02 => zigzag_decode(self.reader.read_bits(7)?),
-            0x06 => zigzag_decode(self.reader.read_bits(9)?),
-            0x0E => zigzag_decode(self.reader.read_bits(12)?),
-            TS_ESCAPE_PREFIX => {
-                if self.reader.read_bit()? {
-                    zigzag_decode(self.reader.read_bits(64)?)
-                } else {
-                    zigzag_decode(self.reader.read_bits(32)?)
-                }
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid timestamp prefix",
-                ));
+        // The prefix is 1–4 bits, terminated by the first zero (`0`, `10`,
+        // `110`, `1110`) or the escape `1111`. One peek of four bits decides
+        // it, in place of a bit-by-bit loop; past the end of the stream the
+        // peek pads with zeros, and `skip` then reports the truncation.
+        let head = self.reader.peek_upto(4);
+        let delta_d = if head < 0b1000 {
+            self.reader.skip(1)?;
+            0
+        } else if head < 0b1100 {
+            self.reader.skip(2)?;
+            zigzag_decode(self.reader.read_bits(7)?)
+        } else if head < 0b1110 {
+            self.reader.skip(3)?;
+            zigzag_decode(self.reader.read_bits(9)?)
+        } else if head == 0b1110 {
+            self.reader.skip(4)?;
+            zigzag_decode(self.reader.read_bits(12)?)
+        } else {
+            debug_assert_eq!(head, TS_ESCAPE_PREFIX);
+            self.reader.skip(4)?;
+            if self.reader.read_bit()? {
+                zigzag_decode(self.reader.read_bits(64)?)
+            } else {
+                zigzag_decode(self.reader.read_bits(32)?)
             }
         };
 
@@ -555,9 +554,13 @@ impl<'a> ChimpDecompressor<'a> {
         Ok(self.last_timestamp)
     }
 
+    #[inline]
     fn read_value(&mut self) -> io::Result<f64> {
-        let value = if !self.reader.read_bit()? {
+        // Cases `0`, `10`, `11`: one two-bit peek instead of one or two reads.
+        let head = self.reader.peek_upto(2);
+        let value = if head < 0b10 {
             // case `0`: a repeat, or a value sharing the previous beta_star.
+            self.reader.skip(1)?;
             let (bits, repeat) = self.chimp.read_value_flagged(&mut self.reader)?;
             if repeat {
                 // Returning `last_value` verbatim rather than recovering it from
@@ -567,13 +570,15 @@ impl<'a> ChimpDecompressor<'a> {
                 return Ok(self.last_value);
             }
             recover(bits, self.last_beta_star)?
-        } else if !self.reader.read_bit()? {
+        } else if head == 0b10 {
             // case `10`: raw value (zero, infinities, NaN, or anything ELF
             // could not erase reversibly)
+            self.reader.skip(2)?;
             let bits = self.chimp.read_value(&mut self.reader)?;
             f64::from_bits(bits)
         } else {
             // case `11`: new 4-bit beta_star
+            self.reader.skip(2)?;
             self.last_beta_star = self.reader.read_bits(4)? as i32;
             let bits = self.chimp.read_value(&mut self.reader)?;
             recover(bits, self.last_beta_star)?
