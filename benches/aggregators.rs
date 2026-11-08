@@ -1,14 +1,20 @@
 //! Per-sample cost of the bucket aggregators and of the GROUPBY partial reducers, isolated from
 //! decoding and reply building. Gate for numerical changes to the accumulators (overflow handling,
-//! dispersion precision): save a baseline before, compare after.
+//! dispersion precision): save a baseline before, compare after. `range_scan` adds the read
+//! pipeline around them (decode, filtering, bucketing), for changes to that path.
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use valkey_timeseries::aggregators::{
-    AggregationHandler, AggregationType, Aggregator, PartialReducer, PartialSampleReducer,
+    AggregationHandler, AggregationType, Aggregator, BucketAlignment, BucketTimestamp,
+    PartialReducer, PartialSampleReducer,
 };
 use valkey_timeseries::common::Sample;
 use valkey_timeseries::common::binop::ComparisonOperator;
-use valkey_timeseries::series::request_types::{AggregatorConfig, ValueComparisonFilter};
+use valkey_timeseries::iterators::create_range_iterator;
+use valkey_timeseries::series::request_types::{
+    AggregationOptions, AggregatorConfig, RangeOptions, ValueComparisonFilter,
+};
+use valkey_timeseries::series::{TimeSeries, ValueFilter};
 
 const SAMPLES: usize = 100_000;
 const BUCKET: usize = 1000;
@@ -139,5 +145,79 @@ fn partial_reducers(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bucket_aggregators, partial_reducers);
+/// `TS.RANGE`-shaped reads through `create_range_iterator` over a 100k-sample series (default
+/// encoding) in 60 s buckets: one aggregation, two, one with `FILTER_BY_VALUE`, and a raw read.
+/// The read pipeline (`sample_iterator_adapter`, `AggregationHelper::update`) sits on every
+/// sample here, which the isolated groups above leave out.
+fn range_scan(c: &mut Criterion) {
+    let mut series = TimeSeries::new();
+    for (i, v) in values().into_iter().enumerate() {
+        series.add(1_700_000_000_000 + i as i64 * 1000, v, None);
+    }
+    let agg = |types: &[AggregationType]| AggregationOptions {
+        aggregations: types
+            .iter()
+            .map(|&t| AggregatorConfig::new(t, None).unwrap())
+            .collect(),
+        bucket_duration: 60_000,
+        timestamp_output: BucketTimestamp::default(),
+        alignment: BucketAlignment::default(),
+        report_empty: false,
+    };
+    let cases: Vec<(&str, RangeOptions)> = vec![
+        (
+            "avg",
+            RangeOptions {
+                aggregation: Some(agg(&[AggregationType::Avg])),
+                ..Default::default()
+            },
+        ),
+        (
+            "sum",
+            RangeOptions {
+                aggregation: Some(agg(&[AggregationType::Sum])),
+                ..Default::default()
+            },
+        ),
+        (
+            "max",
+            RangeOptions {
+                aggregation: Some(agg(&[AggregationType::Max])),
+                ..Default::default()
+            },
+        ),
+        (
+            "avg_filter_by_value",
+            RangeOptions {
+                aggregation: Some(agg(&[AggregationType::Avg])),
+                // Every sample passes: the same work as `avg`, plus the filter itself.
+                value_filter: Some(ValueFilter { min: 0.0, max: 1e9 }),
+                ..Default::default()
+            },
+        ),
+        (
+            "avg_max_two_columns",
+            RangeOptions {
+                aggregation: Some(agg(&[AggregationType::Avg, AggregationType::Max])),
+                ..Default::default()
+            },
+        ),
+        ("raw", RangeOptions::default()),
+    ];
+
+    let mut group = c.benchmark_group("aggregators/range_scan");
+    group.throughput(Throughput::Elements(SAMPLES as u64));
+    for (name, options) in &cases {
+        group.bench_function(BenchmarkId::from_parameter(name), |b| {
+            b.iter(|| {
+                create_range_iterator(&series, options, None, false).for_each(|s| {
+                    black_box(s);
+                });
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bucket_aggregators, partial_reducers, range_scan);
 criterion_main!(benches);
