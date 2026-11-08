@@ -659,6 +659,10 @@ mod tests {
             // An infinite input still yields infinity, and opposite ones NaN.
             (&[&[f64::INFINITY, 1.0]], f64::INFINITY),
             (&[&[max, max], &[f64::INFINITY]], f64::INFINITY),
+            // An overflow of the opposite sign doesn't turn it into NaN, on either path.
+            (&[&[-max, -max, f64::INFINITY]], f64::INFINITY),
+            (&[&[-max, -max], &[f64::INFINITY]], f64::INFINITY),
+            (&[&[max, max], &[f64::NEG_INFINITY]], f64::NEG_INFINITY),
         ];
         for &(shards, expected) in cases {
             let (partial, ordinary) = both_paths(AggregationType::Avg, shards);

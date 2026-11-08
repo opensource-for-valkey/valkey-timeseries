@@ -169,15 +169,22 @@ impl RdbSerializable for KahanAvg {
 /// compensated sum overflowed: finite values then still have a representable mean (up to
 /// `2^32` terms of `f64::MAX`). Scaling by a power of two is exact, and the shadow is an
 /// independent chain, so the common path pays an extra multiply-add and nothing else.
+///
+/// The shadow is deliberately uncompensated, so after an overflow the mean is only as precise as
+/// a naive sum of the inputs: `[M, M, 1, -M, -M]` (`M = f64::MAX`) averages to `0`, not `0.2`,
+/// since the `1` is far below one ulp of the running total. Compensating it would put a second
+/// Neumaier chain on every AVG sample to recover digits the inputs' magnitude doesn't carry.
 pub(crate) const AVG_SHADOW_SCALE: f64 = 1.0 / 4_294_967_296.0;
 
 /// The mean of `count` values, from their compensated sum and their [`AVG_SHADOW_SCALE`]d
-/// shadow. A finite sum is used as is, so results without overflow are unchanged. An infinite
-/// or NaN one is used too when the shadow agrees, which means an input was infinite.
+/// shadow. A finite sum is used as is, so results without overflow are unchanged. Otherwise the
+/// shadow decides: it is non-finite only when an input was, and then it carries the right sign,
+/// whereas the compensated sum can't tell an overflow from an infinite input — `[-M, -M, +inf]`
+/// overflows to `-inf` and then to NaN, where the mean is `+inf`.
 #[inline]
 pub(crate) fn mean_of(sum: &KahanSum, shadow: f64, count: f64) -> f64 {
     let total = sum.value();
-    if total.is_finite() || !shadow.is_finite() {
+    if total.is_finite() {
         total / count
     } else {
         shadow / count / AVG_SHADOW_SCALE
@@ -312,6 +319,26 @@ mod tests {
             sum += value;
         }
         assert_eq!(sum.value(), 2.0);
+    }
+
+    /// An infinite input after an overflow decides the mean: the compensated sum overflowed to
+    /// the opposite infinity and then to NaN, while the shadow saw only the infinite input.
+    #[test]
+    fn test_avg_infinite_input_after_overflow() {
+        for sign in [1.0, -1.0] {
+            let mut avg = KahanAvg::default();
+            for v in [-f64::MAX, -f64::MAX, f64::INFINITY] {
+                avg.add(sign * v);
+            }
+            assert_eq!(avg.value(), Some(sign * f64::INFINITY), "sign {sign}");
+        }
+
+        // Both infinities: no mean.
+        let mut avg = KahanAvg::default();
+        for v in [f64::MAX, f64::MAX, f64::INFINITY, f64::NEG_INFINITY] {
+            avg.add(v);
+        }
+        assert!(avg.value().unwrap().is_nan());
     }
 
     #[test]
