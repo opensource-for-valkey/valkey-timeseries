@@ -127,12 +127,6 @@ Upgrade readers before writers; downgrading persisted version 2 data requires
 exporting logical samples and recreating the series. Details and measured gains:
 [the Gorilla evaluation](docs/benchmarks/gorilla-evaluation.md).
 
-The Chimp chunk grammar was later changed in place, without a version bump,
-because nothing has been released. RDB, DUMP and AOF files that contain Chimp
-series written by builds from before that change will not decode correctly, and
-no load-time check protects them: delete them, or export the logical samples and
-recreate the series. See [chunk encodings](docs/topics/encodings.md).
-
 
 **Why.** The on-disk format is an internal implementation detail and is not part of the compatibility contract. Fixing it would constrain Valkey TimeSeries's ability to evolve its storage, chunk-encoding, and recovery strategies independently of RedisTimeSeries.
 

@@ -4,6 +4,13 @@
 The goal of this module is to provide a simple, efficient, and easy-to-use time series data type for Valkey, as
 well as provide a superset of the _RedisTimeSeries_ API.
 
+> **Note:** valkey-timeseries has not been released yet, and its data formats are not stable.
+> Until the first release, the formats used for RDB snapshots, `DUMP`/`RESTORE` payloads, AOF
+> files and messages between cluster nodes can change between builds without a version bump.
+> Data persisted by one build may fail to load, or load and decode incorrectly, on another.
+> Don't rely on persisted data across upgrades: keep the source data so you can re-ingest it,
+> and run every node of a cluster on the same build.
+
 ## Features
 - In-memory storage for time series data
 - Configurable data retention period
