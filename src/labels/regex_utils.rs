@@ -30,39 +30,45 @@ pub(crate) fn parse_regex_matcher(expr: &str, is_equal: bool) -> ParseResult<Pre
         });
     }
 
-    let Ok(decomposed) = decompose_regex(expr) else {
-        return Err(ParseError::InvalidRegex(expr.to_string()));
-    };
-
+    let invalid = |_| ParseError::InvalidRegex(expr.to_string());
+    // Parse once: the decomposition and the matcher's prefilter hints both
+    // read this tree.
+    let inner = parse_anchored_hir(expr).map_err(invalid)?;
+    let decomposed = decompose_parsed(expr, &inner).map_err(invalid)?;
     Ok(decomposed_regex_to_predicate_match(
-        expr, decomposed, is_equal,
+        expr, &inner, decomposed, is_equal,
     ))
+}
+
+fn regex_predicate(
+    expr: &str,
+    inner: &Hir,
+    regex: Regex,
+    prefix: Option<String>,
+    is_equal: bool,
+) -> PredicateMatch {
+    let hints = regex_hints(inner, prefix.as_deref());
+    // `regex` matches the entire string, prefix included; `expr` is kept as
+    // `value` for display and serialization.
+    let matcher = RegexMatcher::with_hints(regex, expr.to_string(), prefix, hints);
+    if is_equal {
+        PredicateMatch::RegexEqual(matcher)
+    } else {
+        PredicateMatch::RegexNotEqual(matcher)
+    }
 }
 
 fn decomposed_regex_to_predicate_match(
     expr: &str,
+    inner: &Hir,
     decomposed: RegexDecomposition,
     is_equal: bool,
 ) -> PredicateMatch {
     match decomposed {
-        RegexDecomposition::PrefixWithRegex(prefix, remainder) => {
-            // `remainder` now matches the entire string (prefix included).
-            // Store the compiled pattern string as `value` for display/serialization.
-            let matcher = RegexMatcher::from_parts(remainder, expr.to_string(), Some(prefix));
-            if is_equal {
-                PredicateMatch::RegexEqual(matcher)
-            } else {
-                PredicateMatch::RegexNotEqual(matcher)
-            }
+        RegexDecomposition::PrefixWithRegex(prefix, regex) => {
+            regex_predicate(expr, inner, regex, Some(prefix), is_equal)
         }
-        RegexDecomposition::Regex(regex) => {
-            let matcher = RegexMatcher::from_parts(regex, expr.to_string(), None);
-            if is_equal {
-                PredicateMatch::RegexEqual(matcher)
-            } else {
-                PredicateMatch::RegexNotEqual(matcher)
-            }
-        }
+        RegexDecomposition::Regex(regex) => regex_predicate(expr, inner, regex, None, is_equal),
         RegexDecomposition::Prefix(prefix) => {
             if is_equal {
                 PredicateMatch::StartsWith(prefix)
@@ -338,7 +344,19 @@ impl PartialEq for RegexDecomposition {
 
 impl Eq for RegexDecomposition {}
 
-/// Attempt to decompose `expr` into a form that can be resolved directly against
+/// Parse and decompose `expr` in one call; see [`decompose_parsed`].
+#[cfg(test)]
+fn decompose_regex(expr: &str) -> Result<RegexDecomposition, RegexError> {
+    decompose_parsed(expr, &parse_anchored_hir(expr)?)
+}
+
+/// Parse `expr` and strip the redundant outer anchors.
+fn parse_anchored_hir(expr: &str) -> Result<Hir, RegexError> {
+    Ok(strip_anchors_hir(&build_hir(expr)?))
+}
+
+/// Attempt to decompose `expr`, already parsed as `inner` (see
+/// [`parse_anchored_hir`]), into a form that can be resolved directly against
 /// the inverted postings index without running the full regex engine.
 ///
 /// Matchers are fully anchored (Prometheus semantics), so leading `^` and
@@ -353,17 +371,11 @@ impl Eq for RegexDecomposition {}
 ///   `^foo.bar`) -> `RegexDecomposition::PrefixWithRegex(prefix, regex)`, where `regex`
 ///   matches the whole string, prefix included.
 ///
-/// Anything else is compiled as `RegexDecomposition::Regex`. Returns `Err` if
-/// the pattern does not parse or exceeds the compiled-size limit.
-pub fn decompose_regex(expr: &str) -> Result<RegexDecomposition, RegexError> {
-    if expr.is_empty() {
-        return Ok(RegexDecomposition::Literals(vec!["".to_string()]));
-    }
-
-    let inner = strip_anchors_hir(&build_hir(expr)?);
-
+/// Anything else is compiled from `expr` as `RegexDecomposition::Regex`.
+/// Returns `Err` if the compiled regex exceeds the size limit.
+fn decompose_parsed(expr: &str, inner: &Hir) -> Result<RegexDecomposition, RegexError> {
     // Prefix alternatives followed by `.*`, e.g. `^prod.*` or `(a|b).*`.
-    if let Some(prefix) = extract_anchored_prefix_value(&inner) {
+    if let Some(prefix) = extract_anchored_prefix_value(inner) {
         return Ok(RegexDecomposition::Prefix(prefix));
     }
 
@@ -378,14 +390,14 @@ pub fn decompose_regex(expr: &str) -> Result<RegexDecomposition, RegexError> {
         return finish_prefix_rem(prefix, rem);
     }
     // Standalone repetition, e.g. `^a{2,3}`.
-    if let Some(rep) = get_repetition(&inner)
+    if let Some(rep) = get_repetition(inner)
         && let Some((prefix, rem)) = repetition_to_prefix_rem(rep)
     {
         return finish_prefix_rem(prefix, rem);
     }
 
     // Literal prefix followed by a remainder, or by a pure `.*` wildcard.
-    if let Some((prefix, maybe_remainder)) = extract_anchored_prefix_or_remainder(&inner) {
+    if let Some((prefix, maybe_remainder)) = extract_anchored_prefix_or_remainder(inner) {
         let Some(remainder) = maybe_remainder else {
             return Ok(RegexDecomposition::Prefix(PredicateValue::String(prefix)));
         };
@@ -407,13 +419,13 @@ pub fn decompose_regex(expr: &str) -> Result<RegexDecomposition, RegexError> {
         return Ok(RegexDecomposition::Regex(compile_regex(expr)?));
     }
 
-    if let Some(needle) = extract_contains_value(&inner) {
+    if let Some(needle) = extract_contains_value(inner) {
         return Ok(RegexDecomposition::Contains(needle));
     }
 
     // Flat list of literal alternatives.
     let mut or_values = Vec::new();
-    if get_or_values(&inner, &mut or_values) && !or_values.is_empty() {
+    if get_or_values(inner, &mut or_values) && !or_values.is_empty() {
         return Ok(RegexDecomposition::Literals(or_values));
     }
 
@@ -580,45 +592,41 @@ fn extract_anchored_prefix_value(sre: &Hir) -> Option<PredicateValue> {
     validate_starts_with_value(&value).ok().map(|_| value)
 }
 
-pub(crate) fn extract_ordered_required_literals(expr: &str, prefix: Option<&str>) -> Vec<String> {
-    let Ok(sre) = build_hir(expr) else {
-        return Vec::new();
-    };
+/// Cheap prefilters `RegexMatcher::is_match` runs before the full regex.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RegexHints {
+    /// Literals the value must contain, in order, after the prefix.
+    pub(crate) required_literals: Vec<String>,
+    /// A literal the value must end with.
+    pub(crate) suffix: Option<String>,
+}
 
-    let inner = strip_anchors_hir(&sre);
-    match prefix {
-        Some(prefix) => {
-            let Some((actual_prefix, maybe_remainder)) =
-                extract_anchored_prefix_or_remainder(&inner)
-            else {
-                return Vec::new();
-            };
-            if actual_prefix != prefix {
-                return Vec::new();
-            }
-            maybe_remainder
-                .and_then(|remainder| extract_literal_sequence(&remainder))
-                .unwrap_or_default()
-        }
-        None => extract_literal_sequence(&inner).unwrap_or_default(),
+/// [`regex_hints`] for a pattern that has not been parsed yet. A pattern that
+/// does not parse gets no hints.
+pub(crate) fn regex_hints_for_pattern(expr: &str, prefix: Option<&str>) -> RegexHints {
+    parse_anchored_hir(expr)
+        .map(|inner| regex_hints(&inner, prefix))
+        .unwrap_or_default()
+}
+
+/// Derive the prefilter hints from `inner`, the anchor-stripped pattern.
+///
+/// With a `prefix`, the hints describe the remainder after it, and only when
+/// `inner` starts with exactly that literal prefix; otherwise there are none.
+fn regex_hints(inner: &Hir, prefix: Option<&str>) -> RegexHints {
+    let Some(prefix) = prefix else {
+        return hints_from(inner);
+    };
+    match extract_anchored_prefix_or_remainder(inner) {
+        Some((actual, Some(remainder))) if actual == prefix => hints_from(&remainder),
+        _ => RegexHints::default(),
     }
 }
 
-pub(crate) fn extract_stable_suffix_hint(expr: &str, prefix: Option<&str>) -> Option<String> {
-    let Ok(sre) = build_hir(expr) else {
-        return None;
-    };
-
-    let inner = strip_anchors_hir(&sre);
-    match prefix {
-        Some(prefix) => {
-            let (actual_prefix, maybe_remainder) = extract_anchored_prefix_or_remainder(&inner)?;
-            if actual_prefix != prefix {
-                return None;
-            }
-            maybe_remainder.and_then(|remainder| extract_trailing_literal_sequence(&remainder))
-        }
-        None => extract_trailing_literal_sequence(&inner),
+fn hints_from(sre: &Hir) -> RegexHints {
+    RegexHints {
+        required_literals: extract_literal_sequence(sre).unwrap_or_default(),
+        suffix: extract_trailing_literal_sequence(sre),
     }
 }
 
@@ -955,33 +963,38 @@ mod test {
     }
 
     #[test]
-    fn test_extract_ordered_required_literals_prefixed_regex() {
-        let literals =
-            super::extract_ordered_required_literals("^server.*db.*prod$", Some("server"));
-        assert_eq!(literals, vec!["db".to_string(), "prod".to_string()]);
+    fn test_regex_hints_required_literals_prefixed_regex() {
+        let hints = super::regex_hints_for_pattern("^server.*db.*prod$", Some("server"));
+        assert_eq!(
+            hints.required_literals,
+            vec!["db".to_string(), "prod".to_string()]
+        );
     }
 
     #[test]
-    fn test_extract_ordered_required_literals_generic_regex() {
-        let literals = super::extract_ordered_required_literals(".*foo.*bar.*", None);
-        assert_eq!(literals, vec!["foo".to_string(), "bar".to_string()]);
+    fn test_regex_hints_required_literals_generic_regex() {
+        let hints = super::regex_hints_for_pattern(".*foo.*bar.*", None);
+        assert_eq!(
+            hints.required_literals,
+            vec!["foo".to_string(), "bar".to_string()]
+        );
     }
 
     #[test]
-    fn test_extract_stable_suffix_hint_prefixed_regex() {
-        let suffix = super::extract_stable_suffix_hint("^server.*db.*prod$", Some("server"));
+    fn test_regex_hints_suffix_prefixed_regex() {
+        let suffix = super::regex_hints_for_pattern("^server.*db.*prod$", Some("server")).suffix;
         assert_eq!(suffix.as_deref(), Some("prod"));
     }
 
     #[test]
-    fn test_extract_stable_suffix_hint_without_prefix() {
-        let suffix = super::extract_stable_suffix_hint("^.*bar$", None);
+    fn test_regex_hints_suffix_without_prefix() {
+        let suffix = super::regex_hints_for_pattern("^.*bar$", None).suffix;
         assert_eq!(suffix.as_deref(), Some("bar"));
     }
 
     #[test]
-    fn test_extract_stable_suffix_hint_ignores_wildcard_only_tail() {
-        let suffix = super::extract_stable_suffix_hint("^server.*$", Some("server"));
+    fn test_regex_hints_suffix_ignores_wildcard_only_tail() {
+        let suffix = super::regex_hints_for_pattern("^server.*$", Some("server")).suffix;
         assert_eq!(suffix, None);
     }
 
@@ -1530,5 +1543,67 @@ mod test {
         assert_eq!(prefix, "foo");
         assert!(re.is_match("fooXbc"));
         assert!(!re.is_match("bc"));
+    }
+
+    /// The hints `parse_regex_matcher` derives from its parsed tree must equal
+    /// the ones `RegexMatcher::from_parts` derives from the pattern text, which
+    /// is how a fan-out shard rebuilds the matcher.
+    #[test]
+    fn test_parsed_hints_match_from_parts() {
+        use crate::labels::filters::RegexMatcher;
+
+        let patterns = [
+            r"^foo.+a\.b",
+            r"^foo.+a\.b(x|y)",
+            r"^foo.+a\+b$",
+            r"^foo.+(?:a|bc)",
+            r"^a{2,3}x\.y",
+            r"^a{3}b.*c",
+            r"^x(?:a|b)c.+d",
+            r"^prod[^a]*",
+            r"^prod.*[^0]*",
+            r"^prod.+",
+            r"^foo.*bar$",
+            r"^prod.*[0-9]+$",
+            r"(A|B|C).+",
+            r"ab?c",
+            r"abc?d?e",
+            r"^server.*db.*prod$",
+            r".*foo.*bar.*",
+            r"^.*bar$",
+            r"(?i)prod.*server",
+            r"^host-[a-z0-9]{8}-[a-z0-9]{4}$",
+            r"pre(fix).+mid.*end",
+            r"^a.+b.+c$",
+            r"x.*(?:y|z)w",
+            r"^(?:abc).+def",
+            r"^foo$|^bar.+",
+            r"\d+abc",
+        ];
+        let mut regex_matchers = 0;
+        for pattern in patterns {
+            for is_equal in [true, false] {
+                let (PredicateMatch::RegexEqual(parsed) | PredicateMatch::RegexNotEqual(parsed)) =
+                    parse_regex_matcher(pattern, is_equal).unwrap()
+                else {
+                    continue;
+                };
+                regex_matchers += 1;
+                let rebuilt = RegexMatcher::from_parts(
+                    super::compile_regex(&parsed.value).unwrap(),
+                    parsed.value.clone(),
+                    parsed.prefix.clone(),
+                );
+                assert_eq!(parsed.suffix, rebuilt.suffix, "suffix for {pattern:?}");
+                assert_eq!(
+                    parsed.required_literals, rebuilt.required_literals,
+                    "required literals for {pattern:?}"
+                );
+            }
+        }
+        assert!(
+            regex_matchers >= 40,
+            "only {regex_matchers} patterns stayed regexes"
+        );
     }
 }

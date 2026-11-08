@@ -1,9 +1,7 @@
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::parse_series_selector;
 use crate::labels::regex::parse_regex_anchored;
-use crate::labels::regex_utils::{
-    extract_ordered_required_literals, extract_stable_suffix_hint, parse_regex_matcher,
-};
+use crate::labels::regex_utils::{RegexHints, parse_regex_matcher, regex_hints_for_pattern};
 use crate::parser::ParseError;
 use crate::parser::lex::Token;
 use enquote::enquote;
@@ -300,15 +298,27 @@ impl RegexMatcher {
         Self::from_parts(regex, value, None)
     }
 
+    /// Build a matcher for `value`, deriving the prefilter hints from it.
+    /// This parses `value` once; callers that already hold its parsed form use
+    /// [`Self::with_hints`].
     pub(crate) fn from_parts(regex: Regex, value: String, prefix: Option<String>) -> Self {
-        let required_literals = extract_ordered_required_literals(&value, prefix.as_deref()).into();
-        let suffix = extract_stable_suffix_hint(&value, prefix.as_deref());
+        let hints = regex_hints_for_pattern(&value, prefix.as_deref());
+        Self::with_hints(regex, value, prefix, hints)
+    }
+
+    /// Build a matcher from hints the caller already derived from `value`.
+    pub(crate) fn with_hints(
+        regex: Regex,
+        value: String,
+        prefix: Option<String>,
+        hints: RegexHints,
+    ) -> Self {
         Self {
             regex,
             value,
             prefix,
-            suffix,
-            required_literals,
+            suffix: hints.suffix,
+            required_literals: hints.required_literals.into(),
         }
     }
 
