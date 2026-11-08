@@ -6,8 +6,9 @@ rubric for choosing the right encoding based on your data.
 
 Compression figures (sizes, ratios, winners) come from the committed baseline,
 `benches/baselines/compression_baseline.csv`, which reflects the current Chimp
-grammar. Latency figures are historical: they predate the Chimp grammar change
-and the Gorilla changes, and are marked where they appear. For the Gorilla
+grammar. Latency figures come from `latency_report` runs that include the Chimp
+grammar change and the Gorilla changes (see
+[Latency summary](#latency-summary) for how they were taken). For the Gorilla
 changes and their fixed-sample A/B results, see
 [the Gorilla evaluation](../benchmarks/gorilla-evaluation.md); for the Chimp
 encoder changes, measured the same way, see
@@ -17,11 +18,7 @@ encoder changes, measured the same way, see
 version **2**, and this build reads versions 1 and 2 (the Gorilla extended-window
 change, see [Gorilla](#2-gorilla)). The Chimp bit grammar was changed in place
 (see [Chimp](#3-chimp-elf-on-chimp-default)) **without a version bump**, because
-nothing has been released. Chimp chunks carry no grammar marker, so RDB, DUMP and
-AOF files containing Chimp series written by builds from before that change will
-not decode correctly, and no load-time error protects them. Delete local
-`dump.rdb`/AOF files written by those builds, or export the logical samples
-(`TS.RANGE`) and re-ingest them.
+nothing has been released.
 
 ---
 
@@ -85,9 +82,8 @@ range 64 B – 1 MiB, must be a multiple of 8).
 
 ### 2. Gorilla
 
-The current Gorilla evaluation and its measured tradeoffs are recorded in
-[the benchmark report](../benchmarks/gorilla-evaluation.md). Historical comparison
-numbers below predate that change; use the report for current A/B measurements.
+The Gorilla evaluation and its measured tradeoffs are recorded in
+[the benchmark report](../benchmarks/gorilla-evaluation.md).
 
 New persistence payloads use module encoding version **2**. This build reads
 versions 1 and 2, including legacy Gorilla windows mixed with new windows after
@@ -144,16 +140,16 @@ constant series.
 - Sequential/causal: each point compresses using only the previous point
 
 **Strengths:**
-- The fastest compressed encoder — 1.67× faster bulk encode and 1.74× faster
-  append than Chimp (historical, pre-grammar-change measurement)
+- The faster compressed encoder: Chimp takes 1.22–1.34× Gorilla's bulk-encode
+  time and 1.25–1.38× its append time (1,000–10,000 samples per chunk)
 - Unbeatable on repetition: constants (0.25 B/sample, 64×), discrete sets
   (12×) and counters (9×) are all Gorilla wins, by 1.06–2.00× over Chimp
 - Delta-of-delta timestamps collapse regular intervals to 1 bit
 - Mature, well-understood algorithm with predictable behavior
 
 **Weaknesses:**
-- ~18% slower to decode than Chimp, and ~21% slower to scan (historical,
-  pre-grammar-change measurement)
+- Slower to read than Chimp: Chimp decodes in 0.82–0.83× Gorilla's time and
+  scans in 0.81–0.83× of it
 - No special handling for decimal precision — floating-point noise in the low
   mantissa bits consumes bits. This is the single largest compression gap
   against Chimp (up to 4.24×) and it fires on most agent-reported telemetry
@@ -319,8 +315,8 @@ escapes each cost one bit more than they did (38 and 70, from 37 and 69). Becaus
 - **Dramatically better on quantized data.** Values recorded to a fixed number
   of decimal places (e.g., `12.34`, `99.9`, `0.001`) compress 2.6–4.2× better
   than Gorilla because ELF erases the spurious low mantissa bits
-- ~18% faster decode and ~21% faster scan than Gorilla (historical,
-  pre-grammar-change measurement)
+- The faster reader: decode in 0.82–0.83× Gorilla's time, full-range reads in
+  0.84–0.85× and scans in 0.81–0.83× (1,000–10,000 samples per chunk)
 - 2-bit fixed-width control flags enable efficient branch prediction
 - **The best choice when the workload is unknown.** Highest geometric-mean
   ratio (3.59 vs Gorilla's 3.16), most scenarios within 5% of best (24/28 vs
@@ -331,8 +327,10 @@ escapes each cost one bit more than they did (38 and 70, from 37 and 69). Becaus
   survive the round trip unchanged
 
 **Weaknesses:**
-- ~1.67× slower bulk encode and ~1.74× slower append than Gorilla (historical,
-  pre-grammar-change measurement)
+- Slower to encode: 1.22–1.34× Gorilla's bulk-encode time and 1.25–1.38× its
+  append time. Before the encoder changes it was 1.6–1.9×; skipping the ELF
+  search for integers and short binary fractions, and trying the previous
+  decimal-place count first, closed most of that gap
 - Repetition costs double: 4 bits per sample against Gorilla's 2, which loses
   the constant workload by 2.00× and discrete by 1.35×
 - On unquantized floating-point data with random low mantissa bits, Chimp is a
@@ -390,11 +388,11 @@ ratio, and 18 of 28 do the same for Gorilla.
 
 | Concern | Recommendation |
 |---|---|
-| **Maximize ingest throughput** | **Uncompressed** — ~110× cheaper bulk encode than Gorilla, ~185× than Chimp (historical) |
+| **Maximize ingest throughput** | **Uncompressed** — roughly 50–70× cheaper bulk encode than either compressed encoding |
 | **Minimize storage, shape known** | Per the data-type table above |
 | **Minimize storage, shape unknown** | **Chimp** — best geomean (3.59) and shallowest worst case (0.50 of best) |
-| **Minimize decode / scan latency** | **Chimp** — ~18% faster decode, ~21% faster scan than Gorilla (historical) |
-| **Minimize encode latency** | **Gorilla** — 1.67× faster bulk, 1.74× faster append than Chimp (historical) |
+| **Minimize decode / scan latency** | **Chimp** — decodes in 0.82–0.83× and scans in 0.81–0.83× Gorilla's time |
+| **Minimize encode latency** | **Gorilla** — Chimp takes 1.22–1.34× its bulk-encode and 1.25–1.38× its append time |
 | **Predictable memory** | **Uncompressed** — exactly 16 B/sample, `chunk_size / 16` samples |
 | **Best balance (default)** | **Chimp** — the shipped default; see [On the default](#on-the-default) |
 
@@ -458,12 +456,10 @@ is close (Chimp wins 13 of 28, Gorilla 14, one tie; Gorilla's 14 are the
 repetitive shapes plus `noisy` and one `drift` row, each of those by under 5%), but Chimp has the higher geometric-mean ratio (3.59 vs 3.16),
 lands within 5% of the best available ratio more often (24/28 vs 18/28), and has
 a much shallower floor (0.50 vs 0.24) — the number that bounds how badly a blind
-default can go wrong. It was also the cheaper reader on all three read paths in
-the historical latency runs.
+default can go wrong. It is also the cheaper reader on all three read paths.
 
-The cost of that default is **encode speed**: Chimp was 1.67× slower on bulk
-encode and 1.74× slower on append than Gorilla (historical,
-pre-grammar-change measurement). If ingest is your binding
+The cost of that default is **encode speed**: Chimp takes 1.22–1.34× Gorilla's
+bulk-encode time and 1.25–1.38× its append time. If ingest is your binding
 constraint, or your series are dominated by repetition (constants, flags,
 discrete sets, integer counters), set `ts-encoding GORILLA` — Gorilla's wins are
 real, but narrow in scope.
@@ -494,7 +490,8 @@ documented in `AGENTS.md` under Benchmarks. Neither is a criterion bench.
 
 ```sh
 tools/compression_report.sh --check                                   #  84 rows
-tools/latency_report.sh --workloads all --ts-models all --samples 1000 # 108 rows
+tools/latency_report.sh --workloads all --ts-models all --samples 1000 \
+  --iterations 500 --warmup 50                                        # 108 rows
 ```
 
 Outputs land in `target/bench-reports/{compression,latency}.{csv,md}`.
@@ -526,19 +523,38 @@ go wrong.
 
 ### Latency summary
 
-Historical: measured before the Chimp grammar change and before the Gorilla
-changes, and not re-measured here. 1,000 samples, medians across all workloads
-and timestamp models, expressed as a multiple of Uncompressed. Lower is better.
+Measured on 2026-11-08, with the Chimp grammar change, the Chimp encoder changes
+and the Gorilla changes in place. Every workload and timestamp model was run at
+1,000 and 10,000 samples per chunk, 500 iterations after 50 warmups. Five passes
+alternated with a build of the code before those changes, and each cell is the
+fastest of its five medians.
 
-| Encoding | Encode bulk | Encode append | Decode iter | `get_range` | Scan mid 10% |
-|---|---:|---:|---:|---:|---:|
-| Uncompressed | 1.00× | 1.00× | 1.00× | 1.00× | 1.00× |
-| Gorilla | **111×** | **11.1×** | 13.8× | 117× | 82.5× |
-| Chimp | 186× | 19.3× | **11.4×** | **95.7×** | **64.9×** |
+Median time per operation across the 36 workload × timestamp cells, in
+microseconds. Lower is better.
+
+| Encoding | Samples | Encode bulk | Encode append | Decode iter | `get_range` | Scan mid 10% |
+|---|---:|---:|---:|---:|---:|---:|
+| Uncompressed | 1,000 | 0.21 | 1.83 | 0.88 | 0.21 | 0.04 |
+| Gorilla | 1,000 | **10.3** | **10.9** | 11.3 | 11.6 | 4.98 |
+| Chimp | 1,000 | 11.8 | 13.0 | **10.0** | **10.8** | **4.23** |
+| Uncompressed | 10,000 | 2.02 | 17.7 | 8.79 | 2.04 | 0.04 |
+| Gorilla | 10,000 | **120** | **127** | 150 | 156 | 70.9 |
+| Chimp | 10,000 | 143 | 153 | **112** | **120** | **53.5** |
+
+Chimp's time divided by Gorilla's, as the median over matched cells:
+
+| Samples | Encode bulk | Encode append | Decode iter | `get_range` | Scan mid 10% |
+|---:|---:|---:|---:|---:|---:|
+| 1,000 | 1.22× | 1.25× | 0.82× | 0.85× | 0.83× |
+| 10,000 | 1.34× | 1.38× | 0.83× | 0.84× | 0.81× |
 
 Read this as: compression costs one to two orders of magnitude on encode against
 a raw `Vec`, Gorilla is the cheaper encoder, and Chimp is the cheaper reader on
-all three read paths.
+all three read paths. Uncompressed times under a microsecond are a few ticks of
+the 42 ns timer, so ratios against them are not meaningful.
+
+Against the code before these changes, Chimp encode is 28–34 % faster and its
+reads 10–15 % faster; Gorilla encode is 6–11 % faster and its reads 2–7 % faster.
 
 ### Workload detail (4 KiB chunks, regular timestamps)
 
