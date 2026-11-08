@@ -608,4 +608,33 @@ mod tests {
         assert!(!result.contains(1));
         assert!(!result.contains(2));
     }
+
+    #[test]
+    fn test_postings_regex_with_empty_alternative() {
+        // `foo|` decomposes to the literal list ["foo", ""]: it matches `l=foo`
+        // and the series without `l`; its negation matches any other value.
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "l", "foo");
+        postings.add_posting_for_label_value(1, "n", "1");
+        postings.add_posting_for_label_value(2, "l", "bar");
+        postings.add_posting_for_label_value(2, "n", "1");
+        postings.add_posting_for_label_value(3, "n", "1");
+        let n = LabelFilter::create(MatchOp::Equal, "n", "1").unwrap();
+
+        for (op, expected) in [
+            (MatchOp::RegexEqual, vec![1, 3]),
+            (MatchOp::RegexNotEqual, vec![2]),
+        ] {
+            let filter = LabelFilter::create(op, "l", "foo|").unwrap();
+            for filters in [vec![filter.clone()], vec![n.clone(), filter.clone()]] {
+                let got: Vec<u64> = postings
+                    .terms()
+                    .postings_for_label_filters(&filters)
+                    .unwrap()
+                    .iter()
+                    .collect();
+                assert_eq!(got, expected, "{op:?} with {} filter(s)", filters.len());
+            }
+        }
+    }
 }

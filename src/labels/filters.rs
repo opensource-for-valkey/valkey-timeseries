@@ -1,9 +1,7 @@
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::parse_series_selector;
 use crate::labels::regex::parse_regex_anchored;
-use crate::labels::regex_utils::{
-    extract_ordered_required_literals, extract_stable_suffix_hint, parse_regex_matcher,
-};
+use crate::labels::regex_utils::{RegexHints, parse_regex_matcher, regex_hints_for_pattern};
 use crate::parser::ParseError;
 use crate::parser::lex::Token;
 use enquote::enquote;
@@ -104,11 +102,11 @@ impl PredicateValue {
         match self {
             PredicateValue::Empty => value.is_empty(),
             PredicateValue::String(s) => s == value,
+            // An empty list stands for "label absent", so it matches only the
+            // empty value. A non-empty list matches the empty value only when it
+            // holds an empty alternative, e.g. `l=~"foo|"`.
             PredicateValue::List(list) => {
-                if value.is_empty() {
-                    return list.is_empty();
-                }
-                list.iter().any(|x| x.as_str() == value)
+                (value.is_empty() && list.is_empty()) || list.iter().any(|x| x == value)
             }
         }
     }
@@ -300,15 +298,27 @@ impl RegexMatcher {
         Self::from_parts(regex, value, None)
     }
 
+    /// Build a matcher for `value`, deriving the prefilter hints from it.
+    /// This parses `value` once; callers that already hold its parsed form use
+    /// [`Self::with_hints`].
     pub(crate) fn from_parts(regex: Regex, value: String, prefix: Option<String>) -> Self {
-        let required_literals = extract_ordered_required_literals(&value, prefix.as_deref()).into();
-        let suffix = extract_stable_suffix_hint(&value, prefix.as_deref());
+        let hints = regex_hints_for_pattern(&value, prefix.as_deref());
+        Self::with_hints(regex, value, prefix, hints)
+    }
+
+    /// Build a matcher from hints the caller already derived from `value`.
+    pub(crate) fn with_hints(
+        regex: Regex,
+        value: String,
+        prefix: Option<String>,
+        hints: RegexHints,
+    ) -> Self {
         Self {
             regex,
             value,
             prefix,
-            suffix,
-            required_literals,
+            suffix: hints.suffix,
+            required_literals: hints.required_literals.into(),
         }
     }
 
@@ -326,7 +336,7 @@ impl RegexMatcher {
             {
                 return false;
             }
-            return is_empty_regex_matcher(&self.regex);
+            return self.regex.is_match("");
         }
         // Fast-path: if a literal prefix is known, reject immediately without
         // running the full regex engine. The compiled regex already encodes the
@@ -440,11 +450,12 @@ impl PredicateMatch {
     pub fn is_empty(&self) -> bool {
         match self {
             PredicateMatch::Equal(value) | PredicateMatch::NotEqual(value) => value.is_empty(),
-            PredicateMatch::MatchAll => false,
-            PredicateMatch::MatchNone => false,
-            PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re) => {
-                re.regex.as_str().is_empty()
-            }
+            // A regex matcher's pattern is never empty: an empty pattern
+            // decomposes to `=""`, and the compiled form is always anchored.
+            PredicateMatch::MatchAll
+            | PredicateMatch::MatchNone
+            | PredicateMatch::RegexEqual(_)
+            | PredicateMatch::RegexNotEqual(_) => false,
             PredicateMatch::StartsWith(value) => value.is_empty(),
             PredicateMatch::NotStartsWith(value) => value.is_empty(),
             PredicateMatch::Contains(value) => value.is_empty(),
@@ -795,20 +806,6 @@ impl Hash for LabelFilter {
     }
 }
 
-fn is_empty_regex_matcher(re: &Regex) -> bool {
-    // cheap check
-    let value = re.as_str();
-    let matches_empty = match value.len() {
-        0 => true,
-        1 => value == "^" || value == "$",
-        2 => value == ".*" || value == "^$" || value == "?:",
-        3 => value == "^.*" || value == ".*$",
-        4 => value == "^.*$" || value == "^?:$",
-        _ => false,
-    };
-    matches_empty || re.is_match("")
-}
-
 fn get_metric_name(filters: &[LabelFilter]) -> Option<&str> {
     filters
         .iter()
@@ -1136,6 +1133,20 @@ mod tests {
     }
 
     #[test]
+    fn test_regex_filter_rejects_trailing_backslash() {
+        for op in [MatchOp::RegexEqual, MatchOp::RegexNotEqual] {
+            for pattern in [r"foo\", r"foo\\\", r"\"] {
+                assert!(
+                    LabelFilter::create(op, "l", pattern).is_err(),
+                    "{op} {pattern:?} should be an invalid regex"
+                );
+            }
+            // An escaped backslash is a literal, not a dangling escape.
+            assert!(LabelFilter::create(op, "l", r"foo\\").is_ok());
+        }
+    }
+
+    #[test]
     fn test_regex_matcher_empty() {
         let matcher = RegexMatcher::create(".*").unwrap();
         assert!(matcher.is_match(""));
@@ -1413,5 +1424,23 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_predicate_value_list_matches_empty_alternative() {
+        let with_empty = PredicateValue::from(vec!["foo".to_string(), String::new()]);
+        assert!(with_empty.matches(""));
+        assert!(with_empty.matches("foo"));
+        assert!(!with_empty.matches("bar"));
+
+        let without_empty = PredicateValue::from(vec!["foo".to_string(), "bar".to_string()]);
+        assert!(!without_empty.matches(""));
+
+        assert!(PredicateValue::from(Vec::<String>::new()).matches(""));
+
+        let filter = LabelFilter::create(MatchOp::RegexEqual, "l", "foo|").unwrap();
+        assert!(filter.matches_empty());
+        let filter = LabelFilter::create(MatchOp::RegexNotEqual, "l", "foo|").unwrap();
+        assert!(!filter.matches_empty());
     }
 }
