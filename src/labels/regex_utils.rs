@@ -396,10 +396,14 @@ fn decompose_parsed(expr: &str, inner: &Hir) -> Result<RegexDecomposition, Regex
         return finish_prefix_rem(prefix, rem);
     }
 
-    // Literal prefix followed by a remainder, or by a pure `.*` wildcard.
-    if let Some((prefix, maybe_remainder)) = extract_anchored_prefix_or_remainder(inner) {
-        let Some(remainder) = maybe_remainder else {
-            return Ok(RegexDecomposition::Prefix(PredicateValue::String(prefix)));
+    // Literal prefix followed by nothing, by `.*`, or by some other remainder.
+    if let Some((prefix, tail)) = extract_anchored_prefix_or_remainder(inner) {
+        let remainder = match tail {
+            PrefixTail::Exact => return Ok(RegexDecomposition::Literals(vec![prefix])),
+            PrefixTail::Anything => {
+                return Ok(RegexDecomposition::Prefix(PredicateValue::String(prefix)));
+            }
+            PrefixTail::Rest(remainder) => remainder,
         };
         // A remainder that expands into a few literals (e.g. a character
         // class) becomes a flat literal list carrying the prefix.
@@ -478,10 +482,11 @@ fn repetition_to_prefix_rem(rep: &regex_syntax::hir::Repetition) -> Option<(Stri
 }
 
 /// Turn a `(prefix, remainder_pattern)` pair into a `RegexDecomposition`.
-/// An empty remainder means a pure prefix match; otherwise compile and wrap.
+/// An empty remainder means nothing may follow the prefix (e.g. `a{2}`), so it
+/// is an exact literal; otherwise compile and wrap.
 fn finish_prefix_rem(prefix: String, rem: String) -> Result<RegexDecomposition, RegexError> {
     if rem.is_empty() {
-        Ok(RegexDecomposition::Prefix(PredicateValue::String(prefix)))
+        Ok(RegexDecomposition::Literals(vec![prefix]))
     } else {
         compile_prefixed_regex(&rem, prefix)
     }
@@ -511,11 +516,19 @@ fn strip_anchors_hir(sre: &Hir) -> Hir {
     }
 }
 
-/// If `sre` is a concat starting with a `Literal`, return the literal prefix and optionally
-/// the remainder HIR when the remainder is not a simple `.*` wildcard. The return is
-/// `(prefix, Option<remainder>)`. If the remainder is `.*`, it returns `None` and
-/// the caller should treat it as a pure prefix match.
-fn extract_anchored_prefix_or_remainder(sre: &Hir) -> Option<(String, Option<Hir>)> {
+/// What follows the literal prefix found by [`extract_anchored_prefix_or_remainder`].
+enum PrefixTail {
+    /// Nothing: the pattern is exactly the prefix, e.g. `(foo)(bar)`.
+    Exact,
+    /// `.*`: any value starting with the prefix.
+    Anything,
+    /// Any other remainder.
+    Rest(Hir),
+}
+
+/// If `sre` is a concat starting with literals (captures included), return the
+/// literal prefix and what follows it.
+fn extract_anchored_prefix_or_remainder(sre: &Hir) -> Option<(String, PrefixTail)> {
     match sre.kind() {
         HirKind::Concat(subs) => {
             if subs.is_empty() {
@@ -538,21 +551,19 @@ fn extract_anchored_prefix_or_remainder(sre: &Hir) -> Option<(String, Option<Hir
                 return None;
             }
 
-            // No remainder -> pure prefix
             if idx == subs.len() {
-                return Some((prefix, None));
+                return Some((prefix, PrefixTail::Exact));
             }
 
             // Build remainder HIR from the tail.
             let tail = Vec::from(&subs[idx..]);
             let remainder = Hir::concat(tail);
 
-            // If remainder is simply .*, treat it as pure prefix optimization.
             if is_dot_star(&remainder) {
-                return Some((prefix, None));
+                return Some((prefix, PrefixTail::Anything));
             }
 
-            Some((prefix, Some(remainder)))
+            Some((prefix, PrefixTail::Rest(remainder)))
         }
         _ => None,
     }
@@ -618,7 +629,7 @@ fn regex_hints(inner: &Hir, prefix: Option<&str>) -> RegexHints {
         return hints_from(inner);
     };
     match extract_anchored_prefix_or_remainder(inner) {
-        Some((actual, Some(remainder))) if actual == prefix => hints_from(&remainder),
+        Some((actual, PrefixTail::Rest(remainder))) if actual == prefix => hints_from(&remainder),
         _ => RegexHints::default(),
     }
 }
@@ -1433,6 +1444,18 @@ mod test {
             r"foo|bar|baz",
             r"a\.b",
             r"foo\$",
+            // Exact repetitions and capture-split literals have no tail.
+            r"a{2}",
+            r"^a{2}$",
+            r"x{3}",
+            r"(?:ab){2}",
+            r"a{2}b",
+            r"a{2,}",
+            r"(foo)(bar)",
+            r"foo(bar)",
+            r"(foo)bar",
+            r"^pro(d)uction$",
+            r"(foo)(bar).*",
         ];
         let values = [
             "prod",
@@ -1475,6 +1498,19 @@ mod test {
             "a.b",
             "aXb",
             "foo$",
+            "a",
+            "aa",
+            "aaa",
+            "aab",
+            "aabx",
+            "xxx",
+            "xxxx",
+            "abab",
+            "ababx",
+            "foobarbaz",
+            "foobarx",
+            "production",
+            "productionx",
         ];
 
         for pattern in patterns {
@@ -1604,6 +1640,29 @@ mod test {
         assert!(
             regex_matchers >= 40,
             "only {regex_matchers} patterns stayed regexes"
+        );
+    }
+
+    #[test]
+    fn test_decompose_regex_exact_patterns_are_literals() {
+        for (pattern, literal) in [
+            ("a{2}", "aa"),
+            ("^x{3}$", "xxx"),
+            ("(?:ab){2}", "abab"),
+            ("(foo)(bar)", "foobar"),
+            ("foo(bar)", "foobar"),
+            ("^pro(d)uction$", "production"),
+        ] {
+            assert_eq!(
+                decompose_regex(pattern).unwrap(),
+                RegexDecomposition::Literals(vec![literal.into()]),
+                "{pattern:?}"
+            );
+        }
+        // A trailing `.*` still makes it a prefix.
+        assert_eq!(
+            decompose_regex("(foo)(bar).*").unwrap(),
+            RegexDecomposition::Prefix(PredicateValue::String("foobar".into()))
         );
     }
 }
