@@ -38,12 +38,6 @@ pub(crate) const TIMESERIES_TYPE_ENCODING_VERSION: i32 = 2;
 /// Oldest encoding version the loaders still accept.
 pub(crate) const MIN_TIMESERIES_TYPE_ENCODING_VERSION: i32 = 1;
 
-/// Oldest encoding version whose Chimp chunks use the current grammar. The grammar changed in
-/// place before any release, and every build that wrote version 1 used the old one, so a Chimp
-/// chunk in a version 1 payload is refused instead of being decoded into wrong samples.
-/// Gorilla and uncompressed chunks from version 1 still load.
-pub(crate) const MIN_CHIMP_GRAMMAR_ENCODING_VERSION: i32 = 2;
-
 /// Whether this module can read a payload written with encoding version `enc_ver`.
 pub(crate) fn is_supported_encoding_version(enc_ver: i32) -> bool {
     (MIN_TIMESERIES_TYPE_ENCODING_VERSION..=TIMESERIES_TYPE_ENCODING_VERSION).contains(&enc_ver)

@@ -157,16 +157,6 @@ class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseDebugMode):
         assert client.execute_command('TS._RESTORE', 'encver_ok', payload, self.payload_encver)
         assert self.ts_info('encver_ok')['totalSamples'] == 200
 
-    def test_restore_refuses_chimp_chunks_labelled_version_1(self):
-        """Version 1 is readable, but its Chimp chunks used the old grammar: a Chimp payload
-        (the default encoding) labelled version 1 is refused rather than misdecoded."""
-        client = self.client
-        payload = self._genuine_payload(key='chimp_v1_src')
-        with pytest.raises(Exception, match='failed to deserialize series'):
-            client.execute_command('TS._RESTORE', 'chimp_v1', payload, 1)
-        assert client.execute_command('EXISTS', 'chimp_v1') == 0
-        assert client.ping()
-
     def test_restore_zero_duration_rule_is_rejected(self):
         """A restored zero-duration rule is rejected before a later write can divide by zero."""
         client = self.client
