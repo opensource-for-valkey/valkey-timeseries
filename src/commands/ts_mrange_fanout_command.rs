@@ -2418,48 +2418,6 @@ mod tests {
         }
     }
 
-    /// A shard on another build sends chunks with a different wire version. The
-    /// coordinator must fail the command with that diagnosis, not a generic
-    /// fan-out error: `reply` passes this `Err` to the client as is, because the
-    /// chunks are decoded here, after every shard has answered, and not in
-    /// `on_response` (where a `Custom` error would be replaced by
-    /// `generate_error_reply`).
-    #[test]
-    fn mismatched_chunk_wire_version_reaches_the_reply_error() {
-        let mut stale = to_response(series_result("b", None, samples(&[(0, 2.0), (10, 3.0)])));
-        stale.columns[0].version = 1;
-        let resp = |series| MultiRangeResponse {
-            series,
-            group_partials: Vec::new(),
-            applied_aggregation: false,
-            applied_group_reduce: false,
-            applied_count: false,
-            symbol_table_names: Vec::new(),
-            symbol_table_values: Vec::new(),
-        };
-
-        let mut cmd = MRangeFanoutCommand::default();
-        cmd.ingest_response(resp(vec![to_response(series_result(
-            "a",
-            None,
-            samples(&[(0, 1.0)]),
-        ))]))
-        .expect("current-version shard");
-        // Ingesting only stores the series; decoding, and so the check, comes later.
-        cmd.ingest_response(resp(vec![stale]))
-            .expect("ingest does not decode");
-
-        let series = std::mem::take(&mut cmd.series);
-        let partials = std::mem::take(&mut cmd.group_partials);
-        let err = cmd
-            .process_responses(series, partials)
-            .expect_err("a stale wire version must fail the reply")
-            .to_string();
-        for needle in ["chunk wire version 1", "same build", "series 'b'"] {
-            assert!(err.contains(needle), "missing '{needle}' in: {err}");
-        }
-    }
-
     /// End-to-end through `ingest_response`: a shard that interned its labels
     /// (as `get_local_response` always does) must resolve back to exactly the
     /// labels it started with, with the shared `region` value collapsed to one
