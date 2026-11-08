@@ -123,7 +123,7 @@ Control bucket alignment:
 |------------|--------------------------------------------------|-----------------------------------------------------------------------|
 | `increase` | Total increase for monotonic counters            | Handles resets                                                        |
 | `rate`     | Rate of change per second over the bucket window | `increase` divided by the bucket duration in seconds                  |
-| `irate`    | Instantaneous rate from the last two samples     | Requires ≥ 2 samples and positive time delta; returns `NaN` otherwise |
+| `irate`    | Instantaneous rate from the bucket's last sample and the one before it, which may be in an earlier bucket | `NaN` when there is no earlier sample, the time delta is not positive, or the counter reset |
 
 The last sample of each bucket is the starting point of the next, across empty buckets too, so the delta between
 two buckets counts in the later one and the per-bucket `increase` values add up to the counter's whole increase. A
