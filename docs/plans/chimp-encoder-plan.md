@@ -36,6 +36,9 @@ with `--encoding`), pytest integration suite via `./build.sh`.
   `TIMESERIES_TYPE_ENCODING_VERSION` is currently `2` (`src/series/series_data_type.rs:36`),
   `MIN_…` is `1` (`:39`). Phase C sets both to `3` (decision point 1 below). Local
   `dump.rdb`/AOF files from older builds stop loading and must be deleted.
+  **Outcome:** the bump to `3` was reverted in `bebd629c3`. The module writes version `2`
+  and reads `1`–`2`, the Chimp grammar changed in place, and a Chimp chunk in a version `1`
+  payload is refused at load (`MIN_CHIMP_GRAMMAR_ENCODING_VERSION`).
 - Wire encoding for fan-out stays decided in `samples_to_chunk[_lossless]`
   (`src/series/chunks/serialization.rs:26-44`); no new encoding-selection tier.
 - Any change under `src/series/chunks/{stream,gorilla,chimp}` is re-profiled before it lands:
@@ -54,10 +57,15 @@ with `--encoding`), pytest integration suite via `./build.sh`.
    makes it fail loudly. Consequence: the Gorilla v1 RDB read path becomes unreachable from
    persistence (its golden fixture tests still exercise the stream reader). Alternative:
    keep `2` and accept silent misdecode of stale local dumps.
+   **Outcome:** version `2` was kept, with minimum `1`. Instead of raising the minimum, the
+   loader refuses only Chimp chunks from version `1` payloads, so stale Chimp dumps fail
+   loudly while version `1` Gorilla and uncompressed chunks still load.
 2. **Fan-out wire guard (Task 14, optional).** The probe notes point out that an RDB
    version bump does not protect a mixed-version cluster coordinator. For an unreleased
    product the rule "all nodes run the same build" may suffice; Task 14 adds a cheap
    version check to the fan-out contract if you want it.
+   **Outcome:** done in `39215071f`. `SampleData.version` is now `2` and a mismatch fails the
+   reply; coordinators from before the check still ignore it, so the same-build rule stays.
 3. **Leading-zero code width (Task 10).** Data-driven inside the task: 3-bit re-spread vs
    4-bit code, chosen by total bytes over the 45-case matrix with a no-regression bound on
    the 36 base cases.
@@ -188,7 +196,7 @@ Run: `mkdir -p docs/benchmarks/data/chimp-review && cp target/bench-reports/chim
 
 - [ ] **Step 2: Prepend a provenance line to the copied `notes.md`**
 
-One sentence: probes ran against commit `f6e446a35` on 2026-10-29 from standalone sources
+One sentence: probes ran against commit `7d5a3d058` on 2026-10-29 from standalone sources
 that were in `/tmp/valkey-chimp-review` (not retained); CSV columns are as the notes'
 *Method and limitations* section describes.
 
@@ -345,7 +353,7 @@ git commit -am "perf(chimp): skip the ELF search for integers and short binary f
 
 **Interfaces:**
 - Produces: `--encoding gorilla|chimp` (default `gorilla`); CSV columns unchanged. The tool
-  must keep using only APIs present at `3d2dc61c5` so it can be dropped into a baseline
+  must keep using only APIs present at `106088e57` so it can be dropped into a baseline
   worktree as `examples/gorilla_report.rs`, as the Gorilla report describes.
 
 - [ ] **Step 1: Add the flag and parse it with `ChunkEncoding::from_str`/the same parser
@@ -1119,7 +1127,7 @@ git commit -am "feat(series)!: module encoding version 3 for the Chimp grammar; 
 
 - [ ] **Step 1: Build the baseline binary**
 
-Worktree at `f6e446a35`, copy `tools/gorilla_report.rs` to `examples/gorilla_report.rs`
+Worktree at `7d5a3d058`, copy `tools/gorilla_report.rs` to `examples/gorilla_report.rs`
 there, build with `--release --features enable-system-alloc,test-utils --jobs 1`; copy out
 as `/tmp/chimp-baseline`. Build the branch tip as `/tmp/chimp-candidate`.
 

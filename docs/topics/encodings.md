@@ -18,7 +18,9 @@ encoder changes, measured the same way, see
 version **2**, and this build reads versions 1 and 2 (the Gorilla extended-window
 change, see [Gorilla](#2-gorilla)). The Chimp bit grammar was changed in place
 (see [Chimp](#3-chimp-elf-on-chimp-default)) **without a version bump**, because
-nothing has been released.
+nothing has been released. Every build that wrote version 1 used the old Chimp
+grammar, so a Chimp chunk in a version 1 payload is refused at load; version 1
+Gorilla and uncompressed chunks still load.
 
 ---
 
@@ -541,7 +543,10 @@ microseconds. Lower is better.
 | Gorilla | 10,000 | **120** | **127** | 150 | 156 | 70.9 |
 | Chimp | 10,000 | 143 | 153 | **112** | **120** | **53.5** |
 
-Chimp's time divided by Gorilla's, as the median over matched cells:
+Chimp's time divided by Gorilla's. Each figure is the median of the per-cell ratios
+(Chimp and Gorilla on the same workload and timestamp model), so it differs from
+dividing the column medians above: at 1,000 samples those give 1.15× for bulk encode
+and 0.88× for decode.
 
 | Samples | Encode bulk | Encode append | Decode iter | `get_range` | Scan mid 10% |
 |---:|---:|---:|---:|---:|---:|

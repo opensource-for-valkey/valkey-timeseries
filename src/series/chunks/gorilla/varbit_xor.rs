@@ -8,9 +8,11 @@ use crate::series::chunks::stream::utils::{read_bits, read_bool};
 /// The first time it is called, use 0xff (or 255) for the leading bits counts,
 /// and 0 for the trailing bits count.
 ///
-/// `inline(always)`: with the cost compare and the extended branch, and two call sites in the
-/// encoder, LLVM stopped inlining it into the per-sample loop, costing 5-23 % encode time on
-/// regular-timestamp rows. Forcing it measured 6-12 % faster than the pre-extension writer.
+/// `inline(always)`: measured, see `f624ea039`. Without it, regular-timestamp rows encoded
+/// 5-23 % slower than with the pre-extension writer; with it they are 6-12 % faster. The
+/// likely cause, inferred from timings and not checked in disassembly, is that the cost
+/// compare and extended branch, with two call sites in the encoder, pushed the function past
+/// LLVM's inlining threshold. Re-measure before removing it.
 #[inline(always)]
 pub fn write_varbit_xor<W: BitWrite>(
     value: f64,

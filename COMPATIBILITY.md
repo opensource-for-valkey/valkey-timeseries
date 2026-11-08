@@ -121,11 +121,18 @@ Smaller reads, `TS.CARD` without `FILTER_BY_RANGE`, and any of these commands is
 
 Within Valkey TimeSeries, this build writes module encoding version 2 and reads
 versions 1–2. Version 2 adds Gorilla extended XOR windows; existing version 1
-payloads remain readable and writable after loading. Older module builds reject
-new version 2 payloads, including RDB, DUMP/RESTORE, and rewritten AOF state.
-Upgrade readers before writers; downgrading persisted version 2 data requires
-exporting logical samples and recreating the series. Details and measured gains:
+Gorilla and uncompressed chunks remain readable and writable after loading. A
+Chimp chunk in a version 1 payload is refused at load, because the Chimp grammar
+changed before release. Older module builds reject new version 2 payloads,
+including RDB, DUMP/RESTORE, and rewritten AOF state. For persisted data, upgrade
+readers before writers; downgrading persisted version 2 data requires exporting
+logical samples and recreating the series. Details and measured gains:
 [the Gorilla evaluation](docs/benchmarks/gorilla-evaluation.md).
+
+In a cluster, run every node on the same build, upgrading all of them together.
+Nodes exchange encoded chunks during fan-out, and builds older than this one do
+not check the chunk wire version, so a mixed-build cluster can return wrong
+query results instead of an error.
 
 
 **Why.** The on-disk format is an internal implementation detail and is not part of the compatibility contract. Fixing it would constrain Valkey TimeSeries's ability to evolve its storage, chunk-encoding, and recovery strategies independently of RedisTimeSeries.
