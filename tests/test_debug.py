@@ -238,6 +238,26 @@ class TestDebug(ValkeyTimeSeriesTestCaseBase):
 
         assert multi_chunk_digest != single_chunk_digest, "Digests should differ between single and multi-chunk series"
 
+    def test_digest_survives_dump_restore_of_overfull_chunk(self):
+        """A lossless DUMP/RESTORE must not change the digest, even when an out-of-order
+        insert left an uncompressed chunk past its capacity (the load normalizes it)."""
+        key = 'ts_overfull'
+        self.client.execute_command('TS.CREATE', key, 'ENCODING', 'UNCOMPRESSED', 'CHUNK_SIZE', 48)
+        for ts in (10, 20, 30, 15):
+            self.client.execute_command('TS.ADD', key, ts, ts)
+
+        info = self.ts_info(key, debug=True)
+        assert info['chunks'][0]['samples'] == 4, "setup should leave one overfull chunk"
+
+        restored = 'ts_overfull_restored'
+        self.client.restore(restored, 0, self.client.dump(key))
+
+        assert self.client.execute_command('TS.RANGE', restored, '-', '+') == \
+            self.client.execute_command('TS.RANGE', key, '-', '+')
+        assert self.client.execute_command('DEBUG DIGEST-VALUE', restored) == \
+            self.client.execute_command('DEBUG DIGEST-VALUE', key), \
+            "Digest should survive a lossless DUMP/RESTORE"
+
     def test_digest_empty_series(self):
         """Test that DEBUG DIGEST-VALUE works with empty series and produces different digests for different empty series."""
         key1 = 'ts_empty_1'
