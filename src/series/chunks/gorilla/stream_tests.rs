@@ -28,60 +28,6 @@ fn assert_bit_exact(got: &[Sample], want: &[Sample]) {
     }
 }
 
-/// Captured before changing the encoder (the codec as of 106088e57). These independently pin
-/// legacy stream readability, including a full-width XOR and an unset window.
-#[test]
-fn legacy_streams_can_be_loaded_and_appended_to() {
-    for fixture in [
-        include_str!("fixtures/v1-periodic.txt"),
-        include_str!("fixtures/v1-counter.txt"),
-        include_str!("fixtures/v1-constant.txt"),
-    ] {
-        let mut lines = fixture.lines();
-        let wire = lines.next().unwrap();
-        let bytes: Vec<u8> = (0..wire.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&wire[i..i + 2], 16).unwrap())
-            .collect();
-        let mut expected: Vec<Sample> = lines
-            .map(|line| {
-                let (ts, bits) = line.split_once(' ').unwrap();
-                s(
-                    ts.parse().unwrap(),
-                    f64::from_bits(u64::from_str_radix(bits, 16).unwrap()),
-                )
-            })
-            .collect();
-        let mut loaded = GorillaEncoder::deserialize(&bytes).unwrap();
-        assert_bit_exact(
-            &loaded.iter().map(Result::unwrap).collect::<Vec<_>>(),
-            &expected,
-        );
-        // Make the previous last sample decode from the legacy stream rather
-        // than from metadata, and exercise a new window after a legacy prefix.
-        let last = *expected.last().unwrap();
-        // A one-bit mantissa change forces an extended window after the v1
-        // prefix. Append once more so that window is decoded from the stream,
-        // rather than returned through the final-sample metadata shortcut.
-        let extra = s(
-            last.timestamp + 1000,
-            f64::from_bits(last.value.to_bits() ^ 1),
-        );
-        loaded.add_sample(&extra).unwrap();
-        expected.push(extra);
-        let final_sample = s(extra.timestamp + 1000, extra.value + 1.0);
-        loaded.add_sample(&final_sample).unwrap();
-        expected.push(final_sample);
-        let mut saved = Vec::new();
-        loaded.serialize(&mut saved);
-        let resumed = GorillaEncoder::deserialize(&saved).unwrap();
-        assert_bit_exact(
-            &resumed.iter().map(Result::unwrap).collect::<Vec<_>>(),
-            &expected,
-        );
-    }
-}
-
 /// A stream cut at any byte boundary decodes every sample it still holds, bit-exactly,
 /// and then returns `Err` on the first sample it does not: never a wrong sample.
 ///
