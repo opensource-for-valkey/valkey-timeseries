@@ -64,8 +64,10 @@ with `--encoding`), pytest integration suite via `./build.sh`.
    version bump does not protect a mixed-version cluster coordinator. For an unreleased
    product the rule "all nodes run the same build" may suffice; Task 14 adds a cheap
    version check to the fan-out contract if you want it.
-   **Outcome:** done in `39215071f`. `SampleData.version` is now `2` and a mismatch fails the
-   reply; coordinators from before the check still ignore it, so the same-build rule stays.
+   **Outcome:** done in `39215071f`: `SampleData.version` is now `2` and a mismatch fails the
+   reply. Coordinators from before that check ignore the field, so `TS.MRANGE` replies also
+   carry the `MESSAGE_FEATURE_CHUNK_GRAMMAR_V2` envelope bit, which those coordinators refuse.
+   A mixed-build cluster errors in both directions; the same-build rule stays.
 3. **Leading-zero code width (Task 10).** Data-driven inside the task: 3-bit re-spread vs
    4-bit code, chosen by total bytes over the 45-case matrix with a no-regression bound on
    the 36 base cases.

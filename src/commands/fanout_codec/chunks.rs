@@ -14,8 +14,9 @@ use valkey_module::{ValkeyError, ValkeyResult};
 
 /// Wire version of a `SampleData` chunk. Version 2 is the current Chimp and Gorilla grammar;
 /// version 1 shards sent the old Chimp grammar. A mismatch is refused rather than decoded
-/// into wrong samples. Coordinators from before this check ignore the field, so a cluster
-/// still needs every node on the same build.
+/// into wrong samples. Coordinators from before this check ignore the field; they are
+/// stopped instead by the `MESSAGE_FEATURE_CHUNK_GRAMMAR_V2` envelope bit on MRANGE
+/// replies, which they do not support.
 const VERSION: u32 = 2;
 
 fn get_compression_type(chunk: &TimeSeriesChunk) -> CompressionType {

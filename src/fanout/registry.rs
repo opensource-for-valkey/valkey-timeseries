@@ -21,6 +21,8 @@ pub(super) struct RegisteredOperation {
     /// [`FanoutCommand::cancellable`]: whether a request past its time budget may be
     /// dropped unrun, or stopped between read batches.
     pub cancellable: bool,
+    /// [`FanoutCommand::response_features`]: `required_features` on this operation's replies.
+    pub response_features: u64,
 }
 
 /// A registry for fanout operations that allows type-erased storage and retrieval
@@ -84,6 +86,7 @@ impl FanoutOperationRegistry {
             RegisteredOperation {
                 run: request_handler::<OP>,
                 cancellable: OP::cancellable(),
+                response_features: OP::response_features(),
             },
         );
 
@@ -114,4 +117,52 @@ where
 
 pub(super) fn get_fanout_request_handler(name: &str) -> Option<RegisteredOperation> {
     FANOUT_REGISTRY.get_operation_by_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::replies::ReplyContext;
+    use crate::fanout::{FanoutClientCommand, FanoutCommandResult, NodeInfo};
+    use valkey_module::Status;
+
+    #[derive(Default)]
+    struct DemandsFeatures;
+
+    impl FanoutClientCommand for DemandsFeatures {
+        type Request = ();
+        type Response = ();
+
+        fn name() -> &'static str {
+            "demands_features"
+        }
+
+        fn response_features() -> u64 {
+            0b101
+        }
+
+        fn get_local_response(_: &FanoutContext, _: ()) -> ValkeyResult<()> {
+            Ok(())
+        }
+
+        fn generate_request(&self) {}
+
+        fn on_response(&mut self, _: (), _: &NodeInfo) -> FanoutCommandResult {
+            Ok(())
+        }
+
+        fn reply(&mut self, _: &ReplyContext) -> Status {
+            Status::Ok
+        }
+    }
+
+    /// The bits an operation demands of requesters reach its registration, which
+    /// is what the receiving node puts on each reply's `required_features`.
+    #[test]
+    fn registration_records_the_response_features() {
+        let registry = FanoutOperationRegistry::new();
+        registry.register::<DemandsFeatures>().unwrap();
+        let op = registry.get_operation_by_name("demands_features").unwrap();
+        assert_eq!(op.response_features, 0b101);
+    }
 }

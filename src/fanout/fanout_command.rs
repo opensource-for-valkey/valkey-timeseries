@@ -52,6 +52,13 @@ pub trait FanoutCommand: Default + Send + 'static {
         true
     }
 
+    /// Envelope feature bits a requester must support to read this operation's responses,
+    /// sent as `required_features` on each reply. A requester missing one rejects the reply
+    /// as `unsupported_features` instead of reading it. Default: none.
+    fn response_features() -> u64 {
+        0
+    }
+
     /// Return the timeout duration for the entire fanout operation.
     /// This timeout applies to the overall operation, not individual RPC calls.
     fn get_timeout(&self) -> Duration {

@@ -35,6 +35,11 @@ pub trait FanoutClientCommand: Default + Send + 'static {
         true
     }
 
+    /// See [`FanoutCommand::response_features`].
+    fn response_features() -> u64 {
+        0
+    }
+
     fn generate_request(&self) -> Self::Request;
 
     fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult;
@@ -108,6 +113,10 @@ impl<T: FanoutClientCommand> FanoutCommand for T {
 
     fn cancellable() -> bool {
         T::cancellable()
+    }
+
+    fn response_features() -> u64 {
+        T::response_features()
     }
 
     /// Get the target nodes for the fanout operation, bound to the cluster-map
