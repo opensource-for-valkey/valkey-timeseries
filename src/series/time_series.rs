@@ -1224,20 +1224,15 @@ impl TimeSeries {
         }
         digest.add_long_long(self.chunk_size_bytes as i64);
 
-        // Hash the samples inside the retention window, not the chunks. How many expired
-        // samples the head chunk still holds depends on when a trim last ran (see
-        // `trim_lazily`), and the trim cron runs independently on a primary and its replicas,
-        // so the stored layout is not a function of the data set.
-        if self.retention.is_zero() {
-            digest.add_long_long(self.chunks.len() as i64);
-            for chunk in self.chunks.iter() {
-                chunk.debug_digest(digest);
-            }
-        } else {
-            for sample in self.iter() {
-                digest.add_long_long(sample.timestamp);
-                digest.add_string_buffer(sample.value.to_le_bytes().as_ref());
-            }
+        // Hash the samples inside the retention window, not the chunks: the stored layout is
+        // not a function of the data set. How many expired samples the head chunk still holds
+        // depends on when a trim last ran (see `trim_lazily`), and the trim cron runs
+        // independently on a primary and its replicas. Even without retention, an RDB load
+        // normalizes an overfull chunk's capacity, so a lossless DUMP/RESTORE or full sync
+        // would otherwise change the digest.
+        for sample in self.iter() {
+            digest.add_long_long(sample.timestamp);
+            digest.add_string_buffer(sample.value.to_le_bytes().as_ref());
         }
 
         digest.add_long_long(self.visible_total_samples() as i64);
