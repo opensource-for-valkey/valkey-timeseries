@@ -130,12 +130,9 @@ logical samples and recreating the series. Details and measured gains:
 [the Gorilla evaluation](docs/benchmarks/gorilla-evaluation.md).
 
 In a cluster, run every node on the same build, upgrading all of them together.
-Nodes exchange encoded chunks during `TS.MRANGE` fan-out, and the chunk grammar
-changed. A mixed-build cluster fails those commands with an error instead of
-returning wrong results: this build marks its `TS.MRANGE` replies with a fan-out
-feature bit that older coordinators refuse, and it refuses chunks from older
-shards by their wire version. See
-[the fan-out compatibility handshake](docs/topics/fanout-compatibility-handshake.md).
+Nodes exchange encoded chunks during fan-out, and builds older than this one do
+not check the chunk wire version, so a mixed-build cluster can return wrong
+query results instead of an error.
 
 
 **Why.** The on-disk format is an internal implementation detail and is not part of the compatibility contract. Fixing it would constrain Valkey TimeSeries's ability to evolve its storage, chunk-encoding, and recovery strategies independently of RedisTimeSeries.

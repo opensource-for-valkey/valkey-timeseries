@@ -7,21 +7,13 @@ use std::time::Duration;
 
 pub const FANOUT_MESSAGE_MARKER: u32 = 0xBADCAB;
 
-/// Envelope feature bit: the payload carries chunks in the current Chimp and
-/// Gorilla grammar (`SampleData.version` 2). An operation whose responses carry
-/// chunks sets it on every reply ([`FanoutCommand::response_features`]). A
-/// coordinator from before the grammar change supports no feature bits, so it
-/// rejects such a reply as `unsupported_features` instead of misdecoding it.
-///
-/// [`FanoutCommand::response_features`]: super::FanoutCommand::response_features
-pub const MESSAGE_FEATURE_CHUNK_GRAMMAR_V2: u64 = 1 << 0;
-
 /// Envelope feature bits this node supports (`required_features` in the
 /// message header). A message demanding bits outside this mask is rejected at
 /// intake with [`FanoutError::unsupported_features`] instead of being silently
-/// mis-processed. Allocate a bit only for an envelope or payload change the
-/// receiver cannot ignore — see docs/topics/fanout-compatibility-handshake.md.
-pub(super) const SUPPORTED_MESSAGE_FEATURES: u64 = MESSAGE_FEATURE_CHUNK_GRAMMAR_V2;
+/// mis-processed. No bits are defined yet: allocate one only for a future
+/// envelope/payload change the receiver cannot ignore (e.g. payload
+/// compression) — see docs/topics/fanout-compatibility-handshake.md.
+pub(super) const SUPPORTED_MESSAGE_FEATURES: u64 = 0;
 
 /// True when `required_features` demands a feature outside
 /// [`SUPPORTED_MESSAGE_FEATURES`].
@@ -215,32 +207,6 @@ pub(super) fn serialize_request_message(
         },
     );
     dest.extend_from_slice(serialized_request);
-}
-
-/// A response or error. These carry no ACL user, cluster-map fingerprint or time
-/// budget: the requester matches them by request id. `required_features` names
-/// the envelope features the requester must support to read the payload.
-pub(super) fn serialize_reply_message(
-    dest: &mut Vec<u8>,
-    request_id: u64,
-    db: i32,
-    handler: &str,
-    required_features: u64,
-    payload: &[u8],
-) {
-    write_message_header(
-        dest,
-        &EnvelopeHeader {
-            request_id,
-            db: i64::from(db),
-            handler: handler.to_owned(),
-            user: String::new(),
-            cluster_fingerprint: 0,
-            required_features,
-            time_budget_ms: 0,
-        },
-    );
-    dest.extend_from_slice(payload);
 }
 
 #[cfg(test)]
@@ -486,14 +452,14 @@ mod tests {
         assert_eq!(message.header.required_features, 0);
     }
 
-    /// The envelope feature gate: only the chunk grammar bit is supported, any
-    /// other demanded bit is not, and requests demand nothing.
+    /// The envelope feature gate: with no bits defined, any demanded bit is
+    /// unsupported, and `serialize_request_message` keeps sending 0 until a
+    /// feature bit is actually defined.
     #[test]
     fn test_required_features_gate() {
-        assert_eq!(SUPPORTED_MESSAGE_FEATURES, MESSAGE_FEATURE_CHUNK_GRAMMAR_V2);
         assert!(!has_unsupported_features(0));
-        assert!(!has_unsupported_features(MESSAGE_FEATURE_CHUNK_GRAMMAR_V2));
-        assert!(has_unsupported_features(1 << 1));
+        assert!(!has_unsupported_features(SUPPORTED_MESSAGE_FEATURES));
+        assert!(has_unsupported_features(1));
         assert!(has_unsupported_features(1 << 32));
         assert!(has_unsupported_features(u64::MAX));
 
@@ -501,39 +467,6 @@ mod tests {
         serialize_request_message(&mut buf, 7, 0, "mrange", None, 0, None, &[]);
         let message = FanoutMessage::new(&buf).unwrap();
         assert_eq!(message.header.required_features, 0);
-    }
-
-    /// A reply carries the features its payload needs, and nothing a request would
-    /// (user, fingerprint, time budget). A node that supports no feature bits, as
-    /// builds from before the chunk grammar change, would refuse the chunk grammar
-    /// bit: `required & !0` is non-zero.
-    #[test]
-    fn test_reply_carries_its_required_features() {
-        let mut buf = Vec::new();
-        serialize_reply_message(
-            &mut buf,
-            7,
-            3,
-            "mrange",
-            MESSAGE_FEATURE_CHUNK_GRAMMAR_V2,
-            b"payload",
-        );
-        let message = FanoutMessage::new(&buf).unwrap();
-        assert_eq!(message.header.request_id, 7);
-        assert_eq!(message.header.db, 3);
-        assert_eq!(message.header.handler, "mrange");
-        assert_eq!(
-            message.header.required_features,
-            MESSAGE_FEATURE_CHUNK_GRAMMAR_V2
-        );
-        assert_eq!(message.header.user, None);
-        assert_eq!(message.header.cluster_fingerprint, 0);
-        assert_eq!(message.header.time_budget, None);
-        assert_eq!(message.buf, b"payload");
-
-        assert!(!has_unsupported_features(message.header.required_features));
-        let old_supported = 0u64;
-        assert_ne!(message.header.required_features & !old_supported, 0);
     }
 
     /// A request's time budget round-trips and sets no feature bit, and the payload
@@ -602,8 +535,7 @@ mod tests {
     /// truncate them away and let the request through as if it demanded nothing.
     #[test]
     fn test_unsupported_features_survive_parsing_for_intake() {
-        // Bit 0 is the supported chunk grammar feature; every other bit is not.
-        for required_features in [1u64 << 1, 0x8000, 1 << 32, 1 << 63, u64::MAX] {
+        for required_features in [1u64, 0x8000, 1 << 32, 1 << 63, u64::MAX] {
             let buf = RawHeader {
                 required_features,
                 ..Default::default()

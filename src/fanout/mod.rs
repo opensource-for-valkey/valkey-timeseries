@@ -29,7 +29,6 @@ pub use fanout_client_command::*;
 pub use fanout_command::*;
 pub use fanout_context::FanoutContext;
 pub use fanout_error::*;
-pub use fanout_message::MESSAGE_FEATURE_CHUNK_GRAMMAR_V2;
 pub use utils::*;
 pub(crate) use workers::request_lane_stats;
 

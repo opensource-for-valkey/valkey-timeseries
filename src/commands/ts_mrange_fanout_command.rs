@@ -13,9 +13,7 @@ use crate::common::metrics::fanout as fanout_metrics;
 use crate::common::replies::ReplyContext;
 use crate::common::threads::{IntoParRayon, IterIntoParRayon};
 use crate::common::{MultiSample, Sample};
-use crate::fanout::{
-    FanoutClientCommand, FanoutTarget, MESSAGE_FEATURE_CHUNK_GRAMMAR_V2, NodeInfo,
-};
+use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
 use crate::iterators::{KWayMerge, RowReducer, SampleReducer, create_sample_iterator_adapter};
 use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
@@ -102,12 +100,6 @@ impl FanoutClientCommand for MRangeFanoutCommand {
 
     fn name() -> &'static str {
         "mrange"
-    }
-
-    /// Replies carry chunks: a coordinator from before the current chunk grammar must
-    /// reject them rather than decode them into wrong samples.
-    fn response_features() -> u64 {
-        MESSAGE_FEATURE_CHUNK_GRAMMAR_V2
     }
 
     fn get_local_response(
@@ -2424,17 +2416,6 @@ mod tests {
                 "reverse={is_reverse} count={count:?}"
             );
         }
-    }
-
-    /// MRANGE replies carry chunks, so every reply demands the chunk grammar feature:
-    /// a coordinator from before the grammar change rejects it instead of decoding it.
-    #[test]
-    fn replies_demand_the_chunk_grammar_feature() {
-        use crate::fanout::FanoutCommand;
-        assert_eq!(
-            <MRangeFanoutCommand as FanoutCommand>::response_features(),
-            MESSAGE_FEATURE_CHUNK_GRAMMAR_V2
-        );
     }
 
     /// A shard on another build sends chunks with a different wire version. The

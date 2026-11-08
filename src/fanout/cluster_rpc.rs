@@ -1,7 +1,6 @@
 use super::fanout_error::{ErrorKind, FanoutError, NO_CLUSTER_NODES_AVAILABLE};
 use super::fanout_message::{
-    FanoutMessage, FanoutMessageHeader, has_unsupported_features, serialize_reply_message,
-    serialize_request_message,
+    FanoutMessage, FanoutMessageHeader, has_unsupported_features, serialize_request_message,
 };
 use super::utils::{is_clustered, is_multi_or_lua};
 use crate::common::acl::caller_user_name;
@@ -293,7 +292,6 @@ fn send_cancels(ctx: &Context, request: &InFlightRequest) {
             0,
             node.id.raw_ptr(),
             "",
-            0,
             &[],
         );
         if sent == Status::Ok {
@@ -441,7 +439,6 @@ pub(super) fn send_cluster_request(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn send_message_internal(
     ctx: &Context,
     msg_type: u8,
@@ -449,24 +446,21 @@ fn send_message_internal(
     db: i32,
     sender_id: *const c_char,
     handler: &str,
-    required_features: u64,
     buf: &[u8],
 ) -> Status {
     let mut dest = get_pooled_buffer(FANOUT_RPC_RESPONSE_BUFFER_SIZE);
     // Responses and errors don't carry a meaningful cluster-map fingerprint or
     // ACL user; the requester matches them by request id and reacts to the error kind.
-    serialize_reply_message(&mut dest, request_id, db, handler, required_features, buf);
+    serialize_request_message(&mut dest, request_id, db, handler, None, 0, None, buf);
     send_cluster_message(ctx, sender_id, msg_type, dest.as_slice())
 }
 
-/// `required_features` is the operation's [`RegisteredOperation::response_features`].
 fn send_response_message(
     ctx: &Context,
     request_id: u64,
     db: i32,
     sender_id: *const c_char,
     handler: &str,
-    required_features: u64,
     buf: &[u8],
 ) -> Status {
     send_message_internal(
@@ -476,7 +470,6 @@ fn send_response_message(
         db,
         sender_id,
         handler,
-        required_features,
         buf,
     )
 }
@@ -497,7 +490,6 @@ fn send_error_response(
         db,
         target_node,
         "",
-        0,
         &buf,
     )
 }
@@ -651,7 +643,6 @@ fn process_request_message(
                 header.db,
                 sender_id.raw_ptr(),
                 &header.handler,
-                operation.response_features,
                 &dest,
             ) == Status::Err
             {
@@ -991,7 +982,6 @@ mod tests {
         RegisteredOperation {
             run: never_called,
             cancellable,
-            response_features: 0,
         }
     }
 
@@ -1147,7 +1137,6 @@ mod tests {
             RegisteredOperation {
                 run: cancelled_while_running,
                 cancellable: true,
-                response_features: 0,
             },
             &[],
             sender,
@@ -1178,7 +1167,6 @@ mod tests {
             RegisteredOperation {
                 run: gives_up_mid_read,
                 cancellable: true,
-                response_features: 0,
             },
             &[],
             NodeId::default(),

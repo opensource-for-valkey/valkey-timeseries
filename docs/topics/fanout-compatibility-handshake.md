@@ -16,21 +16,9 @@ A receiver ignores header fields it doesn't know, so a new field's absent value 
 behaviour.
 
 A change the receiver must not ignore, such as payload compression, takes a bit in
-`required_features` instead. Every message is checked against `SUPPORTED_MESSAGE_FEATURES` when it
-arrives: requests, replies and errors. If a message needs a bit the receiver doesn't support, the
-receiver doesn't try to read it. A shard answers such a request with an `unsupported_features`
-error, and a coordinator fails that shard's share of the command the same way.
-
-An operation names the bits its replies need with `FanoutCommand::response_features`, and the shard
-sets them on every reply it sends for that operation. Requests and errors set none.
-
-| Bit | Name | Set on | Meaning |
-|---:|---|---|---|
-| 0 | `MESSAGE_FEATURE_CHUNK_GRAMMAR_V2` | `TS.MRANGE` replies | The reply carries chunks in the current Chimp and Gorilla grammar (`SampleData.version` 2). A coordinator from before that grammar supports no bits, so it fails the reply instead of decoding it into wrong samples. |
-
-The chunk grammar is also guarded in the other direction: a coordinator on this build checks
-`SampleData.version` on every chunk, so it refuses chunks from an older shard, which sends
-version 1. Commands whose replies carry no chunks still work between builds.
+`required_features` instead. When a request arrives, the receiver checks that field against
+`SUPPORTED_MESSAGE_FEATURES`. If the request needs a bit the receiver doesn't support, the receiver
+rejects it with an `unsupported_features` error. It doesn't try to read it. No bits are defined yet.
 
 ## Time budget
 
