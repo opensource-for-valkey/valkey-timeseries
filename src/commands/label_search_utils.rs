@@ -19,7 +19,8 @@ use crate::series::index::{
     DefaultLabelQuerier, FuzzyAlgorithm, FuzzyFilter, LabelNameSearchFilter, LabelQuerier,
     LabelQueryResult, SEARCH_RESULT_DEFAULT_LIMIT, SEARCH_RESULT_LIMIT_MAX, SearchHints,
     SearchResultOrdering, SelectHints, SeriesCursor, SeriesSelection, SortBy,
-    check_label_query_permissions, get_db_index, label_search_exceeds_inline_budget, plan_if_cheap,
+    check_label_query_permissions, get_db_index, label_search_exceeds_inline_budget,
+    normalize_limit, plan_if_cheap,
 };
 use crate::series::request_types::MatchFilterOptions;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
@@ -81,11 +82,10 @@ impl LabelNameSearchArgs {
         })
     }
 
+    /// The result limit, normalized: unset or `0` (as a shard request may carry) is the
+    /// default.
     pub fn get_limit(&self) -> usize {
-        self.series_filter
-            .limit
-            .unwrap_or(SEARCH_RESULT_DEFAULT_LIMIT)
-            .min(SEARCH_RESULT_LIMIT_MAX)
+        normalize_limit(self.series_filter.limit.unwrap_or(0))
     }
 
     pub fn validate(&self) -> ValkeyResult<()> {

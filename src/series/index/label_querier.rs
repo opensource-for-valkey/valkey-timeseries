@@ -33,7 +33,8 @@ use std::fmt::Display;
 use std::ops::ControlFlow;
 use valkey_module::{ValkeyError, ValkeyResult};
 
-const DEFAULT_LIMIT: usize = 100;
+/// A starting capacity for result buffers and maps; not a limit.
+const INITIAL_RESULT_CAPACITY: usize = 100;
 
 // todo: get from config
 pub const SEARCH_RESULT_LIMIT_MAX: usize = 1000;
@@ -168,6 +169,7 @@ impl SelectHints {
     }
 }
 
+/// The result limit of a label search that sets none, or sets `0`.
 pub const SEARCH_RESULT_DEFAULT_LIMIT: usize = 100;
 
 /// SearchHints configures search operations with filtering and scoring.
@@ -175,7 +177,8 @@ pub struct SearchHints<'a> {
     /// Filter determines which values to include and their relevance scores.
     pub filter: Option<Box<dyn FuzzyFilter + 'a>>,
 
-    /// Maximum number of results to return.
+    /// Maximum number of results to return: `0` means [`SEARCH_RESULT_DEFAULT_LIMIT`], and
+    /// anything above [`SEARCH_RESULT_LIMIT_MAX`] is capped to it ([`normalize_limit`]).
     pub limit: usize,
 
     /// Selects the ordering of results.
@@ -249,13 +252,15 @@ impl LabelQueryResult {
     /// Merges another query result into this one.
     ///
     /// Duplicate values are coalesced by summing cardinality and keeping the best score.
-    /// The merged set is then sorted and limited according to `order_by` and `limit`.
+    /// The merged set is then sorted and limited according to `order_by` and `limit`, which is
+    /// normalized as a search's is ([`normalize_limit`]).
     pub fn merge_from(
         &mut self,
         other: LabelQueryResult,
         order_by: SearchResultOrdering,
         limit: usize,
     ) {
+        let limit = normalize_limit(limit);
         let mut merged: AHashMap<String, LabelSearchResult> =
             AHashMap::with_capacity(self.results.len() + other.results.len());
 
@@ -385,7 +390,10 @@ fn compare_search_results(
     move |a, b| order.compare(a.rank_key(), b.rank_key())
 }
 
-fn normalize_limit(limit: usize) -> usize {
+/// A requested result limit as every collector applies it: `0` means the default, and the
+/// limit is capped at [`SEARCH_RESULT_LIMIT_MAX`]. Each entry point normalizes once; the
+/// helpers below it take a limit in `1..=SEARCH_RESULT_LIMIT_MAX`.
+pub(crate) fn normalize_limit(limit: usize) -> usize {
     if limit == 0 {
         SEARCH_RESULT_DEFAULT_LIMIT
     } else {
@@ -405,7 +413,7 @@ pub(crate) fn apply_search_hints(
 
     values.sort_by(compare_search_results(hints.order_by));
 
-    let has_more = limit > 0 && values.len() > limit;
+    let has_more = values.len() > limit;
     if has_more {
         values.truncate(limit);
     }
@@ -536,13 +544,12 @@ pub(crate) fn label_search_exceeds_inline_budget(
 }
 
 /// `collect_limited` collects up to `limit + 1` items from `iter`, then truncates to `limit`
-/// and sets `has_more` if the extra item was present. When `limit` is 0, all items are
-/// collected and `has_more` is always `false`.
+/// and sets `has_more` if the extra item was present. `limit` is normalized already.
 fn collect_limited(
     iter: impl Iterator<Item = LabelSearchResult>,
     limit: usize,
 ) -> LabelQueryResult {
-    let limit = if limit == 0 { DEFAULT_LIMIT } else { limit };
+    debug_assert!((1..=SEARCH_RESULT_LIMIT_MAX).contains(&limit));
 
     let mut items: Vec<LabelSearchResult> = iter.take(limit + 1).collect();
     let has_more = items.len() > limit;
@@ -571,12 +578,15 @@ struct TopK {
 
 impl TopK {
     fn new(order: SearchResultOrdering, limit: usize) -> Self {
-        debug_assert!(limit > 0, "a label search limit is normalized first");
+        debug_assert!(
+            (1..=SEARCH_RESULT_LIMIT_MAX).contains(&limit),
+            "a label search limit is normalized first"
+        );
         let limit = limit.max(1);
         Self {
             order,
             limit,
-            items: Vec::with_capacity(limit.saturating_mul(2).min(DEFAULT_LIMIT)),
+            items: Vec::with_capacity(limit.saturating_mul(2).min(INITIAL_RESULT_CAPACITY)),
             bounded: false,
             offered: 0,
         }
@@ -802,7 +812,8 @@ fn get_label_names_asc(
     limit: usize,
 ) -> ValkeyResult<LabelQueryResult> {
     index.read_without_swap(|| {
-        let mut results: Vec<LabelSearchResult> = Vec::with_capacity(limit.min(DEFAULT_LIMIT));
+        let mut results: Vec<LabelSearchResult> =
+            Vec::with_capacity(limit.min(INITIAL_RESULT_CAPACITY));
         let has_more = iterate_label_names_asc(
             index,
             filter,
@@ -848,7 +859,8 @@ fn get_label_names_desc_in_holds(
     entries_per_hold: usize,
 ) -> LabelQueryResult {
     let entries_per_hold = entries_per_hold.max(1);
-    let mut results: Vec<LabelSearchResult> = Vec::with_capacity(limit.min(DEFAULT_LIMIT));
+    let mut results: Vec<LabelSearchResult> =
+        Vec::with_capacity(limit.min(INITIAL_RESULT_CAPACITY));
     let mut current_result: Option<LabelSearchResult> = None;
     let mut has_more = false;
     // The scan resumes below this key: each restart, whether to skip a rejected name or to
@@ -1101,7 +1113,6 @@ fn get_label_names_top_k(
     order: SearchResultOrdering,
     limit: usize,
 ) -> ValkeyResult<LabelQueryResult> {
-    let limit = if limit == 0 { DEFAULT_LIMIT } else { limit };
     index.read_without_swap(|| Ok(get_label_names_top_k_once(index, filter, order, limit)))
 }
 
@@ -1256,7 +1267,7 @@ fn collect_label_names<S: GilSource + ?Sized>(
             // name in the match, and on the main thread (`&Context`) the whole scan is one lock
             // hold. The batched reader bounds only a fan-out share's lock holds, not the scan or
             // the set.
-            let mut names: AHashSet<String> = AHashSet::with_capacity(DEFAULT_LIMIT);
+            let mut names: AHashSet<String> = AHashSet::with_capacity(INITIAL_RESULT_CAPACITY);
             for_each_planned_series(src, cursor, DEFAULT_SERIES_BATCH_SIZE, |_ctx, ts, _key| {
                 for label in ts.labels.iter() {
                     // Not `names.insert(label.name.to_string())`: that allocates for every
@@ -1348,7 +1359,8 @@ fn collect_label_values<S: GilSource + ?Sized>(
     let counts = select_hints
         .unwrap_or_default()
         .read_planned(src.db(), |cursor| {
-            let mut counts: AHashMap<String, usize> = AHashMap::with_capacity(DEFAULT_LIMIT);
+            let mut counts: AHashMap<String, usize> =
+                AHashMap::with_capacity(INITIAL_RESULT_CAPACITY);
             for_each_planned_series(src, cursor, DEFAULT_SERIES_BATCH_SIZE, |_ctx, ts, _key| {
                 if let Some(label) = ts.get_label(label_name) {
                     match counts.get_mut(label.value) {
