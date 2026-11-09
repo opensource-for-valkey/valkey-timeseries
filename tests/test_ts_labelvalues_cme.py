@@ -114,6 +114,22 @@ class TestTimeSeriesLabelValues(ValkeyTimeSeriesClusterTestCase):
                 assert all(item.cardinality == 1 for item in parsed.results)
                 assert parsed.has_more
 
+    def test_shard_truncation_reaches_the_client(self):
+        """A shard that cut its answer short makes the merged reply say so, even when the
+        merged list fits the client's LIMIT."""
+        cluster = self.new_cluster_client()
+        client = self.new_client_for_primary(0)
+        pipe = cluster.pipeline()
+        # All on one shard: 1,001 values against a 1,000-result shard limit.
+        for i in range(1001):
+            pipe.execute_command('TS.CREATE', f'trunc:{{trunc}}:{i}', 'LABELS', 'host', f'h{i:04}')
+        pipe.execute()
+
+        raw = client.execute_command('TS.LABELVALUES', 'host', 'LIMIT', 1000)
+        parsed = LabelSearchResponse.parse(raw)
+        assert len(parsed.results) == 1000
+        assert parsed.has_more
+
     def test_label_values_with_filter(self):
         """Test retrieving label values with a filter"""
         cluster: ValkeyCluster = self.new_cluster_client()
