@@ -1,4 +1,4 @@
-use super::fanout_error::{ErrorKind, FanoutError, NO_CLUSTER_NODES_AVAILABLE};
+use super::fanout_error::{ErrorKind, FANOUT_BLOCKING_DENIED, FanoutError};
 use super::fanout_message::{
     FanoutMessage, FanoutMessageHeader, has_unsupported_features, serialize_request_message,
 };
@@ -6,12 +6,14 @@ use super::utils::{is_clustered, is_multi_or_lua};
 use crate::common::acl::caller_user_name;
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::hash::BuildNoHashHasher;
+use crate::common::logging::{log_debug, log_error, log_warning};
 use crate::common::metrics::clustermap as clustermap_metrics;
 use crate::common::metrics::fanout::{self as metrics, WireCounters};
 use crate::common::pool::get_pooled_buffer;
 use crate::common::sync::lock;
 use crate::common::threads::LockGil;
 use crate::config::FANOUT_COMMAND_TIMEOUT;
+use crate::error_consts;
 use crate::fanout::cluster_map::{CURRENT_NODE_ID, NodeId, NodeRole, SocketAddress};
 use crate::fanout::fanout_command::FanoutResponseCallback;
 use crate::fanout::fanout_context::FanoutContext;
@@ -19,8 +21,8 @@ use crate::fanout::registry::{RegisteredOperation, get_fanout_request_handler};
 use crate::fanout::serialization::Serializable;
 use crate::fanout::workers::PEER_REQUEST_EXECUTOR;
 use crate::fanout::{
-    FanoutResult, NodeInfo, get_cluster_map, get_or_refresh_cluster_map, mark_cluster_map_stale,
-    refresh_cluster_map,
+    FanoutResult, NodeInfo, current_or_refreshed_cluster_map, get_cluster_map,
+    mark_cluster_map_stale, refresh_cluster_map,
 };
 use ahash::HashSet;
 use core::time::Duration;
@@ -29,6 +31,7 @@ use papaya::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::raw::{c_char, c_int, c_uchar};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
@@ -62,6 +65,9 @@ struct InFlightRequest {
     outstanding: AtomicU64,
     timer_id: u64,
     timed_out: AtomicBool,
+    /// The fanout completed before every remote target answered (a share's error
+    /// aborted it); the rest are no longer wanted.
+    fanout_done: AtomicBool,
     /// Remote targets that have answered (a response, an error, or a send failure). A target
     /// answers once: anything more from it, or anything from a node that is not a remote
     /// target, is dropped rather than counted.
@@ -90,7 +96,7 @@ impl InFlightRequest {
     }
 
     fn get_target_node_opt(&self, sender_id: *const c_char) -> Option<&NodeInfo> {
-        let sender = NodeId::from_raw(sender_id);
+        let sender = node_id_of(sender_id);
         self.targets.get(&sender)
     }
 
@@ -102,19 +108,14 @@ impl InFlightRequest {
     /// delivered too — the former as a `Custom` error — and so counted as a shard's reply in both
     /// this request's and the fan-out's bookkeeping, completing the fan-out while real shards
     /// were still outstanding.
-    fn handle_response(
-        &self,
-        ctx: &Context,
-        resp: FanoutResult<&[u8]>,
-        sender_id: *const c_char,
-    ) -> bool {
-        let sender = NodeId::from_raw(sender_id);
+    fn handle_response(&self, resp: FanoutResult<&[u8]>, sender_id: *const c_char) -> bool {
+        let sender = node_id_of(sender_id);
         let Some(target_node) = self
             .get_target_node_opt(sender_id)
             .filter(|node| !node.is_local())
         else {
             metrics::FANOUT_IGNORED_UNKNOWN_SENDER.incr();
-            ctx.log_warning(&format!(
+            log_debug(format!(
                 "cluster rpc: ignoring response for request {} from unknown sender {sender}",
                 self.id
             ));
@@ -122,14 +123,29 @@ impl InFlightRequest {
         };
         if !lock(&self.responded).insert(sender) {
             metrics::FANOUT_IGNORED_DUPLICATE.incr();
-            ctx.log_warning(&format!(
+            log_debug(format!(
                 "cluster rpc: ignoring duplicate response for request {} from {sender}",
                 self.id
             ));
             return false;
         }
 
-        (self.response_handler)(resp, target_node);
+        // The handler runs the command's own `deserialize` and `on_response`. A
+        // panic there must not unwind into the server: it fails this share instead.
+        let handled = panic::catch_unwind(AssertUnwindSafe(|| {
+            (self.response_handler)(resp, target_node)
+        }));
+        let still_waiting = handled.unwrap_or_else(|_| {
+            log_error(format!(
+                "cluster rpc: processing the answer to {} request {} from {sender} panicked",
+                self.command, self.id
+            ));
+            let err = FanoutError::custom("failed to process the node's answer");
+            (self.response_handler)(Err(err), target_node)
+        });
+        if !still_waiting {
+            self.fanout_done.store(true, Ordering::Relaxed);
+        }
         true
     }
 
@@ -144,8 +160,17 @@ impl InFlightRequest {
     /// blocked-client timeout. A timeout ends the whole fanout regardless of the
     /// node it is reported against.
     fn deliver_timeout(&self) {
-        (self.response_handler)(Err(FanoutError::timeout()), &placeholder_node());
+        let _ = (self.response_handler)(Err(FanoutError::timeout()), &placeholder_node());
     }
+}
+
+/// The node id behind a sender pointer. Every such pointer in this module is
+/// either a cluster-message receiver's `sender_id` argument, which the server
+/// guarantees is null or a 40-byte hex id for the duration of the callback, or
+/// [`NodeId::raw_ptr`] of an id we hold.
+fn node_id_of(sender_id: *const c_char) -> NodeId {
+    // SAFETY: see above.
+    unsafe { NodeId::from_raw(sender_id) }
 }
 
 /// Stand-in target for a callback that has no real sender (an unknown sender, or
@@ -160,6 +185,7 @@ fn placeholder_node() -> NodeInfo {
         },
         role: NodeRole::Primary,
         location: Default::default(),
+        healthy: true,
     }
 }
 
@@ -255,6 +281,10 @@ fn next_id(counter: &AtomicU64) -> u64 {
 /// read). The server removes and frees the firing timer itself once this
 /// returns.
 fn on_request_timeout(ctx: &Context, id: u64) {
+    guard_callback("fanout request timer", || request_timed_out(ctx, id));
+}
+
+fn request_timed_out(ctx: &Context, id: u64) {
     let map = INFLIGHT_REQUESTS.pin();
     if let Some(request) = map.get(&id) {
         // Timeout can race with responses; only one path should complete the request.
@@ -302,21 +332,53 @@ fn send_cancels(ctx: &Context, request: &InFlightRequest) {
 
 fn dispatch_send_failure(ctx: &Context, request_id: u64, target_node_id: *const c_char) {
     metrics::FANOUT_SEND_FAILURES.incr();
-    with_inflight_request(ctx, request_id, |ctx, request| {
+    with_inflight_request(ctx, request_id, |request| {
         let err = FanoutError::custom("Failed to send fanout request to target node");
-        request.handle_response(ctx, Err(err), target_node_id)
+        request.handle_response(Err(err), target_node_id)
     });
 }
 
 fn finish_inflight_request(ctx: &Context, request: &InFlightRequest) {
-    if let Ok(v) = request.rpc_done()
-        && v == 1
-    {
+    let last = matches!(request.rpc_done(), Ok(1));
+    if last {
         // Every shard answered before the deadline: the timer is still pending
-        // and this is the one place it is stopped.
+        // and this is one of the two places it is stopped.
         request.cancel_timer(ctx);
-        let map = INFLIGHT_REQUESTS.pin();
-        map.remove(&request.id);
+        INFLIGHT_REQUESTS.pin().remove(&request.id);
+        return;
+    }
+    // The fanout completed early (a share's error aborted it).
+    if request.fanout_done.load(Ordering::Relaxed) {
+        abandon_remaining_shares(ctx, request);
+    }
+}
+
+/// The fanout completed before every remote target answered: tell the shares still running to
+/// stop, stop waiting for them, and forget the request so their late answers are dropped
+/// unread. `timed_out` claims the request against a timer firing at the same moment, and makes
+/// a second call a no-op.
+///
+/// Runs under the GIL, from a message callback or a local share, never from the timer's own
+/// callback, so stopping the timer here is safe (see [`InFlightRequest::cancel_timer`]).
+fn abandon_remaining_shares(ctx: &Context, request: &InFlightRequest) {
+    if request.timed_out.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    metrics::FANOUT_EARLY_COMPLETIONS.incr();
+    send_cancels(ctx, request);
+    request.cancel_timer(ctx);
+    INFLIGHT_REQUESTS.pin().remove(&request.id);
+}
+
+/// The fanout behind request `id` was completed by its local share (that share's error aborted
+/// it), so the remote shares are no longer wanted. Remote answers only reach the request through
+/// [`InFlightRequest::handle_response`], so without this a stalled peer kept its share running
+/// until another answer or the timer arrived. A request that is already gone (every remote target
+/// answered, or the timer fired) is left alone.
+pub(super) fn abandon_inflight_request(ctx: &Context, id: u64) {
+    if let Some(request) = INFLIGHT_REQUESTS.pin().get(&id) {
+        request.fanout_done.store(true, Ordering::Relaxed);
+        abandon_remaining_shares(ctx, request);
     }
 }
 
@@ -325,7 +387,7 @@ fn validate_cluster_exec(ctx: &Context) -> ValkeyResult<()> {
         return Err(ValkeyError::Str("Cluster mode is not enabled"));
     }
     if is_multi_or_lua(ctx) {
-        return Err(ValkeyError::Str("Cannot execute in MULTI or Lua context"));
+        return Err(ValkeyError::Str(FANOUT_BLOCKING_DENIED));
     }
     Ok(())
 }
@@ -335,15 +397,17 @@ pub fn get_cluster_command_timeout() -> Duration {
     Duration::from_millis(timeout)
 }
 
+/// Send `req` to the remote `targets` and return the request's id, which
+/// [`abandon_inflight_request`] takes once the fanout no longer needs them.
 pub fn invoke_rpc<Request: Serializable>(
     ctx: &Context,
     name: &'static str,
-    req: Request,
+    req: &Request,
     targets: Arc<HashSet<NodeInfo>>,
     cluster_fingerprint: u64,
     response_handler: FanoutResponseCallback,
     timeout: Duration,
-) -> ValkeyResult<()> {
+) -> ValkeyResult<u64> {
     let mut buf = get_pooled_buffer(FANOUT_RPC_BUFFER_SIZE);
     req.serialize(&mut buf);
 
@@ -366,7 +430,7 @@ pub(super) fn send_cluster_request(
     cluster_fingerprint: u64,
     response_handler: FanoutResponseCallback,
     timeout: Option<Duration>,
-) -> ValkeyResult<()> {
+) -> ValkeyResult<u64> {
     validate_cluster_exec(ctx)?;
 
     let id = generate_id();
@@ -389,17 +453,11 @@ pub(super) fn send_cluster_request(
         request_buf,
     );
 
-    let remote_targets: Vec<NodeInfo> = targets
-        .iter()
-        .filter(|node| !node.is_local())
-        .copied()
-        .collect();
-
-    if remote_targets.is_empty() {
-        return Err(ValkeyError::Str(NO_CLUSTER_NODES_AVAILABLE));
+    let node_count = targets.iter().filter(|node| !node.is_local()).count();
+    if node_count == 0 {
+        return Err(ValkeyError::Str(error_consts::NO_CLUSTER_NODES_AVAILABLE));
     }
 
-    let node_count = remote_targets.len();
     let timer_id = ctx.create_timer(timeout, on_request_timeout, id);
 
     let request = InFlightRequest {
@@ -411,6 +469,7 @@ pub(super) fn send_cluster_request(
         timer_id,
         outstanding: AtomicU64::new(node_count as u64),
         timed_out: AtomicBool::new(false),
+        fanout_done: AtomicBool::new(false),
         targets: targets.clone(),
         responded: Mutex::new(HashSet::default()),
     };
@@ -420,7 +479,7 @@ pub(super) fn send_cluster_request(
         map.insert(id, request);
     }
 
-    for node in remote_targets {
+    for node in targets.iter().filter(|node| !node.is_local()) {
         let target_id = node.id.raw_ptr();
         let status = send_cluster_message(ctx, target_id, FANOUT_REQUEST_MESSAGE, buf.as_slice());
         if status == Status::Err {
@@ -432,11 +491,11 @@ pub(super) fn send_cluster_request(
                 node.address(),
                 target_id
             );
-            ctx.log_warning(&msg);
+            log_warning(msg);
             dispatch_send_failure(ctx, id, target_id);
         }
     }
-    Ok(())
+    Ok(id)
 }
 
 fn send_message_internal(
@@ -494,12 +553,11 @@ fn send_error_response(
     )
 }
 
-fn parse_fanout_message(
-    ctx: &'_ Context,
+fn parse_fanout_message<'a>(
     sender_id: *const c_char,
     payload: *const c_uchar,
     len: u32,
-) -> Option<FanoutMessage<'_>> {
+) -> Option<FanoutMessage<'a>> {
     // SAFETY: `payload` is expected to be a non-null, valid pointer to `len` bytes of
     // initialized memory provided by Valkey's C API for the duration of this callback,
     // so creating a shared slice from it with `from_raw_parts` is sound.
@@ -507,9 +565,10 @@ fn parse_fanout_message(
     match FanoutMessage::new(buffer) {
         Ok(msg) => Some(msg),
         Err(err) => {
-            let node = NodeId::from_raw(sender_id);
-            let msg = format!("Failed to parse fanout message from node {node}: {err}");
-            ctx.log_warning(&msg);
+            let node = node_id_of(sender_id);
+            log_warning(format!(
+                "Failed to parse fanout message from node {node}: {err}"
+            ));
             None
         }
     }
@@ -527,8 +586,8 @@ fn alloc_db_if_needed(ctx: &Context, db: i32) {
 ///
 /// A fingerprint of `0` means the sender had no map when it built the request,
 /// so the check is skipped. Otherwise, we compare against a fresh local map: if
-/// they disagree, our map may merely be stale, so we force a single refresh and
-/// re-compare before declaring a mismatch. Building the map issues
+/// they disagree and that map was not just rebuilt, it may merely be stale, so
+/// we force a single refresh and re-compare before declaring a mismatch. Building the map issues
 /// `CLUSTER NODES` (not `CLUSTER SLOTS`), whose reply does not depend on a
 /// client, so this is safe on the worker thread that runs it; the GIL is taken
 /// only for that call, and the reply is parsed with it released.
@@ -539,9 +598,13 @@ fn cluster_fingerprint_matches(ctx: &DetachedContext, expected: u64) -> bool {
         return true;
     }
 
-    let local = get_or_refresh_cluster_map(ctx);
+    let (local, refreshed) = current_or_refreshed_cluster_map(ctx);
     if local.cluster_slots_fingerprint() == expected {
         return true;
+    }
+    if refreshed {
+        // Already built from a `CLUSTER NODES` reply taken just now.
+        return false;
     }
 
     // Our map might just be stale; force one refresh and re-check.
@@ -594,7 +657,10 @@ fn process_request_message(
         fanout_ctx.set_deadline(deadline);
     }
     if let Some(registration) = &registration {
-        fanout_ctx.set_cancel_flag(registration.cancelled.clone());
+        registration.entry.running.store(true, Ordering::Relaxed);
+        if operation.cancellable {
+            fanout_ctx.set_cancel_flag(registration.entry.cancelled.clone());
+        }
     }
     if fanout_ctx.expired() {
         // Cancelled, or past a deadline which, counted from arrival, is never earlier than the
@@ -613,10 +679,9 @@ fn process_request_message(
     if !cluster_fingerprint_matches(&MODULE_CONTEXT, header.cluster_fingerprint) {
         metrics::FANOUT_REJECTED_CLUSTER_MAP_MISMATCH.incr();
         let ctx = MODULE_CONTEXT.lock_gil();
-        let msg = format!(
+        log_debug(format!(
             "cluster rpc: rejecting request {request_id} from node {sender_id}: cluster-map fingerprint mismatch"
-        );
-        ctx.log_warning(&msg);
+        ));
         send_error_response(
             &ctx,
             request_id,
@@ -631,7 +696,9 @@ fn process_request_message(
 
     match (operation.run)(&fanout_ctx, request_buf, &mut dest) {
         Ok(()) => {
-            if fanout_ctx.is_cancelled() {
+            // Cancelled, or finished after the deadline: either way nobody is
+            // waiting, so don't take the GIL to send what would be ignored.
+            if fanout_ctx.expired() {
                 metrics::FANOUT_ANSWERS_DISCARDED.incr();
                 return;
             }
@@ -647,9 +714,9 @@ fn process_request_message(
             ) == Status::Err
             {
                 metrics::FANOUT_REPLY_SEND_FAILURES.incr();
-                let msg = format!("Failed to send response message to node {sender_id:?}");
-                // send error ???
-                ctx.log_warning(&msg);
+                log_warning(format!(
+                    "Failed to send response message to node {sender_id}"
+                ));
             }
         }
         // A handler times out only by abandoning its read at the deadline, which the requester
@@ -661,8 +728,15 @@ fn process_request_message(
         }
         Err(e) => {
             metrics::FANOUT_SERVED_ERRORS.incr();
-            let msg = e.to_string();
-            MODULE_CONTEXT.log_warning(&msg);
+            let msg = format!(
+                "cluster rpc: {} request {request_id} from node {sender_id} failed: {e}",
+                header.handler
+            );
+            if e.kind.is_client_visible() {
+                log_debug(msg);
+            } else {
+                log_warning(msg);
+            }
             let ctx = MODULE_CONTEXT.lock_gil();
             send_error_response(&ctx, request_id, header.db, sender_id.raw_ptr(), e);
         }
@@ -686,13 +760,22 @@ pub fn send_cluster_message(
     msg_type: u8,
     message_body: &[u8],
 ) -> Status {
+    // The bus carries a u32 length; refuse what it cannot describe rather than
+    // send a truncated length.
+    let Ok(len) = u32::try_from(message_body.len()) else {
+        log_warning(format!(
+            "cluster rpc: refusing to send a {} byte message, over the cluster bus limit",
+            message_body.len()
+        ));
+        return Status::Err;
+    };
     let sent = unsafe {
         ValkeyModule_SendClusterMessage.expect("ValkeyModule_SendClusterMessage is not available")(
             ctx.ctx as *mut ValkeyModuleCtx,
             target_node_id,
             msg_type,
             message_body.as_ptr().cast::<c_char>(),
-            message_body.len() as u32,
+            len,
         ) == VALKEYMODULE_OK as c_int
     };
     if !sent {
@@ -722,11 +805,22 @@ extern "C" fn on_request_received(
     payload: *const c_uchar,
     len: u32,
 ) {
+    guard_callback("fanout request intake", || {
+        request_received(ctx, sender_id, payload, len)
+    });
+}
+
+fn request_received(
+    ctx: *mut ValkeyModuleCtx,
+    sender_id: *const c_char,
+    payload: *const c_uchar,
+    len: u32,
+) {
     let ctx = Context::new(ctx as *mut RedisModuleCtx);
     let Some(FanoutMessage {
         header,
         buf: request_buf,
-    }) = parse_fanout_message(&ctx, sender_id, payload, len)
+    }) = parse_fanout_message(sender_id, payload, len)
     else {
         metrics::FANOUT_REJECTED_PARSE.incr();
         return;
@@ -742,10 +836,10 @@ extern "C" fn on_request_received(
         let msg = format!(
             "Rejecting fanout request {} from node {}: unsupported required_features {:#06x}",
             header.request_id,
-            NodeId::from_raw(sender_id),
+            node_id_of(sender_id),
             header.required_features
         );
-        ctx.log_warning(&msg);
+        log_warning(msg);
         return;
     }
 
@@ -759,11 +853,11 @@ extern "C" fn on_request_received(
             "No handler registered for fanout operation '{}'",
             header.handler
         );
-        ctx.log_warning(&msg);
+        log_warning(msg);
         return;
     };
 
-    let sender = NodeId::from_raw(sender_id);
+    let sender = node_id_of(sender_id);
 
     let mut buf = get_pooled_buffer(len as usize);
     buf.extend_from_slice(request_buf);
@@ -773,39 +867,104 @@ extern "C" fn on_request_received(
     let (request_id, db) = (header.request_id, header.db);
 
     // A blocking thread: the handler takes the GIL (R1 in `common::threads`).
-    let registration = operation
-        .cancellable
-        .then(|| PeerRequest::register(sender, request_id));
+    let registration = PeerRequest::register(sender, request_id, &operation, received);
     let queued = PEER_REQUEST_EXECUTOR.try_spawn(move || {
-        process_request_message(header, operation, &buf, sender, received, registration);
+        process_request_message(
+            header,
+            operation,
+            &buf,
+            sender,
+            received,
+            Some(registration),
+        );
     });
     if queued.is_err() {
         metrics::FANOUT_REJECTED_BUSY.incr();
         // Answer now rather than leave the requester waiting out its timeout.
         send_error_response(&ctx, request_id, db, sender_id, FanoutError::busy());
-        let msg = format!("Rejecting fanout request {request_id} from node {sender}: workers busy");
-        ctx.log_warning(&msg);
+        log_debug(format!(
+            "Rejecting fanout request {request_id} from node {sender}: workers busy"
+        ));
     }
 }
 
-/// Peer requests being served that their requester may cancel, by requester and request id.
-/// Request ids are only unique per requester.
-static PEER_REQUESTS: LazyLock<HashMap<(NodeId, u64), Arc<AtomicBool>>> =
+/// Every peer request this node is serving, queued or running, by requester and request id.
+/// Request ids are only unique per requester. Writes are tracked too, for observability
+/// (`TS._DEBUG PEER_REQUESTS`, `fanout_serving`), but only a cancellable entry can be cancelled.
+static PEER_REQUESTS: LazyLock<HashMap<(NodeId, u64), Arc<PeerRequestEntry>>> =
     LazyLock::new(HashMap::new);
+
+/// What [`PEER_REQUESTS`] knows about one request.
+struct PeerRequestEntry {
+    command: &'static str,
+    received: Instant,
+    /// [`RegisteredOperation::cancellable`]. A write is not: abandoning it part-way would leave
+    /// it half applied, so a cancel never marks it and its handler never sees the flag.
+    cancellable: bool,
+    /// Set once a worker has picked the request up; until then it waits in the lane's queue.
+    running: AtomicBool,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// How many peer requests this node is serving, queued or running, writes included.
+pub(crate) fn peer_request_count() -> usize {
+    PEER_REQUESTS.pin().len()
+}
+
+/// One peer request being served, as `TS._DEBUG PEER_REQUESTS VERBOSE` reports it.
+pub(crate) struct PeerRequestSummary {
+    pub sender: NodeId,
+    pub id: u64,
+    pub command: &'static str,
+    pub age: Duration,
+    pub running: bool,
+    pub cancellable: bool,
+    pub cancelled: bool,
+}
+
+/// The peer requests this node is serving, oldest first.
+pub(crate) fn peer_requests() -> Vec<PeerRequestSummary> {
+    let mut requests: Vec<_> = PEER_REQUESTS
+        .pin()
+        .iter()
+        .map(|(&(sender, id), entry)| PeerRequestSummary {
+            sender,
+            id,
+            command: entry.command,
+            age: entry.received.elapsed(),
+            running: entry.running.load(Ordering::Relaxed),
+            cancellable: entry.cancellable,
+            cancelled: entry.cancelled.load(Ordering::Relaxed),
+        })
+        .collect();
+    requests.sort_by_key(|request| std::cmp::Reverse(request.age));
+    requests
+}
 
 /// A peer request's entry in [`PEER_REQUESTS`], for as long as the request is queued or running.
 /// Dropping it removes the entry, so a request that never ran (the queue was full) leaves none.
 struct PeerRequest {
     key: (NodeId, u64),
-    cancelled: Arc<AtomicBool>,
+    entry: Arc<PeerRequestEntry>,
 }
 
 impl PeerRequest {
-    fn register(sender: NodeId, request_id: u64) -> Self {
+    fn register(
+        sender: NodeId,
+        request_id: u64,
+        operation: &RegisteredOperation,
+        received: Instant,
+    ) -> Self {
         let key = (sender, request_id);
-        let cancelled = Arc::new(AtomicBool::new(false));
-        PEER_REQUESTS.pin().insert(key, cancelled.clone());
-        Self { key, cancelled }
+        let entry = Arc::new(PeerRequestEntry {
+            command: operation.name,
+            received,
+            cancellable: operation.cancellable,
+            running: AtomicBool::new(false),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        PEER_REQUESTS.pin().insert(key, entry.clone());
+        Self { key, entry }
     }
 }
 
@@ -816,26 +975,30 @@ impl Drop for PeerRequest {
 }
 
 /// Marks a request as no longer wanted. A request that has finished has no entry, which is fine:
-/// its answer has gone already.
+/// its answer has gone already. A write is left alone: a requester never cancels one, and a
+/// cancel that names one anyway must not stop it part-way.
 fn cancel_peer_request(sender: NodeId, request_id: u64) {
-    if let Some(cancelled) = PEER_REQUESTS.pin().get(&(sender, request_id)) {
-        cancelled.store(true, Ordering::Relaxed);
+    if let Some(entry) = PEER_REQUESTS.pin().get(&(sender, request_id))
+        && entry.cancellable
+    {
+        entry.cancelled.store(true, Ordering::Relaxed);
     }
 }
 
 extern "C" fn on_cancel_received(
-    ctx: *mut ValkeyModuleCtx,
+    _ctx: *mut ValkeyModuleCtx,
     sender_id: *const c_char,
     _type: u8,
     payload: *const c_uchar,
     len: u32,
 ) {
-    let ctx = Context::new(ctx as *mut RedisModuleCtx);
-    let Some(message) = parse_fanout_message(&ctx, sender_id, payload, len) else {
-        return;
-    };
-    metrics::FANOUT_CANCELS_RECEIVED.incr();
-    cancel_peer_request(NodeId::from_raw(sender_id), message.header.request_id);
+    guard_callback("fanout cancel intake", || {
+        let Some(message) = parse_fanout_message(sender_id, payload, len) else {
+            return;
+        };
+        metrics::FANOUT_CANCELS_RECEIVED.incr();
+        cancel_peer_request(node_id_of(sender_id), message.header.request_id);
+    });
 }
 
 /// Runs `f` against an in-flight request. `f` reports whether it delivered an answer that
@@ -843,18 +1006,19 @@ extern "C" fn on_cancel_received(
 /// count decremented.
 fn with_inflight_request<F>(ctx: &Context, request_id: u64, f: F)
 where
-    F: FnOnce(&Context, &InFlightRequest) -> bool,
+    F: FnOnce(&InFlightRequest) -> bool,
 {
     let map = INFLIGHT_REQUESTS.pin();
     let Some(request) = map.get(&request_id) else {
+        // Expected after a timeout: answers still arrive for a request that is gone.
         metrics::FANOUT_IGNORED_UNKNOWN_REQUEST.incr();
-        ctx.log_warning(&format!(
+        log_debug(format!(
             "Failed to find inflight request for id {request_id}. Possible timeout.",
         ));
         return;
     };
 
-    if f(ctx, request) {
+    if f(request) {
         finish_inflight_request(ctx, request);
     }
 }
@@ -868,23 +1032,32 @@ extern "C" fn on_response_received(
     payload: *const c_uchar,
     len: u32,
 ) {
+    guard_callback("fanout response intake", || {
+        response_received(ctx, sender_id, payload, len)
+    });
+}
+
+fn response_received(
+    ctx: *mut ValkeyModuleCtx,
+    sender_id: *const c_char,
+    payload: *const c_uchar,
+    len: u32,
+) {
     let ctx = Context::new(ctx as *mut RedisModuleCtx);
 
-    let Some(message) = parse_fanout_message(&ctx, sender_id, payload, len) else {
-        ctx.log_warning("Failed to parse response message");
+    let Some(message) = parse_fanout_message(sender_id, payload, len) else {
         return;
     };
 
-    with_inflight_request(&ctx, message.header.request_id, |ctx, request| {
-        let _ = set_current_db(ctx, message.header.db);
+    with_inflight_request(&ctx, message.header.request_id, |request| {
         // Feature gate: a newer peer's response may demand envelope features
         // (e.g., a payload encoding) we cannot decode; fail this node's slice
         // of the request instead of misinterpreting the payload.
         if has_unsupported_features(message.header.required_features) {
             let err = FanoutError::unsupported_features();
-            return request.handle_response(ctx, Err(err), sender_id);
+            return request.handle_response(Err(err), sender_id);
         }
-        request.handle_response(ctx, Ok(message.buf), sender_id)
+        request.handle_response(Ok(message.buf), sender_id)
     });
 }
 
@@ -895,21 +1068,29 @@ extern "C" fn on_error_received(
     payload: *const c_uchar,
     len: u32,
 ) {
+    guard_callback("fanout error intake", || {
+        error_received(ctx, sender_id, payload, len)
+    });
+}
+
+fn error_received(
+    ctx: *mut ValkeyModuleCtx,
+    sender_id: *const c_char,
+    payload: *const c_uchar,
+    len: u32,
+) {
     let ctx = Context::new(ctx as *mut RedisModuleCtx);
 
-    let local_node_id = CURRENT_NODE_ID.raw_ptr();
-    let Some(message) = parse_fanout_message(&ctx, local_node_id, payload, len) else {
+    let Some(message) = parse_fanout_message(sender_id, payload, len) else {
         return;
     };
 
-    with_inflight_request(&ctx, message.header.request_id, |ctx, request| {
-        let _ = set_current_db(ctx, message.header.db);
-
+    with_inflight_request(&ctx, message.header.request_id, |request| {
         // Feature gate: mirror the response path — an error payload we cannot
         // decode per the demanded features still fails this node's slice.
         if has_unsupported_features(message.header.required_features) {
             let err = FanoutError::unsupported_features();
-            return request.handle_response(ctx, Err(err), sender_id);
+            return request.handle_response(Err(err), sender_id);
         }
 
         match FanoutError::deserialize(message.buf) {
@@ -920,16 +1101,28 @@ extern "C" fn on_error_received(
                 if error.kind == ErrorKind::ClusterMapMismatch {
                     mark_cluster_map_stale();
                 }
-                request.handle_response(ctx, Err(error), sender_id)
+                request.handle_response(Err(error), sender_id)
             }
             Err(_) => {
                 metrics::FANOUT_ERROR_DECODE_FAILURES.incr();
-                ctx.log_warning("Failed to deserialize error response");
+                log_warning(format!(
+                    "Failed to deserialize error response from node {}",
+                    node_id_of(sender_id)
+                ));
                 let err = FanoutError::invalid_message();
-                request.handle_response(ctx, Err(err), sender_id)
+                request.handle_response(Err(err), sender_id)
             }
         }
     });
+}
+
+/// Runs the body of a callback the server calls from C (a cluster-message
+/// receiver or the request timer). Unwinding out of it would abort the server,
+/// so a panic is logged and the callback returns instead.
+fn guard_callback(what: &str, body: impl FnOnce()) {
+    if panic::catch_unwind(AssertUnwindSafe(body)).is_err() {
+        log_error(format!("cluster rpc: {what} panicked"));
+    }
 }
 
 /// Registers a callback function to handle incoming cluster messages.
@@ -980,6 +1173,7 @@ mod tests {
 
     fn operation(cancellable: bool) -> RegisteredOperation {
         RegisteredOperation {
+            name: "test",
             run: never_called,
             cancellable,
         }
@@ -1065,7 +1259,50 @@ mod tests {
 
     /// `from_raw` reads a full node id, however short a string it is handed.
     fn node_id(hex_digit: u8) -> NodeId {
-        NodeId::from_raw([hex_digit; 41].as_ptr().cast())
+        node_id_of([hex_digit; 41].as_ptr().cast())
+    }
+
+    #[test]
+    fn a_panicking_answer_handler_fails_its_share() {
+        let sender = node_id(b'1');
+        let target = NodeInfo {
+            id: sender,
+            shard_id: sender,
+            location: crate::fanout::cluster_map::NodeLocation::Remote,
+            ..placeholder_node()
+        };
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&errors);
+        let request = InFlightRequest {
+            id: 1,
+            command: "test",
+            started: Instant::now(),
+            remote_targets: 1,
+            targets: Arc::new(HashSet::from_iter([target])),
+            response_handler: Box::new(move |res, _| match res {
+                Ok(_) => panic!("command code panicked"),
+                Err(e) => {
+                    lock(&seen).push(e.to_string());
+                    true
+                }
+            }),
+            outstanding: AtomicU64::new(1),
+            timer_id: 0,
+            timed_out: AtomicBool::new(false),
+            fanout_done: AtomicBool::new(false),
+            responded: Mutex::new(HashSet::default()),
+        };
+
+        // Counted as the node's answer, delivered as an error.
+        assert!(request.handle_response(Ok(&[]), sender.raw_ptr()));
+        assert_eq!(lock(&errors).len(), 1);
+        // A second answer from the same node is still a duplicate.
+        assert!(!request.handle_response(Ok(&[]), sender.raw_ptr()));
+    }
+
+    #[test]
+    fn a_panicking_callback_body_returns() {
+        guard_callback("test callback", || panic!("boom"));
     }
 
     /// A cancel marks the request it names, from the requester that sent it, and nothing else:
@@ -1074,22 +1311,96 @@ mod tests {
     fn a_cancel_marks_only_the_request_it_names() {
         let sender = node_id(b'a');
         let other = node_id(b'b');
-        let request = PeerRequest::register(sender, 7);
-        let same_id_elsewhere = PeerRequest::register(other, 7);
-        let another_id = PeerRequest::register(sender, 8);
+        let request = register_read(sender, 7);
+        let same_id_elsewhere = register_read(other, 7);
+        let another_id = register_read(sender, 8);
 
         cancel_peer_request(sender, 7);
 
-        assert!(request.cancelled.load(Ordering::Relaxed));
-        assert!(!same_id_elsewhere.cancelled.load(Ordering::Relaxed));
-        assert!(!another_id.cancelled.load(Ordering::Relaxed));
+        assert!(request.entry.cancelled.load(Ordering::Relaxed));
+        assert!(!same_id_elsewhere.entry.cancelled.load(Ordering::Relaxed));
+        assert!(!another_id.entry.cancelled.load(Ordering::Relaxed));
+    }
+
+    fn register_read(sender: NodeId, request_id: u64) -> PeerRequest {
+        PeerRequest::register(sender, request_id, &operation(true), Instant::now())
+    }
+
+    fn listed(sender: NodeId, request_id: u64) -> Option<PeerRequestSummary> {
+        peer_requests()
+            .into_iter()
+            .find(|request| request.sender == sender && request.id == request_id)
+    }
+
+    /// A write is tracked like a read, but a cancel that names it leaves it alone.
+    #[test]
+    fn a_write_is_tracked_but_never_cancelled() {
+        let sender = node_id(b'f');
+        let request = PeerRequest::register(sender, 13, &operation(false), Instant::now());
+
+        let summary = listed(sender, 13).expect("a write is tracked");
+        assert_eq!(summary.command, "test");
+        assert!(!summary.cancellable && !summary.running && !summary.cancelled);
+        assert!(peer_request_count() >= 1);
+
+        cancel_peer_request(sender, 13);
+        assert!(!request.entry.cancelled.load(Ordering::Relaxed));
+        assert!(!listed(sender, 13).unwrap().cancelled);
+
+        drop(request);
+        assert!(listed(sender, 13).is_none());
+    }
+
+    static WRITE_RAN: AtomicBool = AtomicBool::new(false);
+
+    fn reports_running_then_gives_up(
+        ctx: &FanoutContext,
+        _: &[u8],
+        _: &mut Vec<u8>,
+    ) -> FanoutResult {
+        let summary = listed(node_id(b'2'), 15).expect("tracked while it runs");
+        assert!(summary.running);
+        assert!(
+            !ctx.expired(),
+            "a write's handler must not see its cancel flag"
+        );
+        WRITE_RAN.store(true, Ordering::Relaxed);
+        Err(ValkeyError::Str(error_consts::FANOUT_REQUESTER_GAVE_UP).into())
+    }
+
+    /// A request is queued until a worker picks it up, running from then on, and gone once
+    /// it has been served. A write runs even if its cancel flag is somehow set: its handler
+    /// never sees the flag.
+    #[test]
+    fn a_request_runs_and_is_forgotten_and_a_write_ignores_its_flag() {
+        let sender = node_id(b'2');
+        let write = RegisteredOperation {
+            name: "test",
+            run: reports_running_then_gives_up,
+            cancellable: false,
+        };
+        let registration = PeerRequest::register(sender, 15, &write, Instant::now());
+        assert!(!listed(sender, 15).unwrap().running);
+        registration.entry.cancelled.store(true, Ordering::Relaxed);
+
+        process_request_message(
+            header(None),
+            write,
+            &[],
+            sender,
+            Instant::now(),
+            Some(registration),
+        );
+
+        assert!(WRITE_RAN.load(Ordering::Relaxed));
+        assert!(listed(sender, 15).is_none());
     }
 
     /// A cancel can arrive after the answer has gone, and a finished request leaves no entry.
     #[test]
     fn a_finished_request_is_forgotten() {
         let sender = node_id(b'c');
-        let request = PeerRequest::register(sender, 9);
+        let request = register_read(sender, 9);
         assert!(PEER_REQUESTS.pin().contains_key(&(sender, 9)));
 
         drop(request);
@@ -1103,7 +1414,7 @@ mod tests {
     fn a_cancelled_request_is_dropped_unrun() {
         let before = metrics::FANOUT_DROPPED_EXPIRED.load(Ordering::Relaxed);
         let sender = node_id(b'd');
-        let registration = PeerRequest::register(sender, 11);
+        let registration = register_read(sender, 11);
         cancel_peer_request(sender, 11);
 
         process_request_message(
@@ -1135,13 +1446,14 @@ mod tests {
         process_request_message(
             header(Some(Duration::from_secs(60))),
             RegisteredOperation {
+                name: "test",
                 run: cancelled_while_running,
                 cancellable: true,
             },
             &[],
             sender,
             Instant::now(),
-            Some(PeerRequest::register(sender, 1)),
+            Some(register_read(sender, 1)),
         );
 
         assert_eq!(
@@ -1165,6 +1477,7 @@ mod tests {
         process_request_message(
             header(Some(Duration::from_secs(60))),
             RegisteredOperation {
+                name: "test",
                 run: gives_up_mid_read,
                 cancellable: true,
             },

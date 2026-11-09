@@ -138,7 +138,8 @@ pub(super) const SERIALIZATION_ERROR: &str = "Serialization error";
 pub(super) const BAD_REQUEST_ID_ERROR: &str = "Bad request id";
 pub(super) const TIMEOUT_ERROR: &str = "A multi-shard command failed because at least one shard did not reply within the given timeframe.";
 pub(super) const NODE_UNREACHABLE_ERROR: &str = "Cluster node unreachable";
-pub(super) const NO_CLUSTER_NODES_AVAILABLE: &str = "No cluster nodes available";
+/// Refusal to fan out from inside MULTI or a script: the command would have to block.
+pub(super) const FANOUT_BLOCKING_DENIED: &str = "Cannot execute in MULTI or Lua context";
 pub(super) const INTERNAL_ERROR: &str = "Internal error";
 pub(super) const INVALID_MESSAGE_ERROR: &str = "Invalid cluster message";
 pub(super) const CLUSTER_MAP_MISMATCH_ERROR: &str =
@@ -149,6 +150,21 @@ pub(super) const BUSY_ERROR: &str =
     "A multi-shard command failed because a node has too many fanout requests queued; retry later";
 
 impl ErrorKind {
+    /// An outcome the client sees and can act on (a denial, a busy or swapped
+    /// shard, a deadline), as opposed to a fault. A client can cause one per
+    /// shard on every command it issues, so these log at debug. A cluster-map
+    /// mismatch is not one: it reports a topology change an operator should see.
+    pub fn is_client_visible(self) -> bool {
+        matches!(
+            self,
+            Self::KeyPermissions
+                | Self::Permissions
+                | Self::Busy
+                | Self::DatabaseSwapped
+                | Self::Timeout
+        )
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::InvalidMessage => INVALID_MESSAGE_ERROR,
@@ -369,7 +385,10 @@ fn convert_from_string(err: &str) -> FanoutError {
         // message so the client sees *why* the multi-shard command failed closed
         // instead of a generic aggregate error.
         error_consts::PERMISSION_DENIED => FanoutError::key_permissions(err.to_string()),
-        NO_CLUSTER_NODES_AVAILABLE => ErrorKind::NodeUnreachable.into(),
+        error_consts::ACL_USER_UNAVAILABLE => FanoutError {
+            kind: ErrorKind::Permissions,
+            message: err.to_string(),
+        },
         _ => FanoutError::custom(err.to_string()),
     }
 }
@@ -403,6 +422,39 @@ impl From<ValkeyError> for FanoutError {
 mod tests {
     use super::*;
     use crate::error_consts;
+
+    /// Every per-kind table agrees with `ALL`, so a new kind cannot be registered in some of
+    /// them and not others: its wire code, counter slot, metric name and text all line up.
+    #[test]
+    fn every_kind_is_registered_in_every_table() {
+        let mut names = std::collections::HashSet::new();
+        for (index, kind) in ErrorKind::ALL.iter().copied().enumerate() {
+            assert_eq!(kind.metric_index(), index, "{kind:?}");
+            assert_eq!(ErrorKind::try_from(kind as u8).unwrap(), kind);
+            assert!(
+                names.insert(kind.metric_name()),
+                "duplicate metric name for {kind:?}"
+            );
+            assert!(!kind.as_str().is_empty(), "{kind:?}");
+        }
+        // Every wire code that decodes is in `ALL`.
+        for code in 0..=u8::MAX {
+            if let Ok(kind) = ErrorKind::try_from(code) {
+                assert!(ErrorKind::ALL.contains(&kind), "{kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn shard_side_setup_failures_are_classified() {
+        let user = FanoutError::from(ValkeyError::Str(error_consts::ACL_USER_UNAVAILABLE));
+        assert_eq!(user.kind, ErrorKind::Permissions);
+        assert!(user.to_string().contains("does not exist or is disabled"));
+        let db = FanoutError::from(ValkeyError::Str(INVALID_DB_ERROR));
+        assert_eq!(db.kind, ErrorKind::InvalidDb);
+        let nodes = FanoutError::from(ValkeyError::Str(error_consts::NO_CLUSTER_NODES_AVAILABLE));
+        assert_eq!(nodes.kind, ErrorKind::NodeUnreachable);
+    }
     use prost::encoding::{WireType, encode_key, encode_varint};
     use valkey_module::ValkeyError;
 

@@ -45,6 +45,7 @@ TS._DEBUG <subcommand> [arguments]</subcommand>
 | `STRINGPOOLSTATS` | Report statistics for the global string interning pool  |
 | `INDEXMEMORY`     | Report the label index's heap footprint (fields as in `INFO ts_index`; each `*Bytes` field is followed by a `*BytesHuman` string such as `1.21M`) |
 | `INFLIGHT`        | List this node's fan-out requests still waiting on peers |
+| `PEER_REQUESTS`   | Count, or list with `VERBOSE`, the fan-out requests this node is serving for peers (cluster mode only) |
 | `QUERYINDEX`      | Query this node's local index only, without cluster fan-out |
 | `LIST_CONFIGS`    | List module configuration parameters and current values |
 | `PANIC_NEXT_ANALYSIS_JOB` | Make the next background analysis job (`TS.OUTLIERS` on a large range) panic, to test that its client still gets an error reply |
@@ -253,7 +254,8 @@ As coordinator:
 | `fanout_generic_error_replies_total` | counter | Operations answered with the generic "Internal error in fanout operation" reply after a shard failed with another kind |
 | `fanout_client_timeouts_total` | counter | Blocked clients answered with the timeout error |
 | `fanout_rpc_timeouts_total` | counter | RPCs whose timer fired with remote shares outstanding |
-| `fanout_cancels_sent_total` | counter | Cancel messages sent to shares still outstanding when an RPC's timer fired |
+| `fanout_cancels_sent_total` | counter | Cancel messages sent to shares still outstanding when an RPC's timer fired or its fanout completed early |
+| `fanout_early_completions_total` | counter | Fanout RPCs abandoned with remote shares outstanding because a share's error had already completed the fanout |
 | `fanout_setup_failures_total` | counter | Operations that failed before any remote request was sent |
 | `fanout_blocking_denied_total` | counter | Commands refused because the client could not be blocked (MULTI, a script, a module call) |
 | `fanout_send_failures_total` | counter | Requests the cluster bus refused to send |
@@ -275,6 +277,7 @@ As a peer serving a coordinator:
 
 | Name | Kind | Description |
 |------|------|-------------|
+| `fanout_serving` | gauge | Requests being served, queued or running, writes included (see `TS._DEBUG PEER_REQUESTS`) |
 | `fanout_served_ok_total` | counter | Requests served successfully |
 | `fanout_served_errors_total` | counter | Requests whose handler failed (answered with an error response), not counting reads abandoned at their time budget |
 | `fanout_reply_send_failures_total` | counter | Successful answers the cluster bus refused to send back |
@@ -503,6 +506,40 @@ An array with one map of 5 fields per request:
 Node-local: a request is in flight only on the node coordinating it. A fan-out whose only target
 is this node never appears (it has no remote request), and a request leaves the list as soon as
 its timeout fires. On a standalone server the list is always empty.
+
+---
+
+### TS._DEBUG PEER_REQUESTS
+
+Reports the fan-out requests this node is serving for its peers: the serving side of
+`INFLIGHT`. The tool for "a peer is slow to answer": which requests are waiting for a worker,
+which are running, and for how long.
+
+### Syntax
+
+```bash
+TS._DEBUG PEER_REQUESTS [VERBOSE]
+```
+
+### Return Value
+
+Without `VERBOSE`, an integer: the number of requests queued or running, the same value as the
+`fanout_serving` gauge. With `VERBOSE`, an array with one map of 7 fields per request, oldest
+first:
+
+| Field         | Type    | Description                                                                 |
+|---------------|---------|-----------------------------------------------------------------------------|
+| `sender`      | string  | The node id of the requester                                                |
+| `id`          | string  | The request id (a string: ids span the full unsigned 64-bit range); unique per sender only |
+| `command`     | string  | The fan-out operation, such as `mrange` or `mdel`                           |
+| `ageMs`       | integer | Milliseconds since the request arrived                                      |
+| `state`       | string  | `queued` while it waits for a fan-out worker, `running` once one has it     |
+| `cancellable` | boolean | Whether the requester may cancel it: reads may be, writes such as `mdel` never are |
+| `cancelled`   | boolean | Whether the requester has cancelled it; a cancelled request stops at its next check and is not answered |
+
+Reads and writes are both counted. A request leaves as soon as it has been answered or dropped,
+so a node that is not serving anything reports `0` and an empty list. Node-local, and refused
+outside cluster mode.
 
 ---
 

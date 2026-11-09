@@ -1,3 +1,4 @@
+use super::fanout_error::INVALID_DB_ERROR;
 use crate::common::acl::AclContextGuard;
 use crate::common::context::set_current_db;
 use crate::common::threads::{GilSource, LockGil};
@@ -122,10 +123,8 @@ impl FanoutContext {
         let ctx = self.ctx.lock_gil();
 
         if set_current_db(&ctx, self.db) == Status::Err {
-            return Err(ValkeyError::String(format!(
-                "failed to select database {}",
-                self.db
-            )));
+            // A fixed text the fanout classifies as `InvalidDb`.
+            return Err(ValkeyError::Str(INVALID_DB_ERROR));
         }
         // Resolved afresh on every lock: a user deleted or disabled mid-request fails the
         // next step rather than finishing with rights it no longer has.

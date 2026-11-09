@@ -462,6 +462,79 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         assert sum(errors.values()) >= 1
         assert stats['fanout_errors_total'] == sum(errors.values())
 
+    def test_an_aborted_fanout_cancels_the_shares_still_running(self):
+        """One peer denies its share while another sleeps: the denial completes the fanout,
+        and the sleeping peer is told to stop instead of being waited for."""
+        tags = self.populate()
+        for client in self.primaries():
+            client.execute_command('ACL', 'SETUSER', 'fo_partial', 'on', 'nopass',
+                                   f'~fo:{{{tags[0]}}}:*', f'~fo:{{{tags[1]}}}:*', '+@all')
+        self.reset_all()
+        coordinator, sleeping, denying = self.primaries()
+        limited = self.new_client_for_primary(0)
+        limited.execute_command('AUTH', 'fo_partial', 'any')
+
+        sleeper = threading.Thread(
+            target=lambda: self.new_client_for_primary(1).execute_command('DEBUG', 'SLEEP', 2))
+        sleeper.start()
+        try:
+            time.sleep(0.2)
+            started = time.monotonic()
+            with pytest.raises(ResponseError):
+                limited.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
+            # Answered on the denial, not after the sleeping peer.
+            assert time.monotonic() - started < 1.5
+        finally:
+            sleeper.join()
+
+        stats = debug_metrics(coordinator, 'fanout')
+        assert stats['fanout_aborts_total'] == 1
+        assert stats['fanout_early_completions_total'] == 1
+        assert stats['fanout_cancels_sent_total'] == 1
+        assert stats['fanout_rpc_timeouts_total'] == 0
+        assert stats['fanout_inflight'] == 0
+        wait_for_true(
+            lambda: debug_metrics(sleeping, 'fanout')['fanout_cancels_received_total'] == 1)
+
+    def test_a_local_denial_cancels_the_remote_shares(self):
+        """The coordinator's own share is denied while every peer sleeps: no remote answer
+        arrives to end the fanout, so the local share must cancel the peers itself."""
+        tags = self.populate()
+        coordinator, *peers = self.primaries()
+        for client in self.primaries():
+            client.execute_command('ACL', 'SETUSER', 'fo_remote', 'on', 'nopass',
+                                   *(f'~fo:{{{tag}}}:*' for tag in tags[1:]), '+@all')
+        self.reset_all()
+        limited = self.new_client_for_primary(0)
+        limited.execute_command('AUTH', 'fo_remote', 'any')
+
+        sleepers = [threading.Thread(
+            target=lambda i=i: self.new_client_for_primary(i).execute_command('DEBUG', 'SLEEP', 2))
+            for i in range(1, self.CLUSTER_SIZE)]
+        for sleeper in sleepers:
+            sleeper.start()
+        try:
+            time.sleep(0.2)
+            started = time.monotonic()
+            with pytest.raises(ResponseError):
+                limited.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
+            assert time.monotonic() - started < 1.5
+            # Read while the peers still sleep: the request was dropped and the cancels sent
+            # on the local denial, not on a later remote answer or the timer.
+            stats = debug_metrics(coordinator, 'fanout')
+        finally:
+            for sleeper in sleepers:
+                sleeper.join()
+
+        assert stats['fanout_aborts_total'] == 1
+        assert stats['fanout_early_completions_total'] == 1
+        assert stats['fanout_cancels_sent_total'] == len(peers)
+        assert stats['fanout_rpc_timeouts_total'] == 0
+        assert stats['fanout_inflight'] == 0
+        for peer in peers:
+            wait_for_true(
+                lambda peer=peer: debug_metrics(peer, 'fanout')['fanout_cancels_received_total'] == 1)
+
     def test_timeouts(self):
         """A sleeping peer runs the fanout into both deadlines; its late answer is dropped."""
         self.populate()
@@ -553,6 +626,38 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         assert len(result['reply']) == 3 * self.CLUSTER_SIZE
         wait_for_true(lambda: coordinator.execute_command('TS._DEBUG', 'INFLIGHT') == [])
         assert debug_metrics(coordinator, 'fanout')['fanout_inflight'] == 0
+
+    def assert_serving_nothing(self, node):
+        assert node.execute_command('TS._DEBUG', 'PEER_REQUESTS') == 0
+        assert node.execute_command('TS._DEBUG', 'PEER_REQUESTS', 'VERBOSE') == []
+        assert debug_metrics(node, 'fanout')['fanout_serving'] == 0
+
+    def test_peer_requests_drains_once_peers_have_answered(self):
+        """TS._DEBUG PEER_REQUESTS counts the requests a node is serving for its peers, reads
+        and writes alike. A request leaves once it is answered, so an idle node reports none,
+        before and after serving a read (MRANGE) and a write (MDEL)."""
+        self.populate()
+        self.reset_all()
+        coordinator, *peers = self.primaries()
+        for node in self.primaries():
+            self.assert_serving_nothing(node)
+
+        coordinator.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
+        coordinator.execute_command('TS.MDEL', 'FILTER', 'env=prod')
+
+        for peer in peers:
+            wait_for_true(lambda: debug_metrics(peer, 'fanout')['fanout_served_ok_total'] == 2)
+            wait_for_true(lambda: peer.execute_command('TS._DEBUG', 'PEER_REQUESTS') == 0)
+            self.assert_serving_nothing(peer)
+        self.assert_serving_nothing(coordinator)
+
+    def test_peer_requests_rejects_unknown_arguments(self):
+        node = self.primaries()[0]
+        assert node.execute_command('TS._DEBUG', 'PEER_REQUESTS', 'verbose') == []
+        with pytest.raises(ResponseError, match="expected VERBOSE"):
+            node.execute_command('TS._DEBUG', 'PEER_REQUESTS', 'bogus')
+        with pytest.raises(ResponseError, match="wrong number of arguments"):
+            node.execute_command('TS._DEBUG', 'PEER_REQUESTS', 'VERBOSE', 'extra')
 
     def test_cluster_map_metrics(self):
         coordinator = self.primaries()[0]

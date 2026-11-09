@@ -1,16 +1,17 @@
 use crate::common::context::is_blocking_denied;
 use crate::common::metrics::fanout as metrics;
 use crate::common::replies::ReplyContext;
+use crate::common::sync::lock;
 use crate::fanout::FanoutCommandResult;
 use crate::fanout::blocked_client::FanoutBlockedClient;
+use crate::fanout::cluster_rpc::get_cluster_command_timeout;
+use crate::fanout::fanout_error::FANOUT_BLOCKING_DENIED;
 use crate::fanout::serialization::Serializable;
 use crate::fanout::{FanoutCommand, FanoutContext, FanoutResult, FanoutTarget, NodeInfo};
 use metered::Counter;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use valkey_module::{Context, Status, ValkeyError, ValkeyResult, ValkeyValue};
-
-/// Same text as the remote path's `validate_cluster_exec` refusal.
-const FANOUT_BLOCKING_DENIED: &str = "Cannot execute in MULTI or Lua context";
 
 /// A trait for cluster-mode commands which send results back to clients after receiving responses from other nodes.
 /// This is a higher-level abstraction over `FanoutCommand` that includes client response handling logic.
@@ -59,20 +60,20 @@ pub trait FanoutClientCommand: Default + Send + 'static {
             metrics::FANOUT_BLOCKING_DENIED.incr();
             return Err(ValkeyError::Str(FANOUT_BLOCKING_DENIED));
         }
-        let blocked_client = Arc::new(Mutex::new(FanoutBlockedClient::<Self>::new(
-            ctx,
-            self.get_timeout(),
-        )));
+        // One budget for the whole operation, counted from now (see `exec_command`).
+        let started = Instant::now();
+        let timeout = get_cluster_command_timeout();
+        let blocked_client = Arc::new(Mutex::new(FanoutBlockedClient::<Self>::new(ctx, timeout)));
         let bc_for_closure = Arc::clone(&blocked_client);
 
         let handle_response = move |op: Self, result: FanoutResult| {
-            // Runs on a background thread once all shard responses arrive.
-            if let Ok(mut bc) = bc_for_closure.lock() {
-                bc.set_private_data(op, result);
-            }
+            // Runs once, on whichever thread completes the fanout: the main thread
+            // for the last remote answer, a send failure or the RPC timer, a worker
+            // for the last local answer.
+            lock(&bc_for_closure).set_private_data(op, result);
         };
 
-        let exec_result = Self::exec_command(self, ctx, handle_response);
+        let exec_result = Self::exec_command(self, ctx, started, timeout, handle_response);
         match exec_result {
             Ok(()) => Ok(ValkeyValue::NoReply),
             Err(err) => {
@@ -80,9 +81,7 @@ pub trait FanoutClientCommand: Default + Send + 'static {
                 // proper error message instead of "No reply data".
                 let op = Self::default();
                 let fanout_result: FanoutResult = Err(err);
-                if let Ok(mut bc) = blocked_client.lock() {
-                    bc.set_private_data(op, fanout_result);
-                }
+                lock(&blocked_client).set_private_data(op, fanout_result);
 
                 // Dropping the last Arc triggers unblock(), and the reply_callback
                 // will send the error reply based on the stored fanout_result.

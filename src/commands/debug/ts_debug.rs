@@ -7,7 +7,10 @@ use crate::commands::CommandArgIterator;
 use crate::commands::analysis_runner::panic_next_analysis_job;
 use crate::commands::command_parser::parse_query_index_command_args;
 use crate::common::replies::*;
-use crate::fanout::{ClusterMapRefresh, inflight_requests, is_clustered, refresh_cluster_map};
+use crate::fanout::{
+    ClusterMapRefresh, inflight_requests, is_clustered, peer_request_count, peer_requests,
+    refresh_cluster_map,
+};
 use crate::series::index::series_keys_by_selectors;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
@@ -40,10 +43,62 @@ fn inflight(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
     Ok(())
 }
 
+/// The fanout requests from peers that this node is serving, queued or running, writes
+/// included: their number, or with `VERBOSE` one map per request, oldest first, with `sender`,
+/// `id` (a string: ids span the full `u64` range), `command`, `ageMs`, `state` (`queued` or
+/// `running`), `cancellable` and `cancelled`.
+///
+/// TS._DEBUG PEER_REQUESTS [VERBOSE]
+///
+/// Node-local, and refused outside cluster mode. A request leaves as soon as it has been
+/// answered or dropped. The serving-side counterpart of `INFLIGHT`.
+fn peer_requests_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
+    let mut verbose = false;
+    if let Some(arg) = args.peek() {
+        if !arg.eq_ignore_ascii_case(b"verbose") {
+            return Err(ValkeyError::Str(
+                "Syntax error: unexpected argument, expected VERBOSE",
+            ));
+        }
+        verbose = true;
+        args.next();
+    }
+    args.done()?;
+    if !is_clustered(ctx) {
+        return Err(ValkeyError::Str(
+            "TSDB: PEER_REQUESTS requires cluster mode",
+        ));
+    }
+    if !verbose {
+        reply_with_usize(ctx, peer_request_count());
+        return Ok(());
+    }
+    let requests = peer_requests();
+    reply_with_array(ctx, requests.len());
+    for request in &requests {
+        reply_with_map(ctx, 7);
+        reply_with_str(ctx, "sender");
+        reply_with_bulk_string(ctx, request.sender.as_str());
+        reply_with_str(ctx, "id");
+        reply_with_bulk_string(ctx, &request.id.to_string());
+        reply_with_str(ctx, "command");
+        reply_with_str(ctx, request.command);
+        reply_with_str(ctx, "ageMs");
+        reply_with_integer(ctx, request.age.as_millis().min(i64::MAX as u128) as i64);
+        reply_with_str(ctx, "state");
+        reply_with_str(ctx, if request.running { "running" } else { "queued" });
+        reply_with_str(ctx, "cancellable");
+        reply_with_bool(ctx, request.cancellable);
+        reply_with_str(ctx, "cancelled");
+        reply_with_bool(ctx, request.cancelled);
+    }
+    Ok(())
+}
+
 /// Rebuilds this node's cluster map from `CLUSTER NODES` now, instead of waiting for it to expire
 /// or be marked stale, and reports the map it ends up with: a map with `outcome` (`changed` when a
 /// new map was published, `unchanged` when the topology matched and only its expiry was
-/// extended), `consistent`, `shards` and `fingerprint` (a string: it spans the full `u64` range).
+/// extended, `superseded` when a concurrent refresh had already published or confirmed a newer view), `consistent`, `shards` and `fingerprint` (a string: it spans the full `u64` range).
 ///
 /// TS._DEBUG REFRESH_CLUSTERMAP
 ///
@@ -61,6 +116,7 @@ fn refresh_clustermap(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyRes
     let (outcome, map) = match refresh_cluster_map(ctx) {
         ClusterMapRefresh::Changed(map) => ("changed", map),
         ClusterMapRefresh::Unchanged(map) => ("unchanged", map),
+        ClusterMapRefresh::Superseded(map) => ("superseded", map),
         ClusterMapRefresh::Failed => {
             return Err(ValkeyError::Str(
                 "TSDB: failed to rebuild the cluster map; the previous map is kept",
@@ -125,6 +181,10 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
             "Show this node's label index heap usage for the selected db, or every db with ALLDBS (CLUSTER sums it over one node per shard, replicas preferred; PRIMARY over shard primaries; HASHTAG over the primaries of the shards owning those tags)",
         ),
         (
+            "TS._DEBUG PEER_REQUESTS [VERBOSE]",
+            "Show how many fanout requests from peers this node is serving, queued or running, writes included; VERBOSE lists them, oldest first (cluster mode only)",
+        ),
+        (
             "TS._DEBUG REFRESH_CLUSTERMAP",
             "Rebuild this node's cluster map from CLUSTER NODES now and report the result (cluster mode only)",
         ),
@@ -176,6 +236,7 @@ pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         "STRINGPOOLSTATS" => string_pool_stats(ctx, &mut itr),
         "INDEXMEMORY" => index_memory(ctx, &mut itr),
         "INFLIGHT" => inflight(ctx, &mut itr),
+        "PEER_REQUESTS" => peer_requests_cmd(ctx, &mut itr),
         "QUERYINDEX" => local_query_index(ctx, &mut itr),
         "REFRESH_CLUSTERMAP" => refresh_clustermap(ctx, &mut itr),
         "HELP" => help_cmd(ctx, &mut itr),

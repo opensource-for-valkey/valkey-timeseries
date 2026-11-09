@@ -11,7 +11,7 @@
 //! They usually both fire for one timed-out fanout, so don't add them up.
 
 use super::duration_histogram;
-use crate::fanout::{ErrorKind, inflight_request_count};
+use crate::fanout::{ErrorKind, inflight_request_count, peer_request_count};
 use metered::entry::{counter, counter_value, gauge_value, metric};
 use metered::{BucketHistogram, Counter, Registry};
 use std::sync::LazyLock;
@@ -39,8 +39,12 @@ pub static FANOUT_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub static FANOUT_CLIENT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 /// RPCs whose timer fired with shares outstanding.
 pub static FANOUT_RPC_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
-/// Cancel messages sent to shares still outstanding when an RPC's timer fired.
+/// Cancel messages sent to shares still outstanding when an RPC's timer fired or the fanout
+/// completed early.
 pub static FANOUT_CANCELS_SENT: AtomicU64 = AtomicU64::new(0);
+/// RPCs abandoned with remote shares outstanding because the fanout had already completed (a
+/// share's error aborted it).
+pub static FANOUT_EARLY_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 /// Operations ended early by an error returned to the client as it is (a cluster-map mismatch,
 /// a permission denial, a busy shard).
 pub static FANOUT_ABORTS: AtomicU64 = AtomicU64::new(0);
@@ -206,7 +210,12 @@ static COUNTERS: &[(&str, &AtomicU64, &str)] = &[
     (
         "cancels_sent",
         &FANOUT_CANCELS_SENT,
-        "Cancel messages sent to shares still outstanding when an RPC's timer fired",
+        "Cancel messages sent to shares still outstanding when an RPC's timer fired or its fanout completed early",
+    ),
+    (
+        "early_completions",
+        &FANOUT_EARLY_COMPLETIONS,
+        "Fanout RPCs abandoned with remote shares outstanding because a share's error had already completed the fanout",
     ),
     (
         "rpc_timeouts",
@@ -383,6 +392,11 @@ pub(super) fn register(registry: &mut Registry<'static>) {
                 .help(
                     "Fanout RPCs with remote shares outstanding (local-only operations have none)",
                 ),
+        )
+        .register(
+            gauge_value("serving")
+                .read(|_: &()| peer_request_count())
+                .help("Peer requests this node is serving, queued or running, writes included"),
         )
         .register(
             metric("duration_seconds")

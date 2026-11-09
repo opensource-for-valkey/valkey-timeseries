@@ -1,3 +1,4 @@
+use crate::common::logging::log_error;
 use crate::common::metrics::fanout as metrics;
 use crate::common::replies::ReplyContext;
 use crate::fanout::fanout_error::TIMEOUT_ERROR;
@@ -5,6 +6,7 @@ use crate::fanout::{FanoutClientCommand, FanoutResult};
 use metered::Counter;
 use std::ffi::c_void;
 use std::os::raw::c_int;
+use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
 use valkey_module::{
     Context, Status, ValkeyError, ValkeyModule_BlockClient,
@@ -77,7 +79,9 @@ where
     /// freeing, as it used to, that result (an MRANGE's samples, say) leaked.
     pub fn new(ctx: &Context, timeout: Duration) -> Self {
         // 0 means "never" to the server.
-        let timeout_ms = (timeout.as_millis() as i64).max(1);
+        let timeout_ms = i64::try_from(timeout.as_millis())
+            .unwrap_or(i64::MAX)
+            .max(1);
         let bc_ptr = unsafe {
             ValkeyModule_BlockClient.unwrap()(
                 ctx.ctx as *mut ValkeyModuleCtx,
@@ -167,7 +171,19 @@ extern "C" fn reply_callback<T: FanoutClientCommand>(
         // SAFETY: `unblock` stored a `Box<BlockedClientPrivateData<T>>` for this client, and the
         // server hands it back unchanged, on the main thread, before calling `free_callback`.
         let response_ctx = unsafe { &mut *op_ptr.cast::<BlockedClientPrivateData<T>>() };
-        response_ctx.reply(&ctx) as c_int
+        // `reply` is the command's own code, and unwinding into the server
+        // aborts it. A panic before anything was written still gets an error
+        // reply; one part-way through leaves only this client's reply short.
+        match panic::catch_unwind(AssertUnwindSafe(|| response_ctx.reply(&ctx))) {
+            Ok(status) => status as c_int,
+            Err(_) => {
+                log_error(format!("fanout: replying to '{}' panicked", T::name()));
+                ctx.reply_error_string(&format!(
+                    "Internal error in fanout operation '{}'",
+                    T::name()
+                )) as c_int
+            }
+        }
     }
 }
 
@@ -193,5 +209,12 @@ extern "C" fn free_callback<T: FanoutClientCommand>(
         return;
     }
     // SAFETY: created by `Box::into_raw` in `unblock`, and freed only here.
-    drop(unsafe { Box::from_raw(privdata.cast::<BlockedClientPrivateData<T>>()) });
+    let data = unsafe { Box::from_raw(privdata.cast::<BlockedClientPrivateData<T>>()) };
+    // The command's own `Drop` runs here, called from C.
+    if panic::catch_unwind(AssertUnwindSafe(|| drop(data))).is_err() {
+        log_error(format!(
+            "fanout: freeing the result of '{}' panicked",
+            T::name()
+        ));
+    }
 }
