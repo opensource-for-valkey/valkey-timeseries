@@ -42,7 +42,7 @@ impl FanoutClientCommand for MDelFanoutCommand {
     type Response = CountResponse;
 
     fn name() -> &'static str {
-        "mdel"
+        "cmd:mdel"
     }
 
     /// Unlike every other fanout command in this module, `TS.MDEL` is a write. The trait default

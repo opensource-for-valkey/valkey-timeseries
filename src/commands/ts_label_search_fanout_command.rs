@@ -47,7 +47,7 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
     type Response = LabelSearchResponse;
 
     fn name() -> &'static str {
-        "cmd:label-search"
+        "cmd:label_search"
     }
 
     fn get_local_response(

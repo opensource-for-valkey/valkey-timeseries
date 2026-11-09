@@ -23,8 +23,8 @@ pub(super) fn has_unsupported_features(required_features: u64) -> bool {
 
 const MARKER_SIZE: usize = size_of::<u32>();
 const MAX_USERNAME_LEN: usize = 1024;
-/// Registered fanout handler names are short internal identifiers (e.g. "mget",
-/// "queryindex"); this cap leaves generous headroom.
+/// Registered fanout handler names are short internal identifiers (e.g. "cmd:mget",
+/// "cmd:index_query"); this cap leaves generous headroom.
 const MAX_HANDLER_LEN: usize = 128;
 /// Upper bound on the encoded header, enforced before decoding so it bounds what
 /// a malicious or buggy peer can make the decoder allocate. Well above the field

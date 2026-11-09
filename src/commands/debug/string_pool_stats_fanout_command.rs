@@ -177,7 +177,7 @@ impl FanoutClientCommand for StringPoolStatsFanoutCommand {
     type Response = StringPoolStatsResponse;
 
     fn name() -> &'static str {
-        "cmd::string_pool_stats"
+        "cmd:string_pool_stats"
     }
 
     /// Reads the pool without the GIL: it is lock-free and holds no keys.

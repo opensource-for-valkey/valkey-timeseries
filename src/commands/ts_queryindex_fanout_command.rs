@@ -32,7 +32,7 @@ impl FanoutClientCommand for QueryIndexFanoutCommand {
     type Response = KeyListResponse;
 
     fn name() -> &'static str {
-        "index_query"
+        "cmd:index_query"
     }
 
     fn get_local_response(

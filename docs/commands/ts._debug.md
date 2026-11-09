@@ -508,7 +508,7 @@ An array with one map of 5 fields per request:
 | Field           | Type    | Description                                                             |
 |-----------------|---------|-------------------------------------------------------------------------|
 | `id`            | string  | The request id (a string: ids span the full unsigned 64-bit range)      |
-| `command`       | string  | The fan-out operation, such as `mrange`                                 |
+| `command`       | string  | The fan-out operation, such as `cmd:mrange`                             |
 | `ageMs`         | integer | Milliseconds since the request was sent                                 |
 | `remoteTargets` | integer | Peers the request was sent to                                           |
 | `outstanding`   | integer | Peers that have not answered yet                                        |
@@ -541,10 +541,10 @@ first:
 |---------------|---------|-----------------------------------------------------------------------------|
 | `sender`      | string  | The node id of the requester                                                |
 | `id`          | string  | The request id (a string: ids span the full unsigned 64-bit range); unique per sender only |
-| `command`     | string  | The fan-out operation, such as `mrange` or `mdel`                           |
+| `command`     | string  | The fan-out operation, such as `cmd:mrange` or `cmd:mdel`                   |
 | `ageMs`       | integer | Milliseconds since the request arrived                                      |
 | `state`       | string  | `queued` while it waits for a fan-out worker, `running` once one has it     |
-| `cancellable` | boolean | Whether the requester may cancel it: reads may be, writes such as `mdel` never are |
+| `cancellable` | boolean | Whether the requester may cancel it: reads may be, writes such as `cmd:mdel` never are |
 | `cancelled`   | boolean | Whether the requester has cancelled it; a cancelled request stops at its next check and is not answered |
 
 Reads and writes are both counted. A request leaves as soon as it has been answered or dropped,
