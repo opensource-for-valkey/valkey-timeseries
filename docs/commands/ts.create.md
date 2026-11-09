@@ -38,6 +38,13 @@ so a `__name__` label inside the braces is rejected with `TSDB: invalid metric n
 
 ### Optional Arguments
 
+<details open><summary><code>LABELS [label value ...]</code></summary>
+Label name-value pairs for the series. Names and values must be non-empty, and a name must not
+contain `=` (`TSDB: label name must not contain '='`): no filter could select such a label.
+Values may contain `=`. RedisTimeSeries stores such
+names; see [COMPATIBILITY.md](../../COMPATIBILITY.md) (DIV-0063).
+</details>
+
 <details open><summary><code>retentionPeriod</code></summary>
 The period of time for which to keep series samples. Retention can be specified as an integer indication
 the duration as milliseconds, or a duration expression like `3wk`

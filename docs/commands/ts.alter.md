@@ -23,6 +23,7 @@ TS.ALTER key
 - `DUPLICATE_POLICY policy` — Policy for duplicate timestamps: `BLOCK`, `FIRST`, `LAST`, `MIN`, `MAX`, or `SUM`.
 - `METRIC metric` — Replace the series labels with the labels parsed from a Prometheus-style metric name.
 - `LABELS labelName labelValue ...` — Replace the complete label set. Provide no pairs to clear all labels.
+  A label name must not contain `=` (see [`TS.CREATE`](ts.create.md)); a rejected list leaves the labels unchanged.
 - `IGNORE ignoreMaxTimediff ignoreMaxValDiff` — Ignore incoming samples within both the time and value thresholds.
 - `SIGNIFICANT_DIGITS significantDigits` — Round values to 1–16 significant digits.
 - `DECIMAL_DIGITS decimalDigits` — Round values to 0–16 decimal places. `0` rounds to whole numbers.

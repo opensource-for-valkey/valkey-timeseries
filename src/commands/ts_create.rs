@@ -5,7 +5,7 @@ use crate::commands::command_parser::{
 };
 use crate::common::rounding::{NO_ROUNDING_KEYWORD, RoundingStrategy};
 use crate::error_consts;
-use crate::labels::Label;
+use crate::labels::{Label, check_label_name};
 use crate::series::chunks::ChunkEncoding;
 use crate::series::{DuplicatePolicy, TimeSeriesOptions, create_and_store_series};
 use valkey_module::{Context, NextArg, VALKEY_OK, ValkeyError, ValkeyResult, ValkeyString};
@@ -353,6 +353,7 @@ fn parse_labels(args: &[ValkeyString]) -> ValkeyResult<Vec<Label>> {
             // duplicate — and "Couldn't parse LABELS" is the RTS text for it.
             return Err(ValkeyError::Str(error_consts::CANNOT_PARSE_LABELS));
         }
+        check_label_name(name.as_slice())?;
 
         let label = Label::new(name.to_string_lossy(), value.to_string_lossy());
         labels.push(label);

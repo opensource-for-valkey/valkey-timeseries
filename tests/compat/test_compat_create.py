@@ -290,7 +290,7 @@ def _errors(client, *args):
 
 
 class TestParserDivergences:
-    """The four TS.CREATE parser deltas the registry can not express.
+    """The TS.CREATE parser deltas the registry can not express.
 
     Each is pinned per-engine (`diff.reference` / `diff.subject`) rather than routed
     through `diff`, because they are either accepted-input supersets — which §5.2
@@ -358,6 +358,20 @@ class TestParserDivergences:
         args = ("TS.CREATE", "c:div:lbl2", "LABELS", "CHUNK_SIZE", "x")
         assert _errors(diff.reference, *args)
         assert diff.subject.execute_command(*args) == b"OK"
+
+    @pytest.mark.parametrize("name", ["a=b", "=", "a="])
+    def test_label_name_with_separator_is_rejected(self, diff, name):
+        """DIV-0063: RTS stores a label name containing `=`; we reject it. No filter
+        selects such a label on either engine (RTS matches nothing for `a=b=2`; our
+        parser rejects it). The value side is unaffected and matches."""
+        args = ("LABELS", "a", "1", name, "2")
+        assert diff.reference.execute_command("TS.CREATE", "c:div:eq", *args) == b"OK"
+        assert _errors(diff.subject, "TS.CREATE", "c:div:eq", *args)
+        assert diff.subject.exists("c:div:eq") == 0
+
+        value_args = ("TS.CREATE", "c:div:eqv", "LABELS", "a", "b=c")
+        assert diff.reference.execute_command(*value_args) == b"OK"
+        assert diff.subject.execute_command(*value_args) == b"OK"
 
     def test_key_named_labels_is_not_a_label_list(self, diff):
         """DIV-0043, the positional half: RTS finds LABELS among the positional

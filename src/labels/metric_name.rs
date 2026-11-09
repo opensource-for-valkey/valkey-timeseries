@@ -1,4 +1,4 @@
-use super::label::{Label, SeriesLabel};
+use super::label::{Label, SeriesLabel, check_label_name};
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::common::rdb::{MAX_RDB_COLLECTION_LEN, rdb_load_len, rdb_load_string, rdb_save_usize};
 use crate::common::string_interner::InternedString;
@@ -251,6 +251,9 @@ impl MetricName {
         for _ in 0..count {
             let name = rdb_load_string(rdb)?;
             let value = rdb_load_string(rdb)?;
+            // Same rule as the write path, so a crafted `RESTORE` payload can't store a label
+            // no write would accept, and the pool never holds two labels with the same text.
+            check_label_name(name.as_bytes())?;
             entries.push(InternedString::new_pair(&name, &value));
         }
         Ok(Self::from_entries(entries))
@@ -370,6 +373,23 @@ mod tests {
         ]);
         let pairs: Vec<(&str, &str)> = mn.iter().map(|l| (l.name, l.value)).collect();
         assert_eq!(pairs, [("a", "2"), ("b", "1"), ("c", "3")]);
+    }
+
+    /// `a=1` and `a=b=2` used to intern `a=b`'s pair as name `a`, value `b=2`, which then
+    /// replaced the real `a` as a repeated name: one label lost, the other renamed.
+    #[test]
+    fn names_containing_the_separator_survive() {
+        let mn = MetricName::new(&[Label::new("a", "1"), Label::new("a=b", "2")]);
+        let pairs: Vec<(&str, &str)> = mn.iter().map(|l| (l.name, l.value)).collect();
+        assert_eq!(pairs, [("a", "1"), ("a=b", "2")]);
+        assert_eq!(mn.get_value("a"), Some("1"));
+        assert_eq!(mn.get_value("a=b"), Some("2"));
+
+        let mut edited = mn.clone();
+        edited.add_label("a", "b=2");
+        assert_eq!(edited.get_value("a"), Some("b=2"));
+        assert_eq!(edited.get_value("a=b"), Some("2"));
+        assert_ne!(edited, mn);
     }
 
     #[test]

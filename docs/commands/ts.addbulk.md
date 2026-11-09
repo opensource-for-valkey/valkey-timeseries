@@ -86,7 +86,7 @@ Maximum size in bytes for each chunk. Actual memory usage may exceed this slight
 Series metadata for filtering and queries:
 
 - `METRIC` - A prometheus style metric specification (e.g. http_errors_total{service="auth",region="us-east"})
-- `LABELS` - Explicit label name-value pairs
+- `LABELS` - Explicit label name-value pairs; names must not contain `=`
 
 </summary>
 

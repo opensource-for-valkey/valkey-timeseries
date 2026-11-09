@@ -34,7 +34,7 @@ TS.DECRBY key value
 | `ENCODING <COMPRESSED\|UNCOMPRESSED>` | Storage encoding for a newly created series. | `COMPRESSED` |
 | `CHUNK_SIZE chunkSize` | Chunk size in bytes for a newly created series. | `4096` |
 | `METRIC metric` | Prometheus-style metric name for a newly created series. |—|
-| `LABELS labelName labelValue ...` | Label name-value pairs for a newly created series. |—|
+| `LABELS labelName labelValue ...` | Label name-value pairs for a newly created series. Names must not contain `=`. |—|
 | `IGNORE ignoreMaxTimediff ignoreMaxValDiff` | Ignore the update when it is within both the time and value thresholds. | No filtering |
 | `SIGNIFICANT_DIGITS significantDigits` | Round values to 1–16 significant digits. | No rounding |
 | `DECIMAL_DIGITS decimalDigits` | Round values to 0–16 decimal places. `0` rounds to whole numbers; `none` turns rounding off. | No rounding |

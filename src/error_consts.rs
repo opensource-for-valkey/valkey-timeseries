@@ -113,6 +113,7 @@ pub const CANNOT_PARSE_IGNORE: &str = "TSDB: Couldn't parse IGNORE";
 pub const NEGATIVE_IGNORE_VALUES: &str = "TSDB: IGNORE arguments cannot be negative";
 
 pub const CANNOT_PARSE_LABELS: &str = "TSDB: Couldn't parse LABELS";
+pub const LABEL_NAME_CONTAINS_SEPARATOR: &str = "TSDB: label name must not contain '='";
 pub const CANNOT_PARSE_RETENTION: &str = "TSDB: Couldn't parse RETENTION";
 pub const CANNOT_PARSE_AGGREGATION: &str = "TSDB: Couldn't parse AGGREGATION";
 pub const BUCKET_DURATION_TOO_SMALL: &str = "TSDB: bucketDuration must be greater than zero";

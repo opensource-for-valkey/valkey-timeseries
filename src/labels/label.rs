@@ -1,8 +1,9 @@
+use crate::error_consts;
 use crate::labels::InternedLabel;
 use std::cmp::Ordering;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
-use valkey_module::ValkeyValue;
+use valkey_module::{ValkeyError, ValkeyResult, ValkeyValue};
 
 pub trait SeriesLabel: Sized {
     fn name(&self) -> &str;
@@ -90,4 +91,45 @@ fn hash_label<H: Hasher>(state: &mut H, name: &str, value: &str) {
     state.write(name.as_bytes());
     state.write_u8(SEP);
     state.write(value.as_bytes());
+}
+
+/// Rejects a label name containing `=` (DIV-0063). No filter can select such a label (`a=b=2`
+/// is a parse error here and matches nothing on RTS), and the label index keys `name=value`
+/// split at the first `=`, so it would file `a=b 2` under the name `a`. Values may contain `=`.
+///
+/// Every way a label enters the keyspace checks this: the `LABELS` parser and RDB load
+/// (`DUMP`/`RESTORE`, `TS._RESTORE`, replica sync), so no stored series has such a name.
+pub fn check_label_name(name: &[u8]) -> ValkeyResult<()> {
+    if name.contains(&b'=') {
+        return Err(ValkeyError::Str(
+            error_consts::LABEL_NAME_CONTAINS_SEPARATOR,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_names_must_not_contain_the_separator() {
+        for name in ["a=b", "=", "=a", "a=", "a==b"] {
+            assert!(
+                matches!(
+                    check_label_name(name.as_bytes()),
+                    Err(ValkeyError::Str(
+                        error_consts::LABEL_NAME_CONTAINS_SEPARATOR
+                    ))
+                ),
+                "{name:?} was accepted"
+            );
+        }
+        for name in ["a", "host", "__name__", "a:b.c-d", "région"] {
+            assert!(
+                check_label_name(name.as_bytes()).is_ok(),
+                "{name:?} was rejected"
+            );
+        }
+    }
 }
