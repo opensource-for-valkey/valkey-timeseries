@@ -238,6 +238,26 @@ mod tests {
     }
 
     #[test]
+    fn kahan_pins_the_compensated_result() {
+        // A sequence whose naive sum loses bits: the compensated result is fixed here
+        // bit-for-bit so a change in how `kahan_inc` is compiled (or written) shows up.
+        let terms = [
+            1e16, 1.0, -1e16, 0.1, 0.2, 0.3, 1e-8, -0.6, 1e16, 1.0, -1e16,
+        ];
+        let mut s = KahanSum::new();
+        for t in terms {
+            s += t;
+        }
+        let naive: f64 = terms.iter().sum();
+        assert_ne!(
+            s.value().to_bits(),
+            naive.to_bits(),
+            "the sequence must exercise compensation"
+        );
+        assert_eq!(s.value().to_bits(), 0x4000_0000_0157_98EE, "{}", s.value());
+    }
+
+    #[test]
     fn test_add_and_add_assign_f64() {
         let mut s = KahanSum::new();
         let s2 = s + 2.5f64;

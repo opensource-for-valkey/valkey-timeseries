@@ -324,9 +324,15 @@ impl AggregationHelper {
         }
     }
 
+    #[inline]
     fn update(&mut self, sample: Sample) {
-        for (i, aggregator) in self.aggregators.iter_mut().enumerate() {
-            self.accepted |= u16::from(aggregator.update(sample.timestamp, sample.value)) << i;
+        // The single-aggregation query (all RTS clients send) skips the column walk.
+        if let [aggregator] = &mut self.aggregators[..] {
+            self.accepted |= u16::from(aggregator.update(sample.timestamp, sample.value));
+        } else {
+            for (i, aggregator) in self.aggregators.iter_mut().enumerate() {
+                self.accepted |= u16::from(aggregator.update(sample.timestamp, sample.value)) << i;
+            }
         }
         self.saw_sample = true;
     }
