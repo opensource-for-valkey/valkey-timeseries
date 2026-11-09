@@ -75,9 +75,15 @@ pub trait FanoutClientCommand: Default + Send + 'static {
         let bc_for_closure = Arc::clone(&blocked_client);
 
         let handle_response = move |op: Self, result: FanoutResult| {
-            // Runs once, on whichever thread completes the fanout: the main thread
-            // for the last remote answer, a send failure or the RPC timer, a worker
-            // for the last local answer.
+            // Runs once, with no fanout lock held, on whichever thread completes the
+            // fanout: the main thread for the last remote answer, a send failure or the
+            // RPC timer, a `ts-fanout-request` worker for the last local answer.
+            //
+            // The reply goes to the reply lane from either. A worker could build it in
+            // place and save the hand-off, but it would then hold a request-lane slot
+            // that peer requests and other local shares are queued for: measured, that
+            // saved ~20 µs of CPU per reply and no throughput, and cost peer requests
+            // 5–9 % latency under contention.
             if Self::REPLY_OFF_MAIN_THREAD
                 && result.is_ok()
                 && let Ok(slot) = REPLY_EXECUTOR.try_reserve()

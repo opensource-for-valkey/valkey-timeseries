@@ -252,7 +252,7 @@ enum FanoutLifecycleState {
     Pending,
     /// At least one callback has run and completion may be needed on drop.
     Active,
-    /// Completion callback already ran (or was explicitly finalized).
+    /// Completed: the callback has run, or runs once the state lock is released.
     Completed,
 }
 
@@ -276,6 +276,10 @@ where
     /// per-shard error aggregation.
     abort_error: Option<FanoutError>,
     callback: Option<F>,
+    /// The completion callback with its arguments, set by [`Self::on_completion`] and
+    /// run by [`FanoutState`] once the state lock is released (see
+    /// [`FanoutState::with_inner`]).
+    ready: Option<Completion<OP, F>>,
     /// Set on completion, so a local share still reading stops at its next batch.
     cancelled: Arc<AtomicBool>,
     /// When the operation started, for `fanout_duration_seconds`.
@@ -412,7 +416,28 @@ where
         };
 
         let operation = std::mem::take(&mut self.operation);
-        callback(operation, result);
+        self.ready = Some(Completion {
+            callback,
+            operation,
+            result,
+        });
+    }
+}
+
+/// A fanout's completion callback, taken out of the state together with its arguments
+/// so it can run after the state lock is released.
+struct Completion<OP, F> {
+    callback: F,
+    operation: OP,
+    result: FanoutCommandResult,
+}
+
+impl<OP, F> Completion<OP, F>
+where
+    F: FnOnce(OP, FanoutCommandResult),
+{
+    fn run(self) {
+        (self.callback)(self.operation, self.result);
     }
 }
 
@@ -437,6 +462,10 @@ where
                 }
             }
             self.on_completion();
+        }
+        // Nothing is locked here: the mutex holding this state is being dropped.
+        if let Some(completion) = self.ready.take() {
+            completion.run();
         }
     }
 }
@@ -468,14 +497,31 @@ where
                 abort_error: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 callback: Some(f),
+                ready: None,
                 started,
             }),
         }
     }
 
+    /// Runs `f` under the state lock, then the completion callback if `f` completed the
+    /// fanout — after the lock is released. The callback may then do real work (a
+    /// client command builds its reply in it when already off the main thread) without
+    /// stalling the main thread, which takes this lock while holding the GIL (RPC
+    /// answers, the RPC timer).
+    fn with_inner<R>(&self, f: impl FnOnce(&mut FanoutStateInner<OP, F>) -> R) -> R {
+        let (value, ready) = {
+            let mut inner = lock(&self.inner);
+            let value = f(&mut inner);
+            (value, inner.ready.take())
+        };
+        if let Some(completion) = ready {
+            completion.run();
+        }
+        value
+    }
+
     fn on_error(&self, error: FanoutError, target: &NodeInfo) {
-        let mut inner = lock(&self.inner);
-        inner.on_error(error, target);
+        self.with_inner(|inner| inner.on_error(error, target));
     }
 
     fn is_completed(&self) -> bool {
@@ -487,8 +533,7 @@ where
     }
 
     fn on_response(&self, resp: OP::Response, target: &NodeInfo) {
-        let mut inner = lock(&self.inner);
-        inner.on_response(resp, target);
+        self.with_inner(|inner| inner.on_response(resp, target));
     }
 
     /// Deliver the local share's error. True when it completed the fanout while
@@ -504,12 +549,13 @@ where
     }
 
     fn local_answer_ends_early(&self, deliver: impl FnOnce(&mut FanoutStateInner<OP, F>)) -> bool {
-        let mut inner = lock(&self.inner);
-        let pending = inner.lifecycle != FanoutLifecycleState::Completed;
-        // The local share is one of `outstanding`; any others are remote.
-        let others_outstanding = inner.outstanding > 1;
-        deliver(&mut inner);
-        pending && others_outstanding && inner.lifecycle == FanoutLifecycleState::Completed
+        self.with_inner(|inner| {
+            let pending = inner.lifecycle != FanoutLifecycleState::Completed;
+            // The local share is one of `outstanding`; any others are remote.
+            let others_outstanding = inner.outstanding > 1;
+            deliver(inner);
+            pending && others_outstanding && inner.lifecycle == FanoutLifecycleState::Completed
+        })
     }
 }
 
@@ -681,6 +727,34 @@ mod tests {
         state.on_error(FanoutError::busy(), &node(2));
         drop(state);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// The callback runs after the state lock is released, so it may take as long as it
+    /// needs (a reply built in place) without blocking the threads that take that lock.
+    #[test]
+    fn test_callback_runs_after_the_state_lock_is_released() {
+        type Probe = Box<dyn Fn() -> bool + Send + Sync>;
+        let probe: Arc<std::sync::OnceLock<Probe>> = Arc::default();
+        let (tx, rx) = mpsc::channel();
+        let callback = {
+            let probe = Arc::clone(&probe);
+            move |_: Sum, _| tx.send(probe.get().unwrap()()).unwrap()
+        };
+        let state = Arc::new(FanoutState::new(
+            Sum::default(),
+            1,
+            callback,
+            Instant::now(),
+        ));
+        let weak = Arc::downgrade(&state);
+        let unlocked = move || weak.upgrade().unwrap().inner.try_lock().is_ok();
+        assert!(probe.set(Box::new(unlocked)).is_ok());
+
+        state.on_response(answer(1), &node(1));
+        assert!(
+            rx.try_recv().unwrap(),
+            "the callback ran under the state lock"
+        );
     }
 
     #[test]
