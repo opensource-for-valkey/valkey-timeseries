@@ -15,8 +15,8 @@
 //! the main thread already holds it and reads in one batch.
 
 use super::{
-    DEFAULT_SERIES_BATCH_SIZE, FuzzyFilter, IndexKey, PostingsBitmap, SeriesCursor,
-    SeriesSelection, SimilarityFilter, TimeSeriesIndex, ensure_generation, for_each_planned_series,
+    DEFAULT_SERIES_BATCH_SIZE, FuzzyFilter, IndexKey, NoOpSearchMatcher, PostingsBitmap,
+    SeriesCursor, SeriesSelection, TimeSeriesIndex, ensure_generation, for_each_planned_series,
     get_db_index, read_planned,
 };
 use crate::common::acl::check_metadata_permissions;
@@ -413,12 +413,13 @@ pub(crate) fn apply_search_hints(
     LabelQueryResult::new(values, has_more)
 }
 
+/// Runs `f` with the hints' filter, or without `SEARCH` one that accepts everything with a
+/// score of 1 and never looks at the candidate.
 fn with_search_filter<R>(hints: &SearchHints, f: impl FnOnce(&dyn FuzzyFilter) -> R) -> R {
-    if let Some(filter) = &hints.filter {
-        return f(filter.as_ref());
+    match &hints.filter {
+        Some(filter) => f(filter.as_ref()),
+        None => f(&NoOpSearchMatcher),
     }
-    let default_filter: Box<dyn FuzzyFilter> = Box::new(SimilarityFilter::default());
-    f(default_filter.as_ref())
 }
 
 fn can_use_unscoped_scan(select_hints: Option<&SelectHints>) -> bool {
@@ -1511,7 +1512,7 @@ impl LabelQuerier for DefaultLabelQuerier {
 mod tests {
     use super::{
         FuzzyFilter, LabelQueryResult, LabelSearchResult, SearchHints, SearchResultOrdering,
-        SimilarityFilter, TimeSeriesIndex, apply_search_hints, collect_limited_with_heap,
+        TimeSeriesIndex, apply_search_hints, collect_limited_with_heap,
         collect_unscoped_label_names, collect_unscoped_label_values,
         collect_unscoped_label_values_in_holds, get_label_names_desc_in_holds,
         iterate_label_names_asc_in_holds, label_cardinality_in_holds,
@@ -1519,7 +1520,6 @@ mod tests {
     };
     use crate::labels::{Label, MetricName};
     use crate::series::TimeSeries;
-    use crate::series::index::FuzzyAlgorithm;
     use crate::series::index::postings::Postings;
     use itertools::Itertools;
 
@@ -1820,42 +1820,6 @@ mod tests {
     }
 
     #[test]
-    fn similarity_filter_defaults_to_case_sensitive() {
-        let filter = SimilarityFilter::new("node", FuzzyAlgorithm::JaroWinkler, 1.0);
-        let (accepted, score) = filter.accept("node");
-        assert!(accepted);
-        assert_eq!(1.0, score);
-    }
-
-    #[test]
-    fn similarity_filter_case_sensitive_rejects_case_mismatch() {
-        let filter = SimilarityFilter::new_with_case_sensitivity(
-            "NoDe",
-            FuzzyAlgorithm::JaroWinkler,
-            1.0,
-            true,
-        );
-
-        let (accepted, score) = filter.accept("node");
-        assert!(!accepted);
-        assert!(score < 1.0);
-    }
-
-    #[test]
-    fn similarity_filter_case_insensitive_accepts_case_mismatch() {
-        let filter = SimilarityFilter::new_with_case_sensitivity(
-            "NoDe",
-            FuzzyAlgorithm::JaroWinkler,
-            1.0,
-            false,
-        );
-
-        let (accepted, score) = filter.accept("node");
-        assert!(accepted);
-        assert_eq!(1.0, score);
-    }
-
-    #[test]
     fn collect_unscoped_label_values_orders_ascending() {
         let postings = build_label_values_postings();
         let hints = SearchHints {
@@ -2101,41 +2065,6 @@ mod tests {
             assert!(result.has_more);
             assert_eq!(values(result), ["eu-west", "us-west"][..limit]);
         }
-    }
-
-    #[test]
-    fn jaro_winkler_transposition_matches() {
-        // 'metirc' is a transposition of 'metric'
-        let filter = SimilarityFilter::new_with_case_sensitivity(
-            "metirc",
-            FuzzyAlgorithm::JaroWinkler,
-            0.5,
-            false,
-        );
-        let (accepted, score) = filter.accept("metric");
-        assert!((0.0..=1.0).contains(&score));
-        assert!(
-            accepted,
-            "Expected 'metric' to match 'metirc' with JaroWinkler (score={})",
-            score
-        );
-    }
-
-    #[test]
-    fn subsequence_basic_match() {
-        let filter = SimilarityFilter::new_with_case_sensitivity(
-            "nde",
-            FuzzyAlgorithm::Subsequence,
-            0.3,
-            false,
-        );
-        let (accepted, score) = filter.accept("node");
-        assert!((0.0..=1.0).contains(&score));
-        assert!(
-            accepted,
-            "Expected 'node' to match subsequence 'nde' (score={})",
-            score
-        );
     }
 
     #[test]
