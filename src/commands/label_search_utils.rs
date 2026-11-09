@@ -18,9 +18,9 @@ use crate::parser::series_selector::parse_series_selector;
 use crate::series::index::{
     DefaultLabelQuerier, FuzzyAlgorithm, FuzzyFilter, LabelNameSearchFilter, LabelQuerier,
     LabelQueryResult, SEARCH_RESULT_DEFAULT_LIMIT, SEARCH_RESULT_LIMIT_MAX, SearchHints,
-    SearchResultOrdering, SelectHints, SeriesCursor, SeriesSelection, SortBy,
-    check_label_query_permissions, get_db_index, label_search_exceeds_inline_budget,
-    normalize_limit, plan_if_cheap,
+    SearchResultOrdering, SelectHints, SeriesCursor, SortBy, check_label_query_permissions,
+    get_db_index, label_search_exceeds_inline_budget, label_search_selection, normalize_limit,
+    plan_if_cheap,
 };
 use crate::series::request_types::MatchFilterOptions;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
@@ -467,13 +467,18 @@ fn plan_series_filter(
     ctx: &Context,
     parsed: &LabelNameSearchArgs,
 ) -> ValkeyResult<Option<SeriesCursor>> {
-    let filter = &parsed.series_filter;
+    plan_match_filter(get_current_db(ctx), &parsed.series_filter)
+}
+
+/// [`plan_series_filter`] in database `db`. Plans the selection the read itself would
+/// ([`label_search_selection`]), so a date range without selectors covers every series.
+fn plan_match_filter(db: i32, filter: &MatchFilterOptions) -> ValkeyResult<Option<SeriesCursor>> {
     if filter.matchers.is_empty() && filter.date_range.is_none() {
         return Ok(None);
     }
     plan_if_cheap(
-        get_current_db(ctx),
-        SeriesSelection::Matching(&filter.matchers),
+        db,
+        label_search_selection(&filter.matchers),
         filter.date_range,
     )
 }
@@ -518,6 +523,51 @@ mod tests {
         assert_eq!(inline_entries_budget(true, 0), INLINE_LABEL_SEARCH_ENTRIES);
         assert_eq!(inline_entries_budget(true, 1), INLINE_LABEL_SEARCH_ENTRIES);
         assert_eq!(inline_entries_budget(true, 8), INLINE_LABEL_SEARCH_ENTRIES);
+    }
+
+    /// The command-side plan of a date range without selectors covers every series, as the
+    /// read's own plan does, rather than the nothing an empty `Matching` selects.
+    #[test]
+    fn a_date_range_alone_is_planned_over_every_series() {
+        use crate::labels::{Label, MetricName};
+        use crate::parser::series_selector::parse_series_selector;
+        use crate::series::index::clear_timeseries_index;
+        use crate::series::request_types::MetaDateRangeFilter;
+        use crate::series::{DateRange, TimeSeries};
+
+        const DB: i32 = 7312;
+        clear_timeseries_index(DB);
+        let index = get_db_index(DB);
+        for (id, job) in [(1, "api"), (2, "api"), (3, "worker")] {
+            let mut series = TimeSeries::new();
+            series.id = id;
+            series.labels = MetricName::new(&[Label::new("job", job)]);
+            index.index_timeseries(&series, format!("series:{id}").as_bytes());
+        }
+        let date_range = Some(MetaDateRangeFilter::Includes(DateRange {
+            start: 0,
+            end: 100,
+        }));
+        let planned = |matchers| {
+            let filter = MatchFilterOptions {
+                matchers,
+                date_range,
+                ..Default::default()
+            };
+            plan_match_filter(DB, &filter)
+                .unwrap()
+                .map(|plan| plan.remaining())
+        };
+
+        assert_eq!(planned(vec![]), Some(3));
+        let api = parse_series_selector("job=\"api\"").unwrap();
+        assert_eq!(planned(vec![api]), Some(2));
+        assert!(
+            plan_match_filter(DB, &MatchFilterOptions::default())
+                .unwrap()
+                .is_none()
+        );
+        clear_timeseries_index(DB);
     }
 
     #[test]

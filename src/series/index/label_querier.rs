@@ -129,14 +129,10 @@ impl SelectHints {
         self.selectors.is_empty() && self.date_range.is_none()
     }
 
-    /// The series these hints select before the date range is applied: those the selectors
-    /// match, or, with a date range alone, every series.
+    /// The series these hints select before the date range is applied: see
+    /// [`label_search_selection`].
     pub fn selection(&self) -> SeriesSelection<'_> {
-        if self.selectors.is_empty() {
-            SeriesSelection::All
-        } else {
-            SeriesSelection::Matching(&self.selectors)
-        }
+        label_search_selection(&self.selectors)
     }
 
     /// Run `read` over the series these hints select in database `db`: the plan given with
@@ -150,6 +146,19 @@ impl SelectHints {
         let planned = self.planned.take();
         let replan = || SeriesCursor::plan(db, self.selection(), self.date_range);
         read_planned(planned, replan, read)
+    }
+}
+
+/// The series a scoped label search selects before its date range is applied: those
+/// `selectors` match, or, when it is scoped by a date range alone, every series. Unlike
+/// [`SeriesSelection::Matching`], no selectors does not mean no series. Whoever plans a label
+/// search's read uses this, so that a plan passed to [`SelectHints::with_plan`] agrees with
+/// one the read would make itself.
+pub fn label_search_selection(selectors: &[SeriesSelector]) -> SeriesSelection<'_> {
+    if selectors.is_empty() {
+        SeriesSelection::All
+    } else {
+        SeriesSelection::Matching(selectors)
     }
 }
 
