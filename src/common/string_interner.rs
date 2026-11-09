@@ -714,6 +714,10 @@ impl InternedString {
     /// contains `=` (`name()` is the whole string, `value()` empty). Distinct from
     /// any [`Self::new_pair`] label with the same text. Allocates only if the
     /// string is not already interned.
+    ///
+    /// Test-only: production interns only labels, so no two pool entries share
+    /// display text and `TS._DEBUG STRINGPOOLSTATS` can merge rows by text.
+    #[cfg(test)]
     pub fn new(val: &str) -> Self {
         Self::intern(PoolKey::new(val.as_bytes(), NO_SEPARATOR))
     }

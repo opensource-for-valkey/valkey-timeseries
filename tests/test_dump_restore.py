@@ -22,7 +22,11 @@ def _with_encver(payload: bytes, encver: int) -> bytes:
     assert payload[1] == 0x81, "expected 64-bit length marker for the module id"
     mid = int.from_bytes(payload[2:10], "big")
     mid = (mid & ~0x3FF) | encver
-    body = payload[:2] + mid.to_bytes(8, "big") + payload[10:-8]
+    return _with_crc(payload[:2] + mid.to_bytes(8, "big") + payload[10:-8])
+
+
+def _with_crc(body: bytes) -> bytes:
+    """Append the CRC footer to a DUMP payload body (everything before the checksum)."""
     crc = 0
     for b in body:
         crc = _CRC_TBL[(crc ^ b) & 0xFF] ^ (crc >> 8)
@@ -85,6 +89,25 @@ class TestTimeseriesDumpRestore(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError, match='Bad data format'):
             client.execute_command('RESTORE', f'bad{encver}', 0, _with_encver(payload, encver))
         assert client.execute_command('EXISTS', f'bad{encver}') == 0
+        assert client.ping()
+
+    def test_restore_rejects_label_name_with_separator(self):
+        """A payload whose label name contains `=` is refused like the write would be
+        (DIV-0063), so RESTORE can't store a label no command accepts."""
+        client = self.client
+        client.execute_command('TS.CREATE', 'eq_src', 'LABELS', 'nameXsep', 'v', 'ok', '1')
+        client.execute_command('TS.ADD', 'eq_src', 1000, 1.5)
+        payload = client.execute_command('DUMP', 'eq_src')
+        body = payload[:-8]
+        assert body.count(b'nameXsep') == 1
+
+        # Sanity: the re-checksummed payload with the name unchanged loads.
+        assert client.execute_command('RESTORE', 'eq_ok', 0, _with_crc(body)) == b'OK'
+
+        crafted = _with_crc(body.replace(b'nameXsep', b'name=sep'))
+        with pytest.raises(ResponseError, match='Bad data format'):
+            client.execute_command('RESTORE', 'eq_bad', 0, crafted)
+        assert client.execute_command('EXISTS', 'eq_bad') == 0
         assert client.ping()
 
     @pytest.mark.parametrize('offset', [1 << 30, 1 << 40, 1 << 50])

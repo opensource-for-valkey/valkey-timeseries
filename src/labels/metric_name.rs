@@ -1,4 +1,4 @@
-use super::label::{Label, SeriesLabel};
+use super::label::{Label, SeriesLabel, check_label_name};
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::common::rdb::{MAX_RDB_COLLECTION_LEN, rdb_load_len, rdb_load_string, rdb_save_usize};
 use crate::common::string_interner::InternedString;
@@ -251,6 +251,9 @@ impl MetricName {
         for _ in 0..count {
             let name = rdb_load_string(rdb)?;
             let value = rdb_load_string(rdb)?;
+            // Same rule as the write path, so a crafted `RESTORE` payload can't store a label
+            // no write would accept, and the pool never holds two labels with the same text.
+            check_label_name(name.as_bytes())?;
             entries.push(InternedString::new_pair(&name, &value));
         }
         Ok(Self::from_entries(entries))

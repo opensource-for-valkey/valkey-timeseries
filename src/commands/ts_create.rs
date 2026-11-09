@@ -5,7 +5,7 @@ use crate::commands::command_parser::{
 };
 use crate::common::rounding::{NO_ROUNDING_KEYWORD, RoundingStrategy};
 use crate::error_consts;
-use crate::labels::Label;
+use crate::labels::{Label, check_label_name};
 use crate::series::chunks::ChunkEncoding;
 use crate::series::{DuplicatePolicy, TimeSeriesOptions, create_and_store_series};
 use valkey_module::{Context, NextArg, VALKEY_OK, ValkeyError, ValkeyResult, ValkeyString};
@@ -362,45 +362,9 @@ fn parse_labels(args: &[ValkeyString]) -> ValkeyResult<Vec<Label>> {
     Ok(labels)
 }
 
-/// Rejects a label name containing `=` (DIV-0063). No filter can select such a label (`a=b=2`
-/// is a parse error here and matches nothing on RTS), and the label index keys `name=value`
-/// split at the first `=`, so it would file `a=b 2` under the name `a`. Values may contain `=`.
-///
-/// Only the write path checks this: RDB load and restore must keep accepting a series that was
-/// written before the rule existed.
-fn check_label_name(name: &[u8]) -> ValkeyResult<()> {
-    if name.contains(&b'=') {
-        return Err(ValkeyError::Str(
-            error_consts::LABEL_NAME_CONTAINS_SEPARATOR,
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn label_names_must_not_contain_the_separator() {
-        for name in ["a=b", "=", "=a", "a=", "a==b"] {
-            assert!(
-                matches!(
-                    check_label_name(name.as_bytes()),
-                    Err(ValkeyError::Str(
-                        error_consts::LABEL_NAME_CONTAINS_SEPARATOR
-                    ))
-                ),
-                "{name:?} was accepted"
-            );
-        }
-        for name in ["a", "host", "__name__", "a:b.c-d", "région"] {
-            assert!(
-                check_label_name(name.as_bytes()).is_ok(),
-                "{name:?} was rejected"
-            );
-        }
-    }
 
     fn rounding_already_set(result: ValkeyResult<()>) -> bool {
         matches!(
