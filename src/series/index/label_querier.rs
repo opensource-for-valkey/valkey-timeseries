@@ -928,33 +928,61 @@ where
             _ => Bound::Excluded(self.past.as_slice()),
         };
         let range = postings.label_index.range::<[u8], _>((lower, upper));
-        let entries: Box<dyn Iterator<Item = (&IndexKey, &PostingsBitmap)>> = if self.descending {
-            Box::new(range.rev())
+        let limits = (self.entries_per_hold, self.results_per_hold);
+        let stopped_at = if self.descending {
+            buffer_label_values(
+                &postings,
+                range.rev(),
+                &mut self.check,
+                &mut self.buffered,
+                limits,
+            )
         } else {
-            Box::new(range)
+            buffer_label_values(
+                &postings,
+                range,
+                &mut self.check,
+                &mut self.buffered,
+                limits,
+            )
         };
-
-        let mut read = 0usize;
-        let mut stopped_at: Option<Vec<u8>> = None;
-        for (key, map) in entries {
-            read += 1;
-            let visible = postings.visible_cardinality(map) as usize;
-            if visible > 0
-                && let Some(result) = (self.check)(key, visible)
-            {
-                self.buffered.push_back(result);
-            }
-            if read == self.entries_per_hold || self.buffered.len() >= self.results_per_hold {
-                stopped_at = Some(key.as_ref().to_vec());
-                break;
-            }
-        }
         match stopped_at {
-            Some(key) => self.resume = Some(key),
+            Some(key) => {
+                let resume = self.resume.get_or_insert_with(Vec::new);
+                resume.clear();
+                resume.extend_from_slice(key);
+            }
             // The range ran out: the scan is done.
             None => self.done = true,
         }
     }
+}
+
+/// One hold of a [`LabelValueScan`], in either direction: buffer what `check` makes of each
+/// entry until `entries_per_hold` entries are read or `results_per_hold` results buffered, and
+/// return the key it stopped at, or `None` if the range ran out.
+fn buffer_label_values<'p, F>(
+    postings: &Postings,
+    entries: impl Iterator<Item = (&'p IndexKey, &'p PostingsBitmap)>,
+    check: &mut F,
+    buffered: &mut VecDeque<LabelSearchResult>,
+    (entries_per_hold, results_per_hold): (usize, usize),
+) -> Option<&'p [u8]>
+where
+    F: FnMut(&IndexKey, usize) -> Option<LabelSearchResult>,
+{
+    for (read, (key, map)) in entries.enumerate() {
+        let visible = postings.visible_cardinality(map) as usize;
+        if visible > 0
+            && let Some(result) = check(key, visible)
+        {
+            buffered.push_back(result);
+        }
+        if read + 1 == entries_per_hold || buffered.len() >= results_per_hold {
+            return Some(key.as_ref());
+        }
+    }
+    None
 }
 
 impl<F> Iterator for LabelValueScan<'_, F>
@@ -981,29 +1009,35 @@ fn label_cardinality_in_holds(
     let entries_per_hold = entries_per_hold.max(1);
     let first = first_label_key(name);
     let past = past_label_keys(name);
-    let mut resume: Option<Vec<u8>> = None;
+    // The last key read, once a hold has ended early: one buffer for every hold.
+    let mut resume: Vec<u8> = Vec::new();
+    let mut resuming = false;
     let mut total = 0u64;
     loop {
         let postings = index.get_postings();
-        let lower: Bound<&[u8]> = match resume.as_deref() {
-            Some(after) => Bound::Excluded(after),
-            None => Bound::Included(first.as_slice()),
+        let lower: Bound<&[u8]> = if resuming {
+            Bound::Excluded(resume.as_slice())
+        } else {
+            Bound::Included(first.as_slice())
         };
-        let mut read = 0usize;
-        let mut stopped_at: Option<Vec<u8>> = None;
-        for (key, map) in postings
+        let mut stopped_at: Option<&[u8]> = None;
+        for (read, (key, map)) in postings
             .label_index
             .range::<[u8], _>((lower, Bound::Excluded(past.as_slice())))
+            .enumerate()
         {
             total += postings.visible_cardinality(map);
-            read += 1;
-            if read == entries_per_hold {
-                stopped_at = Some(key.as_ref().to_vec());
+            if read + 1 == entries_per_hold {
+                stopped_at = Some(key.as_ref());
                 break;
             }
         }
         match stopped_at {
-            Some(key) => resume = Some(key),
+            Some(key) => {
+                resume.clear();
+                resume.extend_from_slice(key);
+                resuming = true;
+            }
             None => return total as usize,
         }
     }
