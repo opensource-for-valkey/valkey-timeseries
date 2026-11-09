@@ -330,13 +330,16 @@ where
         // stop waiting on the remaining shards. A shard that was too busy to take
         // its share, or whose database `SWAPDB` kept exchanging under its read,
         // likewise leaves the result incomplete, and the client should see that it
-        // can retry rather than a generic aggregate error.
+        // can retry rather than a generic aggregate error. A shard that cannot
+        // select the request's database never runs its share at all, so its error
+        // is the answer too.
         if matches!(
             error.kind,
             ErrorKind::KeyPermissions
                 | ErrorKind::Permissions
                 | ErrorKind::Busy
                 | ErrorKind::DatabaseSwapped
+                | ErrorKind::InvalidDb
         ) {
             self.abort_error = Some(error);
             self.on_completion();
@@ -670,6 +673,18 @@ mod tests {
         state.on_error(FanoutError::busy(), &node(2));
         let err = rx.try_recv().unwrap().1.unwrap_err();
         assert_eq!(err.kind, ErrorKind::Busy);
+    }
+
+    /// A shard that cannot select the database ends the fanout with that error
+    /// at once, without waiting on the other shares.
+    #[test]
+    fn test_invalid_db_aborts_without_waiting() {
+        let (state, rx) = fanout(3);
+        state.on_response(answer(1), &node(1));
+        state.on_error(FanoutError::invalid_db(), &node(2));
+        let err = rx.try_recv().unwrap().1.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidDb);
+        assert_eq!(err.to_string(), ErrorKind::InvalidDb.as_str());
     }
 
     #[test]
