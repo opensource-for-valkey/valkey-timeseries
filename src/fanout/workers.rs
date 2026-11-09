@@ -24,9 +24,9 @@ pub(super) static PEER_REQUEST_EXECUTOR: BoundedExecutor = BoundedExecutor::new(
 );
 
 /// Builds and writes fan-out replies for commands that opt in
-/// (`FanoutClientCommand::REPLY_OFF_MAIN_THREAD`), so the merge and the per-item reply calls
-/// run off the main thread. Its jobs never take the GIL, so they never queue behind peer
-/// requests waiting for it.
+/// (`FanoutClientCommand::should_reply_off_main_thread`), so the merge and the per-item
+/// reply calls run off the main thread. Its jobs never take the GIL, so they never queue
+/// behind peer requests waiting for it.
 pub(super) static REPLY_EXECUTOR: BoundedExecutor = BoundedExecutor::new(
     "ts-fanout-reply",
     lane_workers,

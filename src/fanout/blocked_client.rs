@@ -125,7 +125,7 @@ where
     /// client is unblocked, as on the main-thread path, when the last handle is dropped.
     ///
     /// Only for an `op` whose `reply` just writes the reply (no keyspace access, no ACL
-    /// checks), which is what `FanoutClientCommand::REPLY_OFF_MAIN_THREAD` promises.
+    /// checks), which is what `FanoutClientCommand::should_reply_off_main_thread` promises.
     ///
     /// Past the client's deadline this builds nothing and leaves the reply to
     /// [`reply_callback`], which the server runs only if it has not timed the client out yet:

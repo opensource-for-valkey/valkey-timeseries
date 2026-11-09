@@ -236,7 +236,9 @@ impl FanoutClientCommand for MRangeFanoutCommand {
     }
 
     // `reply` only merges the shard responses and writes them.
-    const REPLY_OFF_MAIN_THREAD: bool = true;
+    fn should_reply_off_main_thread(&self) -> bool {
+        true
+    }
 
     fn reply(&mut self, ctx: &ReplyContext) -> Status {
         self.options.range.latest = false;

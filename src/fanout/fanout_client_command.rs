@@ -42,7 +42,7 @@ pub trait FanoutClientCommand: Default + Send + 'static {
     fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult;
 
     /// NOTE: Use the provided `ReplyContext` reply helpers. This runs on the main thread,
-    /// unless [`Self::REPLY_OFF_MAIN_THREAD`] moves it, and does not require locking.
+    /// unless [`Self::should_reply_off_main_thread`] moves it, and does not require locking.
     fn reply(&mut self, ctx: &ReplyContext) -> Status;
 
     /// Whether a successful fan-out's [`Self::reply`] may run on the fan-out reply lane
@@ -50,7 +50,13 @@ pub trait FanoutClientCommand: Default + Send + 'static {
     /// blocked client. Only for a `reply` that merges what the shards sent and writes it:
     /// no keyspace access, no ACL checks, nothing that needs the GIL or the real client.
     /// Errors, and replies the lane has no room for, still go through the main thread.
-    const REPLY_OFF_MAIN_THREAD: bool = false;
+    ///
+    /// Asked once, after every shard's answer has gone through [`Self::on_response`] and
+    /// before [`Self::reply`], so it can weigh what `reply` will write: a reply small
+    /// enough to cost less than the hand-off is better written on the main thread.
+    fn should_reply_off_main_thread(&self) -> bool {
+        false
+    }
 
     /// Execute the fanout operation across cluster nodes.
     /// The `where Self: FanoutCommand` bound is always satisfied via the blanket impl below.
@@ -84,8 +90,8 @@ pub trait FanoutClientCommand: Default + Send + 'static {
             // that peer requests and other local shares are queued for: measured, that
             // saved ~20 µs of CPU per reply and no throughput, and cost peer requests
             // 5–9 % latency under contention.
-            if Self::REPLY_OFF_MAIN_THREAD
-                && result.is_ok()
+            if result.is_ok()
+                && op.should_reply_off_main_thread()
                 && let Ok(slot) = REPLY_EXECUTOR.try_reserve()
             {
                 slot.spawn(move || {
