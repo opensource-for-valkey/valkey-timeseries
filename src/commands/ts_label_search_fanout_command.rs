@@ -25,7 +25,8 @@ use valkey_module::{Context, Status, ValkeyError, ValkeyResult};
 pub struct LabelSearchFanoutCommand {
     args: LabelNameSearchArgs,
     limit: usize,
-    result_map: AHashMap<String, IndexLabelSearchResult>,
+    /// Each value's score (the first shard's) and its cardinality summed over shards.
+    result_map: AHashMap<String, (f64, usize)>,
     has_more: bool,
 }
 
@@ -194,19 +195,14 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
-        for r in resp.results.iter() {
-            if let Some(current) = self.result_map.get_mut(&r.value) {
-                current.cardinality += r.cardinality as usize;
-                continue;
+        for r in resp.results {
+            let cardinality = r.cardinality as usize;
+            match self.result_map.get_mut(&r.value) {
+                Some((_, current)) => *current += cardinality,
+                None => {
+                    self.result_map.insert(r.value, (r.score, cardinality));
+                }
             }
-            self.result_map.insert(
-                r.value.clone(),
-                IndexLabelSearchResult {
-                    value: r.value.clone(),
-                    score: r.score,
-                    cardinality: r.cardinality as usize,
-                },
-            );
         }
 
         self.has_more |= resp.has_more;
@@ -216,7 +212,14 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
 
     fn reply(&mut self, ctx: &ReplyContext) -> Status {
         let map = std::mem::take(&mut self.result_map);
-        let values = map.into_values().collect::<Vec<_>>();
+        let values = map
+            .into_iter()
+            .map(|(value, (score, cardinality))| IndexLabelSearchResult {
+                value,
+                score,
+                cardinality,
+            })
+            .collect::<Vec<_>>();
 
         let hints = SearchHints {
             filter: None,
@@ -225,10 +228,10 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
             include_meta: self.args.include_metadata,
         };
 
-        let query_result = apply_search_hints(values, &hints);
+        let mut query_result = apply_search_hints(values, &hints);
         // A shard may have reported has_more, or the coordinator merge itself may have
         // truncated additional entries — either condition means results were cut off.
-        self.has_more |= query_result.has_more;
+        query_result.has_more |= self.has_more;
 
         match reply_with_label_search_result(ctx, query_result, hints.include_meta) {
             Ok(_) => Status::Ok,

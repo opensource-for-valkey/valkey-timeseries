@@ -45,6 +45,9 @@ standalone server and does not filter label values or series keys.
 
 - `SORTBY score DESC` and `SORTBY cardinality DESC` select the highest-ranked values before
   applying `LIMIT`. Equal scores or cardinalities are ordered by value ascending.
+- A value's `cardinality` (reported with `INCLUDE_METADATA`, and ranked by `SORTBY cardinality`) is the number of
+  series carrying it: of every series in the database without `FILTER`, and of the selected series with `FILTER`
+  (and `FILTER_BY_RANGE`). In cluster mode it is summed over the shards.
 - On standalone servers, a search that would read many index entries runs on a bounded pool of
   background workers, shared with `TS.OUTLIERS`, and gives the index back to writers between
   batches. Small searches, and any search inside `MULTI`, a script or a module call, run inline.

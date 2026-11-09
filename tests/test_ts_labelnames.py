@@ -597,3 +597,33 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         values = [lv.value for lv in result.results]
         assert b'node' in values, f"'node' not found in multi-term results: {values}"
         assert b'type' in values, f"'type' not found in multi-term results: {values}"
+
+    def test_labelnames_value_order_follows_names_not_index_keys(self):
+        """`job2=…` sorts before `job=…` in the index, but `job` before `job2` by name. A value
+        order, and the names a LIMIT keeps, must follow the names, scoped or not."""
+        self.client.execute_command('TS.CREATE', 's1', 'LABELS',
+                                    'job', 'api', 'job2', 'worker', 'scope', 'selected')
+
+        def names(*args):
+            parsed = LabelSearchResponse.parse(self.client.execute_command('TS.LABELNAMES', *args))
+            return [lv.value for lv in parsed.results], parsed.has_more
+
+        for scope in [(), ('FILTER', 'scope=selected')]:
+            assert names(*scope) == ([b'job', b'job2', b'scope'], False)
+            assert names('LIMIT', 1, *scope) == ([b'job'], True)
+            assert names('SORTBY', 'value', 'DESC', 'LIMIT', 1, *scope) == ([b'scope'], True)
+            assert names('SEARCH', 'job', 'SORTBY', 'value', 'ASC', 'LIMIT', 1, *scope) == ([b'job'], True)
+            assert names('SEARCH', 'job', 'SORTBY', 'value', 'DESC', 'LIMIT', 1, *scope) == ([b'job2'], True)
+
+    def test_scoped_cardinality_counts_only_selected_series(self):
+        """With FILTER, names and values alike count only the selected series that carry them."""
+        self.client.execute_command('TS.CREATE', 'picked', 'LABELS', 'job', 'api', 'pick', 'yes')
+        self.client.execute_command('TS.CREATE', 'other', 'LABELS', 'job', 'worker')
+
+        names = LabelSearchResponse.parse(self.client.execute_command(
+            'TS.LABELNAMES', 'FILTER', 'pick=yes', 'INCLUDE_METADATA'))
+        assert {lv.value: lv.cardinality for lv in names.results} == {b'job': 1, b'pick': 1}
+
+        values = LabelSearchResponse.parse(self.client.execute_command(
+            'TS.LABELVALUES', 'job', 'FILTER', 'pick=yes', 'INCLUDE_METADATA'))
+        assert [(lv.value, lv.cardinality) for lv in values.results] == [(b'api', 1)]

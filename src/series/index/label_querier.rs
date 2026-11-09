@@ -8,16 +8,17 @@
 //! series materialization, this module is value-centric: it evaluates and ranks label values
 //! using index primitives while reusing selector hints when available.
 //!
-//! A scoped query (selectors or a date range) reads the matching series through the batched
-//! reader ([`for_each_series`]): only the label names or values are copied out under the
+//! A scoped query (selectors, a date range, or both) reads the matching series through the
+//! batched reader, from the caller's plan when it made one ([`for_each_planned_series`]): only the label names or values are copied out under the
 //! module lock, a batch at a time, and fuzzy scoring and cardinality lookups run once the
 //! lock is released. On a fan-out share the lock is given back between batches; a caller on
 //! the main thread already holds it and reads in one batch.
 
+use super::postings::Postings;
 use super::{
-    DEFAULT_SERIES_BATCH_SIZE, FuzzyFilter, IndexKey, PostingsBitmap, SeriesCursor,
-    SeriesSelection, SimilarityFilter, TimeSeriesIndex, ensure_generation, for_each_planned_series,
-    get_db_index, read_planned,
+    DEFAULT_SERIES_BATCH_SIZE, FuzzyFilter, IndexKey, NoOpSearchMatcher, PostingsBitmap,
+    SeriesCursor, SeriesSelection, TimeSeriesIndex, for_each_planned_series, get_db_index,
+    read_planned,
 };
 use crate::common::acl::check_metadata_permissions;
 use crate::common::constants::METRIC_NAME_LABEL;
@@ -26,16 +27,15 @@ use crate::error::{TsdbError, TsdbResult};
 use crate::labels::filters::SeriesSelector;
 use crate::series::index::key_buffer::KeyBuffer;
 use crate::series::request_types::MetaDateRangeFilter;
-use ahash::{AHashMap, AHashSet};
-use itertools::Itertools;
-use min_max_heap::MinMaxHeap;
+use ahash::AHashMap;
 use std::cmp::Ordering;
 use std::collections::{Bound, VecDeque};
 use std::fmt::Display;
 use std::ops::ControlFlow;
 use valkey_module::{ValkeyError, ValkeyResult};
 
-const DEFAULT_LIMIT: usize = 100;
+/// A starting capacity for result buffers and maps; not a limit.
+const INITIAL_RESULT_CAPACITY: usize = 100;
 
 // todo: get from config
 pub const SEARCH_RESULT_LIMIT_MAX: usize = 1000;
@@ -90,34 +90,6 @@ pub enum SearchResultOrdering {
     CardinalityDesc,
 }
 
-impl SearchResultOrdering {
-    pub fn is_ascending(&self) -> bool {
-        matches!(
-            self,
-            SearchResultOrdering::ValueAsc | SearchResultOrdering::CardinalityAsc
-        )
-    }
-
-    pub fn is_descending(&self) -> bool {
-        matches!(
-            self,
-            SearchResultOrdering::ValueDesc
-                | SearchResultOrdering::ScoreDesc
-                | SearchResultOrdering::CardinalityDesc
-        )
-    }
-
-    pub fn sort_field(&self) -> SortBy {
-        match self {
-            SearchResultOrdering::ValueAsc | SearchResultOrdering::ValueDesc => SortBy::Value,
-            SearchResultOrdering::ScoreDesc => SortBy::Score,
-            SearchResultOrdering::CardinalityAsc | SearchResultOrdering::CardinalityDesc => {
-                SortBy::Cardinality
-            }
-        }
-    }
-}
-
 /// SelectHints specifies hints passed for data selections.
 #[derive(Debug, Clone, Default)]
 pub struct SelectHints {
@@ -140,9 +112,15 @@ impl SelectHints {
         }
     }
 
-    /// Read `plan`, made from these hints' selectors and date range, instead of planning them
-    /// again.
+    /// Read `plan`, made from these hints' [`selection`](Self::selection) and date range,
+    /// instead of planning them again. Nothing can check that it was made from the same
+    /// selectors, but its date range must be the same.
     pub fn with_plan(mut self, plan: Option<SeriesCursor>) -> Self {
+        debug_assert!(
+            plan.as_ref()
+                .is_none_or(|plan| plan.date_range() == self.date_range),
+            "a plan made from another date range"
+        );
         self.planned = plan;
         self
     }
@@ -151,25 +129,40 @@ impl SelectHints {
         self.selectors.is_empty() && self.date_range.is_none()
     }
 
+    /// The series these hints select before the date range is applied: see
+    /// [`label_search_selection`].
+    pub fn selection(&self) -> SeriesSelection<'_> {
+        label_search_selection(&self.selectors)
+    }
+
     /// Run `read` over the series these hints select in database `db`: the plan given with
     /// [`Self::with_plan`] first, and a new one when there is none or a `SWAPDB` moved the
     /// database under it ([`read_planned`]).
     fn read_planned<T>(
-        self,
+        mut self,
         db: i32,
         read: impl FnMut(SeriesCursor) -> ValkeyResult<T>,
     ) -> ValkeyResult<T> {
-        let replan = || {
-            SeriesCursor::plan(
-                db,
-                SeriesSelection::Matching(&self.selectors),
-                self.date_range,
-            )
-        };
-        read_planned(self.planned, replan, read)
+        let planned = self.planned.take();
+        let replan = || SeriesCursor::plan(db, self.selection(), self.date_range);
+        read_planned(planned, replan, read)
     }
 }
 
+/// The series a scoped label search selects before its date range is applied: those
+/// `selectors` match, or, when it is scoped by a date range alone, every series. Unlike
+/// [`SeriesSelection::Matching`], no selectors does not mean no series. Whoever plans a label
+/// search's read uses this, so that a plan passed to [`SelectHints::with_plan`] agrees with
+/// one the read would make itself.
+pub fn label_search_selection(selectors: &[SeriesSelector]) -> SeriesSelection<'_> {
+    if selectors.is_empty() {
+        SeriesSelection::All
+    } else {
+        SeriesSelection::Matching(selectors)
+    }
+}
+
+/// The result limit of a label search that sets none, or sets `0`.
 pub const SEARCH_RESULT_DEFAULT_LIMIT: usize = 100;
 
 /// SearchHints configures search operations with filtering and scoring.
@@ -177,7 +170,8 @@ pub struct SearchHints<'a> {
     /// Filter determines which values to include and their relevance scores.
     pub filter: Option<Box<dyn FuzzyFilter + 'a>>,
 
-    /// Maximum number of results to return.
+    /// Maximum number of results to return: `0` means [`SEARCH_RESULT_DEFAULT_LIMIT`], and
+    /// anything above [`SEARCH_RESULT_LIMIT_MAX`] is capped to it ([`normalize_limit`]).
     pub limit: usize,
 
     /// Selects the ordering of results.
@@ -206,24 +200,18 @@ pub struct LabelSearchResult {
     /// Relevance score, with 1.0 being a perfect match.
     pub score: f64,
 
-    /// Optional cardinality of the label name or label value, if known. This can be used for relevance ranking or filtering.
+    /// How many series carry the label name or value, or `0` where it was not computed: a
+    /// scoped search computes it only for `INCLUDE_METADATA` or a cardinality order. An
+    /// unscoped search counts every visible series in the database; a scoped one counts only
+    /// the selected series, so that a cluster's per-shard counts add up to the selection's.
     pub cardinality: usize,
-}
-
-impl LabelSearchResult {
-    pub fn new(value: String, score: f64) -> Self {
-        Self {
-            value,
-            score,
-            cardinality: 1,
-        }
-    }
 }
 
 impl PartialEq for LabelSearchResult {
     fn eq(&self, other: &Self) -> bool {
+        // As the ranking compares scores, so that equality is reflexive even for NaN.
         self.value == other.value
-            && self.score == other.score
+            && self.score.total_cmp(&other.score).is_eq()
             && self.cardinality == other.cardinality
     }
 }
@@ -250,13 +238,15 @@ impl LabelQueryResult {
     /// Merges another query result into this one.
     ///
     /// Duplicate values are coalesced by summing cardinality and keeping the best score.
-    /// The merged set is then sorted and limited according to `order_by` and `limit`.
+    /// The merged set is then sorted and limited according to `order_by` and `limit`, which is
+    /// normalized as a search's is ([`normalize_limit`]).
     pub fn merge_from(
         &mut self,
         other: LabelQueryResult,
         order_by: SearchResultOrdering,
         limit: usize,
     ) {
+        let limit = normalize_limit(limit);
         let mut merged: AHashMap<String, LabelSearchResult> =
             AHashMap::with_capacity(self.results.len() + other.results.len());
 
@@ -273,28 +263,9 @@ impl LabelQueryResult {
             }
         }
 
-        let merged_has_more = merged.len() > limit;
-
-        let results = if merged_has_more {
-            let comparator = compare_search_results(order_by);
-            let mut items: Vec<_> = merged.into_values().collect();
-            items.sort_by(comparator);
-            items.truncate(limit);
-            items
-        } else {
-            collect_limited_with_heap(merged.into_values(), order_by, limit).results
-        };
-
-        self.has_more = self.has_more || other.has_more || merged_has_more;
-        self.results = results;
-    }
-}
-
-impl std::ops::Deref for LabelQueryResult {
-    type Target = Vec<LabelSearchResult>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.results
+        let merged = select_best(merged.into_values().collect(), order_by, limit);
+        self.has_more = self.has_more || other.has_more || merged.has_more;
+        self.results = merged.results;
     }
 }
 
@@ -339,53 +310,58 @@ pub trait LabelQuerier {
     ) -> TsdbResult<LabelQueryResult>;
 }
 
-type ComparisonFn = fn(&LabelSearchResult, &LabelSearchResult) -> Ordering;
+/// The fields a result is ranked by, borrowed, so that a candidate can be compared with the
+/// results kept so far before its value is copied.
+#[derive(Clone, Copy, Debug)]
+struct RankKey<'a> {
+    value: &'a str,
+    score: f64,
+    cardinality: usize,
+}
 
-/// `compare_search_results` returns the total-order comparison function for the
-/// given Ordering. For `OrderByValueAsc` and `OrderByValueDesc` the order is on
-/// value alone. For `OrderByScoreDesc` the order is (score desc, value asc),
-/// which is a total order and defines the position at which a duplicate value
-/// is first emitted by the streaming merge.
-fn compare_search_results(order: SearchResultOrdering) -> ComparisonFn {
-    fn value_asc(a: &LabelSearchResult, b: &LabelSearchResult) -> Ordering {
-        a.value.cmp(&b.value)
-    }
-
-    fn value_desc(a: &LabelSearchResult, b: &LabelSearchResult) -> Ordering {
-        b.value.cmp(&a.value)
-    }
-
-    fn score_desc(a: &LabelSearchResult, b: &LabelSearchResult) -> Ordering {
-        match b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal) {
-            Ordering::Equal => value_asc(a, b),
-            other => other,
+impl LabelSearchResult {
+    fn rank_key(&self) -> RankKey<'_> {
+        RankKey {
+            value: &self.value,
+            score: self.score,
+            cardinality: self.cardinality,
         }
-    }
-
-    fn cardinality_asc(a: &LabelSearchResult, b: &LabelSearchResult) -> Ordering {
-        match a.cardinality.cmp(&b.cardinality) {
-            Ordering::Equal => value_asc(a, b),
-            other => other,
-        }
-    }
-
-    fn cardinality_desc(a: &LabelSearchResult, b: &LabelSearchResult) -> Ordering {
-        match b.cardinality.cmp(&a.cardinality) {
-            Ordering::Equal => value_asc(a, b),
-            other => other,
-        }
-    }
-
-    match order {
-        SearchResultOrdering::ValueDesc => value_desc,
-        SearchResultOrdering::ScoreDesc => score_desc,
-        SearchResultOrdering::CardinalityAsc => cardinality_asc,
-        SearchResultOrdering::CardinalityDesc => cardinality_desc,
-        SearchResultOrdering::ValueAsc => value_asc,
     }
 }
 
-fn normalize_limit(limit: usize) -> usize {
+impl SearchResultOrdering {
+    /// The one ranking rule every label search uses: `Less` means `a` comes first.
+    ///
+    /// A total order: score and cardinality ties fall back to the value, ascending, and scores
+    /// compare by [`f64::total_cmp`], so even a NaN from a [`FuzzyFilter`] has one place and
+    /// cannot make a sort panic.
+    fn compare(self, a: RankKey<'_>, b: RankKey<'_>) -> Ordering {
+        let by_value = || a.value.cmp(b.value);
+        match self {
+            SearchResultOrdering::ValueAsc => by_value(),
+            SearchResultOrdering::ValueDesc => b.value.cmp(a.value),
+            SearchResultOrdering::ScoreDesc => b.score.total_cmp(&a.score).then_with(by_value),
+            SearchResultOrdering::CardinalityAsc => {
+                a.cardinality.cmp(&b.cardinality).then_with(by_value)
+            }
+            SearchResultOrdering::CardinalityDesc => {
+                b.cardinality.cmp(&a.cardinality).then_with(by_value)
+            }
+        }
+    }
+}
+
+/// [`SearchResultOrdering::compare`] over whole results.
+fn compare_search_results(
+    order: SearchResultOrdering,
+) -> impl Fn(&LabelSearchResult, &LabelSearchResult) -> Ordering + Copy {
+    move |a, b| order.compare(a.rank_key(), b.rank_key())
+}
+
+/// A requested result limit as every collector applies it: `0` means the default, and the
+/// limit is capped at [`SEARCH_RESULT_LIMIT_MAX`]. Each entry point normalizes once; the
+/// helpers below it take a limit in `1..=SEARCH_RESULT_LIMIT_MAX`.
+pub(crate) fn normalize_limit(limit: usize) -> usize {
     if limit == 0 {
         SEARCH_RESULT_DEFAULT_LIMIT
     } else {
@@ -394,31 +370,41 @@ fn normalize_limit(limit: usize) -> usize {
     .min(SEARCH_RESULT_LIMIT_MAX)
 }
 
-/// `apply_search_hints` sorts and limits a slice of values according to hints,
-/// returning a [`LabelQueryResult`] that includes a `has_more` flag indicating
-/// whether any entries were truncated at the limit.
+/// `apply_search_hints` keeps the best `hints.limit` of `values` under the hints' ordering,
+/// sorted, returning a [`LabelQueryResult`] whose `has_more` says whether any were cut.
 pub(crate) fn apply_search_hints(
-    mut values: Vec<LabelSearchResult>,
+    values: Vec<LabelSearchResult>,
     hints: &SearchHints,
 ) -> LabelQueryResult {
-    let limit = normalize_limit(hints.limit);
+    select_best(values, hints.order_by, normalize_limit(hints.limit))
+}
 
-    let comparator = compare_search_results(hints.order_by);
-    values.sort_by(comparator);
-
-    let has_more = limit > 0 && values.len() > limit;
+/// The best `limit` of `values` under `order`, sorted, in place: a selection then a sort of
+/// what is kept, rather than a sort of every candidate, which may be every distinct value of a
+/// label.
+fn select_best(
+    mut values: Vec<LabelSearchResult>,
+    order: SearchResultOrdering,
+    limit: usize,
+) -> LabelQueryResult {
+    debug_assert!((1..=SEARCH_RESULT_LIMIT_MAX).contains(&limit));
+    let cmp = compare_search_results(order);
+    let has_more = values.len() > limit;
     if has_more {
+        values.select_nth_unstable_by(limit - 1, cmp);
         values.truncate(limit);
     }
+    values.sort_unstable_by(cmp);
     LabelQueryResult::new(values, has_more)
 }
 
+/// Runs `f` with the hints' filter, or without `SEARCH` one that accepts everything with a
+/// score of 1 and never looks at the candidate.
 fn with_search_filter<R>(hints: &SearchHints, f: impl FnOnce(&dyn FuzzyFilter) -> R) -> R {
-    if let Some(filter) = &hints.filter {
-        return f(filter.as_ref());
+    match &hints.filter {
+        Some(filter) => f(filter.as_ref()),
+        None => f(&NoOpSearchMatcher),
     }
-    let default_filter: Box<dyn FuzzyFilter> = Box::new(SimilarityFilter::default());
-    f(default_filter.as_ref())
 }
 
 fn can_use_unscoped_scan(select_hints: Option<&SelectHints>) -> bool {
@@ -479,23 +465,13 @@ pub(crate) fn label_search_exceeds_inline_budget(
     .then(|| normalize_limit(hints.limit) + 1);
 
     if scoped {
-        // A name search reporting cardinalities walks every value of every name it finds,
-        // however few series matched.
-        let reads_name_cardinality = label_name.is_none()
-            && (hints.include_meta
-                || matches!(
-                    hints.order_by,
-                    SearchResultOrdering::CardinalityAsc | SearchResultOrdering::CardinalityDesc
-                ));
+        // A scoped search reads only the series it matches, and counts names and values from
+        // them alone.
         let postings = index.get_postings();
         return match plan {
             // Planned already: the match count is exact, and planning is paid for.
-            Some(plan) => {
-                plan.remaining() > INLINE_SERIES_READ_LIMIT
-                    || (reads_name_cardinality && postings.label_index.len() > entries_budget)
-            }
-            // Also bound the term dictionary: regex planning and name-cardinality lookups can
-            // scan it, even for few series.
+            Some(plan) => plan.remaining() > INLINE_SERIES_READ_LIMIT,
+            // Also bound the term dictionary: regex planning can scan it, even for few series.
             None => {
                 postings.count() > INLINE_SERIES_READ_LIMIT
                     || postings.label_index.len() > entries_budget
@@ -534,13 +510,12 @@ pub(crate) fn label_search_exceeds_inline_budget(
 }
 
 /// `collect_limited` collects up to `limit + 1` items from `iter`, then truncates to `limit`
-/// and sets `has_more` if the extra item was present. When `limit` is 0, all items are
-/// collected and `has_more` is always `false`.
+/// and sets `has_more` if the extra item was present. `limit` is normalized already.
 fn collect_limited(
     iter: impl Iterator<Item = LabelSearchResult>,
     limit: usize,
 ) -> LabelQueryResult {
-    let limit = if limit == 0 { DEFAULT_LIMIT } else { limit };
+    debug_assert!((1..=SEARCH_RESULT_LIMIT_MAX).contains(&limit));
 
     let mut items: Vec<LabelSearchResult> = iter.take(limit + 1).collect();
     let has_more = items.len() > limit;
@@ -550,29 +525,103 @@ fn collect_limited(
     LabelQueryResult::new(items, has_more)
 }
 
-/// `collect_limited_with_heap` keeps only the best `limit` results in memory for non-value
-/// orderings where we cannot stream directly from the index order.
-fn collect_limited_with_heap(
+/// The best `limit` of the results offered to it under one ordering, and whether more than
+/// `limit` were offered.
+///
+/// It holds at most `2 * limit` results. When full it keeps the best `limit`, by selection
+/// rather than a sort, and from then on turns away, without copying it, any candidate that
+/// does not beat the worst of those. The one sort is over at most `2 * limit` results, in
+/// [`Self::finish`].
+struct TopK {
+    order: SearchResultOrdering,
+    limit: usize,
+    items: Vec<LabelSearchResult>,
+    /// Whether `items[limit - 1]` is the worst of `limit` results already kept, and so the
+    /// bar a candidate must beat. Results pushed after it do not move it.
+    bounded: bool,
+    offered: usize,
+}
+
+impl TopK {
+    fn new(order: SearchResultOrdering, limit: usize) -> Self {
+        debug_assert!(
+            (1..=SEARCH_RESULT_LIMIT_MAX).contains(&limit),
+            "a label search limit is normalized first"
+        );
+        let limit = limit.max(1);
+        Self {
+            order,
+            limit,
+            items: Vec::with_capacity(limit.saturating_mul(2).min(INITIAL_RESULT_CAPACITY)),
+            bounded: false,
+            offered: 0,
+        }
+    }
+
+    fn admits(&self, key: RankKey<'_>) -> bool {
+        !self.bounded
+            || self
+                .order
+                .compare(key, self.items[self.limit - 1].rank_key())
+                .is_lt()
+    }
+
+    /// Offer the result `key` ranks, made by `make` only if it is kept.
+    fn offer_with(&mut self, key: RankKey<'_>, make: impl FnOnce() -> LabelSearchResult) {
+        self.offered += 1;
+        if self.admits(key) {
+            self.push(make());
+        }
+    }
+
+    fn offer(&mut self, item: LabelSearchResult) {
+        self.offered += 1;
+        if self.admits(item.rank_key()) {
+            self.push(item);
+        }
+    }
+
+    fn push(&mut self, item: LabelSearchResult) {
+        self.items.push(item);
+        if self.items.len() >= self.limit.saturating_mul(2) {
+            self.keep_best();
+        }
+    }
+
+    /// The worst of the best `limit` results offered so far. At least `limit` must have been
+    /// offered.
+    fn worst_kept(&mut self) -> &LabelSearchResult {
+        if !self.bounded {
+            self.keep_best();
+        }
+        &self.items[self.limit - 1]
+    }
+
+    /// Keep only the best `limit` results, the worst of them at `limit - 1`.
+    fn keep_best(&mut self) {
+        let cmp = compare_search_results(self.order);
+        self.items.select_nth_unstable_by(self.limit - 1, cmp);
+        self.items.truncate(self.limit);
+        self.bounded = true;
+    }
+
+    fn finish(mut self) -> LabelQueryResult {
+        self.items
+            .sort_unstable_by(compare_search_results(self.order));
+        self.items.truncate(self.limit);
+        LabelQueryResult::new(self.items, self.offered > self.limit)
+    }
+}
+
+/// The best `limit` of `iter` under `order`, sorted: see [`TopK`].
+fn collect_top_k(
     iter: impl Iterator<Item = LabelSearchResult>,
     order: SearchResultOrdering,
     limit: usize,
 ) -> LabelQueryResult {
-    let cmp = compare_search_results(order);
-
-    // The comparator already includes the requested direction: the best results
-    // compare less, even for descending scores or cardinalities.
-    let mut items = iter
-        .k_smallest_relaxed_by(limit + 1, &cmp)
-        .collect::<Vec<_>>();
-
-    items.sort_by(cmp);
-
-    let has_more = items.len() > limit;
-    if has_more {
-        items.truncate(limit);
-    }
-
-    LabelQueryResult::new(items, has_more)
+    let mut top = TopK::new(order, limit);
+    iter.for_each(|item| top.offer(item));
+    top.finish()
 }
 
 /// Label-index entries a scan reads under one hold of the postings read lock.
@@ -599,294 +648,183 @@ fn past_label_keys(name: &str) -> Vec<u8> {
     key
 }
 
-fn set_resume_key(slot: &mut Option<Vec<u8>>, key: &[u8]) {
-    let buf = slot.get_or_insert_with(Vec::new);
+/// Overwrite `buf` with the bound that skips every value of `name` and nothing else: `name=\xFF`
+/// above them ([`past_label_keys`]) or `name=` below them ([`first_label_key`]). A bound such as
+/// `name?` would also skip a name like `name>x`, which sorts between `name=…` and `name?`, and
+/// one such as `name` would skip `name2`, which sorts between `name` and `name=`.
+fn set_label_bound(buf: &mut Vec<u8>, name: &str, above: bool) {
     buf.clear();
-    buf.extend_from_slice(key);
+    buf.extend_from_slice(name.as_bytes());
+    buf.push(b'=');
+    if above {
+        buf.push(0xFF);
+    }
 }
 
-/// Get label names in ascending order, applying a fuzzy filter if provided.
-fn iterate_label_names_asc<F>(
-    index: &TimeSeriesIndex,
-    filter: &dyn FuzzyFilter,
-    limit: Option<usize>,
+/// What a name scan does after reading part of its range under one hold.
+enum NameStep<'p> {
+    /// The range ran out.
+    Done,
+    /// The callback asked to stop.
+    Stopped,
+    /// Read on past this rejected name's values; give the lock back first if `release`.
+    Skip { name: &'p str, release: bool },
+    /// Give the lock back and resume beyond this key.
+    Release(&'p [u8]),
+}
+
+/// The state a name scan carries from one hold to the next.
+struct NameScan<'f, F> {
+    filter: &'f dyn FuzzyFilter,
     f: F,
-) -> bool
-where
-    F: FnMut(&str, f64, usize),
-{
-    iterate_label_names_asc_in_holds(index, filter, limit, LABEL_SCAN_ENTRIES_PER_HOLD, f)
+    entries_per_hold: usize,
+    read_this_hold: usize,
+    /// The name of the entries being read. Owned, so that a name whose entries straddle a
+    /// release goes on accumulating after the lock is taken again.
+    curr_name: String,
+    /// If `curr_name` was accepted: its score and the cardinality summed so far.
+    pending: Option<(f64, usize)>,
 }
 
-/// [`iterate_label_names_asc`] reading at most `entries_per_hold` entries per lock hold.
-///
-/// `limit` is the number of accepted names after which the scan stops and reports `has_more`;
-/// `None` reads every name, for a caller ranking them.
-fn iterate_label_names_asc_in_holds<F>(
-    index: &TimeSeriesIndex,
-    filter: &dyn FuzzyFilter,
-    limit: Option<usize>,
-    entries_per_hold: usize,
-    mut f: F,
-) -> bool
+impl<F> NameScan<'_, F>
 where
-    F: FnMut(&str, f64, usize),
+    F: FnMut(&str, f64, usize) -> ControlFlow<()>,
 {
-    let entries_per_hold = entries_per_hold.max(1);
-    let limit = limit.unwrap_or(usize::MAX);
-    // The scan resumes after this key: each restart, whether to skip a rejected name or to
-    // re-take the lock, is a fresh range from here. `None` means from the bottom of the index.
-    let mut resume_after: Option<Vec<u8>> = None;
-    // The name of the entries being read, and, if it was accepted, its score and the
-    // cardinality summed so far. Owned, so a name whose entries straddle a release keeps
-    // accumulating after the lock is taken again.
-    let mut curr_name = String::new();
-    let mut pending: Option<(f64, usize)> = None;
-    let mut has_more = false;
-    let mut count: usize = 0;
+    /// Hand the completed name, if it was accepted, to the callback.
+    fn emit(&mut self) -> ControlFlow<()> {
+        match self.pending.take() {
+            Some((score, cardinality)) => (self.f)(&self.curr_name, score, cardinality),
+            None => ControlFlow::Continue(()),
+        }
+    }
 
-    'hold: loop {
-        // Note: releasing the lock costs the scan its point-in-time view: an entry added before
-        // the resume point after it was passed is not seen, and a label name whose entries
-        // straddle a release is counted from both holds. `f` gets each name as it is
-        // completed; the `&str` is valid only for that call.
-        let postings = index.get_postings();
-        let mut read_this_hold = 0usize;
-
-        'range: loop {
-            let start_bound: Bound<&[u8]> = match &resume_after {
-                Some(key) => Bound::Excluded(key.as_slice()),
-                None => Bound::Unbounded,
+    fn read<'p>(
+        &mut self,
+        postings: &Postings,
+        entries: impl Iterator<Item = (&'p IndexKey, &'p PostingsBitmap)>,
+    ) -> NameStep<'p> {
+        for (key, map) in entries {
+            self.read_this_hold += 1;
+            let hold_full = self.read_this_hold >= self.entries_per_hold;
+            // An entry only hidden or tombstoned series carry does not exist yet, and a
+            // malformed one is passed over: neither is a name, but both count toward the hold.
+            let visible = postings.visible_cardinality(map) as usize;
+            let name = if visible == 0 {
+                None
+            } else {
+                key.split().map(|(name, _)| name)
             };
-
-            for (key, map) in postings
-                .label_index
-                .range::<[u8], _>((start_bound, Bound::<&[u8]>::Unbounded))
-            {
-                read_this_hold += 1;
-                let visible = postings.visible_cardinality(map) as usize;
-                if visible == 0 {
-                    // Only hidden or tombstoned series carry this entry: it does not exist yet.
-                    if read_this_hold >= entries_per_hold {
-                        set_resume_key(&mut resume_after, key.as_ref());
-                        continue 'hold;
+            if let Some(name) = name {
+                if self.curr_name != name {
+                    if self.emit().is_break() {
+                        return NameStep::Stopped;
                     }
-                    continue;
-                }
-                let Some((key_name, _)) = key.split() else {
-                    // Defensive: a malformed entry is passed over, never re-visited.
-                    if read_this_hold >= entries_per_hold {
-                        // Malformed entries still count toward the lock budget.
-                        set_resume_key(&mut resume_after, key.as_ref());
-                        continue 'hold;
-                    }
-                    continue;
-                };
-
-                if curr_name != key_name {
-                    if let Some((score, cardinality)) = pending.take() {
-                        if count == limit {
-                            has_more = true;
-                            break 'hold;
-                        }
-                        f(&curr_name, score, cardinality);
-                        count += 1;
-                    }
-                    curr_name.clear();
-                    curr_name.push_str(key_name);
-
-                    let (accepted, score) = filter.accept(key_name);
+                    self.curr_name.clear();
+                    self.curr_name.push_str(name);
+                    let (accepted, score) = self.filter.accept(name);
                     if !accepted {
-                        // Jump past every value of this name, and nothing else: see
-                        // `past_label_keys`. A bound such as "name?" would also skip a name
-                        // like "name>x", which sorts between "name=…" and "name?".
-                        resume_after = Some(past_label_keys(key_name));
-                        if read_this_hold >= entries_per_hold {
-                            continue 'hold;
-                        }
-                        continue 'range;
+                        return NameStep::Skip {
+                            name,
+                            release: hold_full,
+                        };
                     }
-                    pending = Some((score, visible));
-                } else if let Some((_, cardinality)) = pending.as_mut() {
+                    self.pending = Some((score, visible));
+                } else if let Some((_, cardinality)) = self.pending.as_mut() {
                     *cardinality += visible;
                 }
-
-                if read_this_hold >= entries_per_hold {
-                    // Give the lock back and resume after this entry.
-                    set_resume_key(&mut resume_after, key.as_ref());
-                    continue 'hold;
-                }
             }
-            // The range ran out: the scan is done.
-            break 'hold;
+            if hold_full {
+                return NameStep::Release(key.as_ref());
+            }
         }
+        NameStep::Done
     }
-
-    // The last name the scan read is still pending: reported if there is room for it, and
-    // otherwise proof that there is more than the limit.
-    if let Some((score, cardinality)) = pending {
-        if count < limit {
-            f(&curr_name, score, cardinality);
-        } else {
-            has_more = true;
-        }
-    }
-
-    has_more
 }
 
-/// Get label names in ascending order, applying a fuzzy filter if provided. Takes the postings
-/// read lock itself and gives it back periodically; see [`iterate_label_names_asc`].
-fn get_label_names_asc(
-    index: &TimeSeriesIndex,
-    filter: &dyn FuzzyFilter,
-    limit: usize,
-) -> ValkeyResult<LabelQueryResult> {
-    index.read_without_swap(|| {
-        let mut results: Vec<LabelSearchResult> = Vec::with_capacity(limit.min(DEFAULT_LIMIT));
-        let has_more = iterate_label_names_asc(
-            index,
-            filter,
-            Some(limit),
-            |key_name, score, cardinality| {
-                results.push(LabelSearchResult {
-                    value: key_name.to_owned(),
-                    score,
-                    cardinality,
-                });
-            },
-        );
-        Ok(LabelQueryResult::new(results, has_more))
-    })
-}
-
-/// Get label names in descending order, applying a fuzzy filter if provided. Efficiently skips label names
-/// that don't match the filter by using the index ordering to jump past them.
+/// Hand each label name in the label index between the keys `after` and `before` (both
+/// exclusive, `None` for no bound) that `filter` accepts to `f`, with its score and the visible
+/// series count summed over its values, until `f` breaks.
 ///
-/// Like [`iterate_label_names_asc`], it takes the postings read lock itself and gives it back
-/// every [`LABEL_SCAN_ENTRIES_PER_HOLD`] entries, so it must not be called with the postings
-/// lock held, and it is not a point-in-time view.
-fn get_label_names_desc(
+/// Names come in index-key order, descending if `descending`. That is the byte order of the
+/// `name=value` keys, which is not quite the order of the names: `job2=…` sorts before `job=…`,
+/// because `2` sorts before `=`. See [`rank_label_names`] for what that costs a value-ordered
+/// search.
+///
+/// It takes the postings read lock itself and gives it back every `entries_per_hold` entries,
+/// so it must not be called with that lock held. Giving it back costs the scan its
+/// point-in-time view: an entry added behind the resume point after it was passed is not
+/// seen. A name whose entries straddle a release is still reported once, with one count summed
+/// across the holds. `f` gets each name as it is completed; the `&str` is valid only for that
+/// call.
+fn scan_label_names_in_holds<F>(
     index: &TimeSeriesIndex,
     filter: &dyn FuzzyFilter,
-    limit: usize,
-) -> ValkeyResult<LabelQueryResult> {
-    index.read_without_swap(|| {
-        Ok(get_label_names_desc_in_holds(
-            index,
-            filter,
-            limit,
-            LABEL_SCAN_ENTRIES_PER_HOLD,
-        ))
-    })
-}
-
-/// [`get_label_names_desc`] reading at most `entries_per_hold` entries per lock hold.
-fn get_label_names_desc_in_holds(
-    index: &TimeSeriesIndex,
-    filter: &dyn FuzzyFilter,
-    limit: usize,
+    descending: bool,
+    after: Option<&[u8]>,
+    before: Option<&[u8]>,
     entries_per_hold: usize,
-) -> LabelQueryResult {
-    let entries_per_hold = entries_per_hold.max(1);
-    let mut results: Vec<LabelSearchResult> = Vec::with_capacity(limit.min(DEFAULT_LIMIT));
-    let mut current_result: Option<LabelSearchResult> = None;
-    let mut has_more = false;
-    // The scan resumes below this key: each restart, whether to skip a rejected name or to
-    // re-take the lock, is a fresh range under it. `None` means from the top of the index.
-    let mut resume_below: Option<Vec<u8>> = None;
-    // The name of the entries being read. Owned, so a name whose entries straddle a release
-    // keeps accumulating into `current_result` after the lock is taken again.
-    let mut curr_name = String::new();
+    f: F,
+) where
+    F: FnMut(&str, f64, usize) -> ControlFlow<()>,
+{
+    let mut scan = NameScan {
+        filter,
+        f,
+        entries_per_hold: entries_per_hold.max(1),
+        read_this_hold: 0,
+        curr_name: String::new(),
+        pending: None,
+    };
+    let (fixed, start) = if descending {
+        (after, before)
+    } else {
+        (before, after)
+    };
+    let fixed: Bound<&[u8]> = fixed.map_or(Bound::Unbounded, Bound::Excluded);
+    // The moving end of the range: each restart, whether to skip a rejected name or to take
+    // the lock again, reads on beyond it — above it ascending, below it descending. One
+    // buffer serves every restart.
+    let mut resume: Vec<u8> = start.map(<[u8]>::to_vec).unwrap_or_default();
+    let mut resuming = start.is_some();
 
-    'hold: loop {
+    loop {
         let postings = index.get_postings();
-        let mut read_this_hold = 0usize;
-
-        'range: loop {
-            let end_bound: Bound<&[u8]> = match &resume_below {
-                Some(buf) => Bound::Excluded(buf.as_slice()),
-                None => Bound::Unbounded,
+        scan.read_this_hold = 0;
+        loop {
+            let moving: Bound<&[u8]> = if resuming {
+                Bound::Excluded(resume.as_slice())
+            } else {
+                Bound::Unbounded
             };
-
-            for (key, map) in postings
-                .label_index
-                .range::<[u8], _>((Bound::<&[u8]>::Unbounded, end_bound))
-                .rev()
-            {
-                read_this_hold += 1;
-                let visible = postings.visible_cardinality(map) as usize;
-                if visible == 0 {
-                    // Only hidden or tombstoned series carry this entry: it does not exist yet.
-                    if read_this_hold >= entries_per_hold {
-                        set_resume_key(&mut resume_below, key.as_ref());
-                        continue 'hold;
-                    }
-                    continue;
+            let step = if descending {
+                let entries = postings.label_index.range::<[u8], _>((fixed, moving));
+                scan.read(&postings, entries.rev())
+            } else {
+                let entries = postings.label_index.range::<[u8], _>((moving, fixed));
+                scan.read(&postings, entries)
+            };
+            resuming = true;
+            match step {
+                NameStep::Done => {
+                    // The last name read is still pending.
+                    let _ = scan.emit();
+                    return;
                 }
-                let Some((key_name, _)) = key.split() else {
-                    if read_this_hold >= entries_per_hold {
-                        // Malformed entries still count toward the lock budget.
-                        set_resume_key(&mut resume_below, key.as_ref());
-                        continue 'hold;
+                NameStep::Stopped => return,
+                NameStep::Skip { name, release } => {
+                    set_label_bound(&mut resume, name, !descending);
+                    if release {
+                        break;
                     }
-                    continue;
-                };
-
-                if curr_name != key_name {
-                    if let Some(stored) = current_result.take() {
-                        if results.len() == limit {
-                            has_more = true;
-                            break 'hold;
-                        }
-                        results.push(stored);
-                    }
-                    curr_name.clear();
-                    curr_name.push_str(key_name);
-
-                    let (accepted, score) = filter.accept(key_name);
-                    if !accepted {
-                        // Jump past every value of this name: each is "name=value", so all of
-                        // them are at or above "name=". The bound must be "name=", not "name":
-                        // a longer name such as "name2" sorts between the two ("2" < "=") and
-                        // would be skipped with it.
-                        resume_below = Some(first_label_key(key_name));
-                        if read_this_hold >= entries_per_hold {
-                            continue 'hold;
-                        }
-                        continue 'range;
-                    }
-
-                    current_result = Some(LabelSearchResult {
-                        value: key_name.to_owned(),
-                        score,
-                        cardinality: visible,
-                    });
-                } else if let Some(active) = current_result.as_mut() {
-                    active.cardinality += visible;
                 }
-
-                if read_this_hold >= entries_per_hold {
-                    // Give the lock back and resume below this entry.
-                    set_resume_key(&mut resume_below, key.as_ref());
-                    continue 'hold;
+                NameStep::Release(key) => {
+                    resume.clear();
+                    resume.extend_from_slice(key);
+                    break;
                 }
             }
-            // The range ran out: the scan is done.
-            break 'hold;
         }
     }
-
-    // As in the ascending scan: the last name read is either reported or proof of more.
-    if let Some(stored) = current_result {
-        if results.len() < limit {
-            results.push(stored);
-        } else {
-            has_more = true;
-        }
-    }
-
-    LabelQueryResult::new(results, has_more)
 }
 
 /// The values of one label, in index order, read at most `entries_per_hold` entries per hold
@@ -955,33 +893,61 @@ where
             _ => Bound::Excluded(self.past.as_slice()),
         };
         let range = postings.label_index.range::<[u8], _>((lower, upper));
-        let entries: Box<dyn Iterator<Item = (&IndexKey, &PostingsBitmap)>> = if self.descending {
-            Box::new(range.rev())
+        let limits = (self.entries_per_hold, self.results_per_hold);
+        let stopped_at = if self.descending {
+            buffer_label_values(
+                &postings,
+                range.rev(),
+                &mut self.check,
+                &mut self.buffered,
+                limits,
+            )
         } else {
-            Box::new(range)
+            buffer_label_values(
+                &postings,
+                range,
+                &mut self.check,
+                &mut self.buffered,
+                limits,
+            )
         };
-
-        let mut read = 0usize;
-        let mut stopped_at: Option<Vec<u8>> = None;
-        for (key, map) in entries {
-            read += 1;
-            let visible = postings.visible_cardinality(map) as usize;
-            if visible > 0
-                && let Some(result) = (self.check)(key, visible)
-            {
-                self.buffered.push_back(result);
-            }
-            if read == self.entries_per_hold || self.buffered.len() >= self.results_per_hold {
-                stopped_at = Some(key.as_ref().to_vec());
-                break;
-            }
-        }
         match stopped_at {
-            Some(key) => self.resume = Some(key),
+            Some(key) => {
+                let resume = self.resume.get_or_insert_with(Vec::new);
+                resume.clear();
+                resume.extend_from_slice(key);
+            }
             // The range ran out: the scan is done.
             None => self.done = true,
         }
     }
+}
+
+/// One hold of a [`LabelValueScan`], in either direction: buffer what `check` makes of each
+/// entry until `entries_per_hold` entries are read or `results_per_hold` results buffered, and
+/// return the key it stopped at, or `None` if the range ran out.
+fn buffer_label_values<'p, F>(
+    postings: &Postings,
+    entries: impl Iterator<Item = (&'p IndexKey, &'p PostingsBitmap)>,
+    check: &mut F,
+    buffered: &mut VecDeque<LabelSearchResult>,
+    (entries_per_hold, results_per_hold): (usize, usize),
+) -> Option<&'p [u8]>
+where
+    F: FnMut(&IndexKey, usize) -> Option<LabelSearchResult>,
+{
+    for (read, (key, map)) in entries.enumerate() {
+        let visible = postings.visible_cardinality(map) as usize;
+        if visible > 0
+            && let Some(result) = check(key, visible)
+        {
+            buffered.push_back(result);
+        }
+        if read + 1 == entries_per_hold || buffered.len() >= results_per_hold {
+            return Some(key.as_ref());
+        }
+    }
+    None
 }
 
 impl<F> Iterator for LabelValueScan<'_, F>
@@ -1008,218 +974,200 @@ fn label_cardinality_in_holds(
     let entries_per_hold = entries_per_hold.max(1);
     let first = first_label_key(name);
     let past = past_label_keys(name);
-    let mut resume: Option<Vec<u8>> = None;
+    // The last key read, once a hold has ended early: one buffer for every hold.
+    let mut resume: Vec<u8> = Vec::new();
+    let mut resuming = false;
     let mut total = 0u64;
     loop {
         let postings = index.get_postings();
-        let lower: Bound<&[u8]> = match resume.as_deref() {
-            Some(after) => Bound::Excluded(after),
-            None => Bound::Included(first.as_slice()),
+        let lower: Bound<&[u8]> = if resuming {
+            Bound::Excluded(resume.as_slice())
+        } else {
+            Bound::Included(first.as_slice())
         };
-        let mut read = 0usize;
-        let mut stopped_at: Option<Vec<u8>> = None;
-        for (key, map) in postings
+        let mut stopped_at: Option<&[u8]> = None;
+        for (read, (key, map)) in postings
             .label_index
             .range::<[u8], _>((lower, Bound::Excluded(past.as_slice())))
+            .enumerate()
         {
             total += postings.visible_cardinality(map);
-            read += 1;
-            if read == entries_per_hold {
-                stopped_at = Some(key.as_ref().to_vec());
+            if read + 1 == entries_per_hold {
+                stopped_at = Some(key.as_ref());
                 break;
             }
         }
         match stopped_at {
-            Some(key) => resume = Some(key),
+            Some(key) => {
+                resume.clear();
+                resume.extend_from_slice(key);
+                resuming = true;
+            }
             None => return total as usize,
         }
     }
 }
 
-/// `HeapResultHolder` is a helper struct for use in the binary heap below.
-///
-/// It stores the full [`SearchResultOrdering`] (not just [`SortBy`]) because the
-/// correct value tie-break direction depends on which drain direction will be used:
-///
-/// * `drain_asc()` (ascending orderings) yields min → max, so items that should appear
-///   first in the output must compare **less** — value-asc tie-break is correct.
-/// * `drain_desc()` (descending orderings) yields max → min, so items that should appear
-///   first must compare **greater** — value-desc tie-break in `Ord` produces value-asc
-///   output after the drain.
-///
-/// This means the `Ord` implementation can encode the complete desired output order
-/// directly, and no post-drain sort is required.
-///
-/// The value is owned: the name scan feeding the heap gives the postings lock back as it goes,
-/// so nothing borrowed from the postings outlives a hold. Only names that enter the heap are
-/// copied.
-#[derive(Debug, Clone)]
-struct HeapResultHolder {
-    value: String,
-    score: f64,
-    cardinality: usize,
-    order: SearchResultOrdering,
-}
-
-impl HeapResultHolder {
-    fn new(value: &str, score: f64, cardinality: usize, order: SearchResultOrdering) -> Self {
-        Self {
-            value: value.to_owned(),
-            score,
-            cardinality,
-            order,
-        }
-    }
-
-    fn compare_parts(
-        order: SearchResultOrdering,
-        a_value: &str,
-        a_score: f64,
-        a_cardinality: usize,
-        b_value: &str,
-        b_score: f64,
-        b_cardinality: usize,
-    ) -> Ordering {
-        match order {
-            SearchResultOrdering::ValueAsc => a_value.cmp(b_value),
-            SearchResultOrdering::ValueDesc => b_value.cmp(a_value),
-            SearchResultOrdering::ScoreDesc => {
-                match b_score.partial_cmp(&a_score).unwrap_or(Ordering::Equal) {
-                    Ordering::Equal => a_value.cmp(b_value),
-                    other => other,
-                }
-            }
-            SearchResultOrdering::CardinalityAsc => match a_cardinality.cmp(&b_cardinality) {
-                Ordering::Equal => a_value.cmp(b_value),
-                other => other,
-            },
-            SearchResultOrdering::CardinalityDesc => match b_cardinality.cmp(&a_cardinality) {
-                Ordering::Equal => a_value.cmp(b_value),
-                other => other,
-            },
-        }
-    }
-
-    fn compare_candidate(
-        &self,
-        candidate_value: &str,
-        candidate_score: f64,
-        candidate_cardinality: usize,
-    ) -> Ordering {
-        Self::compare_parts(
-            self.order,
-            candidate_value,
-            candidate_score,
-            candidate_cardinality,
-            &self.value,
-            self.score,
-            self.cardinality,
-        )
-    }
-}
-
-impl PartialOrd<Self> for HeapResultHolder {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for HeapResultHolder {
-    fn cmp(&self, other: &Self) -> Ordering {
-        Self::compare_parts(
-            self.order,
-            &self.value,
-            self.score,
-            self.cardinality,
-            &other.value,
-            other.score,
-            other.cardinality,
-        )
-    }
-}
-
-impl PartialEq for HeapResultHolder {
-    fn eq(&self, other: &Self) -> bool {
-        self.value == other.value
-            && self.score == other.score
-            && self.cardinality == other.cardinality
-            && self.order == other.order
-    }
-}
-
-impl Eq for HeapResultHolder {}
-
-fn get_label_names_top_k(
+/// The best `limit` label names under `order` that `filter` accepts, each with the visible
+/// series count summed over its values, and whether there are more. See [`rank_label_names_in_holds`].
+fn rank_label_names(
     index: &TimeSeriesIndex,
     filter: &dyn FuzzyFilter,
     order: SearchResultOrdering,
     limit: usize,
 ) -> ValkeyResult<LabelQueryResult> {
-    let limit = if limit == 0 { DEFAULT_LIMIT } else { limit };
-    index.read_without_swap(|| Ok(get_label_names_top_k_once(index, filter, order, limit)))
+    index.read_without_swap(|| {
+        Ok(rank_label_names_in_holds(
+            index,
+            filter,
+            order,
+            limit,
+            LABEL_SCAN_ENTRIES_PER_HOLD,
+        ))
+    })
 }
 
-/// One attempt of [`get_label_names_top_k`].
-fn get_label_names_top_k_once(
+/// [`rank_label_names`] reading at most `entries_per_hold` entries per lock hold.
+///
+/// A score or cardinality order must see every name. A value order stops the scan, as a
+/// stream would, once it has `limit + 1` names, but the scan's order is that of the index
+/// keys, not of the names ([`scan_label_names_in_holds`]), so it then reads the few names that
+/// could still belong in the answer. Take `w`, the worst name kept when the scan stops:
+///
+/// * ascending, a name `p` not yet read can sort before `w` only if `p` is a proper prefix of
+///   `w` followed in it by a byte below `=` (`job` and `job2`): its keys come after `w`'s.
+///   Each is looked up directly.
+/// * descending, a name not yet read can sort after `w` only if it extends `w` by a byte below
+///   `=`; all of those sit in one key range, just below `w`'s own keys, which is read.
+///
+/// For any other pair of names the first differing byte lies inside both names and decides
+/// the key order and the name order alike.
+fn rank_label_names_in_holds(
     index: &TimeSeriesIndex,
     filter: &dyn FuzzyFilter,
     order: SearchResultOrdering,
     limit: usize,
+    entries_per_hold: usize,
 ) -> LabelQueryResult {
-    let mut heap: MinMaxHeap<HeapResultHolder> = MinMaxHeap::with_capacity(limit + 2);
-    let mut has_more = false;
-    // Unbounded: the heap bounds the result, and every name is a candidate for it.
-    let _ = iterate_label_names_asc(index, filter, None, |key_name, score, cardinality| {
-        if heap.len() == limit {
-            let Some(worst) = heap.peek_max() else {
-                return;
-            };
+    let mut top = TopK::new(order, limit);
+    let offer = |top: &mut TopK, name: &str, score: f64, cardinality: usize| {
+        let key = RankKey {
+            value: name,
+            score,
+            cardinality,
+        };
+        // The name is valid only for the call, so only one that is kept is copied.
+        top.offer_with(key, || LabelSearchResult {
+            value: name.to_owned(),
+            score,
+            cardinality,
+        });
+    };
 
-            has_more = true;
-
-            let candidate_cmp = worst.compare_candidate(key_name, score, cardinality);
-            if candidate_cmp != Ordering::Less {
-                return;
-            }
-
-            heap.pop_max();
+    let descending = match order {
+        SearchResultOrdering::ValueAsc => false,
+        SearchResultOrdering::ValueDesc => true,
+        SearchResultOrdering::ScoreDesc
+        | SearchResultOrdering::CardinalityAsc
+        | SearchResultOrdering::CardinalityDesc => {
+            scan_label_names_in_holds(
+                index,
+                filter,
+                false,
+                None,
+                None,
+                entries_per_hold,
+                |name, score, cardinality| {
+                    offer(&mut top, name, score, cardinality);
+                    ControlFlow::Continue(())
+                },
+            );
+            return top.finish();
         }
+    };
 
-        heap.push(HeapResultHolder::new(key_name, score, cardinality, order));
-    });
+    // The last name the scan read, if it stopped early: the names at and before it in the
+    // scan's order have all been read.
+    let mut last: Option<String> = None;
+    scan_label_names_in_holds(
+        index,
+        filter,
+        descending,
+        None,
+        None,
+        entries_per_hold,
+        |name, score, cardinality| {
+            offer(&mut top, name, score, cardinality);
+            if top.offered > top.limit {
+                last = Some(name.to_owned());
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        },
+    );
+    let Some(last) = last else {
+        // The scan read every name.
+        return top.finish();
+    };
+    let worst = top.worst_kept().value.clone();
+    let read_to = first_label_key(&last);
 
-    let results: Vec<LabelSearchResult> = heap
-        .drain_asc()
-        .map(|h| LabelSearchResult {
-            value: h.value,
-            score: h.score,
-            cardinality: h.cardinality,
-        })
-        .collect();
-
-    LabelQueryResult::new(results, has_more)
+    if descending {
+        // Extensions of `worst` by a byte below `=` lie between the key `worst` and
+        // `worst=`; only those below `last`'s keys are unread.
+        let below = first_label_key(&worst).min(read_to);
+        if worst.as_bytes() < below.as_slice() {
+            scan_label_names_in_holds(
+                index,
+                filter,
+                false,
+                Some(worst.as_bytes()),
+                Some(&below),
+                entries_per_hold,
+                |name, score, cardinality| {
+                    offer(&mut top, name, score, cardinality);
+                    ControlFlow::Continue(())
+                },
+            );
+        }
+    } else {
+        let mut prefix_key = Vec::new();
+        for (end, byte) in worst.bytes().enumerate().skip(1) {
+            if byte >= b'=' {
+                continue;
+            }
+            // ASCII, so `end` is a character boundary.
+            let prefix = &worst[..end];
+            set_label_bound(&mut prefix_key, prefix, false);
+            if prefix_key <= read_to {
+                continue; // Read already.
+            }
+            let (accepted, score) = filter.accept(prefix);
+            if !accepted {
+                continue;
+            }
+            match label_cardinality_in_holds(index, prefix, entries_per_hold) {
+                0 => {}
+                cardinality => offer(&mut top, prefix, score, cardinality),
+            }
+        }
+    }
+    top.finish()
 }
 
-/// `collect_unscoped_label_names` attempts to satisfy a label name search by scanning the label index directly
+/// `collect_unscoped_label_names` answers a label name search from the label index alone.
 ///
 /// Takes the index rather than locked postings so that each scan owns its postings read lock
 /// and gives it back periodically, so writers are not starved (see
-/// [`iterate_label_names_asc`]). No lock is held here: the scans take it themselves, and a read
-/// lock taken again behind a waiting writer can deadlock.
+/// [`scan_label_names_in_holds`]). No lock is held here: the scans take it themselves, and a
+/// read lock taken again behind a waiting writer can deadlock.
 fn collect_unscoped_label_names(
     index: &TimeSeriesIndex,
     hints: &SearchHints,
 ) -> ValkeyResult<LabelQueryResult> {
     let limit = normalize_limit(hints.limit);
-
-    with_search_filter(hints, |filter| match hints.order_by {
-        SearchResultOrdering::ValueAsc => get_label_names_asc(index, filter, limit),
-        SearchResultOrdering::ValueDesc => get_label_names_desc(index, filter, limit),
-        SearchResultOrdering::ScoreDesc
-        | SearchResultOrdering::CardinalityAsc
-        | SearchResultOrdering::CardinalityDesc => {
-            get_label_names_top_k(index, filter, hints.order_by, limit)
-        }
+    with_search_filter(hints, |filter| {
+        rank_label_names(index, filter, hints.order_by, limit)
     })
 }
 
@@ -1284,7 +1232,7 @@ fn collect_unscoped_label_values_in_holds(
                 ),
                 SearchResultOrdering::ScoreDesc
                 | SearchResultOrdering::CardinalityAsc
-                | SearchResultOrdering::CardinalityDesc => collect_limited_with_heap(
+                | SearchResultOrdering::CardinalityDesc => collect_top_k(
                     LabelValueScan::new(
                         index,
                         label_name,
@@ -1313,78 +1261,61 @@ fn collect_label_names<S: GilSource + ?Sized>(
     }
 
     // At this point we know we have non-empty selectors or a date range.
-    let db = src.db();
-    let result = select_hints
+    //
+    // Under the lock, only each distinct name and how many matched series carry it are
+    // copied out: a hash lookup per label. The filter then runs once per distinct name, after
+    // the read. A name's cardinality counts the selected series, as a value's does, so that
+    // the counts of a cluster's shards add up to the selection's.
+    //
+    // Still unbounded: every matched series is scanned, `counts` holds every distinct name in
+    // the match, and on the main thread (`&Context`) the whole scan is one lock hold. The
+    // batched reader bounds only a fan-out share's lock holds, not the scan or the set.
+    let counts = select_hints
         .unwrap_or_default()
-        .read_planned(db, |cursor| {
-            let generation = cursor.generation();
-
-            // Under the lock, only the distinct names are copied out: a hash lookup per label.
-            // The fuzzy filter and the cardinality lookups wait until the read is over.
-            //
-            // Still unbounded: every matched series is scanned, `names` holds every distinct
-            // name in the match, and on the main thread (`&Context`) the whole scan is one lock
-            // hold. The batched reader bounds only a fan-out share's lock holds, not the scan or
-            // the set.
-            let mut names: AHashSet<String> = AHashSet::with_capacity(DEFAULT_LIMIT);
+        .read_planned(src.db(), |cursor| {
+            let mut counts: AHashMap<String, usize> =
+                AHashMap::with_capacity(INITIAL_RESULT_CAPACITY);
             for_each_planned_series(src, cursor, DEFAULT_SERIES_BATCH_SIZE, |_ctx, ts, _key| {
                 for label in ts.labels.iter() {
-                    // Not `names.insert(label.name.to_string())`: that allocates for every
+                    // Not `counts.entry(label.name.to_string())`: that allocates for every
                     // label, seen or not.
-                    if !names.contains(label.name) {
-                        names.insert(label.name.to_string());
+                    match counts.get_mut(label.name) {
+                        Some(count) => *count += 1,
+                        None => {
+                            counts.insert(label.name.to_string(), 1);
+                        }
                     }
                 }
                 Ok(ControlFlow::Continue(()))
             })?;
-
-            let need_cardinality = matches!(
-                hints.order_by,
-                SearchResultOrdering::CardinalityAsc | SearchResultOrdering::CardinalityDesc
-            ) || hints.include_meta;
-
-            // A name's cardinality is its database-wide one, not the selection's. Each is read in
-            // bounded holds of the postings lock, taken only for names the filter accepts: one
-            // hold across every name would keep the lock for the sum of their values, a million
-            // entries for a name such as `instance`, while index writers wait. Never taken while
-            // the batched read runs either: it takes the postings lock itself, for writing when it
-            // has a stale id to record, and `RwLock` is not reentrant.
-            let index = need_cardinality.then(|| get_db_index(db));
-
-            let result = with_search_filter(hints, |filter| {
-                let mut result = Vec::with_capacity(names.len());
-                for name in names {
-                    let (accepted, score) = filter.accept(&name);
-                    if !accepted {
-                        continue;
-                    }
-                    let cardinality = match index.as_ref() {
-                        Some(index) => match label_cardinality_in_holds(
-                            index,
-                            &name,
-                            LABEL_SCAN_ENTRIES_PER_HOLD,
-                        ) {
-                            0 => continue,
-                            cardinality => cardinality,
-                        },
-                        None => 0,
-                    };
-                    result.push(LabelSearchResult {
-                        value: name,
-                        score,
-                        cardinality,
-                    });
-                }
-                apply_search_hints(result, hints)
-            });
-            // The cardinalities are read after the scan, in holds of their own: they belong to
-            // the scanned database only if no `SWAPDB` came in between.
-            if index.is_some() {
-                ensure_generation(db, generation)?;
-            }
-            Ok(result)
+            Ok(counts)
         })?;
-    Ok(result)
+
+    Ok(collect_counted(counts, hints))
+}
+
+/// The scoped search's answer from each distinct name or value of the selection and how many
+/// selected series carry it: those the hints' filter accepts, ranked and limited.
+fn collect_counted(counts: AHashMap<String, usize>, hints: &SearchHints) -> LabelQueryResult {
+    let need_cardinality = matches!(
+        hints.order_by,
+        SearchResultOrdering::CardinalityAsc | SearchResultOrdering::CardinalityDesc
+    ) || hints.include_meta;
+
+    with_search_filter(hints, |filter| {
+        let mut result = Vec::with_capacity(counts.len());
+        for (value, count) in counts {
+            let (accepted, score) = filter.accept(&value);
+            if accepted {
+                result.push(LabelSearchResult {
+                    value,
+                    score,
+                    cardinality: if need_cardinality { count } else { 0 },
+                });
+            }
+        }
+        apply_search_hints(result, hints)
+    })
 }
 
 fn collect_label_values<S: GilSource + ?Sized>(
@@ -1418,7 +1349,8 @@ fn collect_label_values<S: GilSource + ?Sized>(
     let counts = select_hints
         .unwrap_or_default()
         .read_planned(src.db(), |cursor| {
-            let mut counts: AHashMap<String, usize> = AHashMap::with_capacity(DEFAULT_LIMIT);
+            let mut counts: AHashMap<String, usize> =
+                AHashMap::with_capacity(INITIAL_RESULT_CAPACITY);
             for_each_planned_series(src, cursor, DEFAULT_SERIES_BATCH_SIZE, |_ctx, ts, _key| {
                 if let Some(label) = ts.get_label(label_name) {
                     match counts.get_mut(label.value) {
@@ -1433,25 +1365,7 @@ fn collect_label_values<S: GilSource + ?Sized>(
             Ok(counts)
         })?;
 
-    let need_cardinality = matches!(
-        search_hints.order_by,
-        SearchResultOrdering::CardinalityAsc | SearchResultOrdering::CardinalityDesc
-    ) || search_hints.include_meta;
-
-    Ok(with_search_filter(search_hints, |filter| {
-        let mut result = Vec::with_capacity(counts.len());
-        for (value, count) in counts {
-            let (accepted, score) = filter.accept(&value);
-            if accepted {
-                result.push(LabelSearchResult {
-                    value,
-                    score,
-                    cardinality: if need_cardinality { count } else { 0 },
-                });
-            }
-        }
-        apply_search_hints(result, search_hints)
-    }))
+    Ok(collect_counted(counts, search_hints))
 }
 
 /// The coarse gate on label discovery, checked under one short lock hold: on a fan-out
@@ -1508,18 +1422,17 @@ impl LabelQuerier for DefaultLabelQuerier {
 #[cfg(test)]
 mod tests {
     use super::{
-        FuzzyFilter, LabelQueryResult, LabelSearchResult, SearchHints, SearchResultOrdering,
-        SimilarityFilter, TimeSeriesIndex, apply_search_hints, collect_limited_with_heap,
+        FuzzyFilter, LabelQueryResult, LabelSearchResult, NoOpSearchMatcher, SearchHints,
+        SearchResultOrdering, TimeSeriesIndex, apply_search_hints, collect_top_k,
         collect_unscoped_label_names, collect_unscoped_label_values,
-        collect_unscoped_label_values_in_holds, get_label_names_desc_in_holds,
-        iterate_label_names_asc_in_holds, label_cardinality_in_holds,
-        label_search_exceeds_inline_budget,
+        collect_unscoped_label_values_in_holds, compare_search_results, label_cardinality_in_holds,
+        label_search_exceeds_inline_budget, rank_label_names_in_holds, scan_label_names_in_holds,
     };
     use crate::labels::{Label, MetricName};
     use crate::series::TimeSeries;
-    use crate::series::index::FuzzyAlgorithm;
     use crate::series::index::postings::Postings;
     use itertools::Itertools;
+    use std::ops::ControlFlow;
 
     /// One series on each side of an import: `imported` will be hidden, `local` stays visible.
     fn index_with_hidden_series() -> TimeSeriesIndex {
@@ -1818,42 +1731,6 @@ mod tests {
     }
 
     #[test]
-    fn similarity_filter_defaults_to_case_sensitive() {
-        let filter = SimilarityFilter::new("node", FuzzyAlgorithm::JaroWinkler, 1.0);
-        let (accepted, score) = filter.accept("node");
-        assert!(accepted);
-        assert_eq!(1.0, score);
-    }
-
-    #[test]
-    fn similarity_filter_case_sensitive_rejects_case_mismatch() {
-        let filter = SimilarityFilter::new_with_case_sensitivity(
-            "NoDe",
-            FuzzyAlgorithm::JaroWinkler,
-            1.0,
-            true,
-        );
-
-        let (accepted, score) = filter.accept("node");
-        assert!(!accepted);
-        assert!(score < 1.0);
-    }
-
-    #[test]
-    fn similarity_filter_case_insensitive_accepts_case_mismatch() {
-        let filter = SimilarityFilter::new_with_case_sensitivity(
-            "NoDe",
-            FuzzyAlgorithm::JaroWinkler,
-            1.0,
-            false,
-        );
-
-        let (accepted, score) = filter.accept("node");
-        assert!(accepted);
-        assert_eq!(1.0, score);
-    }
-
-    #[test]
     fn collect_unscoped_label_values_orders_ascending() {
         let postings = build_label_values_postings();
         let hints = SearchHints {
@@ -2102,41 +1979,6 @@ mod tests {
     }
 
     #[test]
-    fn jaro_winkler_transposition_matches() {
-        // 'metirc' is a transposition of 'metric'
-        let filter = SimilarityFilter::new_with_case_sensitivity(
-            "metirc",
-            FuzzyAlgorithm::JaroWinkler,
-            0.5,
-            false,
-        );
-        let (accepted, score) = filter.accept("metric");
-        assert!((0.0..=1.0).contains(&score));
-        assert!(
-            accepted,
-            "Expected 'metric' to match 'metirc' with JaroWinkler (score={})",
-            score
-        );
-    }
-
-    #[test]
-    fn subsequence_basic_match() {
-        let filter = SimilarityFilter::new_with_case_sensitivity(
-            "nde",
-            FuzzyAlgorithm::Subsequence,
-            0.3,
-            false,
-        );
-        let (accepted, score) = filter.accept("node");
-        assert!((0.0..=1.0).contains(&score));
-        assert!(
-            accepted,
-            "Expected 'node' to match subsequence 'nde' (score={})",
-            score
-        );
-    }
-
-    #[test]
     fn label_query_result_merge_from_coalesces_duplicates() {
         let mut left = LabelQueryResult::new(
             vec![
@@ -2213,7 +2055,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_limited_with_heap_returns_sorted_results() {
+    fn collect_top_k_returns_sorted_results() {
         let items = vec![
             LabelSearchResult {
                 value: "c".to_string(),
@@ -2233,7 +2075,7 @@ mod tests {
         ];
 
         // Test ValueAsc
-        let result = collect_limited_with_heap(
+        let result = collect_top_k(
             items.clone().into_iter(),
             SearchResultOrdering::ValueAsc,
             10,
@@ -2241,7 +2083,7 @@ mod tests {
         assert_eq!(values(result), vec!["a", "b", "c"]);
 
         // Test ValueDesc
-        let result = collect_limited_with_heap(
+        let result = collect_top_k(
             items.clone().into_iter(),
             SearchResultOrdering::ValueDesc,
             10,
@@ -2249,7 +2091,7 @@ mod tests {
         assert_eq!(values(result), vec!["c", "b", "a"]);
 
         // Test ScoreDesc
-        let result = collect_limited_with_heap(
+        let result = collect_top_k(
             items.clone().into_iter(),
             SearchResultOrdering::ScoreDesc,
             10,
@@ -2257,7 +2099,7 @@ mod tests {
         assert_eq!(values(result), vec!["a", "b", "c"]);
 
         // Test CardinalityAsc
-        let result = collect_limited_with_heap(
+        let result = collect_top_k(
             items.clone().into_iter(),
             SearchResultOrdering::CardinalityAsc,
             10,
@@ -2265,12 +2107,25 @@ mod tests {
         assert_eq!(values(result), vec!["a", "b", "c"]);
 
         // Test CardinalityDesc
-        let result = collect_limited_with_heap(
+        let result = collect_top_k(
             items.clone().into_iter(),
             SearchResultOrdering::CardinalityDesc,
             10,
         );
         assert_eq!(values(result), vec!["c", "b", "a"]);
+    }
+
+    /// The best `limit` of `input` by a full sort: what a bounded selection must agree with.
+    fn sorted_prefix(
+        input: &[LabelSearchResult],
+        order: SearchResultOrdering,
+        limit: usize,
+    ) -> (Vec<LabelSearchResult>, bool) {
+        let mut all = input.to_vec();
+        all.sort_by(compare_search_results(order));
+        let has_more = all.len() > limit;
+        all.truncate(limit);
+        (all, has_more)
     }
 
     #[test]
@@ -2301,20 +2156,58 @@ mod tests {
                             order_by: order,
                             ..Default::default()
                         };
-                        let expected = apply_search_hints(input.to_vec(), &hints);
-                        let actual = collect_limited_with_heap(input.iter().cloned(), order, limit);
-                        assert_eq!(
-                            actual.results, expected.results,
-                            "input {input:?}, order {order:?}, limit {limit}"
-                        );
-                        assert_eq!(
-                            actual.has_more, expected.has_more,
-                            "input {input:?}, order {order:?}, limit {limit}"
-                        );
+                        let (expected, expected_more) = sorted_prefix(input, order, limit);
+                        for actual in [
+                            collect_top_k(input.iter().cloned(), order, limit),
+                            apply_search_hints(input.to_vec(), &hints),
+                        ] {
+                            assert_eq!(
+                                actual.results, expected,
+                                "input {input:?}, order {order:?}, limit {limit}"
+                            );
+                            assert_eq!(
+                                actual.has_more, expected_more,
+                                "input {input:?}, order {order:?}, limit {limit}"
+                            );
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// A filter may score NaN: ranking must still be a total order, so sorting cannot panic
+    /// and a bounded selection keeps what a full sort would.
+    #[test]
+    fn ranking_tolerates_nan_scores() {
+        let items: Vec<LabelSearchResult> = (0..64)
+            .map(|i| LabelSearchResult {
+                value: format!("v{:02}", (i * 37) % 64),
+                score: match i % 4 {
+                    0 => f64::NAN,
+                    1 => -f64::NAN,
+                    _ => (i % 7) as f64 / 7.0,
+                },
+                cardinality: i % 5,
+            })
+            .collect();
+        for order in all_orderings() {
+            let cmp = compare_search_results(order);
+            let (sorted, _) = sorted_prefix(&items, order, items.len());
+            assert!(sorted.windows(2).all(|w| cmp(&w[0], &w[1]).is_lt()));
+            for limit in [1, 3, 10, 63, 64, 100] {
+                let (expected, expected_more) = sorted_prefix(&items, order, limit);
+                let actual = collect_top_k(items.iter().cloned(), order, limit);
+                assert_eq!(actual.results, expected, "{order:?}, limit {limit}");
+                assert_eq!(actual.has_more, expected_more, "{order:?}, limit {limit}");
+            }
+        }
+        let nan = LabelSearchResult {
+            value: "x".into(),
+            score: f64::NAN,
+            cardinality: 1,
+        };
+        assert_eq!(nan, nan.clone());
     }
 
     /// Accepts every name but `beta`, scoring each by its length.
@@ -2341,55 +2234,58 @@ mod tests {
         postings
     }
 
+    /// Every name the scan reports, in its order, with `RejectBeta`.
     fn scan_names(
         index: &TimeSeriesIndex,
-        limit: Option<usize>,
+        descending: bool,
         entries_per_hold: usize,
-    ) -> (Vec<(String, f64, usize)>, bool) {
+    ) -> Vec<(String, f64, usize)> {
         let mut names = Vec::new();
-        let has_more = iterate_label_names_asc_in_holds(
+        scan_label_names_in_holds(
             index,
             &RejectBeta,
-            limit,
+            descending,
+            None,
+            None,
             entries_per_hold,
-            |name, score, cardinality| names.push((name.to_owned(), score, cardinality)),
+            |name, score, cardinality| {
+                names.push((name.to_owned(), score, cardinality));
+                ControlFlow::Continue(())
+            },
         );
-        (names, has_more)
+        names
+    }
+
+    /// The best `limit` names in value order, with `RejectBeta`, and whether there are more.
+    fn rank_names(
+        index: &TimeSeriesIndex,
+        descending: bool,
+        limit: usize,
+        entries_per_hold: usize,
+    ) -> (Vec<String>, bool) {
+        let order = if descending {
+            SearchResultOrdering::ValueDesc
+        } else {
+            SearchResultOrdering::ValueAsc
+        };
+        let result = rank_label_names_in_holds(index, &RejectBeta, order, limit, entries_per_hold);
+        let has_more = result.has_more;
+        (values(result), has_more)
     }
 
     #[test]
     fn name_scan_sums_cardinality_and_skips_rejected_names() {
         let index = index_of(build_multi_value_label_postings());
+        let ascending = vec![
+            ("alpha".to_owned(), 5.0, 3),
+            ("gamma".to_owned(), 5.0, 2),
+            ("service".to_owned(), 7.0, 1),
+        ];
+        let mut descending = ascending.clone();
+        descending.reverse();
 
-        let (names, has_more) = scan_names(&index, None, usize::MAX);
-
-        assert!(!has_more);
-        assert_eq!(
-            names,
-            vec![
-                ("alpha".to_owned(), 5.0, 3),
-                ("gamma".to_owned(), 5.0, 2),
-                ("service".to_owned(), 7.0, 1),
-            ]
-        );
-    }
-
-    /// Giving the lock back after every entry, or every few, resumes where the scan stopped:
-    /// a name split across holds keeps its summed cardinality, and limits cut at the same name.
-    #[test]
-    fn name_scan_is_unchanged_by_where_it_gives_the_lock_back() {
-        let index = index_of(build_multi_value_label_postings());
-
-        for limit in [None, Some(1), Some(2), Some(3)] {
-            let one_hold = scan_names(&index, limit, usize::MAX);
-            for entries_per_hold in [1, 2, 3, 4] {
-                assert_eq!(
-                    scan_names(&index, limit, entries_per_hold),
-                    one_hold,
-                    "limit {limit:?}, {entries_per_hold} entries per hold"
-                );
-            }
-        }
+        assert_eq!(scan_names(&index, false, usize::MAX), ascending);
+        assert_eq!(scan_names(&index, true, usize::MAX), descending);
     }
 
     /// `beta` is rejected; `beta2` shares its prefix and sorts between `beta` and `beta=…`.
@@ -2400,57 +2296,33 @@ mod tests {
         postings
     }
 
-    fn scan_names_desc(
-        index: &TimeSeriesIndex,
-        limit: Option<usize>,
-        entries_per_hold: usize,
-    ) -> (Vec<(String, f64, usize)>, bool) {
-        let result = get_label_names_desc_in_holds(
-            index,
-            &RejectBeta,
-            limit.unwrap_or(usize::MAX),
-            entries_per_hold,
-        );
-        let has_more = result.has_more;
-        let names = result
-            .into_iter()
-            .map(|r| (r.value, r.score, r.cardinality))
-            .collect();
-        (names, has_more)
-    }
-
+    /// Giving the lock back after every entry, or every few, resumes where the scan stopped:
+    /// a name split across holds keeps its summed cardinality, and limits cut at the same name.
     #[test]
-    fn descending_name_scan_sums_cardinality_and_skips_rejected_names() {
-        let index = index_of(build_multi_value_label_postings());
-
-        let (names, has_more) = scan_names_desc(&index, None, usize::MAX);
-
-        assert!(!has_more);
-        assert_eq!(
-            names,
-            vec![
-                ("service".to_owned(), 7.0, 1),
-                ("gamma".to_owned(), 5.0, 2),
-                ("alpha".to_owned(), 5.0, 3),
-            ]
-        );
-    }
-
-    #[test]
-    fn descending_name_scan_is_unchanged_by_where_it_gives_the_lock_back() {
+    fn name_scan_is_unchanged_by_where_it_gives_the_lock_back() {
         for postings in [
             build_multi_value_label_postings(),
             build_prefix_sharing_label_postings(),
         ] {
             let index = index_of(postings);
-            for limit in [None, Some(1), Some(2), Some(3)] {
-                let one_hold = scan_names_desc(&index, limit, usize::MAX);
+            for descending in [false, true] {
+                let one_hold = scan_names(&index, descending, usize::MAX);
                 for entries_per_hold in [1, 2, 3, 4] {
                     assert_eq!(
-                        scan_names_desc(&index, limit, entries_per_hold),
+                        scan_names(&index, descending, entries_per_hold),
                         one_hold,
-                        "limit {limit:?}, {entries_per_hold} entries per hold"
+                        "descending {descending}, {entries_per_hold} entries per hold"
                     );
+                }
+                for limit in [1, 2, 3] {
+                    let one_hold = rank_names(&index, descending, limit, usize::MAX);
+                    for entries_per_hold in [1, 2, 3, 4] {
+                        assert_eq!(
+                            rank_names(&index, descending, limit, entries_per_hold),
+                            one_hold,
+                            "descending {descending}, limit {limit}, {entries_per_hold} per hold"
+                        );
+                    }
                 }
             }
         }
@@ -2470,37 +2342,154 @@ mod tests {
         expected_desc.reverse();
 
         for entries_per_hold in [1, 2, usize::MAX] {
-            assert_eq!(
-                scan_names(&index, None, entries_per_hold),
-                (expected_asc.clone(), false)
-            );
-            assert_eq!(
-                scan_names_desc(&index, None, entries_per_hold),
-                (expected_desc.clone(), false)
-            );
+            assert_eq!(scan_names(&index, false, entries_per_hold), expected_asc);
+            assert_eq!(scan_names(&index, true, entries_per_hold), expected_desc);
         }
     }
 
     /// Three names pass the filter; a limit of two must say there is more, in both directions,
     /// however the scan's holds fall. The last name was once dropped at the end of the range.
     #[test]
-    fn a_name_scan_cut_at_its_last_name_reports_more() {
+    fn a_name_ranking_cut_at_its_last_name_reports_more() {
         let index = index_of(build_multi_value_label_postings());
         for entries_per_hold in [1, 2, 3, usize::MAX] {
-            let (names, has_more) = scan_names(&index, Some(2), entries_per_hold);
-            let names: Vec<_> = names.into_iter().map(|(name, ..)| name).collect();
+            let (names, has_more) = rank_names(&index, false, 2, entries_per_hold);
             assert_eq!(names, ["alpha", "gamma"], "{entries_per_hold} per hold");
             assert!(has_more, "ascending, {entries_per_hold} per hold");
 
-            let (names, has_more) = scan_names_desc(&index, Some(2), entries_per_hold);
-            let names: Vec<_> = names.into_iter().map(|(name, ..)| name).collect();
+            let (names, has_more) = rank_names(&index, true, 2, entries_per_hold);
             assert_eq!(names, ["service", "gamma"], "{entries_per_hold} per hold");
             assert!(has_more, "descending, {entries_per_hold} per hold");
 
-            let (_, has_more) = scan_names(&index, Some(3), entries_per_hold);
+            let (_, has_more) = rank_names(&index, false, 3, entries_per_hold);
             assert!(!has_more, "ascending, exactly the limit");
-            let (_, has_more) = scan_names_desc(&index, Some(3), entries_per_hold);
+            let (_, has_more) = rank_names(&index, true, 3, entries_per_hold);
             assert!(!has_more, "descending, exactly the limit");
+        }
+    }
+
+    /// `job2=…` sorts before `job=…` in the index, but `job` before `job2` by name: a value
+    /// order must follow the names, however small the limit.
+    #[test]
+    fn value_ordered_names_follow_the_names_not_the_index_keys() {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "job", "api");
+        postings.add_posting_for_label_value(1, "job2", "worker");
+        postings.add_posting_for_label_value(1, "scope", "selected");
+        let index = index_of(postings);
+        let names = |order_by, limit| {
+            let hints = SearchHints {
+                limit,
+                order_by,
+                ..Default::default()
+            };
+            let result = collect_unscoped_label_names(&index, &hints).unwrap();
+            let has_more = result.has_more;
+            (values(result), has_more)
+        };
+
+        let asc = SearchResultOrdering::ValueAsc;
+        let desc = SearchResultOrdering::ValueDesc;
+        assert_eq!(
+            names(asc, 10),
+            (vec!["job".into(), "job2".into(), "scope".into()], false)
+        );
+        assert_eq!(names(asc, 1), (vec!["job".into()], true));
+        assert_eq!(names(asc, 2), (vec!["job".into(), "job2".into()], true));
+        assert_eq!(
+            names(desc, 10),
+            (vec!["scope".into(), "job2".into(), "job".into()], false)
+        );
+        assert_eq!(names(desc, 1), (vec!["scope".into()], true));
+        assert_eq!(names(desc, 2), (vec!["scope".into(), "job2".into()], true));
+    }
+
+    /// Rejects names containing `b`; scores by the first byte.
+    struct RejectB;
+
+    impl FuzzyFilter for RejectB {
+        fn accept(&self, value: &str) -> (bool, f64) {
+            (!value.contains('b'), value.as_bytes()[0] as f64 / 256.0)
+        }
+    }
+
+    /// Name ranking agrees with sorting every accepted name, over name sets dense in names that
+    /// extend one another by bytes either side of `=`, for every ordering, limit and hold size.
+    #[test]
+    fn name_ranking_matches_a_full_sort() {
+        // Bytes below `=` ('-', '.', '2') and above it ('a', 'b', 'z').
+        let alphabet = ["-", ".", "2", "a", "b", "z"];
+        let mut all_names: Vec<String> = Vec::new();
+        for a in alphabet {
+            all_names.push(a.to_owned());
+            for b in alphabet {
+                all_names.push(format!("{a}{b}"));
+                for c in ["2", "a"] {
+                    all_names.push(format!("{a}{b}{c}"));
+                }
+            }
+        }
+        // A deterministic pseudo-random choice of name sets.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..60 {
+            let mut postings = Postings::default();
+            let mut id = 1;
+            let mut expected_all: Vec<(String, usize)> = Vec::new();
+            for name in &all_names {
+                if next() % 3 != 0 {
+                    continue;
+                }
+                let values = 1 + (next() % 3) as usize;
+                for v in 0..values {
+                    postings.add_posting_for_label_value(id, name, &format!("v{v}"));
+                    id += 1;
+                }
+                expected_all.push((name.clone(), values));
+            }
+            let index = index_of(postings);
+            for filtered in [false, true] {
+                let filter: &dyn FuzzyFilter = if filtered {
+                    &RejectB
+                } else {
+                    &NoOpSearchMatcher
+                };
+                let accepted: Vec<LabelSearchResult> = expected_all
+                    .iter()
+                    .filter_map(|(name, cardinality)| {
+                        let (ok, score) = filter.accept(name);
+                        ok.then(|| LabelSearchResult {
+                            value: name.clone(),
+                            score,
+                            cardinality: *cardinality,
+                        })
+                    })
+                    .collect();
+                for order in all_orderings() {
+                    for limit in [1, 2, 3, 5, 8, 13, 40] {
+                        let (expected, expected_more) = sorted_prefix(&accepted, order, limit);
+                        for entries_per_hold in [1, 3, usize::MAX] {
+                            let actual = rank_label_names_in_holds(
+                                &index,
+                                filter,
+                                order,
+                                limit,
+                                entries_per_hold,
+                            );
+                            let context = format!(
+                                "round {round}, filtered {filtered}, {order:?}, limit {limit}, {entries_per_hold} per hold"
+                            );
+                            assert_eq!(actual.results, expected, "{context}");
+                            assert_eq!(actual.has_more, expected_more, "{context}");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2551,30 +2540,26 @@ mod tests {
         let index = index_of(postings);
 
         for entries_per_hold in [1, 2, usize::MAX] {
-            let mut ascending = Vec::new();
-            iterate_label_names_asc_in_holds(
-                &index,
-                &RejectJob,
-                None,
-                entries_per_hold,
-                |n, _, _| ascending.push(n.to_owned()),
-            );
-            assert_eq!(
-                ascending,
-                [" lead", "job>x", "jobs"],
-                "{entries_per_hold} per hold"
-            );
-
-            let descending: Vec<_> =
-                get_label_names_desc_in_holds(&index, &RejectJob, usize::MAX, entries_per_hold)
-                    .into_iter()
-                    .map(|r| r.value)
-                    .collect();
-            assert_eq!(
-                descending,
-                ["jobs", "job>x", " lead"],
-                "{entries_per_hold} per hold"
-            );
+            for descending in [false, true] {
+                let mut names = Vec::new();
+                scan_label_names_in_holds(
+                    &index,
+                    &RejectJob,
+                    descending,
+                    None,
+                    None,
+                    entries_per_hold,
+                    |n, _, _| {
+                        names.push(n.to_owned());
+                        ControlFlow::Continue(())
+                    },
+                );
+                let mut expected = vec![" lead", "job>x", "jobs"];
+                if descending {
+                    expected.reverse();
+                }
+                assert_eq!(names, expected, "{entries_per_hold} per hold");
+            }
         }
     }
 
@@ -2603,8 +2588,9 @@ mod tests {
             .read_without_swap(|| {
                 attempts += 1;
                 let mut names = Vec::new();
-                iterate_label_names_asc_in_holds(&index, &RejectBeta, None, 1, |n, _, _| {
-                    names.push(n.to_owned())
+                scan_label_names_in_holds(&index, &RejectBeta, false, None, None, 1, |n, _, _| {
+                    names.push(n.to_owned());
+                    ControlFlow::Continue(())
                 });
                 if attempts == 1 {
                     index.swap(&other);
@@ -2722,8 +2708,9 @@ mod tests {
     }
 
     #[test]
-    fn label_cardinality_of_a_filtered_search_leaves_out_hidden_series() {
-        // The filtered path reports this figure, and drops a name when it is zero.
+    fn label_cardinality_of_a_name_lookup_leaves_out_hidden_series() {
+        // A value-ordered name ranking reports this figure for a name it looks up directly,
+        // and leaves the name out when it is zero.
         let index = index_with_hidden_series();
         for entries_per_hold in [1, 2, usize::MAX] {
             for (name, expected) in [("job", 1), ("env", 1), ("only_imported", 0)] {
@@ -2765,6 +2752,42 @@ mod tests {
         }
     }
 
+    /// A date range without selectors selects every series, through its own plan or one the
+    /// caller made; it was once planned as "no selectors", which matches nothing.
+    #[test]
+    fn date_range_hints_alone_select_every_series() {
+        use crate::series::DateRange;
+        use crate::series::index::{clear_timeseries_index, get_db_index};
+        use crate::series::request_types::MetaDateRangeFilter;
+
+        const DB: i32 = 7311;
+        clear_timeseries_index(DB);
+        let index = get_db_index(DB);
+        for id in 1..=3 {
+            let mut series = TimeSeries::new();
+            series.id = id;
+            series.labels = MetricName::new(&[Label::new("job", "api")]);
+            index.index_timeseries(&series, format!("series:{id}").as_bytes());
+        }
+        let range = Some(MetaDateRangeFilter::Includes(DateRange {
+            start: 0,
+            end: 100,
+        }));
+        let hints = || super::SelectHints::new(vec![], range);
+        assert!(!hints().is_empty());
+        assert!(matches!(hints().selection(), super::SeriesSelection::All));
+
+        let planned = hints().read_planned(DB, |cursor| Ok(cursor.remaining()));
+        assert_eq!(planned.unwrap(), 3);
+
+        let plan = super::SeriesCursor::plan(DB, hints().selection(), range).unwrap();
+        let reused = hints()
+            .with_plan(Some(plan))
+            .read_planned(DB, |cursor| Ok(cursor.remaining()));
+        assert_eq!(reused.unwrap(), 3);
+        clear_timeseries_index(DB);
+    }
+
     /// More series than may be read inline, with ids `1..=count`.
     fn index_with_series(count: u64) -> TimeSeriesIndex {
         let mut postings = Postings::default();
@@ -2801,8 +2824,8 @@ mod tests {
         ));
     }
 
-    /// A planned scoped search stays inline when it matches few series, unless it is a name
-    /// search that reports cardinalities: those walk the term dictionary however few match.
+    /// A planned scoped search stays inline when it matches few series, whatever it reports:
+    /// it counts names and values from the series it reads, not from the term dictionary.
     #[test]
     fn a_planned_scoped_search_is_sized_by_its_matches() {
         // 1,101 index entries: over the 1,024-entry budget used below.
@@ -2837,7 +2860,7 @@ mod tests {
             &hints,
             budget
         ));
-        // Names with cardinality read every value of every name.
+        // Names with cardinality count only the matched series.
         for hints in [
             SearchHints {
                 include_meta: true,
@@ -2848,7 +2871,7 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            assert!(label_search_exceeds_inline_budget(
+            assert!(!label_search_exceeds_inline_budget(
                 &index,
                 None,
                 true,
@@ -2866,5 +2889,34 @@ mod tests {
             &hints,
             budget
         ));
+    }
+
+    /// A plan that matched nothing reads nothing, so it stays inline whatever it reports.
+    #[test]
+    fn an_empty_planned_scoped_search_stays_inline() {
+        let index = index_with_series(1100);
+        let empty = plan_of([]);
+        for hints in [
+            SearchHints::default(),
+            SearchHints {
+                include_meta: true,
+                ..Default::default()
+            },
+            SearchHints {
+                order_by: SearchResultOrdering::CardinalityDesc,
+                ..Default::default()
+            },
+        ] {
+            for label_name in [None, Some("instance")] {
+                assert!(!label_search_exceeds_inline_budget(
+                    &index,
+                    label_name,
+                    true,
+                    Some(&empty),
+                    &hints,
+                    1024
+                ));
+            }
+        }
     }
 }

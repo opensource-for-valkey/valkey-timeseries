@@ -548,6 +548,11 @@ impl SeriesCursor {
         self.range.is_some()
     }
 
+    /// The date range the plan was made with.
+    pub fn date_range(&self) -> Option<MetaDateRangeFilter> {
+        self.range
+    }
+
     pub fn is_done(&self) -> bool {
         self.remaining == 0
     }

@@ -1374,8 +1374,9 @@
   documentation_only: true
   description: >
     A label name containing `=` is rejected ("TSDB: label name must not contain '='") by every
-    command that applies LABELS — TS.CREATE, TS.ALTER, and TS.ADD, TS.INCRBY, TS.DECRBY,
-    TS.ADDBULK when they create the series — and by RESTORE. RTS 8.10 stores it. Label values may contain `=` on both engines.
+    command that applies LABELS — TS.CREATE, TS.ALTER, and TS.ADD, TS.INCRBY, TS.DECRBY
+    when they create the series — by TS.ADDBULK whether or not the series exists, and by
+    RESTORE. RTS 8.10 stores it. Label values may contain `=` on both engines.
   rationale: >
     Accepted (owner sign-off 2026-11-09, §5.3): no filter can select a label named `a=b` on
     either engine: probed black-box, RTS returns nothing for `TS.QUERYINDEX a=b=2` (even for

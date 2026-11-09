@@ -1,5 +1,16 @@
 use crate::common::strings::{JaroWinklerMatcher, SubsequenceMatcher};
+use std::borrow::Cow;
 use std::fmt::Display;
+
+/// `value` lowercased, borrowed when lowercasing would not change it: label names and values
+/// are usually lowercase ASCII already, and a filter sees every candidate of a scan.
+fn to_lowercase_cow(value: &str) -> Cow<'_, str> {
+    if value.is_ascii() && !value.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Borrowed(value)
+    } else {
+        Cow::Owned(value.to_lowercase())
+    }
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum FuzzyAlgorithm {
@@ -89,7 +100,6 @@ impl SimilarityMatcher {
     }
 }
 
-#[derive(Default)]
 pub struct SimilarityFilter {
     matcher: SimilarityMatcher,
     threshold: f64,
@@ -124,15 +134,13 @@ impl SimilarityFilter {
 
 impl FuzzyFilter for SimilarityFilter {
     fn accept(&self, value: &str) -> (bool, f64) {
-        let normalized_value;
         let candidate = if self.case_sensitive {
-            value
+            Cow::Borrowed(value)
         } else {
-            normalized_value = value.to_lowercase();
-            &normalized_value
+            to_lowercase_cow(value)
         };
 
-        let score = self.matcher.score(candidate);
+        let score = self.matcher.score(&candidate);
         (score >= self.threshold, score)
     }
 }
@@ -195,12 +203,12 @@ impl FuzzyFilter for LabelNameSearchFilter {
         // behaviour of SEARCH when no fuzzy threshold is provided.
         if let Some(terms) = &self.substring_terms {
             let normalized_value = if self.case_sensitive {
-                value.to_string()
+                Cow::Borrowed(value)
             } else {
-                value.to_lowercase()
+                to_lowercase_cow(value)
             };
             for term in terms {
-                if normalized_value.contains(term) {
+                if normalized_value.contains(term.as_str()) {
                     return (true, 1.0);
                 }
             }
@@ -219,5 +227,111 @@ impl FuzzyFilter for LabelNameSearchFilter {
         }
 
         (accepted, best_score)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FuzzyAlgorithm, FuzzyFilter, LabelNameSearchFilter, SimilarityFilter, to_lowercase_cow,
+    };
+    use std::borrow::Cow;
+
+    #[test]
+    fn similarity_filter_defaults_to_case_sensitive() {
+        let filter = SimilarityFilter::new("node", FuzzyAlgorithm::JaroWinkler, 1.0);
+        assert_eq!(filter.accept("node"), (true, 1.0));
+        let (accepted, score) = filter.accept("NODE");
+        assert!(!accepted);
+        assert!(score < 1.0);
+    }
+
+    #[test]
+    fn similarity_filter_case_sensitive_rejects_case_mismatch() {
+        let filter = SimilarityFilter::new_with_case_sensitivity(
+            "NoDe",
+            FuzzyAlgorithm::JaroWinkler,
+            1.0,
+            true,
+        );
+
+        let (accepted, score) = filter.accept("node");
+        assert!(!accepted);
+        assert!(score < 1.0);
+    }
+
+    #[test]
+    fn similarity_filter_case_insensitive_accepts_case_mismatch() {
+        let filter = SimilarityFilter::new_with_case_sensitivity(
+            "NoDe",
+            FuzzyAlgorithm::JaroWinkler,
+            1.0,
+            false,
+        );
+
+        let (accepted, score) = filter.accept("node");
+        assert!(accepted);
+        assert_eq!(1.0, score);
+    }
+
+    #[test]
+    fn jaro_winkler_transposition_matches() {
+        // 'metirc' is a transposition of 'metric'
+        let filter = SimilarityFilter::new_with_case_sensitivity(
+            "metirc",
+            FuzzyAlgorithm::JaroWinkler,
+            0.5,
+            false,
+        );
+        let (accepted, score) = filter.accept("metric");
+        assert!((0.0..=1.0).contains(&score));
+        assert!(
+            accepted,
+            "Expected 'metric' to match 'metirc' with JaroWinkler (score={})",
+            score
+        );
+    }
+
+    #[test]
+    fn subsequence_basic_match() {
+        let filter = SimilarityFilter::new_with_case_sensitivity(
+            "nde",
+            FuzzyAlgorithm::Subsequence,
+            0.3,
+            false,
+        );
+        let (accepted, score) = filter.accept("node");
+        assert!((0.0..=1.0).contains(&score));
+        assert!(
+            accepted,
+            "Expected 'node' to match subsequence 'nde' (score={})",
+            score
+        );
+    }
+
+    #[test]
+    fn lowercasing_borrows_unless_a_character_changes() {
+        assert!(matches!(
+            to_lowercase_cow("node_1.cpu"),
+            Cow::Borrowed("node_1.cpu")
+        ));
+        assert!(matches!(to_lowercase_cow(""), Cow::Borrowed("")));
+        assert_eq!(to_lowercase_cow("Node"), "node");
+        assert!(matches!(to_lowercase_cow("Node"), Cow::Owned(_)));
+        assert_eq!(to_lowercase_cow("ÄRGER"), "ärger");
+        assert_eq!(to_lowercase_cow("ärger"), "ärger");
+    }
+
+    #[test]
+    fn substring_search_honours_case_sensitivity() {
+        let terms = || vec!["Pu".to_owned()];
+        let sensitive = LabelNameSearchFilter::new(terms(), FuzzyAlgorithm::NoOp, 0.0, true);
+        assert_eq!(sensitive.accept("cPu"), (true, 1.0));
+        assert!(!sensitive.accept("cpu").0);
+
+        let insensitive = LabelNameSearchFilter::new(terms(), FuzzyAlgorithm::NoOp, 0.0, false);
+        assert_eq!(insensitive.accept("cpu"), (true, 1.0));
+        assert_eq!(insensitive.accept("CPU"), (true, 1.0));
+        assert!(!insensitive.accept("gpx").0);
     }
 }
