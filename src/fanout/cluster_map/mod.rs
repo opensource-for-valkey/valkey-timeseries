@@ -116,9 +116,11 @@ pub struct ClusterMap {
     /// finds the topology unchanged can extend the published map's lifetime
     /// in place instead of swapping in an identical copy.
     expiration_ts: AtomicI64,
-    /// Observation sequence of the `CLUSTER NODES` reply this map was built
-    /// from (see [`ClusterNodesSource`]); 0 for the initial empty map.
-    observed_seq: u64,
+    /// Observation sequence of the latest `CLUSTER NODES` reply this map
+    /// stands for (see [`ClusterNodesSource`]): the one it was built from, or a
+    /// later one that confirmed its topology unchanged. 0 for the initial empty
+    /// map. Atomic so a confirmation can raise it on the published map in place.
+    observed_seq: AtomicU64,
     /// is the current map consistent (no collisions/inconsistencies found while building)
     pub is_consistent: bool,
 }
@@ -298,19 +300,27 @@ impl ClusterMap {
         debug_assert!(!my_node_id.is_empty(), "Current node id is empty");
 
         let mut map = Self::from_cluster_nodes(&text, &my_node_id);
-        map.observed_seq = observed_seq;
+        *map.observed_seq.get_mut() = observed_seq;
         Some(map)
     }
 
     #[cfg(test)]
     pub(super) fn with_observed_seq(mut self, observed_seq: u64) -> Self {
-        self.observed_seq = observed_seq;
+        *self.observed_seq.get_mut() = observed_seq;
         self
     }
 
     /// See [`ClusterNodesSource`]: a map with a higher sequence saw a newer topology.
     pub fn observed_seq(&self) -> u64 {
+        self.observed_seq.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Record that the later observation `observed_seq` found this map's
+    /// topology unchanged, so the map now stands for it. Only the publication
+    /// step in `fanout::publish_observation` calls this, under its lock.
+    pub(in crate::fanout) fn confirm_observation(&self, observed_seq: u64) {
         self.observed_seq
+            .fetch_max(observed_seq, AtomicOrdering::Relaxed);
     }
 
     /// Build a ClusterMap from the raw text of a `CLUSTER NODES` reply.

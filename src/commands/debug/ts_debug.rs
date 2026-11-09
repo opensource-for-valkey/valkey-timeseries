@@ -98,7 +98,7 @@ fn peer_requests_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResu
 /// Rebuilds this node's cluster map from `CLUSTER NODES` now, instead of waiting for it to expire
 /// or be marked stale, and reports the map it ends up with: a map with `outcome` (`changed` when a
 /// new map was published, `unchanged` when the topology matched and only its expiry was
-/// extended, `superseded` when a concurrent refresh published a newer map first), `consistent`, `shards` and `fingerprint` (a string: it spans the full `u64` range).
+/// extended, `superseded` when a concurrent refresh had already published or confirmed a newer view), `consistent`, `shards` and `fingerprint` (a string: it spans the full `u64` range).
 ///
 /// TS._DEBUG REFRESH_CLUSTERMAP
 ///
