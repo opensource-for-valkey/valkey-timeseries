@@ -90,34 +90,6 @@ pub enum SearchResultOrdering {
     CardinalityDesc,
 }
 
-impl SearchResultOrdering {
-    pub fn is_ascending(&self) -> bool {
-        matches!(
-            self,
-            SearchResultOrdering::ValueAsc | SearchResultOrdering::CardinalityAsc
-        )
-    }
-
-    pub fn is_descending(&self) -> bool {
-        matches!(
-            self,
-            SearchResultOrdering::ValueDesc
-                | SearchResultOrdering::ScoreDesc
-                | SearchResultOrdering::CardinalityDesc
-        )
-    }
-
-    pub fn sort_field(&self) -> SortBy {
-        match self {
-            SearchResultOrdering::ValueAsc | SearchResultOrdering::ValueDesc => SortBy::Value,
-            SearchResultOrdering::ScoreDesc => SortBy::Score,
-            SearchResultOrdering::CardinalityAsc | SearchResultOrdering::CardinalityDesc => {
-                SortBy::Cardinality
-            }
-        }
-    }
-}
-
 /// SelectHints specifies hints passed for data selections.
 #[derive(Debug, Clone, Default)]
 pub struct SelectHints {
@@ -230,16 +202,6 @@ pub struct LabelSearchResult {
     pub cardinality: usize,
 }
 
-impl LabelSearchResult {
-    pub fn new(value: String, score: f64) -> Self {
-        Self {
-            value,
-            score,
-            cardinality: 1,
-        }
-    }
-}
-
 impl PartialEq for LabelSearchResult {
     fn eq(&self, other: &Self) -> bool {
         // As the ranking compares scores, so that equality is reflexive even for NaN.
@@ -299,14 +261,6 @@ impl LabelQueryResult {
         let merged = select_best(merged.into_values().collect(), order_by, limit);
         self.has_more = self.has_more || other.has_more || merged.has_more;
         self.results = merged.results;
-    }
-}
-
-impl std::ops::Deref for LabelQueryResult {
-    type Target = Vec<LabelSearchResult>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.results
     }
 }
 
