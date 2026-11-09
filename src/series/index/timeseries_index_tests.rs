@@ -26,7 +26,7 @@ mod tests {
         index.index_timeseries(&ts, b"time-series-1");
 
         assert_eq!(index.count(), 1);
-        assert_eq!(index.label_count(), 3); // metric_name + region + env
+        assert_eq!(index.pair_count(), 3); // __name__=latency, region=…, env=…
     }
 
     #[test]
@@ -42,7 +42,7 @@ mod tests {
         index.reindex_timeseries(&ts, b"time-series-1", b"time-series-1");
 
         assert_eq!(index.count(), 1);
-        assert_eq!(index.label_count(), 5); // metric_name + region + env
+        assert_eq!(index.pair_count(), 5); // the three above, plus service and pod
     }
 
     #[test]
@@ -56,7 +56,7 @@ mod tests {
         index.remove_timeseries(&ts);
 
         assert_eq!(index.count(), 0);
-        assert_eq!(index.label_count(), 0);
+        assert_eq!(index.pair_count(), 0);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -5,7 +6,7 @@ use std::sync::{RwLock, RwLockReadGuard};
 
 use super::posting_stats::{PostingStat, PostingsStats, StatsMaxHeap};
 use super::postings::{Postings, PostingsBitmap};
-use crate::common::acl::{KeyAccess, clone_permissions};
+use crate::common::acl::KeyAccess;
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::common::context::create_key_string;
 use crate::common::hash::DeterministicHasher;
@@ -29,8 +30,7 @@ pub struct PostingsReadGuard<'a> {
 }
 
 impl<'a> PostingsReadGuard<'a> {
-    /// Creates a new PostingsReadGuard from an RwLockReadGuard
-    pub(crate) fn new(guard: RwLockReadGuard<'a, Postings>) -> Self {
+    fn new(guard: RwLockReadGuard<'a, Postings>) -> Self {
         Self { guard }
     }
 }
@@ -158,12 +158,6 @@ impl TimeSeriesIndex {
         self.generation.load(Ordering::SeqCst)
     }
 
-    #[allow(dead_code)]
-    pub fn clear(&self) {
-        let mut inner = write_lock(&self.inner);
-        inner.clear();
-    }
-
     // swap the inner value with some other value
     // this is specifically to handle the `swapdb` event callback
     pub fn swap(&self, other: &Self) {
@@ -216,6 +210,7 @@ impl TimeSeriesIndex {
         inner.remove_timeseries_for_key(series, key)
     }
 
+    #[cfg(test)]
     pub fn has_id(&self, id: SeriesRef) -> bool {
         let inner = read_lock(&self.inner);
         inner.has_id(id)
@@ -239,23 +234,21 @@ impl TimeSeriesIndex {
         inner.postings_by_labels(labels)
     }
 
-    /// `postings_for_filters` assembles a single postings iterator against the series index
-    /// based on the given matchers.
-    #[allow(dead_code)]
+    /// The series matching `selector`. Production reads go through `label_querier` and the
+    /// selector planner directly; this and the two lookups below serve tests.
+    #[cfg(test)]
     pub fn postings_for_selector(&self, selector: &SeriesSelector) -> ValkeyResult<PostingsBitmap> {
-        let mut state = ();
-        self.with_postings(&mut state, move |inner, _| {
-            let postings = inner.postings_for_selector(selector)?;
-            let res = postings.into_owned();
-            Ok(res)
-        })
+        let inner = read_lock(&self.inner);
+        Ok(inner.postings_for_selector(selector)?.into_owned())
     }
 
+    #[cfg(test)]
     pub fn get_label_names(&self) -> BTreeSet<String> {
         let inner = read_lock(&self.inner);
         inner.get_label_names()
     }
 
+    #[cfg(test)]
     pub fn get_label_values(&self, label_name: &str) -> Vec<String> {
         let inner = read_lock(&self.inner);
         inner.get_label_values(label_name)
@@ -271,8 +264,9 @@ impl TimeSeriesIndex {
     ///
     /// Ids the postings still reference but that no longer map to a key are queued for the
     /// stale-id sweep (see `Postings::mark_ids_as_stale` in `postings/stale.rs`) and
-    /// omitted from the result. That repair happens even when the call then fails the ACL
-    /// check, so a caller without access still leaves the index healthier than it found it.
+    /// omitted from the result. That repair covers every matching id even when the call then
+    /// fails the ACL check, so a caller without access still leaves the index healthier than it
+    /// found it.
     pub fn keys_for_selectors(
         &self,
         ctx: &Context,
@@ -283,9 +277,14 @@ impl TimeSeriesIndex {
         let mut dangling_ids: Vec<SeriesRef> = Vec::new();
         let mut acl_denied = false;
 
-        let cloned_perms = acl_permissions.as_ref().map(clone_permissions);
+        // The requested permission decides which "all keys" error a denied caller sees.
+        let wants_write = acl_permissions.as_ref().is_some_and(|perms| {
+            perms.intersects(
+                AclPermissions::INSERT | AclPermissions::UPDATE | AclPermissions::DELETE,
+            )
+        });
         let access = match acl_permissions {
-            Some(perms) => KeyAccess::new(ctx, clone_permissions(&perms)),
+            Some(perms) => KeyAccess::new(ctx, perms),
             None => KeyAccess::unrestricted(),
         };
 
@@ -309,10 +308,14 @@ impl TimeSeriesIndex {
                     dangling_ids.push(series_ref);
                     continue;
                 };
+                if acl_denied {
+                    // The call fails either way; keep looking only for ids to repair.
+                    continue;
+                }
                 let real_key = create_key_string(ctx, key.as_ref());
                 if !access.allows(&real_key) {
                     acl_denied = true;
-                    break;
+                    continue;
                 }
                 keys.push(real_key);
             }
@@ -327,47 +330,23 @@ impl TimeSeriesIndex {
         }
 
         if acl_denied {
-            // The requested permission decides which "all keys" error the caller sees.
-            let all_keys_error = match cloned_perms {
-                Some(perms)
-                    if perms.intersects(
-                        AclPermissions::INSERT | AclPermissions::UPDATE | AclPermissions::DELETE,
-                    ) =>
-                {
-                    error_consts::ALL_KEYS_WRITE_PERMISSION_ERROR
-                }
-                _ => error_consts::ALL_KEYS_READ_PERMISSION_ERROR,
-            };
-            return Err(ValkeyError::Str(all_keys_error));
+            return Err(ValkeyError::Str(if wants_write {
+                error_consts::ALL_KEYS_WRITE_PERMISSION_ERROR
+            } else {
+                error_consts::ALL_KEYS_READ_PERMISSION_ERROR
+            }));
         }
 
         Ok(keys)
     }
 
+    /// How many visible series match every one of `selectors`; `0` when there are none.
     pub fn get_cardinality_by_selectors(
         &self,
         selectors: &[SeriesSelector],
     ) -> ValkeyResult<usize> {
-        if selectors.is_empty() {
-            return Ok(0);
-        }
-
-        let mut state = ();
-
-        self.with_postings(&mut state, move |inner, _state| {
-            let filter = &selectors[0];
-            let first = inner.postings_for_selector(filter)?;
-            if selectors.len() == 1 {
-                return Ok(first.cardinality() as usize);
-            }
-            let mut result = first.into_owned();
-            for selector in &selectors[1..] {
-                let postings = inner.postings_for_selector(selector)?;
-                result.and_inplace(&postings);
-            }
-
-            Ok(result.cardinality() as usize)
-        })
+        let inner = read_lock(&self.inner);
+        Ok(inner.postings_for_selectors(selectors)?.cardinality() as usize)
     }
 
     /// The series matching every one of `selectors` (AND-ed together), or `None` when `selectors`
@@ -632,8 +611,10 @@ impl TimeSeriesIndex {
         inner.count()
     }
 
-    #[allow(dead_code)]
-    pub fn label_count(&self) -> usize {
+    /// Distinct `name=value` keys in the label index, including keys whose only ids are stale
+    /// and not yet swept.
+    #[cfg(test)]
+    pub fn pair_count(&self) -> usize {
         let inner = read_lock(&self.inner);
         inner.label_index.len()
     }
@@ -674,24 +655,6 @@ impl TimeSeriesIndex {
         inner.mark_ids_as_stale(ids)
     }
 
-    pub fn remove_stale_ids(&self) -> usize {
-        const BATCH_SIZE: usize = 100;
-
-        let mut inner = write_lock(&self.inner);
-        let old_count = inner.stale_ids.cardinality();
-        if old_count == 0 {
-            return 0; // No stale IDs to remove
-        }
-
-        let mut cursor = None;
-        while let Some(new_cursor) = inner.remove_stale_ids(cursor, BATCH_SIZE) {
-            // Continue removing stale IDs in batches
-            cursor = Some(new_cursor);
-        }
-
-        (old_count - inner.stale_ids.cardinality()) as usize // Return number of removed IDs
-    }
-
     pub fn optimize_incremental(
         &self,
         start_prefix: Option<IndexKey>,
@@ -702,14 +665,16 @@ impl TimeSeriesIndex {
     }
 
     /// Optimizes every posting list in one pass, taking the write lock for at most `hold_budget`
-    /// or `max_lists` lists at a time, whichever comes first, so queries and writes interleave.
-    /// Returns `false` if `should_stop` ended the pass early.
+    /// or `max_lists` lists at a time (at least one), whichever comes first, so queries and writes
+    /// interleave. Returns `false` if `should_stop` ended the pass early.
     pub fn optimize_all(
         &self,
         max_lists: usize,
         hold_budget: Duration,
         should_stop: impl Fn() -> bool,
     ) -> bool {
+        // A hold that may optimize no list would return the same cursor forever.
+        let max_lists = max_lists.max(1);
         let mut cursor = None;
         loop {
             if should_stop() {
@@ -1124,6 +1089,18 @@ mod tests {
             batches += 1;
             assert!(batches <= 3, "a zero batch size still makes progress");
         }
+    }
+
+    #[test]
+    fn optimize_all_with_a_zero_list_budget_still_finishes() {
+        let index = two_series_two_labels();
+        let holds = std::cell::Cell::new(0);
+        let finished = index.optimize_all(0, Duration::from_secs(1), || {
+            holds.set(holds.get() + 1);
+            assert!(holds.get() <= 10, "the pass made no progress");
+            false
+        });
+        assert!(finished);
     }
 
     #[test]

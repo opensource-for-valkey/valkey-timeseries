@@ -8,8 +8,8 @@ use crate::series::index::persistence::{
     on_loading_ended, on_loading_failed, on_loading_started, should_skip_load_indexing,
 };
 use crate::series::index::{
-    TIMESERIES_INDEX, clear_all_timeseries_indexes, clear_timeseries_index, get_db_index,
-    get_timeseries_index, get_timeseries_index_for_db, index_loaded_series, index_series_by_key,
+    clear_all_timeseries_indexes, clear_timeseries_index, get_db_index, get_timeseries_index,
+    index_loaded_series, index_series_by_key, swap_timeseries_index_dbs,
 };
 use crate::series::{relink_renamed_series, try_get_timeseries_mut};
 use std::os::raw::c_void;
@@ -255,14 +255,6 @@ unsafe extern "C" fn on_flush_event(
         FlushSubevent::Ended
     };
     dispatch_displaced_handlers(ctx, &FLUSH_SERVER_EVENTS_LIST, flush_sub_event);
-}
-
-fn swap_timeseries_index_dbs(from_db: i32, to_db: i32) {
-    let guard = TIMESERIES_INDEX.guard();
-
-    let first = get_timeseries_index_for_db(from_db, &guard);
-    let second = get_timeseries_index_for_db(to_db, &guard);
-    first.swap(second)
 }
 
 unsafe extern "C" fn on_swap_db_event(
