@@ -65,7 +65,6 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
     }
 
     fn get_local_response(ctx: &FanoutContext, req: StatsRequest) -> ValkeyResult<StatsResponse> {
-        let limit = req.limit as usize;
         let matchers = deserialize_matchers_list(Some(req.filters))?;
 
         {
@@ -74,10 +73,15 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
             check_metadata_permissions(&ctx)?;
         }
         // Only index data below: planning, batched counts and fingerprinting need no GIL.
+        //
+        // Every entry is returned, untruncated: a shard's local top-K cannot establish the global
+        // one (a value second everywhere can win overall), so the coordinator applies LIMIT after
+        // summing. The fingerprint bitmaps already cost a few bytes per term, so the lists add a
+        // constant factor, not a new order of size.
         let (stats, fingerprints) = get_db_index(ctx.db()).stats_and_label_bitmaps_by_selectors(
             &matchers,
             req.selected_label.as_deref(),
-            limit,
+            usize::MAX,
         )?;
 
         let mut response: StatsResponse = stats.into();
@@ -89,7 +93,6 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
 
     fn generate_request(&self) -> StatsRequest {
         StatsRequest {
-            limit: self.options.limit as u32,
             selected_label: self.options.label.clone(),
             filters: serialize_matchers_list(&self.options.filters)
                 .expect("serialize matchers list"),
@@ -238,6 +241,49 @@ mod tests {
         assert_eq!(command.state.series_count, 4);
         assert_eq!(command.state.labels_bitmap.cardinality(), 3);
         assert_eq!(command.state.label_value_pairs_bitmap.cardinality(), 2);
+    }
+
+    fn focus_response(values: &[(&str, u64)]) -> StatsResponse {
+        StatsResponse {
+            series_count_by_focus_label_value: values
+                .iter()
+                .map(|&(name, count)| MPostingStat {
+                    name: name.to_string(),
+                    count,
+                })
+                .collect(),
+            ..response(&[], &[])
+        }
+    }
+
+    /// The winner is second on every shard, and ties at the cutoff resolve by name whatever the
+    /// order responses arrive in.
+    #[test]
+    fn limit_applies_after_summing_shards() {
+        let shards = [
+            focus_response(&[("a", 3), ("common", 2), ("x", 1)]),
+            focus_response(&[("b", 3), ("common", 2), ("y", 1)]),
+        ];
+        for reversed in [false, true] {
+            let mut command = LabelStatsFanoutCommand::new(LabelStatsOptions {
+                limit: 3,
+                label: Some("host".to_string()),
+                ..Default::default()
+            });
+            let mut order = shards.to_vec();
+            if reversed {
+                order.reverse();
+            }
+            for shard in order {
+                command.on_response(shard, &target()).unwrap();
+            }
+            let merged = collect_map_values(
+                std::mem::take(&mut command.state.series_count_by_focus_label_value),
+                command.options.limit,
+            );
+            let merged: Vec<_> = merged.iter().map(|s| (s.name.as_str(), s.count)).collect();
+            assert_eq!(merged, [("common", 4), ("a", 3), ("b", 3)]);
+        }
     }
 
     /// An unreadable bitmap fails the fan-out rather than undercounting the labels, and the

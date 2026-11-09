@@ -588,11 +588,9 @@ pub struct LabelSearchRequest {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StatsRequest {
-    #[prost(uint32, tag = "1")]
-    pub limit: u32,
-    #[prost(string, optional, tag = "2")]
+    #[prost(string, optional, tag = "1")]
     pub selected_label: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(message, repeated, tag = "3")]
+    #[prost(message, repeated, tag = "2")]
     pub filters: ::prost::alloc::vec::Vec<SeriesSelector>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]

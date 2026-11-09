@@ -103,6 +103,37 @@ class TestTsStatsCluster(ValkeyTimeSeriesClusterTestCase):
             ))
             assert (empty['totalSeries'], empty['totalLabels'], empty['totalLabelValuePairs']) == (0, 0, 0)
 
+    def test_stats_cluster_limit_applies_after_merging_shards(self):
+        """A value that is never first on any one shard can still be first overall: each shard
+        has its own `hostN` 3 times and `common` twice, so with LIMIT 1 only a merge of complete
+        shard lists can find `common` and its full count."""
+        cluster = self.new_cluster_client()
+        tags = self.tag_per_primary(cluster)
+        assert len(tags) >= 2
+        pipe = cluster.pipeline(transaction=False)
+        for n, tag in enumerate(tags):
+            for i in range(3):
+                pipe.execute_command('TS.CREATE', f'merge:{{{tag}}}:own{i}', 'LABELS',
+                                     'host', f'host{n}', 'scope', 'merge')
+            for i in range(2):
+                pipe.execute_command('TS.CREATE', f'merge:{{{tag}}}:common{i}', 'LABELS',
+                                     'host', 'common', 'scope', 'merge')
+        pipe.execute()
+
+        common = 2 * len(tags)
+        for coordinator in range(self.CLUSTER_SIZE):
+            client = self.client_for_primary(coordinator)
+            stats = parse_stats_response(client.execute_command(
+                'TS.LABELSTATS', 'LABEL', 'host', 'LIMIT', 1))
+            focus = [(value.decode(), count) for value, count in stats['seriesCountByFocusLabelValue']]
+            assert focus == [('common', common)]
+            assert stats['seriesCountByLabelValuePair'] == [['scope=merge', 5 * len(tags)]]
+
+            stats = parse_stats_response(client.execute_command(
+                'TS.LABELSTATS', 'LABEL', 'host', 'LIMIT', 3))
+            focus = [(value.decode(), count) for value, count in stats['seriesCountByFocusLabelValue']]
+            assert focus == [('common', common), ('host0', 3), ('host1', 3)]
+
     def test_labelstats_hashtag_scopes_cluster_fanout(self):
         """HASHTAG queries only the slot(s) selected by the supplied hash tag."""
         cluster: ValkeyCluster = self.new_cluster_client()

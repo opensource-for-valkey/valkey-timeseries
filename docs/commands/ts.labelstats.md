@@ -35,6 +35,9 @@ instead of over the whole index.
 
 - `LIMIT <n>`  
   Limits the number of items returned in each top-N section. Higher values may increase runtime.
+  Every section is ordered by count, highest first; equal counts are ordered by ascending name,
+  and a limit that falls inside a run of equal counts keeps the smallest names. In cluster mode
+  the limit is applied after the shards' counts are summed, so the sections are exact.
 
 - `HASHTAG <hash_tag,...>`
   In cluster mode, restricts fan-out to the nodes owning the comma-separated hash tags. It has no effect on standalone

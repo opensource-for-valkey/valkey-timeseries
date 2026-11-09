@@ -89,9 +89,8 @@ message LabelSearchRequest {
 }
 
 message StatsRequest {
-  uint32 limit = 1;
-  optional string selected_label = 2;
-  repeated SeriesSelector filters = 3;
+  optional string selected_label = 1;
+  repeated SeriesSelector filters = 2;
 }
 
 message MultiRangeRequest {
