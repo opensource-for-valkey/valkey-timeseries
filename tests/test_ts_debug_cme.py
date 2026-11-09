@@ -496,6 +496,45 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         wait_for_true(
             lambda: debug_metrics(sleeping, 'fanout')['fanout_cancels_received_total'] == 1)
 
+    def test_a_local_denial_cancels_the_remote_shares(self):
+        """The coordinator's own share is denied while every peer sleeps: no remote answer
+        arrives to end the fanout, so the local share must cancel the peers itself."""
+        tags = self.populate()
+        coordinator, *peers = self.primaries()
+        for client in self.primaries():
+            client.execute_command('ACL', 'SETUSER', 'fo_remote', 'on', 'nopass',
+                                   *(f'~fo:{{{tag}}}:*' for tag in tags[1:]), '+@all')
+        self.reset_all()
+        limited = self.new_client_for_primary(0)
+        limited.execute_command('AUTH', 'fo_remote', 'any')
+
+        sleepers = [threading.Thread(
+            target=lambda i=i: self.new_client_for_primary(i).execute_command('DEBUG', 'SLEEP', 2))
+            for i in range(1, self.CLUSTER_SIZE)]
+        for sleeper in sleepers:
+            sleeper.start()
+        try:
+            time.sleep(0.2)
+            started = time.monotonic()
+            with pytest.raises(ResponseError):
+                limited.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
+            assert time.monotonic() - started < 1.5
+            # Read while the peers still sleep: the request was dropped and the cancels sent
+            # on the local denial, not on a later remote answer or the timer.
+            stats = debug_metrics(coordinator, 'fanout')
+        finally:
+            for sleeper in sleepers:
+                sleeper.join()
+
+        assert stats['fanout_aborts_total'] == 1
+        assert stats['fanout_early_completions_total'] == 1
+        assert stats['fanout_cancels_sent_total'] == len(peers)
+        assert stats['fanout_rpc_timeouts_total'] == 0
+        assert stats['fanout_inflight'] == 0
+        for peer in peers:
+            wait_for_true(
+                lambda peer=peer: debug_metrics(peer, 'fanout')['fanout_cancels_received_total'] == 1)
+
     def test_timeouts(self):
         """A sleeping peer runs the fanout into both deadlines; its late answer is dropped."""
         self.populate()

@@ -347,18 +347,38 @@ fn finish_inflight_request(ctx: &Context, request: &InFlightRequest) {
         INFLIGHT_REQUESTS.pin().remove(&request.id);
         return;
     }
-    // The fanout completed early (a share's error aborted it). Tell the shares
-    // still running to stop, stop waiting for them, and forget the request so
-    // their late answers are dropped unread. `timed_out` claims the request
-    // against a timer firing at the same moment; this runs from a message
-    // callback, never from the timer's own, so stopping the timer here is safe.
-    if request.fanout_done.load(Ordering::Relaxed)
-        && !request.timed_out.swap(true, Ordering::AcqRel)
-    {
-        metrics::FANOUT_EARLY_COMPLETIONS.incr();
-        send_cancels(ctx, request);
-        request.cancel_timer(ctx);
-        INFLIGHT_REQUESTS.pin().remove(&request.id);
+    // The fanout completed early (a share's error aborted it).
+    if request.fanout_done.load(Ordering::Relaxed) {
+        abandon_remaining_shares(ctx, request);
+    }
+}
+
+/// The fanout completed before every remote target answered: tell the shares still running to
+/// stop, stop waiting for them, and forget the request so their late answers are dropped
+/// unread. `timed_out` claims the request against a timer firing at the same moment, and makes
+/// a second call a no-op.
+///
+/// Runs under the GIL, from a message callback or a local share, never from the timer's own
+/// callback, so stopping the timer here is safe (see [`InFlightRequest::cancel_timer`]).
+fn abandon_remaining_shares(ctx: &Context, request: &InFlightRequest) {
+    if request.timed_out.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    metrics::FANOUT_EARLY_COMPLETIONS.incr();
+    send_cancels(ctx, request);
+    request.cancel_timer(ctx);
+    INFLIGHT_REQUESTS.pin().remove(&request.id);
+}
+
+/// The fanout behind request `id` was completed by its local share (that share's error aborted
+/// it), so the remote shares are no longer wanted. Remote answers only reach the request through
+/// [`InFlightRequest::handle_response`], so without this a stalled peer kept its share running
+/// until another answer or the timer arrived. A request that is already gone (every remote target
+/// answered, or the timer fired) is left alone.
+pub(super) fn abandon_inflight_request(ctx: &Context, id: u64) {
+    if let Some(request) = INFLIGHT_REQUESTS.pin().get(&id) {
+        request.fanout_done.store(true, Ordering::Relaxed);
+        abandon_remaining_shares(ctx, request);
     }
 }
 
@@ -377,6 +397,8 @@ pub fn get_cluster_command_timeout() -> Duration {
     Duration::from_millis(timeout)
 }
 
+/// Send `req` to the remote `targets` and return the request's id, which
+/// [`abandon_inflight_request`] takes once the fanout no longer needs them.
 pub fn invoke_rpc<Request: Serializable>(
     ctx: &Context,
     name: &'static str,
@@ -385,7 +407,7 @@ pub fn invoke_rpc<Request: Serializable>(
     cluster_fingerprint: u64,
     response_handler: FanoutResponseCallback,
     timeout: Duration,
-) -> ValkeyResult<()> {
+) -> ValkeyResult<u64> {
     let mut buf = get_pooled_buffer(FANOUT_RPC_BUFFER_SIZE);
     req.serialize(&mut buf);
 
@@ -408,7 +430,7 @@ pub(super) fn send_cluster_request(
     cluster_fingerprint: u64,
     response_handler: FanoutResponseCallback,
     timeout: Option<Duration>,
-) -> ValkeyResult<()> {
+) -> ValkeyResult<u64> {
     validate_cluster_exec(ctx)?;
 
     let id = generate_id();
@@ -473,7 +495,7 @@ pub(super) fn send_cluster_request(
             dispatch_send_failure(ctx, id, target_id);
         }
     }
-    Ok(())
+    Ok(id)
 }
 
 fn send_message_internal(

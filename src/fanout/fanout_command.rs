@@ -1,11 +1,11 @@
-use super::cluster_rpc::invoke_rpc;
+use super::cluster_rpc::{abandon_inflight_request, invoke_rpc};
 use super::fanout_error::{ErrorKind, FanoutError};
 use crate::common::acl::caller_user_name;
 use crate::common::context::get_current_db;
 use crate::common::logging::{log_debug, log_warning};
 use crate::common::metrics::fanout as metrics;
 use crate::common::sync::lock;
-use crate::common::threads::Rejected;
+use crate::common::threads::{LockGil, Rejected};
 use crate::fanout::fanout_context::FanoutContext;
 use crate::fanout::serialization::{Deserialized, Serializable};
 use crate::fanout::workers::PEER_REQUEST_EXECUTOR;
@@ -17,7 +17,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use valkey_module::{Context, ValkeyResult};
+use valkey_module::{Context, MODULE_CONTEXT, ValkeyResult};
 
 /// Delivers one remote share's answer. Returns whether the fanout still wants
 /// answers: `false` once it has completed, so the RPC layer can stop waiting on
@@ -162,11 +162,13 @@ where
     {
         metrics::FANOUT_LOCAL_ONLY.incr();
         let state = Arc::new(FanoutState::new(op, outstanding, f, started));
-        return spawn_local_request(state, req, local, fanout_user, db, deadline).map_err(|_| {
-            metrics::FANOUT_LOCAL_SHARE_BUSY.incr();
-            metrics::FANOUT_DURATION.observe_duration(started.elapsed());
-            FanoutError::busy()
-        });
+        return spawn_local_request(state, req, local, fanout_user, db, deadline, None).map_err(
+            |_| {
+                metrics::FANOUT_LOCAL_SHARE_BUSY.incr();
+                metrics::FANOUT_DURATION.observe_duration(started.elapsed());
+                FanoutError::busy()
+            },
+        );
     }
 
     let state = Arc::new(FanoutState::new(op, outstanding, f, started));
@@ -187,7 +189,7 @@ where
         !rpc_state.is_completed()
     };
 
-    if let Err(e) = invoke_rpc(
+    let rpc = invoke_rpc(
         ctx,
         OP::name(),
         &req,
@@ -195,19 +197,23 @@ where
         cluster_fingerprint,
         Box::new(response_handler),
         remaining,
-    ) {
-        // RPC invocation failed before the fanout could be set up. The local
-        // share has deliberately not been spawned yet, so no callback can run
-        // and the state's lifecycle is still `Pending`: dropping `state` (and
-        // the handler's clone, released by `invoke_rpc`) discards the completion
-        // callback without invoking it, which releases whatever it retains —
-        // for client commands, the blocked client — so the caller can reply
-        // with this error right away instead of waiting on a local response
-        // that would complete the fanout with a partial result.
-        metrics::FANOUT_SETUP_FAILURES.incr();
-        metrics::FANOUT_DURATION.observe_duration(started.elapsed());
-        return Err(FanoutError::from(e));
-    }
+    );
+    let request_id = match rpc {
+        Ok(id) => id,
+        Err(e) => {
+            // RPC invocation failed before the fanout could be set up. The local
+            // share has deliberately not been spawned yet, so no callback can run
+            // and the state's lifecycle is still `Pending`: dropping `state` (and
+            // the handler's clone, released by `invoke_rpc`) discards the completion
+            // callback without invoking it, which releases whatever it retains —
+            // for client commands, the blocked client — so the caller can reply
+            // with this error right away instead of waiting on a local response
+            // that would complete the fanout with a partial result.
+            metrics::FANOUT_SETUP_FAILURES.incr();
+            metrics::FANOUT_DURATION.observe_duration(started.elapsed());
+            return Err(FanoutError::from(e));
+        }
+    };
 
     // The local share is spawned only once the RPC is set up, so a setup
     // failure above leaves the state `Pending` with no callback able to run.
@@ -217,11 +223,23 @@ where
     // ignored.
     if let Some(local) = local_node {
         let local_state = Arc::clone(&state);
-        if spawn_local_request(local_state, req, local, fanout_user, db, deadline).is_err() {
+        let spawned = spawn_local_request(
+            local_state,
+            req,
+            local,
+            fanout_user,
+            db,
+            deadline,
+            Some(request_id),
+        );
+        if spawned.is_err() {
             // Remote shares are already in flight, so this one fails through
-            // the fanout: `Busy` aborts it with that error.
+            // the fanout: `Busy` aborts it with that error, and the remote
+            // shares are no longer wanted.
             metrics::FANOUT_LOCAL_SHARE_BUSY.incr();
-            state.on_error(FanoutError::busy(), &local);
+            if state.local_error_ends_early(FanoutError::busy(), &local) {
+                abandon_inflight_request(ctx, request_id);
+            }
         }
     }
 
@@ -472,6 +490,27 @@ where
         let mut inner = lock(&self.inner);
         inner.on_response(resp, target);
     }
+
+    /// Deliver the local share's error. True when it completed the fanout while
+    /// other shares were still outstanding, so the remote ones should be abandoned.
+    fn local_error_ends_early(&self, error: FanoutError, target: &NodeInfo) -> bool {
+        self.local_answer_ends_early(|inner| inner.on_error(error, target))
+    }
+
+    /// Deliver the local share's response; see [`Self::local_error_ends_early`].
+    /// The operation can still turn it into an aborting error.
+    fn local_response_ends_early(&self, resp: OP::Response, target: &NodeInfo) -> bool {
+        self.local_answer_ends_early(|inner| inner.on_response(resp, target))
+    }
+
+    fn local_answer_ends_early(&self, deliver: impl FnOnce(&mut FanoutStateInner<OP, F>)) -> bool {
+        let mut inner = lock(&self.inner);
+        let pending = inner.lifecycle != FanoutLifecycleState::Completed;
+        // The local share is one of `outstanding`; any others are remote.
+        let others_outstanding = inner.outstanding > 1;
+        deliver(&mut inner);
+        pending && others_outstanding && inner.lifecycle == FanoutLifecycleState::Completed
+    }
 }
 
 /// Queue the local share on the fanout workers.
@@ -479,6 +518,9 @@ where
 /// `user` and `db` are the coordinator-side client's ACL identity and selected
 /// database; the [`FanoutContext`] built from them applies both each time
 /// `get_local_response` takes the GIL.
+///
+/// `rpc_id` is the RPC carrying the remote shares, if any: when this share's
+/// own answer ends the fanout early, the remote shares are abandoned.
 ///
 /// On `Err` the share was not queued and `state` has been dropped; the caller
 /// decides how the fanout fails.
@@ -489,6 +531,7 @@ fn spawn_local_request<OP, F>(
     user: Option<String>,
     db: i32,
     deadline: Instant,
+    rpc_id: Option<u64>,
 ) -> Result<(), Rejected>
 where
     OP: FanoutCommand,
@@ -509,6 +552,7 @@ where
                 return;
             }
             if Instant::now() >= deadline {
+                // The RPC timer shares this deadline and ends the remote shares itself.
                 metrics::FANOUT_LOCAL_SHARE_EXPIRED.incr();
                 state.on_error(FanoutError::timeout(), &target);
                 return;
@@ -523,14 +567,23 @@ where
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
             OP::get_local_response(&fanout_ctx, req)
         }));
-        match outcome {
-            Ok(Ok(response)) => state.on_response(response, &target),
-            Ok(Err(err)) => state.on_error(err.into(), &target),
+        let ends_early = match outcome {
+            Ok(Ok(response)) => state.local_response_ends_early(response, &target),
+            Ok(Err(err)) => state.local_error_ends_early(err.into(), &target),
             Err(_) => {
                 let err =
                     FanoutError::custom(format!("{} panicked on the local share", OP::name()));
-                state.on_error(err, &target);
+                state.local_error_ends_early(err, &target)
             }
+        };
+        // Remote answers end a fanout early through the RPC layer; this share's
+        // answer does not pass through it, so tell it here. Under the GIL, which
+        // serializes this with the RPC timer and the message callbacks, and only
+        // after the state lock is released: the main thread takes that lock while
+        // holding the GIL.
+        if ends_early && let Some(id) = rpc_id {
+            let ctx = MODULE_CONTEXT.lock_gil();
+            abandon_inflight_request(&ctx, id);
         }
     })
 }
@@ -673,6 +726,37 @@ mod tests {
         state.on_error(FanoutError::busy(), &node(2));
         let err = rx.try_recv().unwrap().1.unwrap_err();
         assert_eq!(err.kind, ErrorKind::Busy);
+    }
+
+    /// Only a local answer that completes the fanout while remote shares are
+    /// still outstanding asks for them to be abandoned.
+    #[test]
+    fn test_local_answer_ends_early_only_with_remote_shares_outstanding() {
+        // An aborting error with remote shares outstanding.
+        let (state, rx) = fanout(3);
+        assert!(state.local_error_ends_early(FanoutError::busy(), &node(0)));
+        assert_eq!(rx.try_recv().unwrap().1.unwrap_err().kind, ErrorKind::Busy);
+        // Once completed, later answers end nothing.
+        assert!(!state.local_error_ends_early(FanoutError::busy(), &node(0)));
+
+        // A response the operation turns into an error that does not abort.
+        let (state, rx) = fanout(2);
+        assert!(!state.local_response_ends_early(answer(u64::MAX), &node(0)));
+        assert!(rx.try_recv().is_err());
+        // Still waiting on the remote share: dropping the state completes it.
+        drop(state);
+        assert!(rx.try_recv().unwrap().1.is_err());
+
+        // The last answer completes the fanout normally: nothing is left to abandon.
+        let (state, rx) = fanout(2);
+        state.on_response(answer(1), &node(1));
+        assert!(!state.local_response_ends_early(answer(2), &node(0)));
+        assert_eq!(rx.try_recv().unwrap().0, 3);
+
+        // An aborting error as the last answer: nothing is left to abandon either.
+        let (state, _rx) = fanout(2);
+        state.on_response(answer(1), &node(1));
+        assert!(!state.local_error_ends_early(FanoutError::busy(), &node(0)));
     }
 
     /// A shard that cannot select the database ends the fanout with that error
