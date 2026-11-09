@@ -241,14 +241,16 @@ class TestLabelSearchLaneUse(ValkeyTimeSeriesTestCaseDebugMode):
             assert [r.value for r in LabelSearchResponse.parse(result).results] == [b'host0001']
             result = client.execute_command('TS.LABELNAMES', 'FILTER', 'instance=host0001')
             assert len(LabelSearchResponse.parse(result).results) == 3
+            # Name cardinalities count the matched series too, so they stay inline as well.
+            result = client.execute_command(
+                'TS.LABELNAMES', 'FILTER', 'instance=host0001', 'INCLUDE_METADATA')
+            assert {r.cardinality for r in LabelSearchResponse.parse(result).results} == {1}
 
             # Every search above ran inline: the hook is still armed. Filters that are not
             # planned up front are sized by the database and leave.
             for command in [
                 ('TS.QUERYLABELS', 'VALUES', 'instance', 'FILTER', 'instance=~"host000.*"'),
                 ('TS.LABELVALUES', 'instance', 'FILTER', 'instance=~"host000.*"'),
-                # Narrow, but reporting name cardinalities walks the whole term dictionary.
-                ('TS.LABELNAMES', 'FILTER', 'instance=host0001', 'INCLUDE_METADATA'),
             ]:
                 self.arm_analysis_job_panic(client)
                 with pytest.raises(ResponseError, match='internal error'):

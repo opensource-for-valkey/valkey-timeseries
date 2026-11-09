@@ -301,3 +301,20 @@ class TestTsLabelNamesCME(ValkeyTimeSeriesClusterTestCase):
         assert exec_sorted_values(client, 'FILTER', 'name=~".+"', 'HASHTAG', f'{tag_a},{tag_b}') == [
             b'markA1', b'markA2', b'markB1', b'name',
         ]
+
+    def test_filtered_name_cardinality_sums_selected_series_across_shards(self):
+        """With FILTER, a name counts the selected series that carry it, summed over shards.
+        Unselected series carrying the name, on any shard, do not count."""
+        cluster: ValkeyCluster = self.new_cluster_client()
+        client = self.new_client_for_primary(0)
+        for tag in ['{1}', '{2}', '{3}']:
+            cluster.execute_command('TS.CREATE', f'picked:{tag}', 'LABELS', 'job', 'api', 'pick', 'yes')
+            cluster.execute_command('TS.CREATE', f'other:{tag}', 'LABELS', 'job', 'worker')
+
+        names = LabelSearchResponse.parse(client.execute_command(
+            'TS.LABELNAMES', 'FILTER', 'pick=yes', 'INCLUDE_METADATA'))
+        assert {lv.value: lv.cardinality for lv in names.results} == {b'job': 3, b'pick': 3}
+
+        values = LabelSearchResponse.parse(client.execute_command(
+            'TS.LABELVALUES', 'job', 'FILTER', 'pick=yes', 'INCLUDE_METADATA'))
+        assert [(lv.value, lv.cardinality) for lv in values.results] == [(b'api', 3)]

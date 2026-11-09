@@ -49,8 +49,8 @@ TS.LABELNAMES
 - `SORTBY score` currently supports `DESC` only.
 - `SORTBY value` orders by the label names themselves: `job` comes before `job2`.
 - A label name's `cardinality` (reported with `INCLUDE_METADATA`, and ranked by `SORTBY cardinality`) is the
-  number of series in the database that carry the name, even when `FILTER` selects only some of them. `FILTER`
-  decides which names are returned, not what they count. In cluster mode it is summed over the shards.
+  number of series carrying it: of every series in the database without `FILTER`, and of the selected series with
+  `FILTER` (and `FILTER_BY_RANGE`). In cluster mode it is summed over the shards.
 - In cluster mode this command fans out to all shards and merges results, unless `HASHTAG` is specified, in which case
   it fans out only to the shards owning the given hash tags.
 

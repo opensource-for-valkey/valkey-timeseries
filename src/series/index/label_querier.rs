@@ -17,8 +17,8 @@
 use super::postings::Postings;
 use super::{
     DEFAULT_SERIES_BATCH_SIZE, FuzzyFilter, IndexKey, NoOpSearchMatcher, PostingsBitmap,
-    SeriesCursor, SeriesSelection, TimeSeriesIndex, ensure_generation, for_each_planned_series,
-    get_db_index, read_planned,
+    SeriesCursor, SeriesSelection, TimeSeriesIndex, for_each_planned_series, get_db_index,
+    read_planned,
 };
 use crate::common::acl::check_metadata_permissions;
 use crate::common::constants::METRIC_NAME_LABEL;
@@ -27,7 +27,7 @@ use crate::error::{TsdbError, TsdbResult};
 use crate::labels::filters::SeriesSelector;
 use crate::series::index::key_buffer::KeyBuffer;
 use crate::series::request_types::MetaDateRangeFilter;
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use std::cmp::Ordering;
 use std::collections::{Bound, VecDeque};
 use std::fmt::Display;
@@ -201,13 +201,9 @@ pub struct LabelSearchResult {
     pub score: f64,
 
     /// How many series carry the label name or value, or `0` where it was not computed: a
-    /// scoped search computes it only for `INCLUDE_METADATA` or a cardinality order. The
-    /// series counted differ by path:
-    ///
-    /// * unscoped names and values: every visible series in the database;
-    /// * scoped values: the selected series that carry the value;
-    /// * scoped names: every visible series in the database that carries the name, however few
-    ///   were selected — the selection decides which names are returned, not what they count.
+    /// scoped search computes it only for `INCLUDE_METADATA` or a cardinality order. An
+    /// unscoped search counts every visible series in the database; a scoped one counts only
+    /// the selected series, so that a cluster's per-shard counts add up to the selection's.
     pub cardinality: usize,
 }
 
@@ -469,25 +465,13 @@ pub(crate) fn label_search_exceeds_inline_budget(
     .then(|| normalize_limit(hints.limit) + 1);
 
     if scoped {
-        // A name search reporting cardinalities walks every value of every name it finds,
-        // however few series matched.
-        let reads_name_cardinality = label_name.is_none()
-            && (hints.include_meta
-                || matches!(
-                    hints.order_by,
-                    SearchResultOrdering::CardinalityAsc | SearchResultOrdering::CardinalityDesc
-                ));
+        // A scoped search reads only the series it matches, and counts names and values from
+        // them alone.
         let postings = index.get_postings();
         return match plan {
             // Planned already: the match count is exact, and planning is paid for.
-            // Nothing matched: nothing is read and no cardinality is looked up.
-            Some(plan) if plan.remaining() == 0 => false,
-            Some(plan) => {
-                plan.remaining() > INLINE_SERIES_READ_LIMIT
-                    || (reads_name_cardinality && postings.label_index.len() > entries_budget)
-            }
-            // Also bound the term dictionary: regex planning and name-cardinality lookups can
-            // scan it, even for few series.
+            Some(plan) => plan.remaining() > INLINE_SERIES_READ_LIMIT,
+            // Also bound the term dictionary: regex planning can scan it, even for few series.
             None => {
                 postings.count() > INLINE_SERIES_READ_LIMIT
                     || postings.label_index.len() > entries_budget
@@ -1277,78 +1261,61 @@ fn collect_label_names<S: GilSource + ?Sized>(
     }
 
     // At this point we know we have non-empty selectors or a date range.
-    let db = src.db();
-    let result = select_hints
+    //
+    // Under the lock, only each distinct name and how many matched series carry it are
+    // copied out: a hash lookup per label. The filter then runs once per distinct name, after
+    // the read. A name's cardinality counts the selected series, as a value's does, so that
+    // the counts of a cluster's shards add up to the selection's.
+    //
+    // Still unbounded: every matched series is scanned, `counts` holds every distinct name in
+    // the match, and on the main thread (`&Context`) the whole scan is one lock hold. The
+    // batched reader bounds only a fan-out share's lock holds, not the scan or the set.
+    let counts = select_hints
         .unwrap_or_default()
-        .read_planned(db, |cursor| {
-            let generation = cursor.generation();
-
-            // Under the lock, only the distinct names are copied out: a hash lookup per label.
-            // The fuzzy filter and the cardinality lookups wait until the read is over.
-            //
-            // Still unbounded: every matched series is scanned, `names` holds every distinct
-            // name in the match, and on the main thread (`&Context`) the whole scan is one lock
-            // hold. The batched reader bounds only a fan-out share's lock holds, not the scan or
-            // the set.
-            let mut names: AHashSet<String> = AHashSet::with_capacity(INITIAL_RESULT_CAPACITY);
+        .read_planned(src.db(), |cursor| {
+            let mut counts: AHashMap<String, usize> =
+                AHashMap::with_capacity(INITIAL_RESULT_CAPACITY);
             for_each_planned_series(src, cursor, DEFAULT_SERIES_BATCH_SIZE, |_ctx, ts, _key| {
                 for label in ts.labels.iter() {
-                    // Not `names.insert(label.name.to_string())`: that allocates for every
+                    // Not `counts.entry(label.name.to_string())`: that allocates for every
                     // label, seen or not.
-                    if !names.contains(label.name) {
-                        names.insert(label.name.to_string());
+                    match counts.get_mut(label.name) {
+                        Some(count) => *count += 1,
+                        None => {
+                            counts.insert(label.name.to_string(), 1);
+                        }
                     }
                 }
                 Ok(ControlFlow::Continue(()))
             })?;
-
-            let need_cardinality = matches!(
-                hints.order_by,
-                SearchResultOrdering::CardinalityAsc | SearchResultOrdering::CardinalityDesc
-            ) || hints.include_meta;
-
-            // A name's cardinality is its database-wide one, not the selection's. Each is read in
-            // bounded holds of the postings lock, taken only for names the filter accepts: one
-            // hold across every name would keep the lock for the sum of their values, a million
-            // entries for a name such as `instance`, while index writers wait. Never taken while
-            // the batched read runs either: it takes the postings lock itself, for writing when it
-            // has a stale id to record, and `RwLock` is not reentrant.
-            let index = need_cardinality.then(|| get_db_index(db));
-
-            let result = with_search_filter(hints, |filter| {
-                let mut result = Vec::with_capacity(names.len());
-                for name in names {
-                    let (accepted, score) = filter.accept(&name);
-                    if !accepted {
-                        continue;
-                    }
-                    let cardinality = match index.as_ref() {
-                        Some(index) => match label_cardinality_in_holds(
-                            index,
-                            &name,
-                            LABEL_SCAN_ENTRIES_PER_HOLD,
-                        ) {
-                            0 => continue,
-                            cardinality => cardinality,
-                        },
-                        None => 0,
-                    };
-                    result.push(LabelSearchResult {
-                        value: name,
-                        score,
-                        cardinality,
-                    });
-                }
-                apply_search_hints(result, hints)
-            });
-            // The cardinalities are read after the scan, in holds of their own: they belong to
-            // the scanned database only if no `SWAPDB` came in between.
-            if index.is_some() {
-                ensure_generation(db, generation)?;
-            }
-            Ok(result)
+            Ok(counts)
         })?;
-    Ok(result)
+
+    Ok(collect_counted(counts, hints))
+}
+
+/// The scoped search's answer from each distinct name or value of the selection and how many
+/// selected series carry it: those the hints' filter accepts, ranked and limited.
+fn collect_counted(counts: AHashMap<String, usize>, hints: &SearchHints) -> LabelQueryResult {
+    let need_cardinality = matches!(
+        hints.order_by,
+        SearchResultOrdering::CardinalityAsc | SearchResultOrdering::CardinalityDesc
+    ) || hints.include_meta;
+
+    with_search_filter(hints, |filter| {
+        let mut result = Vec::with_capacity(counts.len());
+        for (value, count) in counts {
+            let (accepted, score) = filter.accept(&value);
+            if accepted {
+                result.push(LabelSearchResult {
+                    value,
+                    score,
+                    cardinality: if need_cardinality { count } else { 0 },
+                });
+            }
+        }
+        apply_search_hints(result, hints)
+    })
 }
 
 fn collect_label_values<S: GilSource + ?Sized>(
@@ -1398,25 +1365,7 @@ fn collect_label_values<S: GilSource + ?Sized>(
             Ok(counts)
         })?;
 
-    let need_cardinality = matches!(
-        search_hints.order_by,
-        SearchResultOrdering::CardinalityAsc | SearchResultOrdering::CardinalityDesc
-    ) || search_hints.include_meta;
-
-    Ok(with_search_filter(search_hints, |filter| {
-        let mut result = Vec::with_capacity(counts.len());
-        for (value, count) in counts {
-            let (accepted, score) = filter.accept(&value);
-            if accepted {
-                result.push(LabelSearchResult {
-                    value,
-                    score,
-                    cardinality: if need_cardinality { count } else { 0 },
-                });
-            }
-        }
-        apply_search_hints(result, search_hints)
-    }))
+    Ok(collect_counted(counts, search_hints))
 }
 
 /// The coarse gate on label discovery, checked under one short lock hold: on a fan-out
@@ -2759,8 +2708,9 @@ mod tests {
     }
 
     #[test]
-    fn label_cardinality_of_a_filtered_search_leaves_out_hidden_series() {
-        // The filtered path reports this figure, and drops a name when it is zero.
+    fn label_cardinality_of_a_name_lookup_leaves_out_hidden_series() {
+        // A value-ordered name ranking reports this figure for a name it looks up directly,
+        // and leaves the name out when it is zero.
         let index = index_with_hidden_series();
         for entries_per_hold in [1, 2, usize::MAX] {
             for (name, expected) in [("job", 1), ("env", 1), ("only_imported", 0)] {
@@ -2874,8 +2824,8 @@ mod tests {
         ));
     }
 
-    /// A planned scoped search stays inline when it matches few series, unless it is a name
-    /// search that reports cardinalities: those walk the term dictionary however few match.
+    /// A planned scoped search stays inline when it matches few series, whatever it reports:
+    /// it counts names and values from the series it reads, not from the term dictionary.
     #[test]
     fn a_planned_scoped_search_is_sized_by_its_matches() {
         // 1,101 index entries: over the 1,024-entry budget used below.
@@ -2910,7 +2860,7 @@ mod tests {
             &hints,
             budget
         ));
-        // Names with cardinality read every value of every name.
+        // Names with cardinality count only the matched series.
         for hints in [
             SearchHints {
                 include_meta: true,
@@ -2921,7 +2871,7 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            assert!(label_search_exceeds_inline_budget(
+            assert!(!label_search_exceeds_inline_budget(
                 &index,
                 None,
                 true,
@@ -2941,8 +2891,7 @@ mod tests {
         ));
     }
 
-    /// A plan that matched nothing reads nothing, so even a name search reporting
-    /// cardinalities, which would otherwise walk the term dictionary, stays inline.
+    /// A plan that matched nothing reads nothing, so it stays inline whatever it reports.
     #[test]
     fn an_empty_planned_scoped_search_stays_inline() {
         let index = index_with_series(1100);
