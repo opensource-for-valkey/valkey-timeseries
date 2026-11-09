@@ -102,7 +102,7 @@ impl FanoutClientCommand for MRangeFanoutCommand {
     type Response = MultiRangeResponse;
 
     fn name() -> &'static str {
-        "mrange"
+        "cmd:mrange"
     }
 
     fn get_local_response(
