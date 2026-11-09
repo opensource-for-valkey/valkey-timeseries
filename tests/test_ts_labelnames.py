@@ -614,3 +614,17 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
             assert names('SORTBY', 'value', 'DESC', 'LIMIT', 1, *scope) == ([b'scope'], True)
             assert names('SEARCH', 'job', 'SORTBY', 'value', 'ASC', 'LIMIT', 1, *scope) == ([b'job'], True)
             assert names('SEARCH', 'job', 'SORTBY', 'value', 'DESC', 'LIMIT', 1, *scope) == ([b'job2'], True)
+
+    def test_scoped_cardinality_counts_differ_for_names_and_values(self):
+        """With FILTER, a value counts the selected series that carry it, but a name counts every
+        series in the database that carries it."""
+        self.client.execute_command('TS.CREATE', 'picked', 'LABELS', 'job', 'api', 'pick', 'yes')
+        self.client.execute_command('TS.CREATE', 'other', 'LABELS', 'job', 'worker')
+
+        names = LabelSearchResponse.parse(self.client.execute_command(
+            'TS.LABELNAMES', 'FILTER', 'pick=yes', 'INCLUDE_METADATA'))
+        assert {lv.value: lv.cardinality for lv in names.results} == {b'job': 2, b'pick': 1}
+
+        values = LabelSearchResponse.parse(self.client.execute_command(
+            'TS.LABELVALUES', 'job', 'FILTER', 'pick=yes', 'INCLUDE_METADATA'))
+        assert [(lv.value, lv.cardinality) for lv in values.results] == [(b'api', 1)]

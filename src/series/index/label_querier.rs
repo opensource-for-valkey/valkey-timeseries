@@ -219,7 +219,14 @@ pub struct LabelSearchResult {
     /// Relevance score, with 1.0 being a perfect match.
     pub score: f64,
 
-    /// Optional cardinality of the label name or label value, if known. This can be used for relevance ranking or filtering.
+    /// How many series carry the label name or value, or `0` where it was not computed: a
+    /// scoped search computes it only for `INCLUDE_METADATA` or a cardinality order. The
+    /// series counted differ by path:
+    ///
+    /// * unscoped names and values: every visible series in the database;
+    /// * scoped values: the selected series that carry the value;
+    /// * scoped names: every visible series in the database that carries the name, however few
+    ///   were selected — the selection decides which names are returned, not what they count.
     pub cardinality: usize,
 }
 
