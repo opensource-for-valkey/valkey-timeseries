@@ -4,62 +4,48 @@
 //! Copyright (c) 2021-2024 Leonid Ryzhyk
 //! License: MIT
 //!
-//! Interning reduces the memory footprint of an application by storing
-//! a unique copy of each distinct value.  It speeds up equality
-//! comparison and hashing operations, as only pointers rather than actual
-//! values need to be compared.  On the flip side, object creation is
-//! slower, as it involves lookup in the interned string pool.
+//! Interning stores one copy of each distinct label, so every series that
+//! carries it shares a single allocation. Equality compares pointers;
+//! hashing reads the bytes (so a hash depends on the content alone, not on
+//! an allocation address). Creating a value costs a lookup in the pool.
 //!
 //! Design choices:
 //!
-//! - Interned strings are reference counted.  When the last reference to
-//!   an interned object is dropped, the string is deallocated.  This
-//!   prevents unbounded growth of the interned object pool in applications
-//!   where the set of interned values changes dynamically at the cost of
-//!   some CPU and memory overhead (due to storing and maintaining an
-//!   atomic counter).
-//! - Multithreading.  A single pool of interned strings is shared by all
-//!   threads in the program.  The pool is a lock-free [`papaya::HashMap`];
-//!   interning, cloning and dropping never take a lock. The pool's own
-//!   reference to a string is released through papaya's deferred
-//!   reclamation, so a thread that found an entry can always finish
-//!   reading it (see [`retire_if_dead`]).
+//! - Reference counted. When the last holder drops a string, the string
+//!   leaves the pool, and its allocation is freed once papaya's deferred
+//!   reclamation has run, so the pool never outgrows the live label set.
+//! - Multithreading. A single pool is shared by all threads: a
+//!   [`papaya::HashMap`]. Lookups, inserts, clones and drops take no lock on
+//!   their common paths (papaya does serialize allocating a new table when it
+//!   resizes). The pool's own reference to a string is released through
+//!   papaya's deferred reclamation, so a thread that found an entry can
+//!   always finish reading it (see [`retire_if_dead`]).
 //! - Thin. An [`InternedString`] is one pointer (8 bytes) to a header that
-//!   holds the reference count, the byte length and the position of the
-//!   `=` in a `name=value` label. The original held an `Arc<[u8]>`, a fat
+//!   holds the reference count, the byte length and the length of the name
+//!   in a `name=value` label. The original held an `Arc<[u8]>`, a fat
 //!   pointer whose 16-byte slot per label dominated the memory of a
 //!   `MetricName` once the pool had deduplicated the strings themselves
 //!   (see `tools/interning_report.sh`). Keeping the separator in the
 //!   header makes [`InternedString::name`] and [`InternedString::value`]
 //!   O(1) slices, so a label needs no side structure to be split.
-//!
-//! # Example
-//! ```ignore
-//! use valkey_timeseries::common::string_interner::InternedString;
-//! let x = InternedString::new("hello");
-//! let y: InternedString = "world".into();
-//! assert_ne!(x, y);
-//! assert_eq!(x, InternedString::new("hello"));
-//! assert_eq!(&*x, "hello"); // dereference an InternedString like a pointer
-//! let l = InternedString::new_pair("env", "prod");
-//! assert_eq!((l.name(), l.value()), ("env", "prod"));
-//! ```
+//! - The separator is part of a string's identity. Label names and values
+//!   may both contain `=`, so `("a=b", "c")` and `("a", "b=c")` are the same
+//!   bytes but different labels: the pool keys an entry by the name length
+//!   *and* the bytes.
 
 use ahash::RandomState;
 use get_size2::GetSize;
 use min_max_heap::MinMaxHeap;
-use papaya::{Guard, HashMap};
+use papaya::{Equivalent, Guard, HashMap};
 use smallvec::SmallVec;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-use std::borrow::Borrow;
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 use std::fmt;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::str::FromStr;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering, fence};
 
@@ -70,7 +56,7 @@ type StringPool = HashMap<PoolEntry, (), RandomState>;
 /// A pool of interned strings and the memory it accounts for.
 pub(crate) struct Interner {
     pool: StringPool,
-    /// Total memory used by the interned strings in `pool`.
+    /// Header-plus-payload bytes of the entries in `pool`; see [`InternedString::memory_used`].
     memory_used: AtomicUsize,
 }
 
@@ -111,6 +97,12 @@ fn interner() -> &'static Interner {
 /// through that thread's pool, so such a test installs the same pool there with
 /// [`TestPool::enter`]. Guards must outlive the strings interned under them — declare the guard
 /// first, so it drops last.
+///
+/// A node doesn't record which pool owns it, so breaking either rule fails silently: the last
+/// holder of a string dropped under the wrong pool removes nothing there, leaving a dead entry
+/// in the owning pool until that pool next interns the same string. Its `interned_count` and
+/// `memory_used` stay high in the meantime, and pointer equality between strings from two
+/// pools means nothing.
 #[cfg(test)]
 pub(crate) mod test_pool {
     use super::Interner;
@@ -164,7 +156,8 @@ pub(crate) mod test_pool {
     }
 }
 
-/// Marker in [`Header::name_len`] for a string with no `=`.
+/// Marker in [`Header::name_len`] for a plain string, one that is not a label. Also the
+/// exclusive upper bound on a string's length, so no real name length can collide with it.
 const NO_SEPARATOR: u32 = u32::MAX;
 
 /// Largest supported strong-reference count. Keeping the count below the
@@ -205,9 +198,9 @@ struct Header {
     strong: AtomicUsize,
     /// Payload length in bytes.
     len: u32,
-    /// Byte offset of the first `=`, or [`NO_SEPARATOR`]. Determined by the
-    /// content alone, so every constructor agrees on it and deduplication
-    /// cannot change what `name()` returns.
+    /// For a label, the byte length of its name: the payload is `name`, `=`,
+    /// `value`. [`NO_SEPARATOR`] for a plain string. Part of the pool key, so
+    /// labels whose name or value contains `=` stay distinct.
     name_len: u32,
 }
 
@@ -239,17 +232,11 @@ fn increment_refcount(current: usize) -> Option<usize> {
 struct Node(NonNull<Header>);
 
 impl Node {
-    /// Allocate a node holding `strong` references, all owned by the caller.
-    fn allocate(bytes: &[u8], strong: usize) -> Node {
+    /// Allocate a node for `key` holding `strong` references, all owned by the caller.
+    fn allocate(key: PoolKey<'_>, strong: usize) -> Node {
+        let PoolKey { name_len, bytes } = key;
         let len = bytes.len();
-        assert!(
-            len < NO_SEPARATOR as usize,
-            "interned string of {len} bytes exceeds u32::MAX"
-        );
-        let name_len = bytes
-            .iter()
-            .position(|&b| b == b'=')
-            .map_or(NO_SEPARATOR, |i| i as u32);
+        debug_assert!(len < NO_SEPARATOR as usize, "checked by PoolKey::new");
         let layout = Header::layout(len);
         // SAFETY: the layout is non-zero-sized (it holds at least the header).
         let ptr = unsafe { alloc(layout) } as *mut Header;
@@ -292,6 +279,20 @@ impl Node {
         // is `len` bytes long, written in full by `allocate`.
         unsafe {
             std::slice::from_raw_parts(self.0.as_ptr().cast::<u8>().add(HEADER_SIZE), self.len())
+        }
+    }
+
+    #[inline]
+    fn name_len(&self) -> u32 {
+        self.header().name_len
+    }
+
+    /// What the pool keys this node by.
+    #[inline]
+    fn key(&self) -> PoolKey<'_> {
+        PoolKey {
+            name_len: self.name_len(),
+            bytes: self.bytes(),
         }
     }
 
@@ -374,20 +375,25 @@ impl Node {
 ///
 /// Both the last holder and an interner that finds a dead entry call this;
 /// `remove_if` makes exactly one of them succeed, and the pointer check keeps
-/// a lookalike entry (same bytes, different allocation) untouched.
+/// a lookalike entry (same key, different allocation) untouched.
+///
+/// Resolves the calling thread's pool, which is the owning one in production;
+/// under [`test_pool`] the caller must have the owning pool installed.
 fn retire_if_dead(node: Node, guard: &impl Guard) -> bool {
     let interner = interner();
     let removed = interner.pool.remove_if(
-        node.bytes(),
+        &node.key(),
         |entry, _| entry.0.0 == node.0 && node.strong().load(Ordering::Acquire) == 1,
         guard,
     );
     if !matches!(removed, Ok(Some(_))) {
         return false;
     }
+    // Relaxed suffices: this node's add happened-before its retirement, through the
+    // holder's release of `strong`, so the counter cannot transiently wrap.
     interner
         .memory_used
-        .fetch_sub(allocated_size(node.len()), Ordering::SeqCst);
+        .fetch_sub(allocated_size(node.len()), Ordering::Relaxed);
     true
 }
 
@@ -396,42 +402,72 @@ fn retire_if_dead(node: Node, guard: &impl Guard) -> bool {
 unsafe impl Send for Node {}
 unsafe impl Sync for Node {}
 
-/// A pool key. Hashes and compares by content, and borrows as `[u8]`, so the
-/// map can be probed with the bytes of a candidate string before anything is
-/// allocated for it.
+/// What identifies a string in the pool: its bytes and, for a label, where the
+/// name ends. Probes the map without allocating; a [`PoolEntry`] hashes and
+/// compares as its node's key.
+#[derive(Clone, Copy)]
+struct PoolKey<'a> {
+    name_len: u32,
+    bytes: &'a [u8],
+}
+
+impl<'a> PoolKey<'a> {
+    /// Panics on a string of `u32::MAX` bytes or more, which the header cannot describe.
+    #[inline]
+    fn new(bytes: &'a [u8], name_len: u32) -> Self {
+        assert!(
+            bytes.len() < NO_SEPARATOR as usize,
+            "interned string of {} bytes reaches the {NO_SEPARATOR}-byte limit",
+            bytes.len()
+        );
+        debug_assert!(
+            name_len == NO_SEPARATOR || bytes.get(name_len as usize) == Some(&b'='),
+            "a label's name must be followed by its separator"
+        );
+        Self { name_len, bytes }
+    }
+}
+
+impl Hash for PoolKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_key(self.name_len, self.bytes, state);
+    }
+}
+
+impl Equivalent<PoolEntry> for PoolKey<'_> {
+    fn equivalent(&self, entry: &PoolEntry) -> bool {
+        let key = entry.0.key();
+        self.name_len == key.name_len && self.bytes == key.bytes
+    }
+}
+
+/// The one hash of a pool key, shared by [`PoolKey`] and [`PoolEntry`] so probes land.
+#[inline]
+fn hash_key<H: Hasher>(name_len: u32, bytes: &[u8], state: &mut H) {
+    name_len.hash(state);
+    bytes.hash(state);
+}
+
+/// A pool entry. Hashes and compares as its node's [`PoolKey`].
 ///
 /// It owns the pool's reference to the node. Papaya may keep this key reachable
 /// from an older table while incrementally resizing, so releasing the reference
 /// in [`Drop`] ensures the node outlives every such lookup.
 struct PoolEntry(Node);
 
-impl PoolEntry {
-    #[inline]
-    fn as_bytes(&self) -> &[u8] {
-        self.0.bytes()
-    }
-}
-
 impl Hash for PoolEntry {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Must match `<[u8] as Hash>::hash` for `Borrow<[u8]>` lookups to land.
-        self.as_bytes().hash(state);
+        self.0.key().hash(state);
     }
 }
 
 impl PartialEq for PoolEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.as_bytes() == other.as_bytes()
+        other.0.key().equivalent(self)
     }
 }
 
 impl Eq for PoolEntry {}
-
-impl Borrow<[u8]> for PoolEntry {
-    fn borrow(&self) -> &[u8] {
-        self.as_bytes()
-    }
-}
 
 impl Drop for PoolEntry {
     fn drop(&mut self) {
@@ -439,10 +475,14 @@ impl Drop for PoolEntry {
     }
 }
 
+/// Totals over a set of pool entries.
 #[derive(Default)]
 pub struct BucketStats {
+    /// Distinct strings (pool entries), however many holders each has.
     pub count: usize,
+    /// Their payload bytes.
     pub bytes: usize,
+    /// Their allocations: payload plus one header each (see [`allocated_size`]).
     pub allocated: usize,
 }
 
@@ -463,18 +503,13 @@ impl BucketStats {
         }
     }
 
+    /// Payload's share of the allocated bytes, `bytes / allocated`. The rest is header: an
+    /// allocation has no spare capacity, so this measures header overhead, not waste.
     pub fn get_utilization(&self) -> f64 {
-        if self.count == 0 {
-            return 0.0;
-        }
-
-        let avg_size = self.get_avg_size();
-        let avg_allocated = self.get_avg_allocated();
-
-        if avg_size == 0.0 || avg_allocated == 0.0 {
+        if self.allocated == 0 {
             0.0
         } else {
-            avg_size / avg_allocated
+            self.bytes as f64 / self.allocated as f64
         }
     }
 }
@@ -502,9 +537,11 @@ impl Display for BucketStats {
 /// A snapshot of an interned string's metrics, used for top-K reporting.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TopKEntry {
-    /// The interned string value.
+    /// The interned string value. Holding it keeps the string alive, so while the entry
+    /// exists `value.ref_count()` counts it too; read [`Self::ref_count`] instead.
     pub value: InternedString,
-    /// Number of external references (excludes the pool's own reference).
+    /// External references when the pool was scanned (excludes the pool's own reference and
+    /// the statistics' holders).
     pub ref_count: usize,
     /// Length of the string in bytes.
     pub bytes: usize,
@@ -512,37 +549,78 @@ pub struct TopKEntry {
     pub allocated: usize,
 }
 
-/// Wrapper for max-heap ordering by `bytes` (used to maintain top-K by size).
-#[derive(Eq, PartialEq)]
+/// Breaks a ranking tie between two entries: the lower value ranks higher. This is the
+/// coordinator's tie-break (`StringPoolSummary::finish_top_k`), so every node keeps exactly the
+/// tied entries the cluster-wide list can use. The name length separates a label from a plain
+/// string with the same text.
+fn rank_tie_break(a: Node, b: Node) -> CmpOrdering {
+    b.bytes()
+        .cmp(a.bytes())
+        .then_with(|| b.name_len().cmp(&a.name_len()))
+}
+
+/// Heap order for the top K by size: greater ranks higher. A total order, consistent with `Eq`.
 struct TopKBySize(TopKEntry);
 
+impl TopKBySize {
+    fn rank(bytes: usize, node: Node, other: &Self) -> CmpOrdering {
+        bytes
+            .cmp(&other.0.bytes)
+            .then_with(|| rank_tie_break(node, other.0.value.0))
+    }
+}
+
 impl Ord for TopKBySize {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.bytes.cmp(&other.0.bytes)
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        Self::rank(self.0.bytes, self.0.value.0, other)
     }
 }
 
 impl PartialOrd for TopKBySize {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
         Some(self.cmp(other))
     }
 }
 
-/// Wrapper for max-heap ordering by `ref_count` (used to maintain top-K by refs).
-#[derive(Eq, PartialEq)]
+impl PartialEq for TopKBySize {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == CmpOrdering::Equal
+    }
+}
+
+impl Eq for TopKBySize {}
+
+/// Heap order for the top K by reference count: greater ranks higher. A total order, consistent
+/// with `Eq`.
 struct TopKByRef(TopKEntry);
 
+impl TopKByRef {
+    fn rank(ref_count: usize, node: Node, other: &Self) -> CmpOrdering {
+        ref_count
+            .cmp(&other.0.ref_count)
+            .then_with(|| rank_tie_break(node, other.0.value.0))
+    }
+}
+
 impl Ord for TopKByRef {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.ref_count.cmp(&other.0.ref_count)
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        Self::rank(self.0.ref_count, self.0.value.0, other)
     }
 }
 
 impl PartialOrd for TopKByRef {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
         Some(self.cmp(other))
     }
 }
+
+impl PartialEq for TopKByRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == CmpOrdering::Equal
+    }
+}
+
+impl Eq for TopKByRef {}
 
 #[derive(Default)]
 pub struct Stats {
@@ -603,22 +681,27 @@ pub fn saved_pct(saved: usize, held: usize) -> f64 {
 
 /// A pointer to an interned, reference-counted, and immutable string object.
 ///
-/// One machine word. The interned string will be held in memory only until
-/// its reference count reaches zero.
+/// One machine word. The string leaves the pool when its last holder drops it,
+/// and its memory is freed once papaya's deferred reclamation runs.
 ///
-/// Labels are interned as `name=value`; [`Self::name`] and [`Self::value`]
-/// return the two halves without scanning, from the separator position the
-/// header records at intern time.
+/// Labels are interned with [`Self::new_pair`] and stored as `name=value`;
+/// [`Self::name`] and [`Self::value`] return the two halves without scanning,
+/// from the name length the header records.
 ///
 /// # Example
 /// ```rust
 /// use valkey_timeseries::common::string_interner::InternedString;
 ///
-/// let x = InternedString::new("hello");
-/// let y: InternedString = "world".into();
-/// assert_ne!(x, y);
-/// assert_eq!(x, InternedString::new("hello"));
-/// assert_eq!(&*x, "hello"); // dereference an InternedString like a pointer
+/// let env = InternedString::new_pair("env", "prod");
+/// assert_eq!(env, InternedString::new_pair("env", "prod"));
+/// assert_eq!((env.name(), env.value()), ("env", "prod"));
+/// assert_eq!(&*env, "env=prod"); // dereferences to the stored `name=value`
+///
+/// // `=` may appear on either side; the split is where the name really ended.
+/// let a = InternedString::new_pair("a=b", "c");
+/// let b = InternedString::new_pair("a", "b=c");
+/// assert_ne!(a, b);
+/// assert_eq!(a.split_pair(), Some(("a=b", "c")));
 /// ```
 pub struct InternedString(Node);
 
@@ -627,33 +710,32 @@ pub struct InternedString(Node);
 type PairBuf = SmallVec<[u8; 128]>;
 
 impl InternedString {
-    /// Intern a string value.  If this value has not previously been
-    /// interned, then `new` will allocate a spot for the value on the
-    /// heap.  Otherwise, it will return a pointer to the object
-    /// previously allocated.
-    ///
-    /// Note that `InternedString::new` is a bit slower than direct allocation, since it needs to check
-    /// a lock. However, the performance should be acceptable for our use cases,
-    /// especially under low contention.
+    /// Intern a plain string: one that is not a label and never splits, even if it
+    /// contains `=` (`name()` is the whole string, `value()` empty). Distinct from
+    /// any [`Self::new_pair`] label with the same text. Allocates only if the
+    /// string is not already interned.
     pub fn new(val: &str) -> Self {
-        Self::intern(val.as_bytes())
+        Self::intern(PoolKey::new(val.as_bytes(), NO_SEPARATOR))
     }
 
-    /// Intern the label `name=value` without building the string first: the
-    /// pool is probed with the bytes on the stack, and only a miss allocates.
+    /// Intern the label `name=value` without building a `String` first. The
+    /// pool is probed with bytes assembled in a stack buffer (on the heap only
+    /// for labels over 128 bytes), and only a miss allocates a node.
     pub fn new_pair(name: &str, value: &str) -> Self {
         let mut buf = PairBuf::with_capacity(name.len() + 1 + value.len());
         buf.extend_from_slice(name.as_bytes());
         buf.push(b'=');
         buf.extend_from_slice(value.as_bytes());
-        Self::intern(&buf)
+        // A name too long for `u32` makes the whole string too long, which `PoolKey::new` rejects.
+        let name_len = u32::try_from(name.len()).unwrap_or(NO_SEPARATOR);
+        Self::intern(PoolKey::new(&buf, name_len))
     }
 
-    fn intern(bytes: &[u8]) -> InternedString {
+    fn intern(key: PoolKey<'_>) -> InternedString {
         let interner = interner();
         let guard = interner.pool.guard();
         loop {
-            if let Some((entry, _)) = interner.pool.get_key_value(bytes, &guard) {
+            if let Some((entry, _)) = interner.pool.get_key_value(&key, &guard) {
                 let node = entry.0;
                 if node.try_acquire() {
                     return InternedString(node);
@@ -664,15 +746,16 @@ impl InternedString {
             }
 
             // Absent: insert a node carrying the pool's reference and ours.
-            let node = Node::allocate(bytes, 2);
+            let node = Node::allocate(key, 2);
             match interner
                 .pool
                 .try_insert_with(PoolEntry(node), || (), &guard)
             {
                 Ok(_) => {
+                    // Before the holder is returned, so before anything can retire it.
                     interner
                         .memory_used
-                        .fetch_add(allocated_size(bytes.len()), Ordering::SeqCst);
+                        .fetch_add(allocated_size(key.bytes.len()), Ordering::Relaxed);
                     return InternedString(node);
                 }
                 Err(_) => {
@@ -715,48 +798,41 @@ impl InternedString {
         unsafe { std::str::from_utf8_unchecked(self.as_bytes()) }
     }
 
-    /// True when the string contains a `=`, i.e. it splits as a label.
+    /// True for a label made by [`Self::new_pair`].
     #[inline]
     pub fn is_pair(&self) -> bool {
-        self.0.header().name_len != NO_SEPARATOR
+        self.0.name_len() != NO_SEPARATOR
     }
 
-    /// The part before the first `=`; the whole string when there is none.
+    /// A label's name; the whole string for a plain one.
     #[inline]
     pub fn name(&self) -> &str {
         let s = self.as_str();
-        match self.0.header().name_len {
+        match self.0.name_len() {
             NO_SEPARATOR => s,
             n => &s[..n as usize],
         }
     }
 
-    /// The part after the first `=`; empty when there is none.
+    /// A label's value; empty for a plain string.
     #[inline]
     pub fn value(&self) -> &str {
         let s = self.as_str();
-        match self.0.header().name_len {
+        match self.0.name_len() {
             NO_SEPARATOR => "",
             n => &s[n as usize + 1..],
         }
     }
 
-    /// `(name, value)` for a string containing `=`, else `None`.
+    /// `(name, value)` for a label, else `None`.
     #[inline]
     pub fn split_pair(&self) -> Option<(&str, &str)> {
         self.is_pair().then(|| (self.name(), self.value()))
     }
 
-    /// Return the number of references to this value.
+    /// Holders of this value, this one included; the pool's own reference is not counted.
     pub fn ref_count(&self) -> usize {
-        // The pool holds one reference; we return the number of
-        // references held by actual clients.
         self.0.strong().load(Ordering::Acquire) - 1
-    }
-
-    /// Return true if this is the only reference to this value.
-    pub fn is_unique(&self) -> bool {
-        self.ref_count() == 1
     }
 
     /// Bytes the pool allocated for this value: the header (reference count, length,
@@ -765,22 +841,28 @@ impl InternedString {
         allocated_size(self.len())
     }
 
-    /// This holder's share of [`Self::allocated_size`].
+    /// This holder's share of [`Self::allocated_size`], rounded up.
     ///
     /// A single pool allocation backs every series carrying the same `label=value` pair, so
     /// charging all of it to each holder would multiply-count it: summing `MEMORY USAGE` over a
-    /// keyspace would report far more memory than the module holds. Splitting it evenly keeps
-    /// that sum equal to the pool's real footprint, which is the number capacity planning wants.
+    /// keyspace would report far more memory than the module holds. Splitting it evenly brings
+    /// that sum close to the pool's footprint without ever understating it: rounding each share
+    /// up overstates an allocation by less than one byte per holder. That bound is relative to
+    /// the allocation, so a short, widely shared string overstates the most (a 19-byte
+    /// allocation shared by 100,000 holders sums to 100,000 bytes).
     pub fn amortized_size(&self) -> usize {
         self.allocated_size().div_ceil(self.ref_count().max(1))
     }
 
-    /// Return the number of unique interned strings.
+    /// Entries in the pool. Includes an entry whose last holder has dropped it while its
+    /// removal is in flight, which [`Self::get_stats`] skips, so the two can briefly disagree.
     pub fn interned_count() -> usize {
         interner().pool.len()
     }
 
-    /// Return the total memory used by all interned strings.
+    /// Header-plus-payload bytes of the entries in the pool, counted as
+    /// [`Self::interned_count`] counts them. Excludes the map's own tables, allocator
+    /// rounding, and removed entries whose memory papaya has not reclaimed yet.
     pub fn memory_used() -> usize {
         interner().memory_used.load(Ordering::Relaxed)
     }
@@ -789,7 +871,10 @@ impl InternedString {
     /// strings by allocated size and by external reference count.
     ///
     /// Passing `k = 0` skips the top-K collection entirely (both `top_k_by_size` and
-    /// `top_k_by_ref` will be empty).
+    /// `top_k_by_ref` will be empty). Ties rank the lower value first.
+    ///
+    /// Walks the whole pool under one guard, so its cost grows with the pool, and memory
+    /// retired during the walk is reclaimed only after it.
     pub fn get_stats_with_top_k(k: usize) -> Stats {
         let interner = interner();
         let guard = interner.pool.guard();
@@ -828,17 +913,26 @@ impl InternedString {
             // that dedup never touches.
             stats.holder_count += ref_count;
 
-            // Each duplicate reference that shares this allocation is a saved copy.
-            // ref_count includes the pool's own ref, so duplicates = ref_count - 1.
-            // (strings with ref_count == 1 have no duplicates → zero saving)
+            // Every holder beyond the first shares this allocation instead of making its own
+            // copy. `ref_count` already excludes the pool's reference.
             if ref_count > 1 {
                 stats.memory_saved_bytes += allocated * (ref_count - 1);
             }
 
             if k > 0 {
+                // Decide before touching the count: most entries make neither list, and
+                // acquiring and releasing them would only contend with live interning.
+                let by_size = size_heap.len() < k
+                    || size_heap.peek_min().is_some_and(|min| {
+                        TopKBySize::rank(bytes, node, min) == CmpOrdering::Greater
+                    });
+                let by_ref = ref_heap.len() < k
+                    || ref_heap.peek_min().is_some_and(|min| {
+                        TopKByRef::rank(ref_count, node, min) == CmpOrdering::Greater
+                    });
                 // The entry may have died since the load above; then it is
                 // not a live string and is skipped like the ones caught earlier.
-                if !node.try_acquire() {
+                if !(by_size || by_ref) || !node.try_acquire() {
                     continue;
                 }
                 let entry = TopKEntry {
@@ -848,14 +942,21 @@ impl InternedString {
                     allocated,
                 };
 
-                size_heap.push(TopKBySize(entry.clone()));
-                if size_heap.len() > k {
-                    size_heap.pop_min(); // Remove the smallest to maintain top-K
+                // A candidate outranks the minimum it displaces, so popping the minimum keeps
+                // the K highest.
+                match (by_size, by_ref) {
+                    (true, true) => {
+                        size_heap.push(TopKBySize(entry.clone()));
+                        ref_heap.push(TopKByRef(entry));
+                    }
+                    (true, false) => size_heap.push(TopKBySize(entry)),
+                    _ => ref_heap.push(TopKByRef(entry)),
                 }
-
-                ref_heap.push(TopKByRef(entry));
+                if size_heap.len() > k {
+                    size_heap.pop_min();
+                }
                 if ref_heap.len() > k {
-                    ref_heap.pop_min(); // Remove the smallest to maintain top-K
+                    ref_heap.pop_min();
                 }
             }
         }
@@ -930,10 +1031,14 @@ impl Drop for InternedString {
                         Err(seen) => current = seen,
                     }
                 }
-                // Only us: the pool's reference is already gone (the entry was
-                // retired without us, which the protocol rules out, but a
-                // decrement is the safe answer either way).
+                // Only us: the pool's reference is already gone. The protocol
+                // rules this out (an entry leaves the pool only once no holder
+                // is left), so a debug build stops on it; in release a plain
+                // decrement is the safe answer.
                 1 => {
+                    if cfg!(debug_assertions) {
+                        panic!("InternedString outlived its pool entry");
+                    }
                     node.release();
                     return;
                 }
@@ -956,23 +1061,12 @@ impl GetSize for InternedString {
     }
 }
 
-impl Borrow<str> for InternedString {
-    fn borrow(&self) -> &str {
-        self.as_str()
-    }
-}
-
-/// Hashes by content, not pointer: fingerprints derived from labels must be
-/// stable across processes.
+/// Hashes the pool key (content and separator), not the pointer, so a hash doesn't depend on
+/// allocation addresses. There is deliberately no `Borrow<str>`: a `&str` can't hash the same
+/// way, so borrowed lookups in a hashed collection would silently miss.
 impl Hash for InternedString {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_bytes().hash(state);
-    }
-}
-
-impl AsRef<[u8]> for InternedString {
-    fn as_ref(&self) -> &[u8] {
-        self.as_bytes()
+        self.0.key().hash(state);
     }
 }
 
@@ -995,46 +1089,8 @@ impl Display for InternedString {
     }
 }
 
-impl FromStr for InternedString {
-    type Err = Infallible;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(s))
-    }
-}
-
-impl From<String> for InternedString {
-    fn from(t: String) -> Self {
-        Self::new(t.as_str())
-    }
-}
-
-impl From<&[u8]> for InternedString {
-    /// Panics if `s` is not valid UTF-8.
-    ///
-    /// Every `InternedString` exposes its bytes as `str`; validate before
-    /// storing them so `as_str` can safely use `from_utf8_unchecked`.
-    fn from(s: &[u8]) -> Self {
-        assert!(
-            std::str::from_utf8(s).is_ok(),
-            "InternedString bytes must be valid UTF-8"
-        );
-        Self::intern(s)
-    }
-}
-
-impl From<&str> for InternedString {
-    fn from(s: &str) -> Self {
-        Self::new(s)
-    }
-}
-
-impl Default for InternedString {
-    fn default() -> InternedString {
-        InternedString::new(Default::default())
-    }
-}
-
-/// Efficiently compares two interned values by comparing their pointers.
+/// Compares pointers: one pool holds one allocation per key, so equal keys share a pointer.
+/// Only meaningful between strings of the same pool (see [`test_pool`]).
 impl PartialEq for InternedString {
     fn eq(&self, other: &InternedString) -> bool {
         self.0.0 == other.0.0
@@ -1043,21 +1099,12 @@ impl PartialEq for InternedString {
 
 impl Eq for InternedString {}
 
-impl PartialOrd for InternedString {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for InternedString {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.as_bytes().cmp(other.as_bytes())
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{InternedString, MAX_REFCOUNT, Node, PoolEntry, increment_refcount, test_pool};
+    use super::{
+        InternedString, MAX_REFCOUNT, NO_SEPARATOR, Node, PoolEntry, PoolKey, increment_refcount,
+        test_pool,
+    };
     use ahash::{HashSet, HashSetExt};
     use std::collections::HashMap;
     use std::ops::Deref;
@@ -1075,7 +1122,7 @@ mod tests {
 
     #[test]
     fn pool_entry_owns_one_reference() {
-        let node = Node::allocate(b"pool-entry", 2);
+        let node = Node::allocate(PoolKey::new(b"pool-entry", NO_SEPARATOR), 2);
         drop(PoolEntry(node));
         assert_eq!(node.strong().load(Ordering::Acquire), 1);
         node.release();
@@ -1103,24 +1150,6 @@ mod tests {
 
         // "bar" is now gone.
         assert_eq!(InternedString::interned_count(), 1);
-    }
-
-    // Ordering should be based on values, not pointers.
-    // Also tests `Display` implementation.
-    #[test]
-    fn sorting() {
-        let _pool = test_pool::isolated();
-        let mut interned_vals = [
-            InternedString::new("4"),
-            InternedString::new("2"),
-            InternedString::new("5"),
-            InternedString::new("0"),
-            InternedString::new("1"),
-            InternedString::new("3"),
-        ];
-        interned_vals.sort();
-        let sorted: Vec<String> = interned_vals.iter().map(|v| format!("{v}")).collect();
-        assert_eq!(&sorted.join(","), "0,1,2,3,4,5");
     }
 
     #[test]
@@ -1287,26 +1316,6 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_ord_and_ord() {
-        let _pool = test_pool::isolated();
-
-        let s1 = InternedString::new("apple");
-        let s2 = InternedString::new("banana");
-        let s3 = InternedString::new("cherry");
-
-        assert!(s1 < s2);
-        assert!(s2 < s3);
-        assert!(s1 < s3);
-
-        let mut vec = [s3.clone(), s1.clone(), s2.clone()];
-        vec.sort();
-
-        assert_eq!(vec[0], s1);
-        assert_eq!(vec[1], s2);
-        assert_eq!(vec[2], s3);
-    }
-
-    #[test]
     fn test_hash_consistency() {
         let _pool = test_pool::isolated();
 
@@ -1356,12 +1365,6 @@ mod tests {
         assert_eq!(unicode1, unicode2);
         assert_ne!(unicode1, different);
         assert_eq!(unicode1.deref(), "🦀 Rust");
-    }
-
-    #[test]
-    #[should_panic(expected = "InternedString bytes must be valid UTF-8")]
-    fn byte_slice_constructor_rejects_invalid_utf8() {
-        let _ = InternedString::from(&[0xff][..]);
     }
 
     #[test]
@@ -1833,7 +1836,7 @@ mod tests {
     }
 
     #[test]
-    fn name_and_value_split_at_first_separator() {
+    fn name_and_value_split_where_the_name_ends() {
         let _pool = test_pool::isolated();
         let l = InternedString::new_pair("env", "prod");
         assert!(l.is_pair());
@@ -1842,43 +1845,139 @@ mod tests {
         assert_eq!(l.split_pair(), Some(("env", "prod")));
         assert_eq!(&*l, "env=prod");
 
-        // A value may itself contain `=`; only the first one splits.
-        let eq = InternedString::new_pair("q", "a=b=c");
-        assert_eq!(eq.split_pair(), Some(("q", "a=b=c")));
+        // Either half may contain `=`.
+        let eq_value = InternedString::new_pair("q", "a=b=c");
+        assert_eq!(eq_value.split_pair(), Some(("q", "a=b=c")));
+        let eq_name = InternedString::new_pair("a=b", "c");
+        assert_eq!(eq_name.split_pair(), Some(("a=b", "c")));
 
-        let bare = InternedString::new("no_separator");
-        assert!(!bare.is_pair());
-        assert_eq!(bare.name(), "no_separator");
-        assert_eq!(bare.value(), "");
-        assert_eq!(bare.split_pair(), None);
-
-        let empty = InternedString::default();
-        assert_eq!(empty.len(), 0);
-        assert_eq!(empty.name(), "");
-        assert_eq!(empty.split_pair(), None);
+        // A plain string never splits, `=` or not.
+        for text in ["no_separator", "k=v", ""] {
+            let bare = InternedString::new(text);
+            assert!(!bare.is_pair(), "{text}");
+            assert_eq!(bare.name(), text);
+            assert_eq!(bare.value(), "");
+            assert_eq!(bare.split_pair(), None);
+        }
 
         // Empty halves are still pairs.
         let empty_value = InternedString::new_pair("k", "");
         assert_eq!(empty_value.split_pair(), Some(("k", "")));
-        let empty_name = InternedString::new("=v");
+        let empty_name = InternedString::new_pair("", "v");
         assert_eq!(empty_name.split_pair(), Some(("", "v")));
     }
 
+    /// `("a=b", "c")` and `("a", "b=c")` are the same bytes; they used to intern to one entry,
+    /// so whichever label came second was silently renamed into the first.
     #[test]
-    fn constructors_deduplicate_to_one_allocation() {
+    fn labels_with_the_same_bytes_stay_distinct() {
         let _pool = test_pool::isolated();
-        let a = InternedString::new_pair("host", "h1");
-        let b = InternedString::new("host=h1");
-        let c: InternedString = String::from("host=h1").into();
-        let d = InternedString::from(b"host=h1".as_slice());
-        assert_eq!(a, b);
-        assert_eq!(b, c);
-        assert_eq!(c, d);
-        assert_eq!(a.ref_count(), 4);
-        assert_eq!(InternedString::interned_count(), 1);
-        assert_eq!(InternedString::memory_used(), 16 + "host=h1".len());
-        // The split is a property of the content, whichever constructor ran first.
-        assert_eq!(b.split_pair(), Some(("host", "h1")));
+        let a = InternedString::new_pair("a=b", "c");
+        let b = InternedString::new_pair("a", "b=c");
+        let plain = InternedString::new("a=b=c");
+        assert_eq!((&*a, &*b, &*plain), ("a=b=c", "a=b=c", "a=b=c"));
+        assert_ne!(a, b);
+        assert_ne!(a, plain);
+        assert_ne!(b, plain);
+        assert_eq!(a.split_pair(), Some(("a=b", "c")));
+        assert_eq!(b.split_pair(), Some(("a", "b=c")));
+        assert_eq!(plain.split_pair(), None);
+        assert_eq!(InternedString::interned_count(), 3);
+        assert_eq!(InternedString::memory_used(), 3 * (16 + "a=b=c".len()));
+
+        // Each still deduplicates against itself.
+        assert_eq!(a, InternedString::new_pair("a=b", "c"));
+        assert_eq!(b, InternedString::new_pair("a", "b=c"));
+        assert_eq!(plain, InternedString::new("a=b=c"));
+
+        // And hashes apart, so hashed collections don't pile them into one bucket.
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        let hasher = BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+        assert_ne!(hasher.hash_one(&a), hasher.hash_one(&b));
+        assert_ne!(hasher.hash_one(&a), hasher.hash_one(&plain));
+
+        drop((a, b, plain));
+        assert_eq!(InternedString::interned_count(), 0);
+        assert_eq!(InternedString::memory_used(), 0);
+    }
+
+    /// Rounding each holder's share up overstates the allocation by less than one byte per
+    /// holder, and never understates it.
+    #[test]
+    fn amortized_shares_bound_the_allocation() {
+        let _pool = test_pool::isolated();
+        const HOLDERS: usize = 100;
+        let first = InternedString::new_pair("k", "v");
+        let holders: Vec<InternedString> = (0..HOLDERS).map(|_| first.clone()).collect();
+        drop(first);
+        let allocated = holders[0].allocated_size();
+        assert_eq!(allocated, 19);
+        let sum: usize = holders.iter().map(InternedString::amortized_size).sum();
+        assert!(sum >= allocated, "{sum} understates {allocated}");
+        assert!(
+            sum < allocated + HOLDERS,
+            "{sum} exceeds {allocated} + {HOLDERS}"
+        );
+    }
+
+    /// Tied rankings break by value, ascending, as the cluster merge does; otherwise which tied
+    /// entry a node reports depends on the pool's iteration order.
+    #[test]
+    fn top_k_ties_break_by_value() {
+        let _pool = test_pool::isolated();
+        let held: Vec<InternedString> = ["ee", "bb", "ff", "aa", "dd", "cc"]
+            .into_iter()
+            .map(InternedString::new)
+            .collect();
+        let stats = InternedString::get_stats_with_top_k(2);
+        let by_size: Vec<String> = stats
+            .top_k_by_size
+            .iter()
+            .map(|e| e.value.to_string())
+            .collect();
+        assert_eq!(by_size, ["aa", "bb"]);
+        let by_ref: Vec<String> = stats
+            .top_k_by_ref
+            .iter()
+            .map(|e| e.value.to_string())
+            .collect();
+        assert_eq!(by_ref, ["aa", "bb"]);
+        // Its entries hold "aa" and "bb", which would otherwise rank them by references below.
+        drop(stats);
+
+        // A higher rank still beats a lower value.
+        let _longer = InternedString::new("zzz");
+        let _shared = held[2].clone(); // "ff", now two holders
+        let stats = InternedString::get_stats_with_top_k(2);
+        assert_eq!(stats.top_k_by_size[0].value.to_string(), "zzz");
+        assert_eq!(stats.top_k_by_size[1].value.to_string(), "aa");
+        assert_eq!(stats.top_k_by_ref[0].value.to_string(), "ff");
+        assert_eq!(stats.top_k_by_ref[1].value.to_string(), "aa");
+    }
+
+    /// Entries that cannot make either list are skipped without being acquired, and the ones
+    /// that do are the K best of each ranking however the pool happens to be ordered.
+    #[test]
+    fn top_k_over_a_large_pool_keeps_the_best() {
+        let _pool = test_pool::isolated();
+        let held: Vec<InternedString> = (0..2_000)
+            .map(|i| InternedString::new(&format!("s{i:0>width$}", width = i % 7)))
+            .collect();
+        let mut expected: Vec<&InternedString> = held.iter().collect();
+        expected.sort_by(|a, b| {
+            b.len()
+                .cmp(&a.len())
+                .then_with(|| a.as_bytes().cmp(b.as_bytes()))
+        });
+        expected.dedup();
+        let stats = InternedString::get_stats_with_top_k(5);
+        let got: Vec<&str> = stats
+            .top_k_by_size
+            .iter()
+            .map(|e| e.value.as_str())
+            .collect();
+        let want: Vec<&str> = expected[..5].iter().map(|s| s.as_str()).collect();
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -1956,10 +2055,13 @@ mod tests {
                     let _pool = pool.enter();
                     for i in 0..20_000usize {
                         let s = NAMES[(i + t) % NAMES.len()];
-                        let a = InternedString::new(s);
+                        let a = InternedString::new_pair("churn", &s[6..]);
                         let b = InternedString::new_pair("churn", &s[6..]);
                         assert_eq!(a, b, "{s}: equal content, distinct allocations");
                         assert_eq!(a.value(), &s[6..]);
+                        // Same bytes as a plain string: a separate entry, churned alongside.
+                        let plain = InternedString::new(s);
+                        assert_ne!(a, plain, "{s}: a plain string matched a label");
                         if i % 3 == 0 {
                             drop(a.clone());
                         }

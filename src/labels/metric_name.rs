@@ -372,6 +372,23 @@ mod tests {
         assert_eq!(pairs, [("a", "2"), ("b", "1"), ("c", "3")]);
     }
 
+    /// `a=1` and `a=b=2` used to intern `a=b`'s pair as name `a`, value `b=2`, which then
+    /// replaced the real `a` as a repeated name: one label lost, the other renamed.
+    #[test]
+    fn names_containing_the_separator_survive() {
+        let mn = MetricName::new(&[Label::new("a", "1"), Label::new("a=b", "2")]);
+        let pairs: Vec<(&str, &str)> = mn.iter().map(|l| (l.name, l.value)).collect();
+        assert_eq!(pairs, [("a", "1"), ("a=b", "2")]);
+        assert_eq!(mn.get_value("a"), Some("1"));
+        assert_eq!(mn.get_value("a=b"), Some("2"));
+
+        let mut edited = mn.clone();
+        edited.add_label("a", "b=2");
+        assert_eq!(edited.get_value("a"), Some("b=2"));
+        assert_eq!(edited.get_value("a=b"), Some("2"));
+        assert_ne!(edited, mn);
+    }
+
     #[test]
     fn clone_and_shared_are_the_same_allocation() {
         let mn: MetricName = r#"m{a="1",b="2"}"#.parse().unwrap();

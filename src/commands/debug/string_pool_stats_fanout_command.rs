@@ -21,10 +21,11 @@ use valkey_module::{Context, Status, ValkeyResult};
 /// reference count.
 ///
 /// The top-K lists merge each node's own top K by value, adding up reference counts and
-/// allocations. By size that is exact: a string in the cluster-wide top K is in the top K of every
-/// node that holds it. By reference count it is approximate — a string just below the cut on
-/// every node can outrank one that made a single node's list, and a listed string's count omits
-/// the nodes where it fell below the cut.
+/// allocations. By size that is exact: every node breaks ties as [`Self::finish_top_k`] does
+/// (lower value first), so a string in the cluster-wide top K is in the top K of every node that
+/// holds it. By reference count it is approximate — a string just below the cut on every node can
+/// outrank one that made a single node's list, and a listed string's count omits the nodes where
+/// it fell below the cut.
 #[derive(Default)]
 pub struct StringPoolSummary {
     pub total: BucketStats,
