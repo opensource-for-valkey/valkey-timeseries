@@ -278,19 +278,9 @@ impl LabelQueryResult {
             }
         }
 
-        let merged_has_more = merged.len() > limit;
-
-        let results = if merged_has_more {
-            let mut items: Vec<_> = merged.into_values().collect();
-            items.sort_by(compare_search_results(order_by));
-            items.truncate(limit);
-            items
-        } else {
-            collect_top_k(merged.into_values(), order_by, limit).results
-        };
-
-        self.has_more = self.has_more || other.has_more || merged_has_more;
-        self.results = results;
+        let merged = select_best(merged.into_values().collect(), order_by, limit);
+        self.has_more = self.has_more || other.has_more || merged.has_more;
+        self.results = merged.results;
     }
 }
 
@@ -403,21 +393,31 @@ pub(crate) fn normalize_limit(limit: usize) -> usize {
     .min(SEARCH_RESULT_LIMIT_MAX)
 }
 
-/// `apply_search_hints` sorts and limits a slice of values according to hints,
-/// returning a [`LabelQueryResult`] that includes a `has_more` flag indicating
-/// whether any entries were truncated at the limit.
+/// `apply_search_hints` keeps the best `hints.limit` of `values` under the hints' ordering,
+/// sorted, returning a [`LabelQueryResult`] whose `has_more` says whether any were cut.
 pub(crate) fn apply_search_hints(
-    mut values: Vec<LabelSearchResult>,
+    values: Vec<LabelSearchResult>,
     hints: &SearchHints,
 ) -> LabelQueryResult {
-    let limit = normalize_limit(hints.limit);
+    select_best(values, hints.order_by, normalize_limit(hints.limit))
+}
 
-    values.sort_by(compare_search_results(hints.order_by));
-
+/// The best `limit` of `values` under `order`, sorted, in place: a selection then a sort of
+/// what is kept, rather than a sort of every candidate, which may be every distinct value of a
+/// label.
+fn select_best(
+    mut values: Vec<LabelSearchResult>,
+    order: SearchResultOrdering,
+    limit: usize,
+) -> LabelQueryResult {
+    debug_assert!((1..=SEARCH_RESULT_LIMIT_MAX).contains(&limit));
+    let cmp = compare_search_results(order);
     let has_more = values.len() > limit;
     if has_more {
+        values.select_nth_unstable_by(limit - 1, cmp);
         values.truncate(limit);
     }
+    values.sort_unstable_by(cmp);
     LabelQueryResult::new(values, has_more)
 }
 
