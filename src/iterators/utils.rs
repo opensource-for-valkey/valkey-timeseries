@@ -539,7 +539,7 @@ fn create_filtered_sample_iterator<'a>(
 /// Create the multi-aggregation row pipeline for one series:
 /// filtered samples -> MultiAggregateIterator -> optional reverse -> take(COUNT).
 /// Only valid when `options.aggregation` is present (typically multi).
-pub(crate) fn create_row_iterator<'a>(
+pub fn create_row_iterator<'a>(
     series: &'a TimeSeries,
     options: &RangeOptions,
     latest_sample: Option<Sample>,

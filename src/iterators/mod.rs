@@ -18,8 +18,8 @@ pub(crate) use timeseries_range_iterator::{
     TimeSeriesRangeIterator, TimeSeriesRangeRowIterator, get_range_latest_sample,
 };
 pub use timestamp_filter_iterator::TimestampFilterIterator;
-pub use utils::create_range_iterator;
 pub(crate) use utils::{
-    TailIter, create_range_iterator_for_reply, create_range_tail_iterator, create_row_iterator,
+    TailIter, create_range_iterator_for_reply, create_range_tail_iterator,
     create_row_iterator_for_reply, create_row_tail_iterator, create_sample_iterator_adapter,
 };
+pub use utils::{create_range_iterator, create_row_iterator};

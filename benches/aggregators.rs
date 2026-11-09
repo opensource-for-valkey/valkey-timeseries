@@ -10,7 +10,7 @@ use valkey_timeseries::aggregators::{
 };
 use valkey_timeseries::common::Sample;
 use valkey_timeseries::common::binop::ComparisonOperator;
-use valkey_timeseries::iterators::create_range_iterator;
+use valkey_timeseries::iterators::{create_range_iterator, create_row_iterator};
 use valkey_timeseries::series::request_types::{
     AggregationOptions, AggregatorConfig, RangeOptions, ValueComparisonFilter,
 };
@@ -145,10 +145,11 @@ fn partial_reducers(c: &mut Criterion) {
     group.finish();
 }
 
-/// `TS.RANGE`-shaped reads through `create_range_iterator` over a 100k-sample series (default
-/// encoding) in 60 s buckets: one aggregation, two, one with `FILTER_BY_VALUE`, and a raw read.
-/// The read pipeline (`sample_iterator_adapter`, `AggregationHelper::update`) sits on every
-/// sample here, which the isolated groups above leave out.
+/// `TS.RANGE`-shaped reads over a 100k-sample series (default encoding) in 60 s buckets: one
+/// aggregation, one with `FILTER_BY_VALUE`, and a raw read through `create_range_iterator`, and
+/// two aggregations through `create_row_iterator`, the row pipeline a multi-aggregation
+/// `TS.RANGE` takes. The read pipeline sits on every sample here, which the isolated groups above
+/// leave out.
 fn range_scan(c: &mut Criterion) {
     let mut series = TimeSeries::new();
     for (i, v) in values().into_iter().enumerate() {
@@ -195,15 +196,14 @@ fn range_scan(c: &mut Criterion) {
                 ..Default::default()
             },
         ),
-        (
-            "avg_max_two_columns",
-            RangeOptions {
-                aggregation: Some(agg(&[AggregationType::Avg, AggregationType::Max])),
-                ..Default::default()
-            },
-        ),
         ("raw", RangeOptions::default()),
     ];
+    // `create_range_iterator` yields one value per bucket, so a multi-aggregation read takes the
+    // row pipeline, as `TS.RANGE` does.
+    let two_columns = RangeOptions {
+        aggregation: Some(agg(&[AggregationType::Avg, AggregationType::Max])),
+        ..Default::default()
+    };
 
     let mut group = c.benchmark_group("aggregators/range_scan");
     group.throughput(Throughput::Elements(SAMPLES as u64));
@@ -216,6 +216,16 @@ fn range_scan(c: &mut Criterion) {
             })
         });
     }
+    group.bench_function(BenchmarkId::from_parameter("avg_max_two_columns"), |b| {
+        b.iter(|| {
+            create_row_iterator(&series, &two_columns, None, false).for_each(|row| {
+                black_box(row.timestamp);
+                for value in row.values.iter() {
+                    black_box(*value);
+                }
+            });
+        })
+    });
     group.finish();
 }
 
