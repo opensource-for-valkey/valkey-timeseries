@@ -222,7 +222,7 @@ pub struct AggregationOptions {
 
 /// A filter that can be either inclusive or exclusive over a date range.
 /// Used primarily in metadata queries.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MetaDateRangeFilter {
     Includes(DateRange),
     Excludes(DateRange),

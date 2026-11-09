@@ -8,8 +8,8 @@
 //! series materialization, this module is value-centric: it evaluates and ranks label values
 //! using index primitives while reusing selector hints when available.
 //!
-//! A scoped query (selectors or a date range) reads the matching series through the batched
-//! reader ([`for_each_series`]): only the label names or values are copied out under the
+//! A scoped query (selectors, a date range, or both) reads the matching series through the
+//! batched reader, from the caller's plan when it made one ([`for_each_planned_series`]): only the label names or values are copied out under the
 //! module lock, a batch at a time, and fuzzy scoring and cardinality lookups run once the
 //! lock is released. On a fan-out share the lock is given back between batches; a caller on
 //! the main thread already holds it and reads in one batch.
@@ -140,9 +140,15 @@ impl SelectHints {
         }
     }
 
-    /// Read `plan`, made from these hints' selectors and date range, instead of planning them
-    /// again.
+    /// Read `plan`, made from these hints' [`selection`](Self::selection) and date range,
+    /// instead of planning them again. Nothing can check that it was made from the same
+    /// selectors, but its date range must be the same.
     pub fn with_plan(mut self, plan: Option<SeriesCursor>) -> Self {
+        debug_assert!(
+            plan.as_ref()
+                .is_none_or(|plan| plan.date_range() == self.date_range),
+            "a plan made from another date range"
+        );
         self.planned = plan;
         self
     }
@@ -151,22 +157,27 @@ impl SelectHints {
         self.selectors.is_empty() && self.date_range.is_none()
     }
 
+    /// The series these hints select before the date range is applied: those the selectors
+    /// match, or, with a date range alone, every series.
+    pub fn selection(&self) -> SeriesSelection<'_> {
+        if self.selectors.is_empty() {
+            SeriesSelection::All
+        } else {
+            SeriesSelection::Matching(&self.selectors)
+        }
+    }
+
     /// Run `read` over the series these hints select in database `db`: the plan given with
     /// [`Self::with_plan`] first, and a new one when there is none or a `SWAPDB` moved the
     /// database under it ([`read_planned`]).
     fn read_planned<T>(
-        self,
+        mut self,
         db: i32,
         read: impl FnMut(SeriesCursor) -> ValkeyResult<T>,
     ) -> ValkeyResult<T> {
-        let replan = || {
-            SeriesCursor::plan(
-                db,
-                SeriesSelection::Matching(&self.selectors),
-                self.date_range,
-            )
-        };
-        read_planned(self.planned, replan, read)
+        let planned = self.planned.take();
+        let replan = || SeriesCursor::plan(db, self.selection(), self.date_range);
+        read_planned(planned, replan, read)
     }
 }
 
@@ -2819,6 +2830,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A date range without selectors selects every series, through its own plan or one the
+    /// caller made; it was once planned as "no selectors", which matches nothing.
+    #[test]
+    fn date_range_hints_alone_select_every_series() {
+        use crate::series::DateRange;
+        use crate::series::index::{clear_timeseries_index, get_db_index};
+        use crate::series::request_types::MetaDateRangeFilter;
+
+        const DB: i32 = 7311;
+        clear_timeseries_index(DB);
+        let index = get_db_index(DB);
+        for id in 1..=3 {
+            let mut series = TimeSeries::new();
+            series.id = id;
+            series.labels = MetricName::new(&[Label::new("job", "api")]);
+            index.index_timeseries(&series, format!("series:{id}").as_bytes());
+        }
+        let range = Some(MetaDateRangeFilter::Includes(DateRange {
+            start: 0,
+            end: 100,
+        }));
+        let hints = || super::SelectHints::new(vec![], range);
+        assert!(!hints().is_empty());
+        assert!(matches!(hints().selection(), super::SeriesSelection::All));
+
+        let planned = hints().read_planned(DB, |cursor| Ok(cursor.remaining()));
+        assert_eq!(planned.unwrap(), 3);
+
+        let plan = super::SeriesCursor::plan(DB, hints().selection(), range).unwrap();
+        let reused = hints()
+            .with_plan(Some(plan))
+            .read_planned(DB, |cursor| Ok(cursor.remaining()));
+        assert_eq!(reused.unwrap(), 3);
+        clear_timeseries_index(DB);
     }
 
     /// More series than may be read inline, with ids `1..=count`.
