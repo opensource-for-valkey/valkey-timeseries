@@ -27,8 +27,6 @@ use crate::labels::filters::SeriesSelector;
 use crate::series::index::key_buffer::KeyBuffer;
 use crate::series::request_types::MetaDateRangeFilter;
 use ahash::{AHashMap, AHashSet};
-use itertools::Itertools;
-use min_max_heap::MinMaxHeap;
 use std::cmp::Ordering;
 use std::collections::{Bound, VecDeque};
 use std::fmt::Display;
@@ -222,8 +220,9 @@ impl LabelSearchResult {
 
 impl PartialEq for LabelSearchResult {
     fn eq(&self, other: &Self) -> bool {
+        // As the ranking compares scores, so that equality is reflexive even for NaN.
         self.value == other.value
-            && self.score == other.score
+            && self.score.total_cmp(&other.score).is_eq()
             && self.cardinality == other.cardinality
     }
 }
@@ -276,13 +275,12 @@ impl LabelQueryResult {
         let merged_has_more = merged.len() > limit;
 
         let results = if merged_has_more {
-            let comparator = compare_search_results(order_by);
             let mut items: Vec<_> = merged.into_values().collect();
-            items.sort_by(comparator);
+            items.sort_by(compare_search_results(order_by));
             items.truncate(limit);
             items
         } else {
-            collect_limited_with_heap(merged.into_values(), order_by, limit).results
+            collect_top_k(merged.into_values(), order_by, limit).results
         };
 
         self.has_more = self.has_more || other.has_more || merged_has_more;
@@ -339,50 +337,52 @@ pub trait LabelQuerier {
     ) -> TsdbResult<LabelQueryResult>;
 }
 
-type ComparisonFn = fn(&LabelSearchResult, &LabelSearchResult) -> Ordering;
+/// The fields a result is ranked by, borrowed, so that a candidate can be compared with the
+/// results kept so far before its value is copied.
+#[derive(Clone, Copy, Debug)]
+struct RankKey<'a> {
+    value: &'a str,
+    score: f64,
+    cardinality: usize,
+}
 
-/// `compare_search_results` returns the total-order comparison function for the
-/// given Ordering. For `OrderByValueAsc` and `OrderByValueDesc` the order is on
-/// value alone. For `OrderByScoreDesc` the order is (score desc, value asc),
-/// which is a total order and defines the position at which a duplicate value
-/// is first emitted by the streaming merge.
-fn compare_search_results(order: SearchResultOrdering) -> ComparisonFn {
-    fn value_asc(a: &LabelSearchResult, b: &LabelSearchResult) -> Ordering {
-        a.value.cmp(&b.value)
-    }
-
-    fn value_desc(a: &LabelSearchResult, b: &LabelSearchResult) -> Ordering {
-        b.value.cmp(&a.value)
-    }
-
-    fn score_desc(a: &LabelSearchResult, b: &LabelSearchResult) -> Ordering {
-        match b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal) {
-            Ordering::Equal => value_asc(a, b),
-            other => other,
+impl LabelSearchResult {
+    fn rank_key(&self) -> RankKey<'_> {
+        RankKey {
+            value: &self.value,
+            score: self.score,
+            cardinality: self.cardinality,
         }
     }
+}
 
-    fn cardinality_asc(a: &LabelSearchResult, b: &LabelSearchResult) -> Ordering {
-        match a.cardinality.cmp(&b.cardinality) {
-            Ordering::Equal => value_asc(a, b),
-            other => other,
+impl SearchResultOrdering {
+    /// The one ranking rule every label search uses: `Less` means `a` comes first.
+    ///
+    /// A total order: score and cardinality ties fall back to the value, ascending, and scores
+    /// compare by [`f64::total_cmp`], so even a NaN from a [`FuzzyFilter`] has one place and
+    /// cannot make a sort panic.
+    fn compare(self, a: RankKey<'_>, b: RankKey<'_>) -> Ordering {
+        let by_value = || a.value.cmp(b.value);
+        match self {
+            SearchResultOrdering::ValueAsc => by_value(),
+            SearchResultOrdering::ValueDesc => b.value.cmp(a.value),
+            SearchResultOrdering::ScoreDesc => b.score.total_cmp(&a.score).then_with(by_value),
+            SearchResultOrdering::CardinalityAsc => {
+                a.cardinality.cmp(&b.cardinality).then_with(by_value)
+            }
+            SearchResultOrdering::CardinalityDesc => {
+                b.cardinality.cmp(&a.cardinality).then_with(by_value)
+            }
         }
     }
+}
 
-    fn cardinality_desc(a: &LabelSearchResult, b: &LabelSearchResult) -> Ordering {
-        match b.cardinality.cmp(&a.cardinality) {
-            Ordering::Equal => value_asc(a, b),
-            other => other,
-        }
-    }
-
-    match order {
-        SearchResultOrdering::ValueDesc => value_desc,
-        SearchResultOrdering::ScoreDesc => score_desc,
-        SearchResultOrdering::CardinalityAsc => cardinality_asc,
-        SearchResultOrdering::CardinalityDesc => cardinality_desc,
-        SearchResultOrdering::ValueAsc => value_asc,
-    }
+/// [`SearchResultOrdering::compare`] over whole results.
+fn compare_search_results(
+    order: SearchResultOrdering,
+) -> impl Fn(&LabelSearchResult, &LabelSearchResult) -> Ordering + Copy {
+    move |a, b| order.compare(a.rank_key(), b.rank_key())
 }
 
 fn normalize_limit(limit: usize) -> usize {
@@ -403,8 +403,7 @@ pub(crate) fn apply_search_hints(
 ) -> LabelQueryResult {
     let limit = normalize_limit(hints.limit);
 
-    let comparator = compare_search_results(hints.order_by);
-    values.sort_by(comparator);
+    values.sort_by(compare_search_results(hints.order_by));
 
     let has_more = limit > 0 && values.len() > limit;
     if has_more {
@@ -553,29 +552,86 @@ fn collect_limited(
     LabelQueryResult::new(items, has_more)
 }
 
-/// `collect_limited_with_heap` keeps only the best `limit` results in memory for non-value
-/// orderings where we cannot stream directly from the index order.
-fn collect_limited_with_heap(
+/// The best `limit` of the results offered to it under one ordering, and whether more than
+/// `limit` were offered.
+///
+/// It holds at most `2 * limit` results. When full it keeps the best `limit`, by selection
+/// rather than a sort, and from then on turns away, without copying it, any candidate that
+/// does not beat the worst of those. The one sort is over at most `2 * limit` results, in
+/// [`Self::finish`].
+struct TopK {
+    order: SearchResultOrdering,
+    limit: usize,
+    items: Vec<LabelSearchResult>,
+    /// Whether `items[limit - 1]` is the worst of `limit` results already kept, and so the
+    /// bar a candidate must beat. Results pushed after it do not move it.
+    bounded: bool,
+    offered: usize,
+}
+
+impl TopK {
+    fn new(order: SearchResultOrdering, limit: usize) -> Self {
+        debug_assert!(limit > 0, "a label search limit is normalized first");
+        let limit = limit.max(1);
+        Self {
+            order,
+            limit,
+            items: Vec::with_capacity(limit.saturating_mul(2).min(DEFAULT_LIMIT)),
+            bounded: false,
+            offered: 0,
+        }
+    }
+
+    fn admits(&self, key: RankKey<'_>) -> bool {
+        !self.bounded
+            || self
+                .order
+                .compare(key, self.items[self.limit - 1].rank_key())
+                .is_lt()
+    }
+
+    /// Offer the result `key` ranks, made by `make` only if it is kept.
+    fn offer_with(&mut self, key: RankKey<'_>, make: impl FnOnce() -> LabelSearchResult) {
+        self.offered += 1;
+        if self.admits(key) {
+            self.push(make());
+        }
+    }
+
+    fn offer(&mut self, item: LabelSearchResult) {
+        self.offered += 1;
+        if self.admits(item.rank_key()) {
+            self.push(item);
+        }
+    }
+
+    fn push(&mut self, item: LabelSearchResult) {
+        self.items.push(item);
+        if self.items.len() >= self.limit.saturating_mul(2) {
+            let cmp = compare_search_results(self.order);
+            self.items.select_nth_unstable_by(self.limit - 1, cmp);
+            self.items.truncate(self.limit);
+            self.bounded = true;
+        }
+    }
+
+    fn finish(mut self) -> LabelQueryResult {
+        self.items
+            .sort_unstable_by(compare_search_results(self.order));
+        self.items.truncate(self.limit);
+        LabelQueryResult::new(self.items, self.offered > self.limit)
+    }
+}
+
+/// The best `limit` of `iter` under `order`, sorted: see [`TopK`].
+fn collect_top_k(
     iter: impl Iterator<Item = LabelSearchResult>,
     order: SearchResultOrdering,
     limit: usize,
 ) -> LabelQueryResult {
-    let cmp = compare_search_results(order);
-
-    // The comparator already includes the requested direction: the best results
-    // compare less, even for descending scores or cardinalities.
-    let mut items = iter
-        .k_smallest_relaxed_by(limit + 1, &cmp)
-        .collect::<Vec<_>>();
-
-    items.sort_by(cmp);
-
-    let has_more = items.len() > limit;
-    if has_more {
-        items.truncate(limit);
-    }
-
-    LabelQueryResult::new(items, has_more)
+    let mut top = TopK::new(order, limit);
+    iter.for_each(|item| top.offer(item));
+    top.finish()
 }
 
 /// Label-index entries a scan reads under one hold of the postings read lock.
@@ -1039,119 +1095,6 @@ fn label_cardinality_in_holds(
     }
 }
 
-/// `HeapResultHolder` is a helper struct for use in the binary heap below.
-///
-/// It stores the full [`SearchResultOrdering`] (not just [`SortBy`]) because the
-/// correct value tie-break direction depends on which drain direction will be used:
-///
-/// * `drain_asc()` (ascending orderings) yields min → max, so items that should appear
-///   first in the output must compare **less** — value-asc tie-break is correct.
-/// * `drain_desc()` (descending orderings) yields max → min, so items that should appear
-///   first must compare **greater** — value-desc tie-break in `Ord` produces value-asc
-///   output after the drain.
-///
-/// This means the `Ord` implementation can encode the complete desired output order
-/// directly, and no post-drain sort is required.
-///
-/// The value is owned: the name scan feeding the heap gives the postings lock back as it goes,
-/// so nothing borrowed from the postings outlives a hold. Only names that enter the heap are
-/// copied.
-#[derive(Debug, Clone)]
-struct HeapResultHolder {
-    value: String,
-    score: f64,
-    cardinality: usize,
-    order: SearchResultOrdering,
-}
-
-impl HeapResultHolder {
-    fn new(value: &str, score: f64, cardinality: usize, order: SearchResultOrdering) -> Self {
-        Self {
-            value: value.to_owned(),
-            score,
-            cardinality,
-            order,
-        }
-    }
-
-    fn compare_parts(
-        order: SearchResultOrdering,
-        a_value: &str,
-        a_score: f64,
-        a_cardinality: usize,
-        b_value: &str,
-        b_score: f64,
-        b_cardinality: usize,
-    ) -> Ordering {
-        match order {
-            SearchResultOrdering::ValueAsc => a_value.cmp(b_value),
-            SearchResultOrdering::ValueDesc => b_value.cmp(a_value),
-            SearchResultOrdering::ScoreDesc => {
-                match b_score.partial_cmp(&a_score).unwrap_or(Ordering::Equal) {
-                    Ordering::Equal => a_value.cmp(b_value),
-                    other => other,
-                }
-            }
-            SearchResultOrdering::CardinalityAsc => match a_cardinality.cmp(&b_cardinality) {
-                Ordering::Equal => a_value.cmp(b_value),
-                other => other,
-            },
-            SearchResultOrdering::CardinalityDesc => match b_cardinality.cmp(&a_cardinality) {
-                Ordering::Equal => a_value.cmp(b_value),
-                other => other,
-            },
-        }
-    }
-
-    fn compare_candidate(
-        &self,
-        candidate_value: &str,
-        candidate_score: f64,
-        candidate_cardinality: usize,
-    ) -> Ordering {
-        Self::compare_parts(
-            self.order,
-            candidate_value,
-            candidate_score,
-            candidate_cardinality,
-            &self.value,
-            self.score,
-            self.cardinality,
-        )
-    }
-}
-
-impl PartialOrd<Self> for HeapResultHolder {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for HeapResultHolder {
-    fn cmp(&self, other: &Self) -> Ordering {
-        Self::compare_parts(
-            self.order,
-            &self.value,
-            self.score,
-            self.cardinality,
-            &other.value,
-            other.score,
-            other.cardinality,
-        )
-    }
-}
-
-impl PartialEq for HeapResultHolder {
-    fn eq(&self, other: &Self) -> bool {
-        self.value == other.value
-            && self.score == other.score
-            && self.cardinality == other.cardinality
-            && self.order == other.order
-    }
-}
-
-impl Eq for HeapResultHolder {}
-
 fn get_label_names_top_k(
     index: &TimeSeriesIndex,
     filter: &dyn FuzzyFilter,
@@ -1169,38 +1112,22 @@ fn get_label_names_top_k_once(
     order: SearchResultOrdering,
     limit: usize,
 ) -> LabelQueryResult {
-    let mut heap: MinMaxHeap<HeapResultHolder> = MinMaxHeap::with_capacity(limit + 2);
-    let mut has_more = false;
-    // Unbounded: the heap bounds the result, and every name is a candidate for it.
-    let _ = iterate_label_names_asc(index, filter, None, |key_name, score, cardinality| {
-        if heap.len() == limit {
-            let Some(worst) = heap.peek_max() else {
-                return;
-            };
-
-            has_more = true;
-
-            let candidate_cmp = worst.compare_candidate(key_name, score, cardinality);
-            if candidate_cmp != Ordering::Less {
-                return;
-            }
-
-            heap.pop_max();
-        }
-
-        heap.push(HeapResultHolder::new(key_name, score, cardinality, order));
+    let mut top = TopK::new(order, limit);
+    // Unbounded: `top` bounds the result, and every name is a candidate for it. The name is
+    // valid only for the call, so only one that is kept is copied.
+    let _ = iterate_label_names_asc(index, filter, None, |name, score, cardinality| {
+        let key = RankKey {
+            value: name,
+            score,
+            cardinality,
+        };
+        top.offer_with(key, || LabelSearchResult {
+            value: name.to_owned(),
+            score,
+            cardinality,
+        });
     });
-
-    let results: Vec<LabelSearchResult> = heap
-        .drain_asc()
-        .map(|h| LabelSearchResult {
-            value: h.value,
-            score: h.score,
-            cardinality: h.cardinality,
-        })
-        .collect();
-
-    LabelQueryResult::new(results, has_more)
+    top.finish()
 }
 
 /// `collect_unscoped_label_names` attempts to satisfy a label name search by scanning the label index directly
@@ -1287,7 +1214,7 @@ fn collect_unscoped_label_values_in_holds(
                 ),
                 SearchResultOrdering::ScoreDesc
                 | SearchResultOrdering::CardinalityAsc
-                | SearchResultOrdering::CardinalityDesc => collect_limited_with_heap(
+                | SearchResultOrdering::CardinalityDesc => collect_top_k(
                     LabelValueScan::new(
                         index,
                         label_name,
@@ -1512,11 +1439,10 @@ impl LabelQuerier for DefaultLabelQuerier {
 mod tests {
     use super::{
         FuzzyFilter, LabelQueryResult, LabelSearchResult, SearchHints, SearchResultOrdering,
-        TimeSeriesIndex, apply_search_hints, collect_limited_with_heap,
-        collect_unscoped_label_names, collect_unscoped_label_values,
-        collect_unscoped_label_values_in_holds, get_label_names_desc_in_holds,
-        iterate_label_names_asc_in_holds, label_cardinality_in_holds,
-        label_search_exceeds_inline_budget,
+        TimeSeriesIndex, apply_search_hints, collect_top_k, collect_unscoped_label_names,
+        collect_unscoped_label_values, collect_unscoped_label_values_in_holds,
+        compare_search_results, get_label_names_desc_in_holds, iterate_label_names_asc_in_holds,
+        label_cardinality_in_holds, label_search_exceeds_inline_budget,
     };
     use crate::labels::{Label, MetricName};
     use crate::series::TimeSeries;
@@ -2144,7 +2070,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_limited_with_heap_returns_sorted_results() {
+    fn collect_top_k_returns_sorted_results() {
         let items = vec![
             LabelSearchResult {
                 value: "c".to_string(),
@@ -2164,7 +2090,7 @@ mod tests {
         ];
 
         // Test ValueAsc
-        let result = collect_limited_with_heap(
+        let result = collect_top_k(
             items.clone().into_iter(),
             SearchResultOrdering::ValueAsc,
             10,
@@ -2172,7 +2098,7 @@ mod tests {
         assert_eq!(values(result), vec!["a", "b", "c"]);
 
         // Test ValueDesc
-        let result = collect_limited_with_heap(
+        let result = collect_top_k(
             items.clone().into_iter(),
             SearchResultOrdering::ValueDesc,
             10,
@@ -2180,7 +2106,7 @@ mod tests {
         assert_eq!(values(result), vec!["c", "b", "a"]);
 
         // Test ScoreDesc
-        let result = collect_limited_with_heap(
+        let result = collect_top_k(
             items.clone().into_iter(),
             SearchResultOrdering::ScoreDesc,
             10,
@@ -2188,7 +2114,7 @@ mod tests {
         assert_eq!(values(result), vec!["a", "b", "c"]);
 
         // Test CardinalityAsc
-        let result = collect_limited_with_heap(
+        let result = collect_top_k(
             items.clone().into_iter(),
             SearchResultOrdering::CardinalityAsc,
             10,
@@ -2196,12 +2122,25 @@ mod tests {
         assert_eq!(values(result), vec!["a", "b", "c"]);
 
         // Test CardinalityDesc
-        let result = collect_limited_with_heap(
+        let result = collect_top_k(
             items.clone().into_iter(),
             SearchResultOrdering::CardinalityDesc,
             10,
         );
         assert_eq!(values(result), vec!["c", "b", "a"]);
+    }
+
+    /// The best `limit` of `input` by a full sort: what a bounded selection must agree with.
+    fn sorted_prefix(
+        input: &[LabelSearchResult],
+        order: SearchResultOrdering,
+        limit: usize,
+    ) -> (Vec<LabelSearchResult>, bool) {
+        let mut all = input.to_vec();
+        all.sort_by(compare_search_results(order));
+        let has_more = all.len() > limit;
+        all.truncate(limit);
+        (all, has_more)
     }
 
     #[test]
@@ -2232,20 +2171,58 @@ mod tests {
                             order_by: order,
                             ..Default::default()
                         };
-                        let expected = apply_search_hints(input.to_vec(), &hints);
-                        let actual = collect_limited_with_heap(input.iter().cloned(), order, limit);
-                        assert_eq!(
-                            actual.results, expected.results,
-                            "input {input:?}, order {order:?}, limit {limit}"
-                        );
-                        assert_eq!(
-                            actual.has_more, expected.has_more,
-                            "input {input:?}, order {order:?}, limit {limit}"
-                        );
+                        let (expected, expected_more) = sorted_prefix(input, order, limit);
+                        for actual in [
+                            collect_top_k(input.iter().cloned(), order, limit),
+                            apply_search_hints(input.to_vec(), &hints),
+                        ] {
+                            assert_eq!(
+                                actual.results, expected,
+                                "input {input:?}, order {order:?}, limit {limit}"
+                            );
+                            assert_eq!(
+                                actual.has_more, expected_more,
+                                "input {input:?}, order {order:?}, limit {limit}"
+                            );
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// A filter may score NaN: ranking must still be a total order, so sorting cannot panic
+    /// and a bounded selection keeps what a full sort would.
+    #[test]
+    fn ranking_tolerates_nan_scores() {
+        let items: Vec<LabelSearchResult> = (0..64)
+            .map(|i| LabelSearchResult {
+                value: format!("v{:02}", (i * 37) % 64),
+                score: match i % 4 {
+                    0 => f64::NAN,
+                    1 => -f64::NAN,
+                    _ => (i % 7) as f64 / 7.0,
+                },
+                cardinality: i % 5,
+            })
+            .collect();
+        for order in all_orderings() {
+            let cmp = compare_search_results(order);
+            let (sorted, _) = sorted_prefix(&items, order, items.len());
+            assert!(sorted.windows(2).all(|w| cmp(&w[0], &w[1]).is_lt()));
+            for limit in [1, 3, 10, 63, 64, 100] {
+                let (expected, expected_more) = sorted_prefix(&items, order, limit);
+                let actual = collect_top_k(items.iter().cloned(), order, limit);
+                assert_eq!(actual.results, expected, "{order:?}, limit {limit}");
+                assert_eq!(actual.has_more, expected_more, "{order:?}, limit {limit}");
+            }
+        }
+        let nan = LabelSearchResult {
+            value: "x".into(),
+            score: f64::NAN,
+            cardinality: 1,
+        };
+        assert_eq!(nan, nan.clone());
     }
 
     /// Accepts every name but `beta`, scoring each by its length.
