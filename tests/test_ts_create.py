@@ -188,6 +188,35 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command("TS.CREATE", "lbl:name", "LABELS", "labels", "x")
         assert self.ts_info("lbl:name")["labels"] == {"labels": "x"}
 
+    def test_duplicate_series_needs_the_exact_label_set(self):
+        """With a `__name__` label, a series is its label set: a second series with exactly the
+        same labels is refused, but one whose labels are a subset or superset of an existing
+        series' is a different series, however many such series exist."""
+        self.client.execute_command("TS.CREATE", "dup:a", "LABELS", "__name__", "cpu", "host", "a")
+        with pytest.raises(ResponseError, match="duplicate series"):
+            self.client.execute_command("TS.CREATE", "dup:a2", "LABELS", "host", "a", "__name__", "cpu")
+        assert self.client.exists("dup:a2") == 0
+
+        # one superset exists
+        assert self.client.execute_command("TS.CREATE", "dup:cpu", "LABELS", "__name__", "cpu") == b'OK'
+        with pytest.raises(ResponseError, match="duplicate series"):
+            self.client.execute_command("TS.CREATE", "dup:cpu2", "LABELS", "__name__", "cpu")
+
+        # a superset of existing series
+        assert self.client.execute_command(
+            "TS.CREATE", "dup:ab", "LABELS", "__name__", "cpu", "host", "a", "dc", "b") == b'OK'
+
+        # several supersets exist, none of them exact
+        self.client.execute_command("FLUSHALL")
+        for host in ("a", "b"):
+            self.client.execute_command("TS.CREATE", f"dup:{host}", "LABELS", "__name__", "mem", "host", host)
+        assert self.client.execute_command("TS.CREATE", "dup:mem", "LABELS", "__name__", "mem") == b'OK'
+
+        # TS.ADD auto-creation takes the same path
+        with pytest.raises(ResponseError, match="duplicate series"):
+            self.client.execute_command("TS.ADD", "dup:auto", 1, 1, "LABELS", "__name__", "mem")
+        assert self.client.execute_command("TS.ADD", "dup:auto", 1, 1, "LABELS", "__name__", "mem", "x", "1") == 1
+
     def test_label_names_containing_equals_are_rejected(self):
         """DIV-0063: a label name may not contain `=`, since no filter could select it
         (`a=b=2` does not parse). Every write command that applies LABELS rejects it, creates

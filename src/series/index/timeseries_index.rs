@@ -12,8 +12,8 @@ use crate::common::context::create_key_string;
 use crate::common::hash::DeterministicHasher;
 use crate::common::sync::{read_lock, write_lock};
 use crate::error_consts;
+use crate::labels::SeriesLabel;
 use crate::labels::filters::{LabelFilter, SeriesSelector};
-use crate::labels::{Label, SeriesLabel};
 use crate::series::index::IndexKey;
 use crate::series::{SeriesRef, TimeSeries};
 use croaring::Bitmap64;
@@ -214,57 +214,12 @@ impl TimeSeriesIndex {
         PostingsWriteGuard::new(guard)
     }
 
-    /// Return all series ids corresponding to the given label value pairs
+    /// Every visible series carrying all of `labels` (it may carry others too). A series whose
+    /// label set *is* `labels` is among them; telling it apart needs the candidates' full label
+    /// sets, which the index does not keep.
     pub fn postings_by_labels<T: SeriesLabel>(&self, labels: &[T]) -> PostingsBitmap {
         let inner = read_lock(&self.inner);
         inner.postings_by_labels(labels)
-    }
-
-    /// This exists primarily to ensure that we disallow duplicate metric names
-    pub fn posting_by_labels(&self, labels: &[Label]) -> ValkeyResult<Option<SeriesRef>> {
-        let acc = self.postings_by_labels(labels);
-        match acc.cardinality() {
-            0 => Ok(None),
-            1 => Ok(Some(acc.iter().next().expect("cardinality should be 1"))),
-            _ => Err(ValkeyError::Str(error_consts::DUPLICATE_SERIES)),
-        }
-    }
-
-    /// Retrieves the series identifier (ID) corresponding to a specific set of labels.
-    ///
-    /// This method looks up the series ID in the underlying postings index based on the provided
-    /// labels. For instance, if we have a time series with the metric name
-    ///
-    /// `http_requests_total{status="200", method="GET", service="inference"}`,
-    ///
-    /// we can retrieve its series ID by passing the appropriate labels to this function.
-    ///
-    /// ```no_run
-    /// use valkey_timeseries::Label;
-    /// let labels = vec![
-    ///     Label::new("__name__", "http_requests_total"),
-    ///     Label::new("status", "200"),
-    ///     Label::new("method", "GET"),
-    ///     Label::new("service", "inference"),
-    /// ];
-    /// // `index` would be a TimeSeriesIndex obtained via the public API (omitted here).
-    /// // if let Some(series_id) = index.series_id_by_labels(&labels) {
-    /// //     println!("Found series ID: {:?}", series_id);
-    /// // } else {
-    /// //    println!("No series found with the given labels.");
-    /// // }
-    /// ```
-    /// # Arguments
-    ///
-    /// * `labels` - A slice of `Label` objects that describe the series to look up.
-    ///
-    /// # Returns
-    ///
-    /// * `Option<SeriesRef>` - Returns `Some(SeriesRef)` if a matching series ID is found.
-    ///
-    pub fn series_id_by_labels(&self, labels: &[Label]) -> Option<SeriesRef> {
-        let inner = read_lock(&self.inner);
-        inner.posting_id_by_labels(labels)
     }
 
     /// `postings_for_filters` assembles a single postings iterator against the series index

@@ -71,11 +71,8 @@ mod tests {
             .iter()
             .map(|x| Label::new(x.name, x.value))
             .collect::<Vec<_>>();
-        let id = index
-            .posting_by_labels(&labels)
-            .unwrap()
-            .unwrap_or_default();
-        assert_eq!(id, ts.id);
+        let ids: Vec<_> = index.postings_by_labels(&labels).iter().collect();
+        assert_eq!(ids, [ts.id]);
     }
 
     #[test]

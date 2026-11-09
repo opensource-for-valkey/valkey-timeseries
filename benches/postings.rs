@@ -116,17 +116,20 @@ fn bench_series_id_by_labels(c: &mut Criterion) {
         // TS.CREATE passes `MetricName::to_label_vec`, which is in label-name order.
         let mut pairs = fleet_labels(id);
         let labels = query_labels(&pairs);
-        assert_eq!(index.series_id_by_labels(&labels), Some(id));
+        assert_eq!(
+            index.postings_by_labels(&labels).iter().collect::<Vec<_>>(),
+            [id]
+        );
         // a new series: same labels except an unseen host
         pairs[1].1 = "h-new".into();
         let fresh = query_labels(&pairs);
-        assert_eq!(index.series_id_by_labels(&fresh), None);
+        assert!(index.postings_by_labels(&fresh).is_empty());
 
         group.bench_with_input(BenchmarkId::new("existing", size), &labels, |b, labels| {
-            b.iter(|| black_box(index.series_id_by_labels(black_box(labels))))
+            b.iter(|| black_box(index.postings_by_labels(black_box(labels))))
         });
         group.bench_with_input(BenchmarkId::new("new_series", size), &fresh, |b, labels| {
-            b.iter(|| black_box(index.series_id_by_labels(black_box(labels))))
+            b.iter(|| black_box(index.postings_by_labels(black_box(labels))))
         });
     }
     group.finish();

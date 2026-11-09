@@ -326,9 +326,9 @@ mod tests {
     fn a_hidden_series_is_not_a_duplicate_of_a_new_one() {
         let postings = hidden_fixture();
         let unique = [Label::new("only_imported", "x")];
-        assert_eq!(postings.posting_id_by_labels(&unique), None);
+        assert!(postings.postings_by_labels(&unique).is_empty());
         let shared = [Label::new("job", "imported"), Label::new("env", "prod")];
-        assert_eq!(postings.posting_id_by_labels(&shared), None);
+        assert!(postings.postings_by_labels(&shared).is_empty());
     }
 
     #[test]
