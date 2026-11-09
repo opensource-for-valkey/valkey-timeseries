@@ -51,6 +51,8 @@ The data model — series identified by a Valkey key, each holding a sequence of
 
 In some cases RedisTimeSeries silently accepts extraneous or malformed syntax — for example, unrecognized trailing arguments or filter fragments that do not conform to the documented grammar — and returns a successful reply. Valkey TimeSeries may be stricter: in these cases it may reject the input with an error rather than accept it. This stricter validation is an intentional choice and is **not** considered a compatibility bug, even though it falls on a surface that is otherwise expected to be compatible. Applications that have been relying (knowingly or not) on RedisTimeSeries's tolerant parsing will need to clean up the offending call sites as part of migration.
 
+Label names are one such case: a label name may not contain `=` (DIV-0063). RedisTimeSeries stores `LABELS a=b 2`, but no filter can select that label on either engine: RedisTimeSeries returns nothing for `a=b=2`, and Valkey TimeSeries rejects that filter as malformed. Every command that takes `LABELS` (`TS.CREATE`, `TS.ALTER`, `TS.ADD`, `TS.INCRBY`, `TS.DECRBY`, `TS.ADDBULK`) rejects such a name with `TSDB: label name must not contain '='`. Label *values* may contain `=`, and `METRIC` names could never contain it.
+
 ### A note on label ordering within returned series
 
 When a multi-series command returns labels (via `WITHLABELS` or `SELECTED_LABELS`), the order in which the label name/value pairs appear for a given series is not guaranteed to match between RedisTimeSeries and Valkey TimeSeries. The _set_ of labels returned for each series is expected to match; the sequence in which those labels are laid out inside the reply may differ. This is **not** considered a compatibility bug.

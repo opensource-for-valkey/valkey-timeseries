@@ -1361,3 +1361,29 @@
     Rejecting these durations instead would add an error the reference does not have. Pinned by
     TestTimeSeriesRange::test_largest_duration_is_one_bucket.
   since: 0.1.0
+
+# DIV-0063 came with the label-name check on the write path. Reference behavior was observed
+# black-box against the pinned redis:8.10 image: `TS.CREATE k LABELS a 1 a=b 2` succeeds and
+# TS.INFO lists both labels.
+#
+# ⚠️ `behavior`-kind: requested by the owner (ccollie), 2026-11-09; needs sign-off in the PR
+# that adds it.
+
+- id: DIV-0063
+  command: TS.CREATE
+  kind: behavior
+  documentation_only: true
+  description: >
+    A label name containing `=` is rejected ("TSDB: label name must not contain '='") by every
+    command that takes LABELS — TS.CREATE, TS.ALTER, TS.ADD, TS.INCRBY, TS.DECRBY, TS.ADDBULK.
+    RTS 8.10 stores it. Label values may contain `=` on both engines.
+  rationale: >
+    No filter can select a label named `a=b` on either engine: probed black-box, RTS returns
+    nothing for `TS.QUERYINDEX a=b=2` (even for a series whose `a` is `b=2`), and our filter
+    parser rejects it. Here the label index also keys `name=value` split at the first `=`, so
+    storing such a name would make label-name queries and label statistics credit its value
+    to `a`. Rejecting it is a visible, fixable error
+    where accepting it gives wrong answers later. Stricter input, so `ts-compatibility-mode
+    strict` does not relax it. RDB load and RESTORE still accept such names. Pinned by
+    TestParserDivergences::test_label_name_with_separator_is_rejected.
+  since: 0.1.0

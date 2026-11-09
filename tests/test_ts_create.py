@@ -188,17 +188,31 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command("TS.CREATE", "lbl:name", "LABELS", "labels", "x")
         assert self.ts_info("lbl:name")["labels"] == {"labels": "x"}
 
-    def test_label_names_containing_equals_are_kept(self):
-        """`a=b 2` is the same `name=value` bytes as `a b=2`; interning used to collapse it
-        onto `a`, losing one label and renaming the other. Both must survive a reload too."""
-        self.client.execute_command("TS.CREATE", "eq:name", "LABELS", "a", "1", "a=b", "2")
-        expected = {"a": "1", "a=b": "2"}
-        assert self.ts_info("eq:name")["labels"] == expected
-        assert self.client.execute_command("TS.QUERYINDEX", "a=1") == [b"eq:name"]
+    def test_label_names_containing_equals_are_rejected(self):
+        """DIV-0063: a label name may not contain `=`, since no filter could select it
+        (`a=b=2` does not parse). Every write command that takes LABELS rejects it, creates
+        nothing, and leaves an existing series' labels alone; values may still contain `=`."""
+        bulk = '{"values":[1.0],"timestamps":[100]}'
+        writes = [
+            ("TS.CREATE", "eq:create"),
+            ("TS.ADD", "eq:add", 100, 1),
+            ("TS.INCRBY", "eq:incr", 1),
+            ("TS.DECRBY", "eq:decr", 1),
+            ("TS.ADDBULK", "eq:bulk", bulk),
+        ]
+        for name in ("a=b", "=", "a="):
+            for command in writes:
+                with pytest.raises(ResponseError, match="must not contain '='"):
+                    self.client.execute_command(*command, "LABELS", "ok", "1", name, "2")
+                assert self.client.exists(command[1]) == 0, (command, name)
 
-        self.client.execute_command("DEBUG", "RELOAD")
-        assert self.ts_info("eq:name")["labels"] == expected
-        assert self.client.execute_command("TS.QUERYINDEX", "a=1") == [b"eq:name"]
+        self.client.execute_command("TS.CREATE", "eq:alter", "LABELS", "a", "1")
+        with pytest.raises(ResponseError, match="must not contain '='"):
+            self.client.execute_command("TS.ALTER", "eq:alter", "LABELS", "a=b", "2")
+        assert self.ts_info("eq:alter")["labels"] == {"a": "1"}
+
+        self.client.execute_command("TS.CREATE", "eq:value", "LABELS", "a", "b=c")
+        assert self.ts_info("eq:value")["labels"] == {"a": "b=c"}
 
     def test_option_operand_named_labels_is_not_the_keyword(self):
         """An option's operand spelled `labels` is that option's value, not the LABELS
