@@ -490,6 +490,8 @@ pub(crate) fn label_search_exceeds_inline_budget(
         let postings = index.get_postings();
         return match plan {
             // Planned already: the match count is exact, and planning is paid for.
+            // Nothing matched: nothing is read and no cardinality is looked up.
+            Some(plan) if plan.remaining() == 0 => false,
             Some(plan) => {
                 plan.remaining() > INLINE_SERIES_READ_LIMIT
                     || (reads_name_cardinality && postings.label_index.len() > entries_budget)
@@ -2866,5 +2868,35 @@ mod tests {
             &hints,
             budget
         ));
+    }
+
+    /// A plan that matched nothing reads nothing, so even a name search reporting
+    /// cardinalities, which would otherwise walk the term dictionary, stays inline.
+    #[test]
+    fn an_empty_planned_scoped_search_stays_inline() {
+        let index = index_with_series(1100);
+        let empty = plan_of([]);
+        for hints in [
+            SearchHints::default(),
+            SearchHints {
+                include_meta: true,
+                ..Default::default()
+            },
+            SearchHints {
+                order_by: SearchResultOrdering::CardinalityDesc,
+                ..Default::default()
+            },
+        ] {
+            for label_name in [None, Some("instance")] {
+                assert!(!label_search_exceeds_inline_budget(
+                    &index,
+                    label_name,
+                    true,
+                    Some(&empty),
+                    &hints,
+                    1024
+                ));
+            }
+        }
     }
 }
