@@ -1,5 +1,5 @@
 /// Stat holds values for a single cardinality statistic.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PostingStat {
     pub name: String,
     pub count: u64,

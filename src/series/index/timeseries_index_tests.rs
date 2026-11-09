@@ -175,7 +175,7 @@ mod tests {
             )]),
         );
 
-        let stats = index.stats("region", 10);
+        let stats = index.stats(Some("region"), 10).unwrap();
         assert_eq!(stats.series_count, 1);
         let by_region = stats.series_count_by_focus_label_value.unwrap();
         assert_eq!(by_region.len(), 1, "{by_region:?}");
@@ -192,7 +192,7 @@ mod tests {
     fn test_stats_empty_index() {
         let index = TimeSeriesIndex::new();
 
-        let stats = index.stats("", 10);
+        let stats = index.stats(Some(""), 10).unwrap();
 
         // No series present
         assert_eq!(stats.series_count, 0);
@@ -219,7 +219,7 @@ mod tests {
 
         index.index_timeseries(&ts, b"time-series-1");
 
-        let stats = index.stats("region", 10);
+        let stats = index.stats(Some("region"), 10).unwrap();
 
         // One series indexed
         assert_eq!(stats.series_count, 1);
@@ -275,7 +275,7 @@ mod tests {
         index.index_timeseries(&s3, b"time-series-3");
 
         // With limit 2 we should get the top 2 metric names (by count)
-        let stats_lim2 = index.stats("region", 2);
+        let stats_lim2 = index.stats(Some("region"), 2).unwrap();
         assert_eq!(stats_lim2.series_count, 3);
 
         // There should be at most 2 entries in the focus list
@@ -304,7 +304,7 @@ mod tests {
         }
 
         // With limit 1 we should only get the top ("us", 2)
-        let stats_lim1 = index.stats("region", 1);
+        let stats_lim1 = index.stats(Some("region"), 1).unwrap();
         match stats_lim1.series_count_by_focus_label_value {
             Some(v) => {
                 assert_eq!(v.len(), 1);
@@ -326,7 +326,7 @@ mod tests {
         index.index_timeseries(&s2, b"t2");
 
         // Request stats for a label that doesn't exist
-        let stats_missing = index.stats("does_not_exist", 10);
+        let stats_missing = index.stats(Some("does_not_exist"), 10).unwrap();
         assert_eq!(stats_missing.series_count, 2);
 
         // The focus vector should exist but be empty since the label is missing
@@ -336,7 +336,7 @@ mod tests {
         }
 
         // Request with zero limit: top lists should be empty but counts preserved
-        let stats_zero_limit = index.stats("a", 0);
+        let stats_zero_limit = index.stats(Some("a"), 0).unwrap();
         assert_eq!(stats_zero_limit.series_count, 2);
         assert!(stats_zero_limit.label_count >= 1);
         assert!(stats_zero_limit.series_count_by_metric_name.is_empty());
@@ -363,7 +363,7 @@ mod tests {
         index.index_timeseries(&s2, b"s2");
 
         // Very large limit - should return all items
-        let stats = index.stats("region", 10000);
+        let stats = index.stats(Some("region"), 10000).unwrap();
 
         assert_eq!(stats.series_count, 2);
 
@@ -391,7 +391,7 @@ mod tests {
         index.index_timeseries(&s2, b"s2");
         index.index_timeseries(&s3, b"s3");
 
-        let stats = index.stats("", 10);
+        let stats = index.stats(Some(""), 10).unwrap();
 
         // Check that env=prod appears twice
         let env_prod = stats
@@ -436,7 +436,7 @@ mod tests {
             index.index_timeseries(&ts, format!("s{}", i).as_bytes());
         }
 
-        let stats = index.stats("method", 10);
+        let stats = index.stats(Some("method"), 10).unwrap();
 
         assert_eq!(stats.series_count, 5);
 
@@ -520,9 +520,9 @@ mod tests {
     fn test_stats_filtered_no_filters_matches_unfiltered() {
         let index = filtered_stats_index();
 
-        let unfiltered = index.stats("method", 10);
+        let unfiltered = index.stats(Some("method"), 10).unwrap();
         let filtered = index
-            .stats_filtered(&[], "method", 10)
+            .stats_filtered(&[], Some("method"), 10)
             .expect("call should succeed");
 
         assert_eq!(filtered.series_count, unfiltered.series_count);
@@ -547,7 +547,7 @@ mod tests {
 
         let filters = [LabelFilter::equals("region".to_string(), "us")];
         let stats = index
-            .stats_filtered(&filters, "method", 10)
+            .stats_filtered(&filters, Some("method"), 10)
             .expect("call should succeed");
 
         // Four of the five series match region="us"; the eu one drops out of every count.
@@ -590,7 +590,7 @@ mod tests {
 
         let filters = [LabelFilter::equals("region".to_string(), "us")];
         let stats = index
-            .stats_filtered(&filters, "", 10)
+            .stats_filtered(&filters, Some(""), 10)
             .expect("call should succeed");
 
         // `tier` belongs to the eu series alone, so it contributes neither a label name, a
@@ -613,7 +613,7 @@ mod tests {
 
         let filters = [LabelFilter::equals("region".to_string(), "apac")];
         let stats = index
-            .stats_filtered(&filters, "method", 10)
+            .stats_filtered(&filters, Some("method"), 10)
             .expect("call should succeed");
 
         assert_eq!(stats.series_count, 0);
@@ -638,7 +638,7 @@ mod tests {
             LabelFilter::not_equals("status".to_string(), "404"),
         ];
         let stats = index
-            .stats_filtered(&filters, METRIC_NAME_LABEL, 10)
+            .stats_filtered(&filters, Some(METRIC_NAME_LABEL), 10)
             .expect("call should succeed");
 
         assert_eq!(stats.series_count, 3);
@@ -670,7 +670,7 @@ mod tests {
         let selectors = vec![SeriesSelector::parse(r#"region="us""#).unwrap()];
 
         let before = index
-            .stats_by_selectors(&selectors, "host", 10)
+            .stats_by_selectors(&selectors, Some("host"), 10)
             .expect("call should succeed");
         assert_eq!(before.series_count, 2);
         assert_eq!(
@@ -681,7 +681,7 @@ mod tests {
         index.mark_id_as_stale(doomed.id);
 
         let after = index
-            .stats_by_selectors(&selectors, "host", 10)
+            .stats_by_selectors(&selectors, Some("host"), 10)
             .expect("call should succeed");
 
         assert_eq!(

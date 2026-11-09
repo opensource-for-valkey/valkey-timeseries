@@ -66,7 +66,6 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
 
     fn get_local_response(ctx: &FanoutContext, req: StatsRequest) -> ValkeyResult<StatsResponse> {
         let limit = req.limit as usize;
-        let label = req.selected_label.as_deref().unwrap_or("");
         let matchers = deserialize_matchers_list(Some(req.filters))?;
 
         {
@@ -75,12 +74,15 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
             check_metadata_permissions(&ctx)?;
         }
         // Only index data below: planning, batched counts and fingerprinting need no GIL.
-        let (stats, (labels_bitmap, label_value_pairs_bitmap)) =
-            get_db_index(ctx.db()).stats_and_label_bitmaps_by_selectors(&matchers, label, limit)?;
+        let (stats, fingerprints) = get_db_index(ctx.db()).stats_and_label_bitmaps_by_selectors(
+            &matchers,
+            req.selected_label.as_deref(),
+            limit,
+        )?;
 
         let mut response: StatsResponse = stats.into();
-        response.labels_bitmap = serialize_bitmap(&labels_bitmap);
-        response.label_value_pairs_bitmap = serialize_bitmap(&label_value_pairs_bitmap);
+        response.labels_bitmap = serialize_bitmap(&fingerprints.names);
+        response.label_value_pairs_bitmap = serialize_bitmap(&fingerprints.pairs);
 
         Ok(response)
     }
