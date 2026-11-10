@@ -97,9 +97,13 @@ const MAX_KEY_EXPANSION_RATIO: usize = 16;
 const MIN_GROUP_BYTES: usize = 2;
 
 /// Cheapest possible label entry: a one-byte zero-length suffix, a one-byte blob length, and the
-/// smallest non-empty portable `Bitmap64` (8-byte bucket count, 4-byte high word, 18-byte
-/// single-element roaring32). Pinned by `min_entry_bytes_matches_encoder`.
-const MIN_ENTRY_BYTES: usize = 1 + 1 + 30;
+/// smallest non-empty portable `Bitmap64` the encoder writes: an 8-byte bucket count, a 4-byte
+/// high word, and a 15-byte roaring32 holding a single run container (run cookie, run flags,
+/// key/cardinality, run count, one run). That is the shape `run_optimize` gives any bucket that
+/// is one run of four or more consecutive ids — ordinary for series created together — and it
+/// undercuts the 18-byte single-element array container by three bytes. Pinned by
+/// `min_entry_bytes_is_the_cheapest_encoder_shape`.
+const MIN_ENTRY_BYTES: usize = 1 + 1 + 27;
 
 /// Cheapest possible id-directory entry: a one-byte delta varint and a one-byte zero length.
 const MIN_ID_ENTRY_BYTES: usize = 2;
@@ -448,19 +452,68 @@ mod tests {
     }
 
     /// [`MIN_ENTRY_BYTES`] is important for the entry-count check, and it is derived from a
-    /// croaring format detail. Pin it against what the encoder actually writes.
+    /// croaring format detail. Pin it against what the encoder actually writes, for every shape
+    /// that can be the cheapest: if it exceeds any of them, valid snapshots are rejected.
     #[test]
-    fn min_entry_bytes_matches_encoder() {
-        let mut entry = Vec::new();
-        write_byte_slice(&mut entry, b"");
-        let mut bitmap = PostingsBitmap::new();
-        bitmap.add(1);
-        write_bitmap(&mut entry, &bitmap);
-        assert_eq!(
-            entry.len(),
-            MIN_ENTRY_BYTES,
-            "cheapest encodable label entry must match MIN_ENTRY_BYTES"
+    fn min_entry_bytes_is_the_cheapest_encoder_shape() {
+        let entry_len = |bitmap: &PostingsBitmap| {
+            let mut entry = Vec::new();
+            write_byte_slice(&mut entry, b"");
+            write_bitmap(&mut entry, bitmap);
+            entry.len()
+        };
+
+        let singleton_array = bitmap_of(&[1]);
+        let mut single_run = bitmap_of(&[1, 2, 3, 4]);
+        assert!(
+            single_run.run_optimize(),
+            "four consecutive ids must become a run"
         );
+
+        let shapes = [
+            ("singleton array", entry_len(&singleton_array)),
+            ("single run", entry_len(&single_run)),
+        ];
+        for (shape, len) in shapes {
+            assert!(
+                MIN_ENTRY_BYTES <= len,
+                "{shape} entry is {len} bytes, under MIN_ENTRY_BYTES ({MIN_ENTRY_BYTES})"
+            );
+        }
+        let cheapest = shapes.iter().map(|(_, len)| *len).min().unwrap();
+        assert_eq!(
+            cheapest, MIN_ENTRY_BYTES,
+            "MIN_ENTRY_BYTES must equal the cheapest encodable label entry"
+        );
+    }
+
+    /// The shape the cron's `run_optimize` leaves behind: a handful of series created together,
+    /// sharing many labels, so every bitmap is one short run. Near the minimum entry size with no
+    /// trailing slack, this is what an entry-size bound set above the run shape rejects.
+    #[test]
+    fn round_trips_run_optimized_postings() {
+        let mut postings = Postings::default();
+        for id in 1..=4u64 {
+            for label in 0..20 {
+                postings.add_posting_for_label_value(id, &format!("label{label}"), "v");
+            }
+            postings.set_timeseries_key(id, format!("t{id}").as_bytes());
+        }
+        assert!(postings.optimize_postings(None, usize::MAX).is_none());
+
+        let mut buf = Vec::new();
+        serialize(&mut buf, &postings);
+        let mut slice = buf.as_slice();
+        let loaded = deserialize(&mut slice).expect("run-optimized postings must round-trip");
+
+        assert!(slice.is_empty(), "decoder must consume exactly the body");
+        assert_eq!(loaded.id_to_key, postings.id_to_key);
+        assert_eq!(loaded.all_postings, postings.all_postings);
+        assert_eq!(loaded.label_index.len(), postings.label_index.len());
+        for ((ka, va), (kb, vb)) in loaded.label_index.iter().zip(postings.label_index.iter()) {
+            assert_eq!(ka, kb);
+            assert_eq!(va, vb);
+        }
     }
 
     /// The amplification this hardening exists for: one long group prefix, rebuilt once per
