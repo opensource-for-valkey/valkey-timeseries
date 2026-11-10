@@ -78,20 +78,59 @@ pub(in crate::series::index) const BODY_VERSION: u8 = 1;
 /// leaves room to spare while still rejecting a wildly corrupt length.
 const MAX_BITMAP_BLOB_BYTES: usize = 256 * 1024 * 1024;
 
-/// How much label-key data the body may expand into, as a multiple of the bytes it was decoded
-/// from.
+/// How much label-key data a payload may expand into, as a multiple of the bytes it was decoded
+/// from. Enforced through a [`KeyBudget`] shared by every body in the payload.
 ///
 /// This is the bound that closes prefix-fanout amplification, and neither a per-key cap nor an
-/// entry count closes it alone (nor is needed beside it): the directory writes a group's prefix *once* and the decoder
-/// rebuilds it *per entry*, so `n` minimum-size entries under one long prefix cost `n * 32`
-/// bytes of payload but `n * prefix.len()` bytes of memory. At the per-key ceiling above that
-/// ratio reaches 2048x.
+/// entry count closes it alone (nor is needed beside it): the directory writes a group's prefix
+/// *once* and the decoder rebuilds it *per entry*, so `n` minimum-size entries under one long
+/// prefix cost `n * MIN_ENTRY_BYTES` bytes of payload but `n * prefix.len()` bytes of memory.
 ///
 /// Prefix sharing is real compression, so the honest ratio is above 1 — but not by much, because
 /// a group's per-entry cost is dominated by its bitmap, which no amount of sharing shrinks. Real
 /// schemas sit well under 1; 16 leaves room for a pathologically long label name over
 /// single-byte values.
 const MAX_KEY_EXPANSION_RATIO: usize = 16;
+
+/// The label-key bytes still allowed to be reconstructed, out of [`MAX_KEY_EXPANSION_RATIO`]
+/// times a whole payload.
+///
+/// One budget per payload, not per body: the payload's sections are decoded back to back before
+/// any is installed, so a budget sized from the bytes remaining at each body's start would let
+/// every section spend against the same trailing bytes, and the total expansion would grow with
+/// the number of sections rather than staying within the ratio.
+pub(in crate::series::index) struct KeyBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl KeyBudget {
+    /// The budget for a payload of `encoded_len` bytes, taken before any of it is decoded.
+    pub(in crate::series::index) fn for_payload(encoded_len: usize) -> Self {
+        Self {
+            limit: encoded_len.saturating_mul(MAX_KEY_EXPANSION_RATIO),
+            used: 0,
+        }
+    }
+
+    /// Fails if `len` more bytes would cross the limit, without spending them.
+    fn check(&self, len: usize) -> DecodeResult<()> {
+        if self.used.saturating_add(len) > self.limit {
+            return Err(format!(
+                "label index keys expand past {} bytes, {MAX_KEY_EXPANSION_RATIO}x the encoded payload",
+                self.limit
+            ));
+        }
+        Ok(())
+    }
+
+    /// Spends `len` bytes, failing if they cross the limit.
+    fn charge(&mut self, len: usize) -> DecodeResult<()> {
+        self.check(len)?;
+        self.used += len;
+        Ok(())
+    }
+}
 
 /// Cheapest possible group-directory entry: a one-byte zero length and a one-byte count.
 const MIN_GROUP_BYTES: usize = 2;
@@ -237,21 +276,21 @@ pub(in crate::series::index) fn serialize(buf: &mut Vec<u8>, postings: &Postings
     }
 }
 
-/// Reads one index body from `buf`, advancing it past the bytes consumed.
+/// Reads one index body from `buf`, advancing it past the bytes consumed, and charges the label
+/// keys it rebuilds to `key_budget` — which the caller sizes from, and shares across, the whole
+/// payload the body sits in (see [`KeyBudget`]).
 ///
 /// Assumes hostile input; see the decode limits above for what is bounded and why.
-pub(in crate::series::index) fn deserialize(buf: &mut &[u8]) -> DecodeResult<Postings> {
+pub(in crate::series::index) fn deserialize(
+    buf: &mut &[u8],
+    key_budget: &mut KeyBudget,
+) -> DecodeResult<Postings> {
     let version = try_read_u8(buf).map_err(|e| e.to_string())?;
     if version != BODY_VERSION {
         return Err(format!(
             "unsupported index body version {version} (expected {BODY_VERSION})"
         ));
     }
-
-    // Budget for reconstructed label-key bytes, taken before any of the body proper is read.
-    // `buf` may extend past this section (the caller decodes sections back to back), which only
-    // ever makes the budget more generous, never tighter than the section deserves.
-    let key_budget = buf.len().saturating_mul(MAX_KEY_EXPANSION_RATIO);
 
     // Leads the body so each label bitmap can be checked against it as it is read.
     let all_postings = read_bitmap(buf)?;
@@ -275,34 +314,24 @@ pub(in crate::series::index) fn deserialize(buf: &mut &[u8]) -> DecodeResult<Pos
 
     let mut label_index = PostingsIndex::new();
     let mut key_bytes: Vec<u8> = Vec::new();
-    let mut key_bytes_used: usize = 0;
     for (prefix, count) in groups {
         for _ in 0..count {
             let suffix = try_read_byte_slice(buf).map_err(|e| e.to_string())?;
-            // Charged before the key is built, so no allocation outruns the budget.
+            // Checked before the key is built, so no allocation outruns the budget.
             let key_len = prefix.len() + suffix.len();
-            if key_bytes_used.saturating_add(key_len) > key_budget {
-                return Err(format!(
-                    "label index keys expand past {key_budget} bytes, {MAX_KEY_EXPANSION_RATIO}x the encoded body"
-                ));
-            }
+            key_budget.check(key_len)?;
             key_bytes.clear();
             key_bytes.reserve(key_len);
             key_bytes.extend_from_slice(prefix);
             key_bytes.extend_from_slice(suffix);
             let key = IndexKey::from(key_bytes.as_slice());
 
-            // Charged again after construction, at the built length: `IndexKey::from` converts
+            // Charged after construction, at the built length: `IndexKey::from` converts
             // lossily, and each invalid byte expands into a 3-byte U+FFFD. Charging only the
             // encoded length would leave the budget short by 3x on a payload of invalid UTF-8,
             // which is free for an attacker to produce. The check above bounds this one
-            // allocation to 3x what it was charged.
-            key_bytes_used = key_bytes_used.saturating_add(key.len());
-            if key_bytes_used > key_budget {
-                return Err(format!(
-                    "label index keys expand past {key_budget} bytes, {MAX_KEY_EXPANSION_RATIO}x the encoded body"
-                ));
-            }
+            // allocation to 3x what it was checked against.
+            key_budget.charge(key.len())?;
 
             let bitmap = read_bitmap(buf)?;
             // `serialize` drops entries whose bitmap is empty, before and after stale masking,
@@ -352,6 +381,14 @@ pub(in crate::series::index) fn deserialize(buf: &mut &[u8]) -> DecodeResult<Pos
         hidden_ids: HiddenSet::default(),
         all_postings,
     })
+}
+
+/// [`deserialize`] for a body that is a whole payload on its own, so the key budget is sized from
+/// the body alone.
+#[cfg(test)]
+pub(in crate::series::index) fn deserialize_standalone(buf: &mut &[u8]) -> DecodeResult<Postings> {
+    let mut key_budget = KeyBudget::for_payload(buf.len());
+    deserialize(buf, &mut key_budget)
 }
 
 #[cfg(test)]
@@ -413,7 +450,7 @@ mod tests {
 
     fn decode_err(body: &[u8]) -> String {
         let mut slice = body;
-        match deserialize(&mut slice) {
+        match deserialize_standalone(&mut slice) {
             Err(e) => e,
             Ok(_) => panic!("hostile body must be rejected"),
         }
@@ -504,7 +541,8 @@ mod tests {
         let mut buf = Vec::new();
         serialize(&mut buf, &postings);
         let mut slice = buf.as_slice();
-        let loaded = deserialize(&mut slice).expect("run-optimized postings must round-trip");
+        let loaded =
+            deserialize_standalone(&mut slice).expect("run-optimized postings must round-trip");
 
         assert!(slice.is_empty(), "decoder must consume exactly the body");
         assert_eq!(loaded.id_to_key, postings.id_to_key);
@@ -678,7 +716,8 @@ mod tests {
         let mut buf = Vec::new();
         serialize(&mut buf, &postings);
         let mut slice = buf.as_slice();
-        let loaded = deserialize(&mut slice).expect("a label-less series must round-trip");
+        let loaded =
+            deserialize_standalone(&mut slice).expect("a label-less series must round-trip");
 
         assert!(slice.is_empty(), "decoder must consume exactly the body");
         assert_eq!(loaded.count(), 2);
@@ -717,7 +756,7 @@ mod tests {
 
         let mut buf = Vec::new();
         serialize(&mut buf, &postings);
-        let decoded = deserialize(&mut buf.as_slice()).expect("long keys must decode");
+        let decoded = deserialize_standalone(&mut buf.as_slice()).expect("long keys must decode");
         assert_eq!(decoded.id_to_key.get(&1), Some(&long_key));
         let keys: Vec<String> = decoded
             .label_index
@@ -750,7 +789,8 @@ mod tests {
         let mut buf = Vec::new();
         serialize(&mut buf, &postings);
         let mut slice = buf.as_slice();
-        let loaded = deserialize(&mut slice).expect("realistic prefix sharing must decode");
+        let loaded =
+            deserialize_standalone(&mut slice).expect("realistic prefix sharing must decode");
         assert_eq!(loaded.label_index.len(), postings.label_index.len());
 
         let key_bytes: usize = loaded.label_index.iter().map(|(k, _)| k.len()).sum();
@@ -786,7 +826,7 @@ mod tests {
         let mut buf = Vec::new();
         serialize(&mut buf, &postings);
         let mut slice = buf.as_slice();
-        let loaded = deserialize(&mut slice).expect("body should round-trip");
+        let loaded = deserialize_standalone(&mut slice).expect("body should round-trip");
 
         assert!(slice.is_empty(), "decoder must consume exactly the body");
         assert_eq!(loaded.id_to_key, postings.id_to_key);
@@ -810,7 +850,7 @@ mod tests {
         let mut buf = Vec::new();
         serialize(&mut buf, &postings);
         let mut slice = buf.as_slice();
-        let loaded = deserialize(&mut slice).expect("body should round-trip");
+        let loaded = deserialize_standalone(&mut slice).expect("body should round-trip");
 
         assert!(loaded.stale_ids.is_empty(), "stale set is not persisted");
         assert!(!loaded.all_postings.contains(2));
