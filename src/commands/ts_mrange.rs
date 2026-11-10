@@ -15,15 +15,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
-/// EXPERIMENT (not for merge as-is): `TS_MRANGE_DEFER=1` answers non-clustered,
-/// non-grouped TS.MRANGE off the main thread — chunks are copied under the
-/// command, the client is blocked, and decode + reply happen on the
-/// [`MRANGE_EXECUTOR`] lane through a thread-safe reply context, the way
-/// TS.OUTLIERS already works. Read once so the two modes can be A/B'd from one
-/// binary.
-static DEFER_MRANGE: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("TS_MRANGE_DEFER").is_ok_and(|v| v == "1"));
-
 /// Deferred TS.MRANGE jobs waiting for a worker before new requests run inline.
 const MRANGE_QUEUE_CAPACITY: usize = 256;
 
@@ -117,7 +108,9 @@ fn mrange_internal(ctx: &Context, args: Vec<ValkeyString>, reverse: bool) -> Val
         return operation.exec(ctx);
     }
 
-    if *DEFER_MRANGE && !is_blocking_denied(ctx) && is_snapshot_answerable(&options) {
+    // Off the main thread when that pays (see `mrange_deferred`), which needs a client that
+    // can be blocked and a query a snapshot can answer.
+    if !is_blocking_denied(ctx) && is_snapshot_answerable(&options) {
         return mrange_deferred(ctx, options);
     }
 
@@ -126,6 +119,10 @@ fn mrange_internal(ctx: &Context, args: Vec<ValkeyString>, reverse: bool) -> Val
     reply_with_mrange_series_results(ctx, &result_rows, &shape)
 }
 
+/// A non-clustered TS.MRANGE answered off the main thread: the chunks are copied under the
+/// command, the client is blocked, and the decode and the reply run on the
+/// [`MRANGE_EXECUTOR`] lane through a thread-safe reply context, as TS.OUTLIERS does.
+///
 /// Answers inline unless other clients keep the main thread busy
 /// ([`mrange_contended`]) or the request carries enough work to pay for the
 /// block/unblock round trip ([`DEFER_MIN_WORK`](crate::series::mrange::DEFER_MIN_WORK));

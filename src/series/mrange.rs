@@ -1620,13 +1620,11 @@ pub(crate) fn decode_snapshot_series(
     series: Vec<SnapshotSeries>,
     options: &MRangeOptions,
 ) -> Vec<MRangeSeriesResult> {
-    let mut items: Vec<MRangeSeriesResult> = series
-        .into_iter()
-        .map(|s| decode_snapshot(s, options, None, false))
-        .collect();
-    if options.exclude_empty {
-        items.retain(|item| !item.data.is_empty());
-    }
+    // The shard decode with nothing pushed down and no requester to give up: COUNT and
+    // the direction are in `options`, and the samples go straight to the reply.
+    // Only an expired deadline fails that decode, and this one has none.
+    let mut items =
+        decode_shard_snapshots(series, options, None, false, &|| false).unwrap_or_default();
     sort_mrange_results(&mut items, false);
     items
 }
