@@ -39,6 +39,109 @@ struct MRangeSeriesMeta<'a> {
     group_label_value: Option<String>,
 }
 
+/// One member series of a GROUPBY group, wherever its samples are read from: the live
+/// series under the lock ([`MRangeSeriesMeta`]), or a copy of its chunks once the lock is
+/// released ([`SnapshotSeries`]). The reduce is written once, over this.
+trait GroupMember: Send + Sync {
+    fn source_key(&self) -> &[u8];
+    /// The GROUPBY label's value, taken once when the members are grouped.
+    fn take_group_label_value(&mut self) -> Option<String>;
+    /// LATEST's still-open bucket, if the query asked for it.
+    fn latest(&self) -> Option<Sample>;
+    /// The series' first and last stored timestamps; `None` when it holds no samples.
+    fn extent(&self) -> Option<(Timestamp, Timestamp)>;
+    /// Samples the series stores.
+    fn total_samples(&self) -> usize;
+    /// Rough number of samples to decode for `[start, end]`; only feeds dispatch decisions.
+    fn estimated_samples(&self, start: Timestamp, end: Timestamp) -> usize;
+    /// The member's own single-column pipeline over `range`, ascending. `range` carries no
+    /// COUNT: that applies to the reduced stream.
+    fn samples<'a>(&'a self, range: &RangeOptions) -> Box<dyn Iterator<Item = Sample> + 'a>;
+    /// [`Self::samples`] for multi-aggregation rows.
+    fn rows<'a>(&'a self, range: &RangeOptions) -> Box<dyn Iterator<Item = MultiSample> + 'a>;
+}
+
+impl GroupMember for MRangeSeriesMeta<'_> {
+    fn source_key(&self) -> &[u8] {
+        &self.source_key
+    }
+
+    fn take_group_label_value(&mut self) -> Option<String> {
+        self.group_label_value.take()
+    }
+
+    fn latest(&self) -> Option<Sample> {
+        self.latest
+    }
+
+    fn extent(&self) -> Option<(Timestamp, Timestamp)> {
+        (!self.series.is_empty())
+            .then(|| (self.series.first_timestamp, self.series.last_timestamp()))
+    }
+
+    fn total_samples(&self) -> usize {
+        self.series.total_samples
+    }
+
+    fn estimated_samples(&self, start: Timestamp, end: Timestamp) -> usize {
+        estimated_samples_in_range(self.series, start, end)
+    }
+
+    fn samples<'a>(&'a self, range: &RangeOptions) -> Box<dyn Iterator<Item = Sample> + 'a> {
+        create_range_iterator(self.series, range, self.latest, false)
+    }
+
+    fn rows<'a>(&'a self, range: &RangeOptions) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+        create_row_iterator(self.series, range, self.latest, false)
+    }
+}
+
+impl GroupMember for SnapshotSeries {
+    fn source_key(&self) -> &[u8] {
+        &self.key
+    }
+
+    fn take_group_label_value(&mut self) -> Option<String> {
+        self.group_label_value.take()
+    }
+
+    fn latest(&self) -> Option<Sample> {
+        self.latest
+    }
+
+    fn extent(&self) -> Option<(Timestamp, Timestamp)> {
+        self.snapshot.series_extent()
+    }
+
+    fn total_samples(&self) -> usize {
+        self.snapshot.series_total_samples()
+    }
+
+    fn estimated_samples(&self, _start: Timestamp, _end: Timestamp) -> usize {
+        self.snapshot.estimated_samples()
+    }
+
+    fn samples<'a>(&'a self, range: &RangeOptions) -> Box<dyn Iterator<Item = Sample> + 'a> {
+        create_range_iterator_from_snapshot(
+            &self.snapshot,
+            range,
+            self.latest,
+            false,
+            self.empty_fill,
+        )
+    }
+
+    fn rows<'a>(&'a self, range: &RangeOptions) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+        create_row_iterator_from_snapshot(
+            &self.snapshot,
+            range,
+            self.latest,
+            self.empty_fill,
+            false,
+        )
+    }
+}
+
 /// Head/tail pre-filter applied shard-side under COUNT push-down
 /// (`apply_count`). Tail is used for reverse queries: shards stream
 /// ascending, so the last `n` items are the first `n` in requested order.
@@ -451,11 +554,11 @@ fn estimated_samples_in_range(series: &TimeSeries, start: Timestamp, end: Timest
 const PER_SERIES_WORK: usize = 32;
 
 /// Work estimate for a set of series over the request's range.
-fn estimated_work(metas: &[MRangeSeriesMeta], options: &RangeOptions) -> usize {
+fn estimated_work<M: GroupMember>(metas: &[M], options: &RangeOptions) -> usize {
     let (start, end) = options.get_timestamp_range();
     metas
         .iter()
-        .map(|m| PER_SERIES_WORK + estimated_samples_in_range(m.series, start, end))
+        .map(|m| PER_SERIES_WORK + m.estimated_samples(start, end))
         .sum()
 }
 
@@ -571,8 +674,8 @@ fn handle_non_grouped(
         .collect()
 }
 
-fn handle_grouping(
-    metas: Vec<MRangeSeriesMeta>,
+fn handle_grouping<M: GroupMember>(
+    metas: Vec<M>,
     options: MRangeOptions,
 ) -> ValkeyResult<Vec<MRangeSeriesResult>> {
     // Callers only reach this function after confirming `options.grouping.is_some()`
@@ -619,13 +722,12 @@ fn handle_grouping(
             .as_ref()
             .expect("Grouping options should be present");
         let template = grouping.aggregation.create_aggregator();
-        let series_refs: Vec<&MRangeSeriesMeta> =
-            dense.iter().flat_map(|(_, g, _)| g.series.iter()).collect();
+        let series_refs: Vec<&M> = dense.iter().flat_map(|(_, g, _)| g.series.iter()).collect();
         let series_threads = request_par_threads(series_refs.len(), total_work);
         let mut rows: Vec<Vec<Sample>> = series_refs
             .par_rayon()
             .num_threads(series_threads)
-            .map(|meta| series_bucket_rows(meta, &options.range))
+            .map(|meta| series_bucket_rows(*meta, &options.range))
             .collect();
         let mut rows = rows.drain(..);
         for (label_value, group_data, grid) in dense {
@@ -681,9 +783,9 @@ fn handle_grouping(
 
 /// One reduced group as a result row, its samples as an uncompressed chunk (grouping only
 /// runs on the node answering the client, so they never cross the network).
-fn grouped_result(
+fn grouped_result<M>(
     label_value: String,
-    group_data: GroupedSeriesData,
+    group_data: GroupedSeriesData<M>,
     grouping: &RangeGroupingOptions,
     samples: Vec<Sample>,
 ) -> MRangeSeriesResult {
@@ -718,19 +820,19 @@ const DENSE_GROUP_MAX_SLOTS: usize = 1 << 20;
 /// past this budget take the streaming merge instead.
 const DENSE_STAGING_MAX_ROWS: usize = 4 << 20;
 
-type DenseGroup<'a> = (String, GroupedSeriesData<'a>, BucketGrid);
-type MergedGroup<'a> = (String, GroupedSeriesData<'a>);
+type DenseGroup<M> = (String, GroupedSeriesData<M>, BucketGrid);
+type MergedGroup<M> = (String, GroupedSeriesData<M>);
 
 /// Splits groups between the bucket table and the merge. A group takes the merge when
 /// the grid cannot serve it, when an ascending `COUNT` asks for fewer buckets than the
 /// grid spans (the merge stops after `count` buckets; the table decodes all of them),
 /// or when staging its rows would exceed `budget` rows across the dense groups.
-fn plan_dense_groups<'a>(
-    groups: impl IntoIterator<Item = MergedGroup<'a>>,
+fn plan_dense_groups<M: GroupMember>(
+    groups: impl IntoIterator<Item = MergedGroup<M>>,
     options: &MRangeOptions,
     count: Option<usize>,
     budget: usize,
-) -> (Vec<DenseGroup<'a>>, Vec<MergedGroup<'a>>) {
+) -> (Vec<DenseGroup<M>>, Vec<MergedGroup<M>>) {
     let is_multi = options
         .range
         .aggregation
@@ -766,18 +868,13 @@ fn plan_dense_groups<'a>(
 
 /// Upper bound on the rows [`series_bucket_rows`] yields for `meta`: the buckets its own
 /// extent spans inside the window, and without `EMPTY` no more than one per sample.
-fn estimated_bucket_rows(
-    meta: &MRangeSeriesMeta,
+fn estimated_bucket_rows<M: GroupMember>(
+    meta: &M,
     range: &RangeOptions,
     grid: &BucketGrid,
 ) -> usize {
-    let series = meta.series;
-    let (mut first, mut last) = if series.is_empty() {
-        (Timestamp::MAX, Timestamp::MIN)
-    } else {
-        (series.first_timestamp, series.last_timestamp())
-    };
-    if let Some(latest) = meta.latest {
+    let (mut first, mut last) = meta.extent().unwrap_or((Timestamp::MAX, Timestamp::MIN));
+    if let Some(latest) = meta.latest() {
         first = first.min(latest.timestamp);
         last = last.max(latest.timestamp);
     }
@@ -791,7 +888,7 @@ fn estimated_bucket_rows(
     let rows = if report_empty {
         buckets
     } else {
-        buckets.min(series.total_samples + usize::from(meta.latest.is_some()))
+        buckets.min(meta.total_samples() + usize::from(meta.latest().is_some()))
     };
     rows.min(grid.slots)
 }
@@ -801,7 +898,7 @@ impl BucketGrid {
     /// reported timestamp is clamped there, which folds distinct buckets onto one
     /// timestamp — the merge already treats those as one, but a table cannot address them),
     /// or when the window spans more buckets than the cap.
-    fn for_query(range: &RangeOptions, members: &[MRangeSeriesMeta]) -> Option<Self> {
+    fn for_query<M: GroupMember>(range: &RangeOptions, members: &[M]) -> Option<Self> {
         let agg = range.aggregation.as_ref()?;
         let (start, end) = range.get_timestamp_range();
         // The grid is aligned on the query window, as every member's own iterator aligns it;
@@ -815,12 +912,12 @@ impl BucketGrid {
         let mut data_start = Timestamp::MAX;
         let mut data_end = Timestamp::MIN;
         for meta in members {
-            if meta.series.is_empty() {
+            let Some((first, last)) = meta.extent() else {
                 continue;
-            }
-            data_start = data_start.min(meta.series.first_timestamp);
-            data_end = data_end.max(meta.series.last_timestamp());
-            if let Some(latest) = meta.latest {
+            };
+            data_start = data_start.min(first);
+            data_end = data_end.max(last);
+            if let Some(latest) = meta.latest() {
                 data_start = data_start.min(latest.timestamp);
                 data_end = data_end.max(latest.timestamp);
             }
@@ -933,8 +1030,8 @@ impl DenseGroupTable {
 /// The bucket rows of one member series, ascending — what the merge would have pulled from
 /// its iterator, materialised so the decode can run on any thread while the fold keeps
 /// series order.
-fn series_bucket_rows(meta: &MRangeSeriesMeta, range: &RangeOptions) -> Vec<Sample> {
-    create_range_iterator(meta.series, range, meta.latest, false).collect()
+fn series_bucket_rows<M: GroupMember>(meta: &M, range: &RangeOptions) -> Vec<Sample> {
+    meta.samples(range).collect()
 }
 
 /// Folds one group's per-series rows into a table; `None` when a row falls outside the grid
@@ -955,8 +1052,8 @@ fn fold_group_rows(
 
 /// The k-way merge reduce. `handle_grouping` has already tried the bucket table for
 /// every group it could serve, so this never retries it.
-fn get_grouped_samples(
-    series_metas: &[MRangeSeriesMeta],
+fn get_grouped_samples<M: GroupMember>(
+    series_metas: &[M],
     options: &MRangeOptions,
     grouping_options: &RangeGroupingOptions,
     count: Option<usize>,
@@ -979,7 +1076,7 @@ fn get_grouped_samples(
     // on it buffering every iterator, which stopped holding once the merge was corrected.
     let iterators = series_metas
         .iter()
-        .map(|meta| create_range_iterator(meta.series, &options.range, meta.latest, false))
+        .map(|meta| meta.samples(&options.range))
         .collect::<Vec<_>>();
 
     let multi_iter = KWayMerge::new(iterators);
@@ -992,8 +1089,8 @@ fn get_grouped_samples(
 /// Multi-aggregation twin of `get_grouped_samples`: per-series row pipeline
 /// (bucket aggregation, ascending), k-way merge by bucket timestamp, then a
 /// column-wise reduce across the group's series.
-fn get_grouped_rows(
-    series_metas: &[MRangeSeriesMeta],
+fn get_grouped_rows<M: GroupMember>(
+    series_metas: &[M],
     options: &MRangeOptions,
     grouping_options: &RangeGroupingOptions,
     count: Option<usize>,
@@ -1009,7 +1106,7 @@ fn get_grouped_rows(
     // reduced rows below.
     let iterators = series_metas
         .iter()
-        .map(|meta| create_row_iterator(meta.series, &options.range, meta.latest, false))
+        .map(|meta| meta.rows(&options.range))
         .collect::<Vec<_>>();
 
     let multi_iter = KWayMerge::new(iterators);
@@ -1134,23 +1231,23 @@ fn collect_group_label_values(metas: &mut Vec<MRangeSeriesMeta>, grouping: &Rang
     }
 }
 
-struct GroupedSeriesData<'a> {
-    series: Vec<MRangeSeriesMeta<'a>>,
+struct GroupedSeriesData<M> {
+    series: Vec<M>,
     labels: Vec<Label>,
     source_keys: Vec<Vec<u8>>,
 }
 
-fn group_series_by_label<'a>(
-    metas: Vec<MRangeSeriesMeta<'a>>,
+fn group_series_by_label<M: GroupMember>(
+    metas: Vec<M>,
     grouping: &RangeGroupingOptions,
     with_labels: bool,
-) -> AHashMap<String, GroupedSeriesData<'a>> {
-    let mut grouped: AHashMap<String, GroupedSeriesData<'a>> = AHashMap::new();
+) -> AHashMap<String, GroupedSeriesData<M>> {
+    let mut grouped: AHashMap<String, GroupedSeriesData<M>> = AHashMap::new();
     let group_by_label_name = &grouping.group_label;
     let reducer_name = grouping.aggregation.aggregation_name();
 
     for mut meta in metas.into_iter() {
-        if let Some(label_value_str) = meta.group_label_value.take() {
+        if let Some(label_value_str) = meta.take_group_label_value() {
             let entry = grouped
                 .entry(label_value_str)
                 .or_insert_with(|| GroupedSeriesData {
@@ -1158,7 +1255,7 @@ fn group_series_by_label<'a>(
                     labels: Vec::new(),
                     source_keys: Vec::new(),
                 });
-            entry.source_keys.push(meta.source_key.clone());
+            entry.source_keys.push(meta.source_key().to_vec());
             entry.series.push(meta);
         }
     }
@@ -1200,10 +1297,10 @@ fn snapshot_supports(range: &RangeOptions) -> bool {
     range.timestamp_filter.is_none()
 }
 
-/// Whether the non-clustered path can answer `options` from snapshots; grouping
-/// needs the reducer pass as well.
+/// Whether the non-clustered path can answer `options` from snapshots. GROUPBY included:
+/// the reduce runs over the snapshots as it does over the live series ([`GroupMember`]).
 pub(crate) fn is_snapshot_answerable(options: &MRangeOptions) -> bool {
-    options.grouping.is_none() && snapshot_supports(&options.range)
+    snapshot_supports(&options.range)
 }
 
 /// Whether a shard can answer its share of a clustered TS.MRANGE from
@@ -1284,10 +1381,26 @@ pub(crate) fn local_mrange_query<R>(
         return process_mrange(metas, options.clone(), MRangeScope::Client, None, &|| false)
             .map(LocalMRange::Answered);
     };
-    Ok(LocalMRange::Deferred(
-        slot,
-        snapshot_series(ctx, &series_guards, options, None),
-    ))
+    let snapshots = match group_member_options(options) {
+        Some(member_options) => snapshot_series(ctx, &series_guards, &member_options, None),
+        None => snapshot_series(ctx, &series_guards, options, None),
+    };
+    Ok(LocalMRange::Deferred(slot, snapshots))
+}
+
+/// For a grouped query, the options each member is snapshotted with. A group is aggregated
+/// per series before it is reduced, ascending and unlimited whatever the reply's order:
+/// direction and COUNT apply to the reduced stream, and EMPTY must be told so. Members'
+/// own labels are never reported, so they are not copied either.
+fn group_member_options(options: &MRangeOptions) -> Option<MRangeOptions> {
+    options.grouping.as_ref()?;
+    let mut member = options.clone();
+    member.is_reverse = false;
+    member.reply_reverse = false;
+    member.range.count = None;
+    member.with_labels = false;
+    member.selected_labels.clear();
+    Some(member)
 }
 
 /// How much of the window a series' snapshot must hold. A raw, unfiltered read emits every
@@ -1615,11 +1728,20 @@ fn decode_snapshot(
 }
 
 /// The off-thread half: decode every snapshot through the same pipeline
-/// `handle_non_grouped` uses, apply EXCLUDEEMPTY, sort by key.
+/// `handle_non_grouped` uses, apply EXCLUDEEMPTY, sort by key. For GROUPBY, reduce the
+/// groups as `handle_grouping` does and sort by group; the snapshots must then have been
+/// taken with [`group_member_options`].
 pub(crate) fn decode_snapshot_series(
     series: Vec<SnapshotSeries>,
     options: &MRangeOptions,
 ) -> Vec<MRangeSeriesResult> {
+    if options.grouping.is_some() {
+        // The live path's reduce, with snapshots for members. It only fails without
+        // grouping options, which this branch has.
+        let mut items = handle_grouping(series, options.clone()).unwrap_or_default();
+        sort_mrange_results(&mut items, true);
+        return items;
+    }
     // The shard decode with nothing pushed down and no requester to give up: COUNT and
     // the direction are in `options`, and the samples go straight to the reply.
     // Only an expired deadline fails that decode, and this one has none.
@@ -1924,7 +2046,10 @@ mod tests {
         }
     }
 
-    fn group<'a>(name: &str, members: Vec<MRangeSeriesMeta<'a>>) -> MergedGroup<'a> {
+    fn group<'a>(
+        name: &str,
+        members: Vec<MRangeSeriesMeta<'a>>,
+    ) -> MergedGroup<MRangeSeriesMeta<'a>> {
         let group = GroupedSeriesData {
             series: members,
             labels: Vec::new(),
@@ -1933,7 +2058,7 @@ mod tests {
         (name.to_string(), group)
     }
 
-    fn planned_names(planned: &[MergedGroup]) -> Vec<String> {
+    fn planned_names(planned: &[MergedGroup<MRangeSeriesMeta>]) -> Vec<String> {
         planned.iter().map(|(name, _)| name.clone()).collect()
     }
 
@@ -2813,5 +2938,136 @@ mod tests {
         assert_eq!(threads(16, false), 1);
         assert_eq!(threads(16, true), 0);
         assert_eq!(threads(64, false), 0);
+    }
+
+    /// A standalone GROUPBY reduces the same from snapshots as from the live series: the
+    /// bucket table and the merge, single and multi-column, EMPTY and counters, either
+    /// direction, with COUNT and with LATEST.
+    #[test]
+    fn test_deferred_snapshot_groupby_matches_live_path() {
+        let s1 = multi_chunk_series(0.0);
+        let s2 = multi_chunk_series(100.0);
+        let s3 = multi_chunk_series(7.5);
+        let gappy = nan_gap_series();
+        let empty = TimeSeries::new();
+        let fixtures = [
+            (&s1, "a", Some("g1")),
+            (&s2, "b", Some("g2")),
+            (&s3, "c", Some("g1")),
+            (&gappy, "d", Some("g2")),
+            (&empty, "e", Some("g3")),
+            (&s2, "f", None),
+        ];
+        let reducers = [
+            AggregationType::Sum,
+            AggregationType::Max,
+            AggregationType::Avg,
+            AggregationType::Count,
+        ];
+        for agg in limit_test_aggregations() {
+            for reducer in reducers {
+                for (is_reverse, count) in [
+                    (false, None),
+                    (true, None),
+                    (false, Some(3)),
+                    (true, Some(3)),
+                ] {
+                    for (from, to) in [(95, 2405), (0, 5000)] {
+                        for (with_labels, with_latest) in [(false, false), (true, true)] {
+                            let options = MRangeOptions {
+                                range: RangeOptions {
+                                    date_range: crate::series::TimestampRange::from_timestamps(
+                                        from, to,
+                                    )
+                                    .unwrap(),
+                                    aggregation: agg.clone(),
+                                    count,
+                                    ..Default::default()
+                                },
+                                grouping: Some(RangeGroupingOptions {
+                                    aggregation: AggregatorConfig::new(reducer, None).unwrap(),
+                                    group_label: "region".into(),
+                                }),
+                                is_reverse,
+                                with_labels,
+                                ..Default::default()
+                            };
+                            let latest_of = |series: &TimeSeries| {
+                                (with_latest && to >= 3000 && !series.is_empty()).then_some(
+                                    Sample {
+                                        timestamp: 3000,
+                                        value: 4.0,
+                                    },
+                                )
+                            };
+                            let member_options = group_member_options(&options).unwrap();
+                            let snapshots = fixtures
+                                .iter()
+                                .map(|(series, key, group)| {
+                                    let mut snapshot = snapshot_one(
+                                        series,
+                                        (*key).into(),
+                                        latest_of(series),
+                                        &member_options,
+                                        None,
+                                    );
+                                    snapshot.group_label_value = group.map(String::from);
+                                    snapshot
+                                })
+                                .collect();
+                            let deferred = decode_snapshot_series(snapshots, &options);
+
+                            let metas = fixtures
+                                .iter()
+                                .map(|(series, key, group)| MRangeSeriesMeta {
+                                    series,
+                                    source_key: (*key).into(),
+                                    latest: latest_of(series),
+                                    group_label_value: group.map(String::from),
+                                })
+                                .collect();
+                            let mut live = handle_grouping(metas, options.clone()).unwrap();
+                            sort_mrange_results(&mut live, true);
+
+                            let case = format!(
+                                "agg={agg:?} reducer={reducer:?} reverse={is_reverse} \
+                                 count={count:?} window={from}..{to} labels={with_labels}"
+                            );
+                            assert_eq!(keys_of(&deferred), keys_of(&live), "{case}");
+                            assert!(!live.is_empty(), "{case}");
+                            for (d, l) in deferred.iter().zip(&live) {
+                                assert_eq!(d.group_label_value, l.group_label_value, "{case}");
+                                assert_eq!(d.labels, l.labels, "{case}");
+                                assert_eq!(d.sources, l.sources, "{case}");
+                                assert_eq!(data_of(d), data_of(l), "{case}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Group members are snapshotted ascending, unlimited and without their own labels,
+    /// whatever the reply asks for.
+    #[test]
+    fn test_group_members_are_snapshotted_ascending_and_unlimited() {
+        let mut options = MRangeOptions {
+            is_reverse: true,
+            with_labels: true,
+            ..Default::default()
+        };
+        options.range.count = Some(3);
+        assert!(group_member_options(&options).is_none());
+
+        options.grouping = Some(RangeGroupingOptions {
+            aggregation: AggregatorConfig::new(AggregationType::Sum, None).unwrap(),
+            group_label: "region".into(),
+        });
+        let member = group_member_options(&options).unwrap();
+        assert!(!member.is_reverse && !member.reply_reverse && !member.with_labels);
+        assert_eq!(member.range.count, None);
+        assert!(member.grouping.is_some());
+        assert!(is_snapshot_answerable(&options));
     }
 }

@@ -120,7 +120,7 @@ fn mrange_internal(ctx: &Context, args: Vec<ValkeyString>, reverse: bool) -> Val
 }
 
 /// A non-clustered TS.MRANGE answered off the main thread: the chunks are copied under the
-/// command, the client is blocked, and the decode and the reply run on the
+/// command, the client is blocked, and the decode, any GROUPBY reduce and the reply run on the
 /// [`MRANGE_EXECUTOR`] lane through a thread-safe reply context, as TS.OUTLIERS does.
 ///
 /// Answers inline unless other clients keep the main thread busy

@@ -838,7 +838,9 @@ impl TimeSeries {
             start,
             end,
             chunks,
-            last_timestamp: (!self.is_empty()).then(|| self.last_timestamp()),
+            series_extent: (!self.is_empty())
+                .then(|| (self.first_timestamp, self.last_timestamp())),
+            series_total_samples: self.total_samples,
         }
     }
 
@@ -1464,8 +1466,11 @@ pub struct RangeSnapshot {
     start: Timestamp,
     end: Timestamp,
     chunks: Vec<TimeSeriesChunk>,
-    /// The series' last stored timestamp when it was copied; `None` for an empty series.
-    last_timestamp: Option<Timestamp>,
+    /// The series' first and last stored timestamps when it was copied; `None` for an
+    /// empty series.
+    series_extent: Option<(Timestamp, Timestamp)>,
+    /// Samples the series stored when it was copied.
+    series_total_samples: usize,
 }
 
 impl RangeSnapshot {
@@ -1505,7 +1510,17 @@ impl RangeSnapshot {
 
     /// The series' last stored timestamp when it was copied; `None` for an empty series.
     pub(crate) fn series_last_timestamp(&self) -> Option<Timestamp> {
-        self.last_timestamp
+        self.series_extent.map(|(_, last)| last)
+    }
+
+    /// The series' first and last stored timestamps when it was copied.
+    pub(crate) fn series_extent(&self) -> Option<(Timestamp, Timestamp)> {
+        self.series_extent
+    }
+
+    /// Samples the series stored when it was copied, in and out of the window.
+    pub(crate) fn series_total_samples(&self) -> usize {
+        self.series_total_samples
     }
 
     #[cfg(test)]
