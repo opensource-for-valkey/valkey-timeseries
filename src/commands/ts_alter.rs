@@ -15,6 +15,7 @@ acl_categories!(TS_ALTER, "ts.alter", "write timeseries");
 ///
 /// TS.ALTER key
 ///   [RETENTION retentionPeriod]
+///   [ENCODING <COMPRESSED|UNCOMPRESSED|...>]   (validated, then ignored)
 ///   [DUPLICATE_POLICY duplicatePolicy]
 ///   [SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS decimalDigits]
 ///   [IGNORE ignoreMaxTimediff ignoreMaxValDiff]
@@ -43,11 +44,16 @@ pub fn ts_alter_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     with_timeseries_mut(ctx, &key, Some(AclPermissions::UPDATE), |series| {
         // Parse onto an empty baseline, not the module configuration: an option the
         // command did not name must stay `None` so it can be left untouched.
+        //
+        // `ENCODING` (and the bare `COMPRESSED` / `UNCOMPRESSED` keywords) are parsed and
+        // validated as on `TS.CREATE`, then ignored, as RTS does: a series keeps the encoding
+        // it was created with. `update_series` never reads `chunk_encoding`, and the RDB
+        // loader rejects a series whose chunks disagree with it.
         let options = parse_series_options_onto(
             TimeSeriesOptions::empty(),
             args,
             1,
-            &[CommandArgToken::Encoding, CommandArgToken::OnDuplicate],
+            &[CommandArgToken::OnDuplicate],
         )?;
 
         let changed = update_series(ctx, series, options, &key);

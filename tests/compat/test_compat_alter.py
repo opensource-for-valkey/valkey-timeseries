@@ -216,6 +216,43 @@ class TestOptionParsing:
         diff("TS.INFO", "a:novalue")
 
 
+class TestEncodingIsIgnored:
+    """TS.ALTER validates ENCODING like TS.CREATE, then leaves the series' encoding
+    as it was created: TS.INFO's chunkType and the stored samples must not move."""
+
+    @pytest.mark.parametrize("create", ["COMPRESSED", "UNCOMPRESSED"])
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ("ENCODING", "COMPRESSED"),
+            ("ENCODING", "uncompressed"),
+            ("encoding", "Uncompressed"),
+            ("UNCOMPRESSED",),
+            ("COMPRESSED",),
+            ("ENCODING", "COMPRESSED", "ENCODING", "UNCOMPRESSED"),
+            ("RETENTION", 10, "ENCODING", "UNCOMPRESSED", "LABELS", "a", "b"),
+        ],
+    )
+    def test_encoding_accepted_and_ignored(self, diff, create, args):
+        diff("TS.CREATE", "a:enc", "ENCODING", create)
+        for ts, value in SAMPLES:
+            diff("TS.ADD", "a:enc", ts, value)
+        diff("TS.ALTER", "a:enc", *args)
+        diff("TS.INFO", "a:enc")
+        diff("TS.RANGE", "a:enc", "-", "+")
+
+    @pytest.mark.parametrize("args", [("ENCODING", "foo"), ("ENCODING",)])
+    def test_invalid_encoding_rejected(self, diff, args):
+        mk_series(diff, "a:enc:bad")
+        with pytest.raises(ResponseError):
+            diff("TS.ALTER", "a:enc:bad", *args)
+        diff("TS.INFO", "a:enc:bad")
+
+    def test_missing_key(self, diff):
+        with pytest.raises(ResponseError):
+            diff("TS.ALTER", "a:enc:missing", "ENCODING", "COMPRESSED")
+
+
 class TestAlterDivergences:
     """Pinned per-engine; see TestParserDivergences in test_compat_create.py for why
     this class of delta can not be routed through `diff`."""
