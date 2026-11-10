@@ -127,7 +127,7 @@ fn parse_encoding(encoding: &str) -> Option<ChunkEncoding> {
 #[enum_dispatch]
 pub trait ChunkOps {
     /// The chunk's samples with timestamps in `[start, end]`, ascending. A decode error ends
-    /// the iteration early (logged in debug builds).
+    /// the iteration early (counted in `chunk_decode_errors_total`).
     fn range_iter(&self, start: Timestamp, end: Timestamp) -> SampleIter<'_>;
     /// Every sample in the chunk, ascending.
     fn iter(&self) -> SampleIter<'_> {

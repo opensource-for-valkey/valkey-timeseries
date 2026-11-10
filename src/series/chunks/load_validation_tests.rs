@@ -316,3 +316,16 @@ fn unordered_streams_are_rejected() {
     }
     assert!(gorilla.verify_stream().is_err(), "repeated");
 }
+
+/// A read that hits an undecodable sample still ends early with an OK reply, but is counted.
+#[test]
+fn a_decode_error_is_counted() {
+    use crate::common::metrics::chunk::DECODE_ERRORS;
+    use std::sync::atomic::Ordering;
+
+    let mut chunk: GorillaChunk = chunk_of(&base_samples());
+    chunk.encoder.truncate_stream_for_test(12);
+    let before = DECODE_ERRORS.load(Ordering::Relaxed);
+    assert!(chunk.range_iter(i64::MIN, i64::MAX).count() < 20);
+    assert!(DECODE_ERRORS.load(Ordering::Relaxed) > before);
+}

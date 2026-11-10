@@ -205,6 +205,21 @@ The exporting node has no task of its own: the server deletes the exported keys,
 The same metrics are in `INFO ts_asm`, each prefixed `ts_`, without the `debug-mode` gate, except
 the duration histograms. `INFO` counts since module start: `METRICS RESET` doesn't move it.
 
+#### `chunk`
+
+Stored chunks that could not be read back. A compressed chunk is decoded on every read, and a
+decode error ends that read with the samples decoded so far, under an OK reply. Loading rejects a
+chunk whose stream disagrees with its header, so on a healthy node this stays at zero; a non-zero
+value means in-memory corruption or a codec bug. The first error, and at most one per minute after
+it, is also logged at `warning` level.
+
+| Name | Kind | Description |
+|------|------|-------------|
+| `chunk_decode_errors_total` | counter | Reads that stopped at an undecodable sample; the reply was truncated |
+
+The same metric is in `INFO ts_chunk` as `ts_chunk_decode_errors_total`, without the
+`debug-mode` gate. `INFO` counts since module start: `METRICS RESET` doesn't move it.
+
 #### `clustermap`
 
 The cluster map fan-outs choose their targets from. Empty-handed on a standalone server: the

@@ -9,7 +9,7 @@ use crate::common::{Sample, Timestamp};
 use crate::error::TsdbResult;
 
 /// Yields the samples of `inner` with timestamps in `[start, end]`. Returns `None` at the first
-/// sample past `end` or the first decode error (logged in debug builds); like the per-codec
+/// sample past `end` or the first decode error (counted in `chunk_decode_errors_total`); like the per-codec
 /// wrappers it replaces it is not fused, so callers stop at the first `None`.
 ///
 /// Polling past the first `None` keeps decoding, one sample per call. After a sample past
@@ -36,8 +36,8 @@ impl<I> RangeFiltered<I> {
 }
 
 impl<I: Iterator<Item = TsdbResult<Sample>>> RangeFiltered<I> {
-    /// The next decoded sample at or before `end`; `None` past `end`, on a decode error, or
-    /// when the codec runs out.
+    /// The next decoded sample at or before `end`; `None` past `end`, on a decode error (which
+    /// is counted and, rate-limited, logged), or when the codec runs out.
     fn next_in_window(&mut self) -> Option<Sample> {
         match self.inner.next() {
             Some(Ok(sample)) => {
@@ -46,15 +46,10 @@ impl<I: Iterator<Item = TsdbResult<Sample>>> RangeFiltered<I> {
                 }
                 Some(sample)
             }
-            #[cfg(debug_assertions)]
             Some(Err(err)) => {
-                crate::common::logging::log_warning(format!(
-                    "error decoding chunk sample: {err:?}"
-                ));
+                crate::common::metrics::chunk::note_decode_error(&err);
                 None
             }
-            #[cfg(not(debug_assertions))]
-            Some(Err(_)) => None,
             None => None,
         }
     }
