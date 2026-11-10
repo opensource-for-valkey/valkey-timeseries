@@ -5,7 +5,7 @@ use crate::common::hash::IntSet;
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::iterators::TimestampFilterIterator;
 use crate::series::request_types::{AggregationOptions, RangeOptions};
-use crate::series::{SeriesSampleIterator, TimeSeries, ValueFilter};
+use crate::series::{RangeSnapshot, SeriesSampleIterator, TimeSeries, ValueFilter};
 use itertools::Either;
 use smallvec::SmallVec;
 
@@ -120,12 +120,7 @@ fn counter_baseline(
     read_floor: Option<Timestamp>,
 ) -> Option<Sample> {
     let floor = read_floor?;
-    let aggregation = options.aggregation.as_ref()?;
-    if !aggregation
-        .aggregations
-        .iter()
-        .any(|config| config.aggregation.carries_baseline())
-    {
+    if !carries_baseline(options) {
         return None;
     }
     debug_assert!(options.timestamp_filter.is_none());
@@ -137,6 +132,33 @@ fn counter_baseline(
     }
     let value_filter = options.value_filter;
     SeriesSampleIterator::new(series, lower, floor - 1, true)
+        .find(|sample| is_empty_fill_data(sample, value_filter))
+}
+
+/// Whether any of the query's aggregators needs a [`counter_baseline`].
+fn carries_baseline(options: &RangeOptions) -> bool {
+    options.aggregation.as_ref().is_some_and(|aggregation| {
+        aggregation
+            .aggregations
+            .iter()
+            .any(|config| config.aggregation.carries_baseline())
+    })
+}
+
+/// [`counter_baseline`] for a read of `snapshot` from `read_floor`. The snapshot holds the
+/// whole window, so the sample before the floor is in it.
+fn snapshot_counter_baseline(
+    snapshot: &RangeSnapshot,
+    options: &RangeOptions,
+    read_floor: Option<Timestamp>,
+) -> Option<Sample> {
+    let floor = read_floor?;
+    if !carries_baseline(options) || floor <= snapshot.start() {
+        return None;
+    }
+    let value_filter = options.value_filter;
+    snapshot
+        .samples_before(floor)
         .find(|sample| is_empty_fill_data(sample, value_filter))
 }
 
@@ -246,16 +268,27 @@ impl ReverseTailRead {
         latest: Option<Sample>,
         count: usize,
     ) -> Option<Self> {
-        if series.is_empty() || options.timestamp_filter.is_some() {
+        let last = (!series.is_empty()).then(|| series.last_timestamp());
+        Self::plan_from(last, options, latest, count)
+    }
+
+    /// [`Self::plan`] from the series' last stored timestamp alone (`None` when it is empty),
+    /// which is all a plan needs of it: a [`RangeSnapshot`] carries that much.
+    fn plan_from(
+        series_last: Option<Timestamp>,
+        options: &RangeOptions,
+        latest: Option<Sample>,
+        count: usize,
+    ) -> Option<Self> {
+        let series_last = series_last?;
+        if options.timestamp_filter.is_some() {
             return None;
         }
         let aggregation = options.aggregation.as_ref().filter(|a| !a.report_empty)?;
 
         let (start, end) = options.get_timestamp_range();
         let newest = latest
-            .map_or(series.last_timestamp(), |sample| {
-                sample.timestamp.max(series.last_timestamp())
-            })
+            .map_or(series_last, |sample| sample.timestamp.max(series_last))
             .min(end);
         if newest < start {
             return None;
@@ -545,6 +578,128 @@ pub(crate) fn range_empty_fill_bounds(
     empty_fill_bounds(series, options, reply_reverse, tail_limit)
 }
 
+/// [`range_empty_fill_bounds`] for a shard's newest-first COUNT
+/// ([`create_range_tail_iterator_from_snapshot`]): only the stream's last `count` rows are
+/// used, as [`create_range_tail_iterator`] tells EMPTY on a live series.
+pub(crate) fn range_tail_empty_fill_bounds(
+    series: &TimeSeries,
+    options: &RangeOptions,
+    count: usize,
+    reply_reverse: bool,
+) -> EmptyFillBounds {
+    empty_fill_bounds(series, options, reply_reverse, Some(count))
+}
+
+/// One pass of the single-column pipeline over a snapshot, as [`range_pipeline`] is over a
+/// live series: read from `read_floor`, seeded with the counter baseline before it.
+fn snapshot_range_pipeline<'a>(
+    snapshot: &'a RangeSnapshot,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    empty_fill: EmptyFillBounds,
+    is_reverse: bool,
+    read_floor: Option<Timestamp>,
+) -> Box<dyn Iterator<Item = Sample> + 'a> {
+    let has_aggregation = options.aggregation.is_some();
+    let should_reverse_iter = !has_aggregation && is_reverse;
+    let output = SampleOutput {
+        options,
+        is_reverse: has_aggregation && is_reverse,
+        empty_fill,
+        baseline: snapshot_counter_baseline(snapshot, options, read_floor),
+    };
+    if should_reverse_iter {
+        // Raw samples read newest-first; floors are only planned for aggregations.
+        debug_assert!(read_floor.is_none());
+        output.chain_latest(snapshot.sample_iter(true), latest_sample, true)
+    } else {
+        output.chain_latest(snapshot.sample_iter_from(read_floor), latest_sample, false)
+    }
+}
+
+/// [`create_range_iterator_for_reply`] over a [`RangeSnapshot`]: the same output, and the
+/// same short read for a newest-first COUNT over buckets. `latest_sample` and `empty_fill`
+/// must have been derived from the series beforehand ([`range_empty_fill_bounds`]); the
+/// snapshot must hold the whole window whenever the query aggregates. `FILTER_BY_TS` is not
+/// supported: its base reader needs the series.
+pub(crate) fn create_range_iterator_from_snapshot<'a>(
+    snapshot: &'a RangeSnapshot,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    is_reverse: bool,
+    empty_fill: EmptyFillBounds,
+) -> Box<dyn Iterator<Item = Sample> + 'a> {
+    debug_assert!(options.timestamp_filter.is_none());
+    let build = |read_floor| {
+        snapshot_range_pipeline(
+            snapshot,
+            options,
+            latest_sample,
+            empty_fill,
+            is_reverse,
+            read_floor,
+        )
+    };
+    let tail_limit = options.count.filter(|_| is_reverse);
+    let plan = tail_limit.and_then(|count| {
+        ReverseTailRead::plan_from(
+            snapshot.series_last_timestamp(),
+            options,
+            latest_sample,
+            count,
+        )
+    });
+    match plan {
+        Some(tail) => tail.read(build),
+        None => build(None),
+    }
+}
+
+/// [`create_range_tail_iterator`] over a [`RangeSnapshot`]: the window's newest `count`
+/// items, oldest first, decoding no more of the snapshot than that takes. `empty_fill` comes
+/// from [`range_tail_empty_fill_bounds`]; the rest is as for
+/// [`create_range_iterator_from_snapshot`].
+pub(crate) fn create_range_tail_iterator_from_snapshot<'a>(
+    snapshot: &'a RangeSnapshot,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    count: usize,
+    empty_fill: EmptyFillBounds,
+) -> Box<dyn Iterator<Item = Sample> + 'a> {
+    debug_assert!(options.timestamp_filter.is_none());
+    if options.aggregation.is_none() {
+        let mut newest_first: Vec<Sample> =
+            snapshot_range_pipeline(snapshot, options, latest_sample, empty_fill, true, None)
+                .take(count)
+                .collect();
+        newest_first.reverse();
+        return Box::new(newest_first.into_iter());
+    }
+
+    let build = |read_floor| -> Box<dyn Iterator<Item = Sample> + 'a> {
+        Box::new(TailIter::new(
+            snapshot_range_pipeline(
+                snapshot,
+                options,
+                latest_sample,
+                empty_fill,
+                false,
+                read_floor,
+            ),
+            count,
+        ))
+    };
+    match ReverseTailRead::plan_from(
+        snapshot.series_last_timestamp(),
+        options,
+        latest_sample,
+        count,
+    ) {
+        Some(tail) => tail.read(build),
+        None => build(None),
+    }
+}
+
 /// Pre-aggregation composition for one series: base reader (ts-filter variant
 /// when FILTER_BY_TS is present) + LATEST chaining + value filter. The output
 /// is always ascending — multi-aggregation consumes ascending input and
@@ -703,6 +858,22 @@ pub(crate) fn create_row_iterator_from_base<'a, I>(
 where
     I: Iterator<Item = Sample> + 'a,
 {
+    row_pipeline_from_base(base, options, latest_sample, empty_fill, is_reverse, None)
+}
+
+/// [`create_row_iterator_from_base`] for a base read from a floor, with the counter
+/// aggregators' [`counter_baseline`].
+fn row_pipeline_from_base<'a, I>(
+    base: I,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    empty_fill: EmptyFillBounds,
+    is_reverse: bool,
+    baseline: Option<Sample>,
+) -> Box<dyn Iterator<Item = MultiSample> + 'a>
+where
+    I: Iterator<Item = Sample> + 'a,
+{
     let aggregation = options
         .aggregation
         .as_ref()
@@ -724,9 +895,96 @@ where
         aggregation,
         aligned_timestamp,
         empty_fill,
-    );
+    )
+    .with_baseline(baseline);
 
     finalize(aggr_iter, is_reverse, options.count)
+}
+
+/// One pass of the row pipeline over a snapshot, as [`row_pipeline`] is over a live series.
+fn snapshot_row_pipeline<'a>(
+    snapshot: &'a RangeSnapshot,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    empty_fill: EmptyFillBounds,
+    is_reverse: bool,
+    read_floor: Option<Timestamp>,
+) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+    row_pipeline_from_base(
+        snapshot.sample_iter_from(read_floor),
+        options,
+        latest_sample,
+        empty_fill,
+        is_reverse,
+        snapshot_counter_baseline(snapshot, options, read_floor),
+    )
+}
+
+/// [`create_row_iterator_for_reply`] over a [`RangeSnapshot`]; see
+/// [`create_range_iterator_from_snapshot`].
+pub(crate) fn create_row_iterator_from_snapshot<'a>(
+    snapshot: &'a RangeSnapshot,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    empty_fill: EmptyFillBounds,
+    is_reverse: bool,
+) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+    let build = |read_floor| {
+        snapshot_row_pipeline(
+            snapshot,
+            options,
+            latest_sample,
+            empty_fill,
+            is_reverse,
+            read_floor,
+        )
+    };
+    let tail_limit = options.count.filter(|_| is_reverse);
+    let plan = tail_limit.and_then(|count| {
+        ReverseTailRead::plan_from(
+            snapshot.series_last_timestamp(),
+            options,
+            latest_sample,
+            count,
+        )
+    });
+    match plan {
+        Some(tail) => tail.read(build),
+        None => build(None),
+    }
+}
+
+/// [`create_row_tail_iterator`] over a [`RangeSnapshot`]; see
+/// [`create_range_tail_iterator_from_snapshot`].
+pub(crate) fn create_row_tail_iterator_from_snapshot<'a>(
+    snapshot: &'a RangeSnapshot,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    count: usize,
+    empty_fill: EmptyFillBounds,
+) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+    let build = |read_floor| -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+        Box::new(TailIter::new(
+            snapshot_row_pipeline(
+                snapshot,
+                options,
+                latest_sample,
+                empty_fill,
+                false,
+                read_floor,
+            ),
+            count,
+        ))
+    };
+    match ReverseTailRead::plan_from(
+        snapshot.series_last_timestamp(),
+        options,
+        latest_sample,
+        count,
+    ) {
+        Some(tail) => tail.read(build),
+        None => build(None),
+    }
 }
 
 /// Apply reversal and COUNT, then box. Buckets and samples alike: COUNT limits output items, and

@@ -12,9 +12,12 @@ use crate::common::{MultiSample, Sample, Timestamp};
 use crate::error_consts;
 use crate::iterators::{
     KWayMerge, RowReducer, SampleReducer, TailIter, create_range_iterator,
-    create_range_iterator_for_reply, create_range_iterator_from_base, create_range_tail_iterator,
-    create_row_iterator, create_row_iterator_for_reply, create_row_iterator_from_base,
-    create_row_tail_iterator, get_range_latest_sample, range_empty_fill_bounds,
+    create_range_iterator_for_reply, create_range_iterator_from_base,
+    create_range_iterator_from_snapshot, create_range_tail_iterator,
+    create_range_tail_iterator_from_snapshot, create_row_iterator, create_row_iterator_for_reply,
+    create_row_iterator_from_base, create_row_iterator_from_snapshot, create_row_tail_iterator,
+    create_row_tail_iterator_from_snapshot, get_range_latest_sample, range_empty_fill_bounds,
+    range_tail_empty_fill_bounds,
 };
 use crate::labels::Label;
 use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk, samples_to_chunk_lossless};
@@ -22,7 +25,7 @@ use crate::series::index::series_by_selectors;
 use crate::series::request_types::{
     MRangeOptions, MRangeSeriesResult, RangeGroupingOptions, RangeOptions, SeriesResultData,
 };
-use crate::series::{RangeSnapshot, SeriesGuard, TimeSeries};
+use crate::series::{RangeSnapshot, SeriesGuard, SnapshotKeep, TimeSeries};
 use ahash::AHashMap;
 use orx_parallel::Par;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1260,54 +1263,93 @@ pub(crate) fn local_mrange_query<R>(
     };
     Ok(LocalMRange::Deferred(
         slot,
-        snapshot_series(ctx, &series_guards, options),
+        snapshot_series(ctx, &series_guards, options, None),
     ))
 }
 
+/// How much of the window a series' snapshot must hold. A raw, unfiltered read emits every
+/// stored sample of the window, so a COUNT reaches a known number of them from one end and
+/// the chunks past those need not be copied under the lock. Aggregation and
+/// `FILTER_BY_VALUE` break that count, and keep the whole window.
+fn snapshot_keep(options: &MRangeOptions, limit: Option<SampleLimit>) -> SnapshotKeep {
+    let range = &options.range;
+    if range.aggregation.is_some() || range.value_filter.is_some() {
+        return SnapshotKeep::All;
+    }
+    match (limit, range.count) {
+        (Some(SampleLimit::Head(count)), _) => SnapshotKeep::Oldest(count),
+        (Some(SampleLimit::Tail(count)), _) => SnapshotKeep::Newest(count),
+        (None, Some(count)) if options.is_reverse => SnapshotKeep::Newest(count),
+        (None, Some(count)) => SnapshotKeep::Oldest(count),
+        (None, None) => SnapshotKeep::All,
+    }
+}
+
 /// Copies out of each guarded series what the decode needs; the caller holds
-/// the guards, so this runs under the lock.
+/// the guards, so this runs under the lock. `limit` is the COUNT push-down the decode
+/// will apply ([`decode_shard_snapshots`]); pass `None` when the decode limits something
+/// other than one series' own stream, as a group reduce does.
 fn snapshot_series(
     ctx: &Context,
     guards: &[(SeriesGuard, ValkeyString)],
     options: &MRangeOptions,
+    limit: Option<SampleLimit>,
 ) -> Vec<SnapshotSeries> {
-    let (start, end) = options.range.get_timestamp_range();
     guards
         .iter()
-        .map(|(guard, key)| SnapshotSeries {
-            key: key.as_slice().to_vec(),
-            labels: convert_labels(guard, options.with_labels, &options.selected_labels),
-            snapshot: guard.snapshot_range(start, end),
-            latest: get_latest(&options.range, ctx, guard),
-            empty_fill: range_empty_fill_bounds(
-                guard,
-                &options.range,
-                options.is_reverse,
-                options.is_reverse || options.reply_reverse,
-            ),
-            group_label_value: options
-                .grouping
-                .as_ref()
-                .and_then(|g| guard.label_value(&g.group_label))
-                .map(|v| v.to_string()),
+        .map(|(guard, key)| {
+            let latest = get_latest(&options.range, ctx, guard);
+            snapshot_one(guard, key.as_slice().to_vec(), latest, options, limit)
         })
         .collect()
+}
+
+/// One series' [`SnapshotSeries`]: everything [`decode_snapshot`] needs of it for `options`
+/// and `limit`.
+fn snapshot_one(
+    series: &TimeSeries,
+    key: Vec<u8>,
+    latest: Option<Sample>,
+    options: &MRangeOptions,
+    limit: Option<SampleLimit>,
+) -> SnapshotSeries {
+    let (start, end) = options.range.get_timestamp_range();
+    let reply_reverse = options.is_reverse || options.reply_reverse;
+    SnapshotSeries {
+        key,
+        labels: convert_labels(series, options.with_labels, &options.selected_labels),
+        snapshot: series.snapshot_range_keeping(start, end, snapshot_keep(options, limit)),
+        latest,
+        empty_fill: match limit {
+            // As the live tail read tells EMPTY: only the last `count` rows are used.
+            Some(SampleLimit::Tail(count)) => {
+                range_tail_empty_fill_bounds(series, &options.range, count, reply_reverse)
+            }
+            _ => range_empty_fill_bounds(series, &options.range, options.is_reverse, reply_reverse),
+        },
+        group_label_value: options
+            .grouping
+            .as_ref()
+            .and_then(|g| series.label_value(&g.group_label))
+            .map(|v| v.to_string()),
+    }
 }
 
 /// A shard's share of a clustered TS.MRANGE, under the lock: resolve and
 /// ACL-check the series, then snapshot them. [`decode_shard_snapshots`] does
 /// the rest once the lock is released, so the shard's main thread waits only
 /// for the copy, not the decode. `options` must satisfy
-/// [`is_shard_snapshot_answerable`].
+/// [`is_shard_snapshot_answerable`], and `limit` must be the one the decode is given.
 pub(crate) fn snapshot_shard_mrange(
     ctx: &Context,
     options: &MRangeOptions,
+    limit: Option<SampleLimit>,
 ) -> ValkeyResult<Vec<SnapshotSeries>> {
     if options.filters.is_empty() {
         return Err(ValkeyError::Str(error_consts::MISSING_FILTER));
     }
     let series_guards = series_by_selectors(ctx, &options.filters, None)?;
-    Ok(snapshot_series(ctx, &series_guards, options))
+    Ok(snapshot_series(ctx, &series_guards, options, limit))
 }
 
 /// Decodes a shard's snapshots as `process_mrange` does for a clustered
@@ -1354,7 +1396,8 @@ pub(crate) fn snapshot_shard_group_partials(
     options: &MRangeOptions,
 ) -> ValkeyResult<Vec<SnapshotSeries>> {
     check_metadata_permissions(ctx)?;
-    snapshot_shard_mrange(ctx, options)
+    // No limit: COUNT applies to each group's reduced stream, not to a member's own.
+    snapshot_shard_mrange(ctx, options, None)
 }
 
 /// [`process_mrange_group_partials`] over snapshots: group by the captured label (series
@@ -1457,7 +1500,8 @@ pub(crate) fn decode_group_partials(
 
 /// One snapshot through the pipeline `handle_non_grouped` runs over a live
 /// series. Grouping never applies here: a standalone deferred request has none,
-/// and a shard leaves the reduce to the coordinator.
+/// and a shard leaves the reduce to the coordinator. `limit` must be the one the
+/// snapshot was taken with ([`snapshot_series`]).
 fn decode_snapshot(
     s: SnapshotSeries,
     options: &MRangeOptions,
@@ -1473,16 +1517,29 @@ fn decode_snapshot(
         .as_ref()
         .is_some_and(|a| a.is_multi())
     {
-        let iter = create_row_iterator_from_base(
-            s.snapshot.sample_iter(false),
-            &options.range,
-            s.latest,
-            s.empty_fill,
-            options.is_reverse,
-        );
         let rows = match limit {
-            Some(limit) => limit.apply(iter).collect(),
-            None => iter.collect(),
+            // The newest rows, read from the end of the window as the live path reads them.
+            Some(SampleLimit::Tail(count)) => create_row_tail_iterator_from_snapshot(
+                &s.snapshot,
+                &options.range,
+                s.latest,
+                count,
+                s.empty_fill,
+            )
+            .collect(),
+            limit => {
+                let iter = create_row_iterator_from_snapshot(
+                    &s.snapshot,
+                    &options.range,
+                    s.latest,
+                    s.empty_fill,
+                    options.is_reverse,
+                );
+                match limit {
+                    Some(limit) => limit.apply(iter).collect(),
+                    None => iter.collect(),
+                }
+            }
         };
         return MRangeSeriesResult {
             group_label_value: s.group_label_value,
@@ -1492,21 +1549,31 @@ fn decode_snapshot(
             data: SeriesResultData::Rows(rows),
         };
     }
-    let has_aggregation = options.range.aggregation.is_some();
-    let should_reverse_iter = !has_aggregation && options.is_reverse;
-    // The live path's base reader over the copied chunks: decoded lazily, so
-    // COUNT stops the decode, descending for a non-aggregated reverse query, and
-    // unboxed, so the aggregation inlines the decode as it does on the live path.
-    let iter = create_range_iterator_from_base(
-        s.snapshot.sample_iter(should_reverse_iter),
-        &options.range,
-        s.latest,
-        options.is_reverse,
-        s.empty_fill,
-    );
+    // The live path's reader over the copied chunks: decoded lazily, so COUNT stops the
+    // decode, descending for a non-aggregated reverse query, and from the end of the
+    // window for a newest-first COUNT.
     let samples: Vec<Sample> = match limit {
-        Some(limit) => limit.apply(iter).collect(),
-        None => iter.collect(),
+        Some(SampleLimit::Tail(count)) => create_range_tail_iterator_from_snapshot(
+            &s.snapshot,
+            &options.range,
+            s.latest,
+            count,
+            s.empty_fill,
+        )
+        .collect(),
+        limit => {
+            let iter = create_range_iterator_from_snapshot(
+                &s.snapshot,
+                &options.range,
+                s.latest,
+                options.is_reverse,
+                s.empty_fill,
+            );
+            match limit {
+                Some(limit) => limit.apply(iter).collect(),
+                None => iter.collect(),
+            }
+        }
     };
     let data = if compress {
         SeriesResultData::Chunk(samples_to_chunk_lossless(samples))
@@ -2460,5 +2527,247 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Aggregations for the limit tests: plain, a counter (which carries a baseline across a
+    /// read floor), EMPTY with `last`, and multi-column.
+    fn limit_test_aggregations() -> Vec<Option<AggregationOptions>> {
+        let single = |kind: AggregationType, bucket_duration, report_empty| AggregationOptions {
+            aggregations: smallvec::smallvec![kind.into()],
+            bucket_duration,
+            timestamp_output: Default::default(),
+            alignment: Default::default(),
+            report_empty,
+        };
+        let mut multi_counter = multi_aggregation();
+        multi_counter.report_empty = false;
+        multi_counter.bucket_duration = 50;
+        multi_counter.aggregations = smallvec::smallvec![
+            AggregationType::Increase.into(),
+            AggregationType::Max.into()
+        ];
+        vec![
+            None,
+            Some(single(AggregationType::Avg, 50, false)),
+            Some(single(AggregationType::Increase, 50, false)),
+            Some(single(AggregationType::Rate, 70, false)),
+            Some(single(AggregationType::Last, 250, true)),
+            Some(multi_aggregation()),
+            Some(multi_counter),
+        ]
+    }
+
+    /// A shard's COUNT push-down answers the same from limit-aware snapshots as from the
+    /// live series: the copy keeps only the chunks the limit reaches, and a newest-first
+    /// COUNT reads from the end of the window, floors and counter baselines included.
+    #[test]
+    fn test_shard_snapshot_limits_match_live_path() {
+        let s1 = multi_chunk_series(0.0);
+        let s2 = multi_chunk_series(100.0);
+        let gappy = nan_gap_series();
+        let empty = TimeSeries::new();
+        let fixtures = [(&s1, "a"), (&s2, "b"), (&empty, "c"), (&gappy, "d")];
+        let filters = [
+            None,
+            Some(crate::series::ValueFilter::new(3.0, 110.0).unwrap()),
+        ];
+        let limits = [
+            SampleLimit::Head(1),
+            SampleLimit::Head(7),
+            SampleLimit::Head(10_000),
+            SampleLimit::Tail(1),
+            SampleLimit::Tail(7),
+            SampleLimit::Tail(40),
+            SampleLimit::Tail(10_000),
+        ];
+        for agg in limit_test_aggregations() {
+            for value_filter in filters {
+                for (from, to) in [(95, 2405), (0, 5000), (1500, 1600), (2990, 2990)] {
+                    for reply_reverse in [false, true] {
+                        for with_latest in [false, true] {
+                            let options = MRangeOptions {
+                                range: RangeOptions {
+                                    date_range: crate::series::TimestampRange::from_timestamps(
+                                        from, to,
+                                    )
+                                    .unwrap(),
+                                    aggregation: agg.clone(),
+                                    value_filter,
+                                    ..Default::default()
+                                },
+                                reply_reverse,
+                                ..Default::default()
+                            };
+                            // LATEST's open bucket lies past the last stored sample.
+                            let latest = (with_latest && to >= 3000).then_some(Sample {
+                                timestamp: 3000,
+                                value: 4.0,
+                            });
+                            for limit in limits {
+                                let snapshots = fixtures
+                                    .iter()
+                                    .map(|(series, key)| {
+                                        let latest = latest.filter(|_| !series.is_empty());
+                                        snapshot_one(
+                                            series,
+                                            (*key).into(),
+                                            latest,
+                                            &options,
+                                            Some(limit),
+                                        )
+                                    })
+                                    .collect();
+                                let mut shard = decode_shard_snapshots(
+                                    snapshots,
+                                    &options,
+                                    Some(limit),
+                                    false,
+                                    &|| false,
+                                )
+                                .unwrap();
+                                let metas = fixtures
+                                    .iter()
+                                    .map(|(series, key)| MRangeSeriesMeta {
+                                        series,
+                                        source_key: (*key).into(),
+                                        latest: latest.filter(|_| !series.is_empty()),
+                                        group_label_value: None,
+                                    })
+                                    .collect();
+                                let mut live = handle_non_grouped(
+                                    metas,
+                                    options.clone(),
+                                    false,
+                                    Some(limit),
+                                    &ReadDeadline::new(&|| false),
+                                );
+                                sort_mrange_results(&mut shard, false);
+                                sort_mrange_results(&mut live, false);
+                                let case = format!(
+                                    "limit={limit:?} agg={agg:?} filter={value_filter:?} \
+                                     window={from}..{to} reply_reverse={reply_reverse} \
+                                     latest={latest:?}"
+                                );
+                                assert_eq!(keys_of(&shard), keys_of(&live), "{case}");
+                                for (s, l) in shard.iter().zip(&live) {
+                                    assert_eq!(data_of(s), data_of(l), "{case}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The standalone deferred path, which carries COUNT and the direction in its options:
+    /// same answer as the live path, from a snapshot trimmed to what COUNT reaches.
+    #[test]
+    fn test_deferred_snapshot_count_matches_live_path() {
+        let s1 = multi_chunk_series(0.0);
+        let gappy = nan_gap_series();
+        let fixtures = [(&s1, "a"), (&gappy, "d")];
+        for agg in limit_test_aggregations() {
+            for value_filter in [
+                None,
+                Some(crate::series::ValueFilter::new(3.0, 110.0).unwrap()),
+            ] {
+                for is_reverse in [false, true] {
+                    for count in [1usize, 7, 40, 10_000] {
+                        let options = MRangeOptions {
+                            range: RangeOptions {
+                                date_range: crate::series::TimestampRange::from_timestamps(
+                                    95, 2405,
+                                )
+                                .unwrap(),
+                                aggregation: agg.clone(),
+                                value_filter,
+                                count: Some(count),
+                                ..Default::default()
+                            },
+                            is_reverse,
+                            ..Default::default()
+                        };
+                        let snapshots = fixtures
+                            .iter()
+                            .map(|(series, key)| {
+                                snapshot_one(series, (*key).into(), None, &options, None)
+                            })
+                            .collect();
+                        let deferred = decode_snapshot_series(snapshots, &options);
+                        let metas = fixtures
+                            .iter()
+                            .map(|(series, key)| meta(series, key, None))
+                            .collect();
+                        let live = process_mrange(
+                            metas,
+                            options.clone(),
+                            MRangeScope::Client,
+                            None,
+                            &|| false,
+                        )
+                        .unwrap();
+                        let case = format!(
+                            "count={count} agg={agg:?} filter={value_filter:?} \
+                             is_reverse={is_reverse}"
+                        );
+                        assert_eq!(keys_of(&deferred), keys_of(&live), "{case}");
+                        for (d, l) in deferred.iter().zip(&live) {
+                            assert_eq!(data_of(d), data_of(l), "{case}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A raw, unfiltered COUNT copies only the chunks it can reach; anything that makes the
+    /// number of emitted samples unknowable keeps the whole window.
+    #[test]
+    fn test_snapshot_keeps_only_the_chunks_a_count_reaches() {
+        let series = multi_chunk_series(0.0);
+        let window = |options: &mut MRangeOptions| {
+            options.range.date_range =
+                crate::series::TimestampRange::from_timestamps(0, 5000).unwrap();
+        };
+        let chunks = |options: &MRangeOptions, limit| {
+            snapshot_one(&series, b"a".to_vec(), None, options, limit)
+                .snapshot
+                .chunk_count()
+        };
+        let mut raw = MRangeOptions::default();
+        window(&mut raw);
+        let all = chunks(&raw, None);
+        assert_eq!(all, series.chunks.len());
+
+        for limit in [SampleLimit::Head(2), SampleLimit::Tail(2)] {
+            let kept = chunks(&raw, Some(limit));
+            assert!(kept < all && kept <= 2, "{limit:?} kept {kept} of {all}");
+        }
+        assert_eq!(chunks(&raw, Some(SampleLimit::Tail(10_000))), all);
+
+        // A window that cuts into its edge chunks: those are kept without being counted.
+        let mut inner = MRangeOptions::default();
+        inner.range.date_range = crate::series::TimestampRange::from_timestamps(95, 2405).unwrap();
+        let inner_all = chunks(&inner, None);
+        for limit in [SampleLimit::Head(2), SampleLimit::Tail(2)] {
+            let kept = chunks(&inner, Some(limit));
+            assert!((2..inner_all).contains(&kept), "{limit:?} kept {kept}");
+        }
+
+        // The standalone path's own COUNT trims the same way, by direction.
+        let mut counted = raw.clone();
+        counted.range.count = Some(2);
+        assert!(chunks(&counted, None) < all);
+        counted.is_reverse = true;
+        assert!(chunks(&counted, None) < all);
+
+        let mut filtered = raw.clone();
+        filtered.range.value_filter = Some(crate::series::ValueFilter::new(0.0, 1.0).unwrap());
+        assert_eq!(chunks(&filtered, Some(SampleLimit::Tail(2))), all);
+
+        let mut aggregated = raw.clone();
+        aggregated.range.aggregation = limit_test_aggregations().remove(1);
+        assert_eq!(chunks(&aggregated, Some(SampleLimit::Head(2))), all);
     }
 }

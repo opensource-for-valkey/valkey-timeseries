@@ -189,7 +189,7 @@ impl FanoutClientCommand for MRangeFanoutCommand {
         let series = if is_shard_snapshot_answerable(&options) {
             let snapshots = {
                 let ctx = ctx.lock_unexpired()?;
-                snapshot_shard_mrange(&ctx, &options)?
+                snapshot_shard_mrange(&ctx, &options, limit)?
             };
             decode_shard_snapshots(snapshots, &options, limit, scope.compress(), &expired)?
         } else {

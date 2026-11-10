@@ -813,16 +813,33 @@ impl TimeSeries {
     /// is no longer borrowed. See [`RangeSnapshot`]. Ported from the promql
     /// branch (9c845860e) for the deferred TS.MRANGE experiment.
     pub fn snapshot_range(&self, start: Timestamp, end: Timestamp) -> RangeSnapshot {
+        self.snapshot_range_keeping(start, end, SnapshotKeep::All)
+    }
+
+    /// [`Self::snapshot_range`], copying no more chunks than `keep` can reach: the copy
+    /// runs under the lock, and a COUNT that only reads one end of the window has no use
+    /// for the rest of it.
+    pub fn snapshot_range_keeping(
+        &self,
+        start: Timestamp,
+        end: Timestamp,
+        keep: SnapshotKeep,
+    ) -> RangeSnapshot {
         let start = start.max(self.get_min_timestamp());
         let chunks = if start > end || self.is_empty() || !self.overlaps(start, end) {
             Vec::new()
         } else {
             match self.get_chunk_index_bounds(start, end) {
-                Some((first, last)) => self.chunks[first..=last].to_vec(),
+                Some((first, last)) => keep.trim(&self.chunks[first..=last], start, end).to_vec(),
                 None => Vec::new(),
             }
         };
-        RangeSnapshot { start, end, chunks }
+        RangeSnapshot {
+            start,
+            end,
+            chunks,
+            last_timestamp: (!self.is_empty()).then(|| self.last_timestamp()),
+        }
     }
 
     /// Iterate the samples physically stored in `[start, end]`, **without** clamping `start`
@@ -1447,6 +1464,8 @@ pub struct RangeSnapshot {
     start: Timestamp,
     end: Timestamp,
     chunks: Vec<TimeSeriesChunk>,
+    /// The series' last stored timestamp when it was copied; `None` for an empty series.
+    last_timestamp: Option<Timestamp>,
 }
 
 impl RangeSnapshot {
@@ -1461,6 +1480,91 @@ impl RangeSnapshot {
     /// aggregation pipeline built over it compiles to the same loop.
     pub fn sample_iter(&self, is_reverse: bool) -> SeriesSampleIterator<'_> {
         SeriesSampleIterator::over_chunks(&self.chunks, self.start, self.end, is_reverse)
+    }
+
+    /// [`Self::sample_iter`], ascending, reading nothing older than `floor`.
+    pub(crate) fn sample_iter_from(&self, floor: Option<Timestamp>) -> SeriesSampleIterator<'_> {
+        let start = self.start.max(floor.unwrap_or(Timestamp::MIN));
+        SeriesSampleIterator::over_chunks(&self.chunks, start, self.end, false)
+    }
+
+    /// The window's samples older than `floor`, newest first.
+    pub(crate) fn samples_before(&self, floor: Timestamp) -> SeriesSampleIterator<'_> {
+        SeriesSampleIterator::over_chunks(
+            &self.chunks,
+            self.start,
+            floor.saturating_sub(1).min(self.end),
+            true,
+        )
+    }
+
+    /// The window's lower bound, clamped to the retention floor.
+    pub(crate) fn start(&self) -> Timestamp {
+        self.start
+    }
+
+    /// The series' last stored timestamp when it was copied; `None` for an empty series.
+    pub(crate) fn series_last_timestamp(&self) -> Option<Timestamp> {
+        self.last_timestamp
+    }
+
+    #[cfg(test)]
+    pub(crate) fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+}
+
+/// How much of a window a [`RangeSnapshot`] has to hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotKeep {
+    /// Every chunk the window touches.
+    All,
+    /// Only the reader's first this-many stored samples of the window will be used.
+    Oldest(usize),
+    /// Only the last this-many.
+    Newest(usize),
+}
+
+impl SnapshotKeep {
+    /// The chunks of `chunks` (those `[start, end]` touches, in order) that hold the kept
+    /// samples. Only a chunk lying wholly inside the window is counted, at its full length:
+    /// an edge chunk may hold samples outside it, so it is kept and counted for nothing.
+    fn trim(
+        self,
+        chunks: &[TimeSeriesChunk],
+        start: Timestamp,
+        end: Timestamp,
+    ) -> &[TimeSeriesChunk] {
+        let inside = |c: &TimeSeriesChunk| {
+            if !c.is_empty() && c.first_timestamp() >= start && c.last_timestamp() <= end {
+                c.len()
+            } else {
+                0
+            }
+        };
+        match self {
+            SnapshotKeep::All => chunks,
+            SnapshotKeep::Oldest(count) => {
+                let mut have = 0usize;
+                for (i, chunk) in chunks.iter().enumerate() {
+                    have = have.saturating_add(inside(chunk));
+                    if have >= count {
+                        return &chunks[..=i];
+                    }
+                }
+                chunks
+            }
+            SnapshotKeep::Newest(count) => {
+                let mut have = 0usize;
+                for (i, chunk) in chunks.iter().enumerate().rev() {
+                    have = have.saturating_add(inside(chunk));
+                    if have >= count {
+                        return &chunks[i..];
+                    }
+                }
+                chunks
+            }
+        }
     }
 }
 
