@@ -1,5 +1,5 @@
 use super::fanout_codec::filters::{deserialize_matchers_list, serialize_matchers_list};
-use super::fanout_codec::generated::{PostingStat as MPostingStat, StatsRequest, StatsResponse};
+use super::fanout_codec::generated::{LabelValueCounts, StatsRequest, StatsResponse, ValueCount};
 use crate::commands::DEFAULT_STATS_RESULTS_LIMIT;
 use crate::commands::command_parser::LabelStatsOptions;
 use crate::commands::ts_labelstats::reply_with_postings_stats;
@@ -7,25 +7,19 @@ use crate::commands::utils::get_multi_command_targets;
 use crate::common::acl::check_metadata_permissions;
 use crate::common::replies::ReplyContext;
 use crate::fanout::{
-    FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutError, FanoutTarget, NodeInfo,
+    FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
 };
-use crate::series::index::{
-    PostingStat, PostingsBitmap, PostingsStats, StatsMaxHeap, deserialize_bitmap, get_db_index,
-    serialize_bitmap,
-};
+use crate::series::index::{LabelCensus, PostingsStats, StatsBuilder, get_db_index};
 use ahash::AHashMap;
 use std::default::Default;
 use valkey_module::{Context, Status, ValkeyResult};
 
+/// The shards' label censuses summed: series counts by label name, then value. Every section of
+/// the reply derives from these once all shards have answered.
 #[derive(Default)]
 struct StatsResults {
-    series_count: usize,
-    series_count_by_metric_name: AHashMap<String, PostingStat>,
-    series_count_by_label_name: AHashMap<String, PostingStat>,
-    series_count_by_label_value_pairs: AHashMap<String, PostingStat>,
-    series_count_by_focus_label_value: AHashMap<String, PostingStat>,
-    labels_bitmap: PostingsBitmap,
-    label_value_pairs_bitmap: PostingsBitmap,
+    series_count: u64,
+    labels: AHashMap<String, AHashMap<String, u64>>,
 }
 
 pub struct LabelStatsFanoutCommand {
@@ -72,30 +66,18 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
             // The coordinator checked its own node; each shard enforces its own ACL rules.
             check_metadata_permissions(&ctx)?;
         }
-        // Only index data below: planning, batched counts and fingerprinting need no GIL.
+        // Only index data below: planning and batched counts need no GIL.
         //
-        // Every entry is returned, untruncated: a shard's local top-K cannot establish the global
-        // one (a value second everywhere can win overall), so the coordinator applies LIMIT after
-        // summing. The reply is linear in the shard's distinct terms either way, since the
-        // fingerprint bitmaps hold one hash per term, but a `name=value` string and its count
-        // is several times a hash: a high-cardinality label (a per-series `host` or `uid`) puts
-        // about one string per series on the wire and in the coordinator's merge maps.
-        let (stats, fingerprints) = get_db_index(ctx.db()).stats_and_label_bitmaps_by_selectors(
-            &matchers,
-            req.selected_label.as_deref(),
-            usize::MAX,
-        )?;
-
-        let mut response: StatsResponse = stats.into();
-        response.labels_bitmap = serialize_bitmap(&fingerprints.names);
-        response.label_value_pairs_bitmap = serialize_bitmap(&fingerprints.pairs);
-
-        Ok(response)
+        // The whole census is returned, untruncated: a shard's local top-K cannot establish the
+        // global one (a value second everywhere can win overall), so the coordinator ranks after
+        // summing. That makes the reply linear in the shard's distinct label-value pairs; a
+        // high-cardinality label (a per-series `host` or `uid`) costs about one value per series.
+        let census = get_db_index(ctx.db()).label_census_by_selectors(&matchers)?;
+        Ok(census.into())
     }
 
     fn generate_request(&self) -> StatsRequest {
         StatsRequest {
-            selected_label: self.options.label.clone(),
             filters: serialize_matchers_list(&self.options.filters)
                 .expect("serialize matchers list"),
         }
@@ -106,95 +88,59 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
-        // Handle the response from a remote target. Decoded first, so that a response with an
-        // unreadable bitmap adds nothing.
-        let decode = |bitmap| {
-            deserialize_bitmap(bitmap).map_err(|e| FanoutError::serialization(e.to_string()))
-        };
-        let labels_bitmap = decode(&resp.labels_bitmap)?;
-        let label_value_pairs_bitmap = decode(&resp.label_value_pairs_bitmap)?;
-
-        self.state.series_count += resp.series_count as usize;
-        self.state.labels_bitmap |= labels_bitmap;
-        self.state.label_value_pairs_bitmap |= label_value_pairs_bitmap;
-
-        collate_stats_values(
-            &mut self.state.series_count_by_metric_name,
-            &resp.series_count_by_metric_name,
-        );
-        collate_stats_values(
-            &mut self.state.series_count_by_label_name,
-            &resp.series_count_by_label_name,
-        );
-        collate_stats_values(
-            &mut self.state.series_count_by_label_value_pairs,
-            &resp.series_count_by_label_value_pairs,
-        );
-        collate_stats_values(
-            &mut self.state.series_count_by_focus_label_value,
-            &resp.series_count_by_focus_label_value,
-        );
+        let state = &mut self.state;
+        state.series_count = state.series_count.saturating_add(resp.series_count);
+        for label in resp.labels {
+            let values = state.labels.entry(label.name).or_default();
+            for ValueCount { value, count } in label.values {
+                let total = values.entry(value).or_default();
+                *total = total.saturating_add(count);
+            }
+        }
         Ok(())
     }
 
     fn reply(&mut self, ctx: &ReplyContext) -> Status {
-        let limit = self.options.limit;
         let state = std::mem::take(&mut self.state);
-
-        // Calculate num_labels from the aggregated map to ensure uniqueness
-        let label_count = state.labels_bitmap.cardinality() as usize;
-        let total_label_value_pairs = state.label_value_pairs_bitmap.cardinality() as usize;
-        let focused = if self.options.label.is_some() {
-            Some(collect_map_values(
-                state.series_count_by_focus_label_value,
-                limit,
-            ))
-        } else {
-            None
-        };
-
-        let result = PostingsStats {
-            series_count: state.series_count as u64,
-            label_count,
-            total_label_value_pairs,
-            series_count_by_metric_name: collect_map_values(
-                state.series_count_by_metric_name,
-                limit,
-            ),
-            series_count_by_label_name: collect_map_values(state.series_count_by_label_name, limit),
-            series_count_by_label_value_pairs: collect_map_values(
-                state.series_count_by_label_value_pairs,
-                limit,
-            ),
-            series_count_by_focus_label_value: focused,
-        };
-
-        reply_with_postings_stats(ctx, &result);
+        let stats = merged_stats(state, self.options.label.as_deref(), self.options.limit);
+        reply_with_postings_stats(ctx, &stats);
         Status::Ok
     }
 }
 
-fn collect_map_values(map: AHashMap<String, PostingStat>, limit: usize) -> Vec<PostingStat> {
-    let mut map = map;
-    let mut heap = StatsMaxHeap::new(limit);
-    for stat in map.drain().map(|(_, v)| v) {
-        heap.push(stat);
+/// Ranks the summed censuses as a standalone read ranks its own index, so the two report the
+/// same statistics for the same series.
+fn merged_stats(state: StatsResults, focus_label: Option<&str>, limit: usize) -> PostingsStats {
+    let mut stats = StatsBuilder::new(focus_label, limit);
+    let mut pair = String::new();
+    for (name, values) in &state.labels {
+        for (value, &count) in values {
+            pair.clear();
+            pair.push_str(name);
+            pair.push('=');
+            pair.push_str(value);
+            stats.add(name, value, &pair, count);
+        }
     }
-    heap.into_vec()
+    stats.finish(state.series_count)
 }
 
-fn collate_stats_values(map: &mut AHashMap<String, PostingStat>, values: &[MPostingStat]) {
-    for result in values.iter() {
-        if let Some(stat) = map.get_mut(result.name.as_str()) {
-            stat.count += result.count;
-        } else {
-            map.insert(
-                result.name.clone(),
-                PostingStat {
-                    name: result.name.clone(),
-                    count: result.count,
-                },
-            );
+impl From<LabelCensus> for StatsResponse {
+    fn from(census: LabelCensus) -> Self {
+        StatsResponse {
+            series_count: census.series_count,
+            labels: census
+                .labels
+                .into_iter()
+                .map(|label| LabelValueCounts {
+                    name: label.name,
+                    values: label
+                        .values
+                        .into_iter()
+                        .map(|(value, count)| ValueCount { value, count })
+                        .collect(),
+                })
+                .collect(),
         }
     }
 }
@@ -202,7 +148,8 @@ fn collate_stats_values(map: &mut AHashMap<String, PostingStat>, values: &[MPost
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fanout::{ErrorKind, NodeRole, SocketAddress};
+    use crate::fanout::{NodeRole, SocketAddress};
+    use crate::series::index::PostingStat;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn target() -> NodeInfo {
@@ -219,43 +166,44 @@ mod tests {
         }
     }
 
-    fn response(labels: &[u64], pairs: &[u64]) -> StatsResponse {
+    /// A shard's reply: `series_count` series, carrying `labels` as `(name, [(value, count)])`.
+    fn census(series_count: u64, labels: &[(&str, &[(&str, u64)])]) -> StatsResponse {
         StatsResponse {
-            series_count: 2,
-            labels_bitmap: serialize_bitmap(&PostingsBitmap::of(labels)),
-            label_value_pairs_bitmap: serialize_bitmap(&PostingsBitmap::of(pairs)),
-            ..Default::default()
-        }
-    }
-
-    /// A shard's label sets merge across responses, so the same label counts once.
-    #[test]
-    fn valid_bitmaps_merge() {
-        let mut command = LabelStatsFanoutCommand::default();
-
-        command
-            .on_response(response(&[1, 2], &[10]), &target())
-            .unwrap();
-        command
-            .on_response(response(&[2, 3], &[11]), &target())
-            .unwrap();
-
-        assert_eq!(command.state.series_count, 4);
-        assert_eq!(command.state.labels_bitmap.cardinality(), 3);
-        assert_eq!(command.state.label_value_pairs_bitmap.cardinality(), 2);
-    }
-
-    fn focus_response(values: &[(&str, u64)]) -> StatsResponse {
-        StatsResponse {
-            series_count_by_focus_label_value: values
+            series_count,
+            labels: labels
                 .iter()
-                .map(|&(name, count)| MPostingStat {
+                .map(|&(name, values)| LabelValueCounts {
                     name: name.to_string(),
-                    count,
+                    values: values
+                        .iter()
+                        .map(|&(value, count)| ValueCount {
+                            value: value.to_string(),
+                            count,
+                        })
+                        .collect(),
                 })
                 .collect(),
-            ..response(&[], &[])
         }
+    }
+
+    fn merge(label: Option<&str>, limit: usize, shards: &[StatsResponse]) -> PostingsStats {
+        let mut command = LabelStatsFanoutCommand::new(LabelStatsOptions {
+            limit,
+            label: label.map(str::to_string),
+            ..Default::default()
+        });
+        for shard in shards {
+            command.on_response(shard.clone(), &target()).unwrap();
+        }
+        merged_stats(
+            std::mem::take(&mut command.state),
+            command.options.label.as_deref(),
+            command.options.limit,
+        )
+    }
+
+    fn ranked(stats: &[PostingStat]) -> Vec<(&str, u64)> {
+        stats.iter().map(|s| (s.name.as_str(), s.count)).collect()
     }
 
     /// The winner is second on every shard, and ties at the cutoff resolve by name whatever the
@@ -263,48 +211,93 @@ mod tests {
     #[test]
     fn limit_applies_after_summing_shards() {
         let shards = [
-            focus_response(&[("a", 3), ("common", 2), ("x", 1)]),
-            focus_response(&[("b", 3), ("common", 2), ("y", 1)]),
+            census(6, &[("host", &[("a", 3), ("common", 2), ("x", 1)])]),
+            census(6, &[("host", &[("b", 3), ("common", 2), ("y", 1)])]),
         ];
         for reversed in [false, true] {
-            let mut command = LabelStatsFanoutCommand::new(LabelStatsOptions {
-                limit: 3,
-                label: Some("host".to_string()),
-                ..Default::default()
-            });
             let mut order = shards.to_vec();
             if reversed {
                 order.reverse();
             }
-            for shard in order {
-                command.on_response(shard, &target()).unwrap();
-            }
-            let merged = collect_map_values(
-                std::mem::take(&mut command.state.series_count_by_focus_label_value),
-                command.options.limit,
+            let stats = merge(Some("host"), 3, &order);
+            assert_eq!(
+                ranked(stats.series_count_by_focus_label_value.as_deref().unwrap()),
+                [("common", 4), ("a", 3), ("b", 3)]
             );
-            let merged: Vec<_> = merged.iter().map(|s| (s.name.as_str(), s.count)).collect();
-            assert_eq!(merged, [("common", 4), ("a", 3), ("b", 3)]);
+            assert_eq!(
+                ranked(&stats.series_count_by_label_value_pairs),
+                [("host=common", 4), ("host=a", 3), ("host=b", 3)]
+            );
         }
     }
 
-    /// An unreadable bitmap fails the fan-out rather than undercounting the labels, and the
-    /// response leaves nothing behind, for either of its bitmaps.
+    /// Every section derives from the summed pairs: a term on several shards counts once in the
+    /// distinct totals, and a label name's count is the sum of its values'.
     #[test]
-    fn an_invalid_bitmap_is_an_error() {
-        let corrupt = vec![1, 0xFF, 0xFF];
-        let mut bad_labels = response(&[1], &[10]);
-        bad_labels.labels_bitmap = corrupt.clone();
-        let mut bad_pairs = response(&[1], &[10]);
-        bad_pairs.label_value_pairs_bitmap = corrupt;
+    fn every_section_derives_from_the_summed_pairs() {
+        let shards = [
+            census(
+                3,
+                &[
+                    ("__name__", &[("cpu", 2), ("mem", 1)]),
+                    ("host", &[("a", 2), ("shared", 1)]),
+                ],
+            ),
+            census(
+                2,
+                &[
+                    ("__name__", &[("cpu", 2)]),
+                    ("host", &[("shared", 2)]),
+                    ("zone", &[("z1", 1)]),
+                ],
+            ),
+        ];
+        let stats = merge(None, 10, &shards);
+        assert_eq!(stats.series_count, 5);
+        assert_eq!(stats.label_count, 3);
+        assert_eq!(stats.total_label_value_pairs, 5);
+        assert_eq!(
+            ranked(&stats.series_count_by_metric_name),
+            [("cpu", 4), ("mem", 1)]
+        );
+        assert_eq!(
+            ranked(&stats.series_count_by_label_name),
+            [("__name__", 5), ("host", 5), ("zone", 1)]
+        );
+        assert_eq!(
+            ranked(&stats.series_count_by_label_value_pairs),
+            [
+                ("__name__=cpu", 4),
+                ("host=shared", 3),
+                ("host=a", 2),
+                ("__name__=mem", 1),
+                ("zone=z1", 1),
+            ]
+        );
+        assert!(stats.series_count_by_focus_label_value.is_none());
 
-        for bad in [bad_labels, bad_pairs] {
-            let mut command = LabelStatsFanoutCommand::default();
-            let error = command.on_response(bad, &target()).unwrap_err();
+        let metric_focus = merge(Some(""), 10, &shards);
+        assert_eq!(
+            metric_focus.series_count_by_focus_label_value.as_deref(),
+            Some(metric_focus.series_count_by_metric_name.as_slice())
+        );
+        let absent = merge(Some("missing"), 10, &shards);
+        assert_eq!(absent.series_count_by_focus_label_value, Some(vec![]));
+    }
 
-            assert_eq!(error.kind, ErrorKind::Serialization);
-            assert_eq!(command.state.series_count, 0);
-            assert_eq!(command.state.labels_bitmap.cardinality(), 0);
-        }
+    /// A shard's census goes on the wire whole, in index order.
+    #[test]
+    fn a_census_converts_to_a_response_whole() {
+        let local = LabelCensus {
+            series_count: 2,
+            labels: vec![crate::series::index::LabelValues {
+                name: "host".to_string(),
+                values: vec![("a".to_string(), 1), ("b".to_string(), 1)],
+            }],
+        };
+        assert_eq!(
+            StatsResponse::from(local),
+            census(2, &[("host", &[("a", 1), ("b", 1)])])
+        );
     }
 }

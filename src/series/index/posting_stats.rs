@@ -1,3 +1,5 @@
+use crate::common::constants::METRIC_NAME_LABEL;
+
 /// Stat holds values for a single cardinality statistic.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PostingStat {
@@ -90,6 +92,143 @@ impl StatsMaxHeap {
         let mut items = self.items;
         items.sort_unstable_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
         items
+    }
+}
+
+/// Every label-value pair a statistics read found among its series, grouped by label name, with
+/// how many of those series carry each. Untruncated: the whole of what [`StatsBuilder`] ranks.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LabelCensus {
+    pub series_count: u64,
+    pub labels: Vec<LabelValues>,
+}
+
+/// One label name's values in a [`LabelCensus`], each with its series count.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LabelValues {
+    pub name: String,
+    pub values: Vec<(String, u64)>,
+}
+
+/// Builds a [`PostingsStats`] from label-value pair counts. Every section derives from the pairs:
+/// the metric-name and focus lists are the pairs of one label, a label name's count is the sum
+/// of its pairs' (a series carries one value per label), and the distinct totals count names and
+/// pairs. Each list keeps `limit` entries ranked as [`StatsMaxHeap`] does, and an entry's
+/// `String` is built only once the heap would keep it.
+///
+/// Pairs must arrive grouped by label name: all of one name's before any of the next's.
+pub(crate) struct StatsBuilder<'a> {
+    focus_label: Option<&'a str>,
+    metric_names: StatsMaxHeap,
+    label_names: StatsMaxHeap,
+    pairs: StatsMaxHeap,
+    /// `None` for a focus on the metric name, which is the metric-name list itself.
+    focus_values: Option<StatsMaxHeap>,
+    label_count: usize,
+    pair_count: usize,
+    run: Option<LabelRun>,
+}
+
+/// The label name whose pairs a [`StatsBuilder`] is receiving, and their series so far.
+struct LabelRun {
+    name: String,
+    series: u64,
+}
+
+impl<'a> StatsBuilder<'a> {
+    /// `focus_label` names the label broken out in `series_count_by_focus_label_value`: `""` is
+    /// the metric name, and `None` leaves the list out.
+    pub fn new(focus_label: Option<&'a str>, limit: usize) -> Self {
+        let focus_label = focus_label.map(|label| {
+            if label.is_empty() {
+                METRIC_NAME_LABEL
+            } else {
+                label
+            }
+        });
+        StatsBuilder {
+            focus_label,
+            metric_names: StatsMaxHeap::new(limit),
+            label_names: StatsMaxHeap::new(limit),
+            pairs: StatsMaxHeap::new(limit),
+            focus_values: focus_label
+                .filter(|&label| label != METRIC_NAME_LABEL)
+                .map(|_| StatsMaxHeap::new(limit)),
+            label_count: 0,
+            pair_count: 0,
+            run: None,
+        }
+    }
+
+    /// Records that `count` series carry `name=value`; `pair` is that `name=value` string.
+    pub fn add(&mut self, name: &str, value: &str, pair: &str, count: u64) {
+        self.pair_count += 1;
+        match self.run.as_mut() {
+            Some(run) if run.name == name => run.series = run.series.saturating_add(count),
+            _ => {
+                let next = LabelRun {
+                    name: name.to_owned(),
+                    series: count,
+                };
+                if let Some(finished) = self.run.replace(next) {
+                    self.finish_run(finished);
+                }
+            }
+        }
+
+        if self.pairs.would_accept(count, pair) {
+            self.pairs.push(PostingStat {
+                name: pair.to_owned(),
+                count,
+            });
+        }
+        let values = if name == METRIC_NAME_LABEL {
+            Some(&mut self.metric_names)
+        } else if self.focus_label == Some(name) {
+            self.focus_values.as_mut()
+        } else {
+            None
+        };
+        if let Some(values) = values
+            && values.would_accept(count, value)
+        {
+            values.push(PostingStat {
+                name: value.to_owned(),
+                count,
+            });
+        }
+    }
+
+    fn finish_run(&mut self, run: LabelRun) {
+        self.label_count += 1;
+        if self.label_names.would_accept(run.series, &run.name) {
+            self.label_names.push(PostingStat {
+                name: run.name,
+                count: run.series,
+            });
+        }
+    }
+
+    pub fn finish(mut self, series_count: u64) -> PostingsStats {
+        if let Some(run) = self.run.take() {
+            self.finish_run(run);
+        }
+        let series_count_by_metric_name = self.metric_names.into_vec();
+        let series_count_by_focus_label_value = match self.focus_values {
+            Some(focus) => Some(focus.into_vec()),
+            None => self
+                .focus_label
+                .map(|_| series_count_by_metric_name.clone()),
+        };
+        PostingsStats {
+            series_count_by_metric_name,
+            series_count_by_label_name: self.label_names.into_vec(),
+            series_count_by_label_value_pairs: self.pairs.into_vec(),
+            series_count_by_focus_label_value,
+            total_label_value_pairs: self.pair_count,
+            label_count: self.label_count,
+            series_count,
+        }
     }
 }
 

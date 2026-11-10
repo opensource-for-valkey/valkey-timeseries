@@ -1,16 +1,13 @@
 use std::borrow::Cow;
 #[cfg(test)]
 use std::collections::BTreeSet;
-use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard};
 
-use super::posting_stats::{PostingStat, PostingsStats, StatsMaxHeap};
+use super::posting_stats::{LabelCensus, LabelValues, PostingsStats, StatsBuilder};
 use super::postings::{Postings, PostingsBitmap};
 use crate::common::acl::KeyAccess;
-use crate::common::constants::METRIC_NAME_LABEL;
 use crate::common::context::create_key_string;
-use crate::common::hash::DeterministicHasher;
 use crate::common::sync::{read_lock, write_lock};
 use crate::error_consts;
 use crate::labels::SeriesLabel;
@@ -19,7 +16,6 @@ use crate::labels::filters::LabelFilter;
 use crate::labels::filters::SeriesSelector;
 use crate::series::index::IndexKey;
 use crate::series::{SeriesRef, TimeSeries};
-use croaring::Bitmap64;
 use std::ops::{Bound, Deref, DerefMut};
 use std::time::Duration;
 use valkey_module::{AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString};
@@ -76,42 +72,8 @@ fn next_generation() -> u64 {
     NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The distinct label names and `name=value` pairs a statistics scan observed, as hashed
-/// fingerprints. A fan-out shard ships these to the coordinator, which unions the bitmaps and
-/// counts their cardinality: a term present on several shards is then counted once, without
-/// shipping the terms themselves.
-#[derive(Default)]
-pub struct LabelFingerprints {
-    pub names: Bitmap64,
-    pub pairs: Bitmap64,
-}
-
-/// [`LabelFingerprints`] under construction. The hasher lives here rather than beside the scan,
-/// so it exists only when fingerprints are asked for: the standalone `stats` family passes `None`
-/// and hashes nothing.
-#[derive(Default)]
-struct TermFingerprints {
-    hasher: DeterministicHasher,
-    bitmaps: LabelFingerprints,
-}
-
-impl TermFingerprints {
-    fn add_name(&mut self, name: &str) {
-        self.bitmaps.names.add(self.hasher.hash_one(name));
-    }
-
-    fn add_pair(&mut self, key: &IndexKey) {
-        self.bitmaps.pairs.add(self.hasher.hash_one(key));
-    }
-}
-
-/// One label name's run of `name=value` keys in a statistics scan: label names may not contain
-/// `=`, so all of a name's keys sit together in the byte-ordered label index, and its series count
-/// is summed over one run.
-struct LabelRun {
-    name: String,
-    series: u64,
-}
+/// Label-index keys a statistics scan visits per postings-lock hold.
+const STATS_BATCH_SIZE: usize = 512;
 
 /// How many times [`TimeSeriesIndex::read_without_swap`] runs a read that `SWAPDB` keeps
 /// exchanging the database under before it gives up. One swap during a read is rare; three
@@ -366,20 +328,17 @@ impl TimeSeriesIndex {
         Ok(Some(inner.postings_for_selectors(selectors)?.into_owned()))
     }
 
-    /// Counts and distinct-label fingerprints from one scan with bounded postings-lock
-    /// holds and no module lock required. Both use the same filter and observed terms.
-    pub fn stats_and_label_bitmaps_by_selectors(
+    /// Every label-value pair the series matching `selectors` carry, with how many of them carry
+    /// each, from one scan with bounded postings-lock holds and no module lock required. A
+    /// fan-out shard's statistics: the coordinator sums these and ranks the totals, which a
+    /// shard's own top-N could not establish. Names and values come in index order.
+    pub fn label_census_by_selectors(
         &self,
         selectors: &[SeriesSelector],
-        label: Option<&str>,
-        limit: usize,
-    ) -> ValkeyResult<(PostingsStats, LabelFingerprints)> {
+    ) -> ValkeyResult<LabelCensus> {
         self.read_without_swap(|| {
             let matching = self.matching_postings(selectors)?;
-            let mut fingerprints = TermFingerprints::default();
-            let stats =
-                self.collect_stats(matching.as_ref(), label, limit, Some(&mut fingerprints));
-            Ok((stats, fingerprints.bitmaps))
+            Ok(self.collect_census(matching.as_ref()))
         })
     }
 
@@ -414,7 +373,7 @@ impl TimeSeriesIndex {
     /// (the metric name when `Some("")`; the list is `None` when `label` is), and `limit` bounds
     /// the length of each top-N list.
     pub fn stats(&self, label: Option<&str>, limit: usize) -> ValkeyResult<PostingsStats> {
-        self.read_without_swap(|| Ok(self.collect_stats(None, label, limit, None)))
+        self.read_without_swap(|| Ok(self.collect_stats(None, label, limit)))
     }
 
     /// [`TimeSeriesIndex::stats`], restricted to the series matching `filters` (AND-ed together).
@@ -438,7 +397,7 @@ impl TimeSeriesIndex {
                 let inner = read_lock(&self.inner);
                 inner.postings_for_label_filters(filters)?.into_owned()
             };
-            Ok(self.collect_stats(Some(&matching), label, limit, None))
+            Ok(self.collect_stats(Some(&matching), label, limit))
         })
     }
 
@@ -452,7 +411,7 @@ impl TimeSeriesIndex {
     ) -> ValkeyResult<PostingsStats> {
         self.read_without_swap(|| {
             let matching = self.matching_postings(selectors)?;
-            Ok(self.collect_stats(matching.as_ref(), label, limit, None))
+            Ok(self.collect_stats(matching.as_ref(), label, limit))
         })
     }
 
@@ -465,145 +424,81 @@ impl TimeSeriesIndex {
         label: Option<&str>,
         limit: usize,
     ) -> PostingsStats {
-        self.collect_stats(matching, label, limit, None)
+        self.collect_stats(matching, label, limit)
     }
 
     /// The shared body of the `stats` family. When `matching` is given, each posting list is
-    /// counted through its intersection with that set. Optional fingerprints are collected
-    /// alongside the counts so a fan-out reply cannot describe two different sets of terms.
-    ///
-    /// Each list keeps `limit` entries, ranked as [`StatsMaxHeap`] does, and an entry's `String`
-    /// is built only once the heap would keep it.
+    /// counted through its intersection with that set.
     fn collect_stats(
         &self,
         matching: Option<&PostingsBitmap>,
         focus_label: Option<&str>,
         limit: usize,
-        mut fingerprints: Option<&mut TermFingerprints>,
     ) -> PostingsStats {
-        // `LABEL ""` focuses on the metric name.
-        let focus_label = focus_label.map(|label| {
-            if label.is_empty() {
-                METRIC_NAME_LABEL
-            } else {
-                label
-            }
-        });
+        let mut stats = StatsBuilder::new(focus_label, limit);
         if matching.is_some_and(PostingsBitmap::is_empty) {
             // A filter matched nothing, so there are no series, no labels and no label-value pairs
             // to report. Still report the (empty) focus-label list when one was asked for.
-            return PostingsStats {
-                series_count_by_focus_label_value: focus_label.map(|_| Vec::new()),
-                ..Default::default()
-            };
+            return stats.finish(0);
         }
+        let series_count = self.series_count_within(matching);
+        // Label names may not contain `=`, so a name's keys sit together in the byte-ordered
+        // label index, as the builder needs, and each `IndexKey` holds `name=value` already.
+        self.scan_label_pairs(matching, |name, value, key, count| {
+            stats.add(name, value, key.as_str(), count);
+        });
+        stats.finish(series_count)
+    }
 
-        let series_count = {
-            let inner = read_lock(&self.inner);
-            match matching {
-                // `matching` may have been resolved under an earlier hold: `all_postings` holds
-                // what is visible now, so this also drops a series deleted since.
-                Some(matching) => inner.all_postings.and_cardinality(matching),
-                None => inner.count() as u64,
+    /// [`TimeSeriesIndex::label_census_by_selectors`] over a resolved set of series.
+    fn collect_census(&self, matching: Option<&PostingsBitmap>) -> LabelCensus {
+        if matching.is_some_and(PostingsBitmap::is_empty) {
+            return LabelCensus::default();
+        }
+        let series_count = self.series_count_within(matching);
+        let mut labels: Vec<LabelValues> = Vec::new();
+        self.scan_label_pairs(matching, |name, value, _, count| {
+            let entry = (value.to_owned(), count);
+            match labels.last_mut() {
+                Some(label) if label.name == name => label.values.push(entry),
+                _ => labels.push(LabelValues {
+                    name: name.to_owned(),
+                    values: vec![entry],
+                }),
             }
-        };
+        });
+        LabelCensus {
+            series_count,
+            labels,
+        }
+    }
 
-        let mut metric_name_counts = StatsMaxHeap::new(limit);
-        let mut label_name_counts = StatsMaxHeap::new(limit);
-        let mut label_value_pair_counts = StatsMaxHeap::new(limit);
-        // A focus on the metric name is the metric-name list itself; only another label needs its
-        // own heap.
-        let mut focus_label_value_counts = focus_label
-            .filter(|&label| label != METRIC_NAME_LABEL)
-            .map(|_| StatsMaxHeap::new(limit));
-        let mut label_count = 0usize;
-        let mut total_label_value_pairs = 0usize;
-        let mut run: Option<LabelRun> = None;
+    /// How many visible series `matching` holds, or the index when it is `None`. `matching` may
+    /// have been resolved under an earlier hold: `all_postings` holds what is visible now, so
+    /// this also drops a series deleted since.
+    fn series_count_within(&self, matching: Option<&PostingsBitmap>) -> u64 {
+        let inner = read_lock(&self.inner);
+        match matching {
+            Some(matching) => inner.all_postings.and_cardinality(matching),
+            None => inner.count() as u64,
+        }
+    }
 
-        let mut finish_run = |run: LabelRun, label_count: &mut usize| {
-            *label_count += 1;
-            if label_name_counts.would_accept(run.series, &run.name) {
-                label_name_counts.push(PostingStat {
-                    name: run.name,
-                    count: run.series,
-                });
-            }
-        };
-
-        const BATCH_SIZE: usize = 512;
-        let mut iterator = BatchIterator::new(self, BATCH_SIZE, matching);
-
+    /// Calls `visit(name, value, key, count)` for each label-index key, in key order, with the
+    /// number of visible series (within `matching`, when given) it holds; keys holding none are
+    /// skipped. Gives the postings lock back every [`STATS_BATCH_SIZE`] keys.
+    fn scan_label_pairs(
+        &self,
+        matching: Option<&PostingsBitmap>,
+        mut visit: impl FnMut(&str, &str, &IndexKey, u64),
+    ) {
+        let mut iterator = BatchIterator::new(self, STATS_BATCH_SIZE, matching);
         while !iterator.is_complete() {
             iterator.next_batch(|key, count| {
-                let Some((name, value)) = key.split() else {
-                    return;
-                };
-                total_label_value_pairs += 1;
-                if let Some(fingerprints) = fingerprints.as_deref_mut() {
-                    fingerprints.add_pair(key);
+                if let Some((name, value)) = key.split() {
+                    visit(name, value, key, count);
                 }
-
-                match run.as_mut() {
-                    Some(current) if current.name == name => {
-                        current.series = current.series.saturating_add(count);
-                    }
-                    _ => {
-                        if let Some(fingerprints) = fingerprints.as_deref_mut() {
-                            fingerprints.add_name(name);
-                        }
-                        let next = LabelRun {
-                            name: name.to_owned(),
-                            series: count,
-                        };
-                        if let Some(finished) = run.replace(next) {
-                            finish_run(finished, &mut label_count);
-                        }
-                    }
-                }
-
-                // `IndexKey` holds `name=value` already.
-                let pair = key.as_str();
-                if label_value_pair_counts.would_accept(count, pair) {
-                    label_value_pair_counts.push(PostingStat {
-                        name: pair.to_owned(),
-                        count,
-                    });
-                }
-                if name == METRIC_NAME_LABEL && metric_name_counts.would_accept(count, value) {
-                    metric_name_counts.push(PostingStat {
-                        name: value.to_owned(),
-                        count,
-                    });
-                }
-                if let Some(focus) = focus_label_value_counts.as_mut()
-                    && focus_label == Some(name)
-                    && focus.would_accept(count, value)
-                {
-                    focus.push(PostingStat {
-                        name: value.to_owned(),
-                        count,
-                    });
-                }
-            })
-        }
-        if let Some(finished) = run {
-            finish_run(finished, &mut label_count);
-        }
-
-        let series_count_by_metric_name = metric_name_counts.into_vec();
-        let series_count_by_focus_label_value = match focus_label_value_counts {
-            Some(focus) => Some(focus.into_vec()),
-            None => focus_label.map(|_| series_count_by_metric_name.clone()),
-        };
-
-        PostingsStats {
-            series_count_by_metric_name,
-            series_count_by_label_name: label_name_counts.into_vec(),
-            series_count_by_label_value_pairs: label_value_pair_counts.into_vec(),
-            series_count_by_focus_label_value,
-            total_label_value_pairs,
-            label_count,
-            series_count,
+            });
         }
     }
 
@@ -788,6 +683,7 @@ impl<'a> BatchIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::series::index::PostingStat;
     use ahash::AHashMap;
 
     /// Series 1 and 2 share both labels, and each has a key.
@@ -945,8 +841,10 @@ mod tests {
         index
     }
 
+    /// The census a shard ships and the stats a standalone read ranks see the same series and
+    /// terms: both apply the filter and leave out tombstoned ids.
     #[test]
-    fn stats_and_fingerprints_share_the_filter_and_stale_id_mask() {
+    fn census_and_stats_share_the_filter_and_stale_id_mask() {
         let index = index_with_posting(1, "host", "a");
         {
             let mut postings = index.get_postings_mut();
@@ -969,8 +867,8 @@ mod tests {
                 .map(|s| SeriesSelector::parse(s).unwrap())
                 .into_iter()
                 .collect();
-            let (stats, fingerprints) = index
-                .stats_and_label_bitmaps_by_selectors(&selectors, Some("host"), 10)
+            let stats = index
+                .stats_by_selectors(&selectors, Some("host"), 10)
                 .unwrap();
             assert_eq!(
                 (
@@ -980,12 +878,26 @@ mod tests {
                 ),
                 expected
             );
-            assert_eq!(fingerprints.names.cardinality(), stats.label_count as u64);
-            assert_eq!(
-                fingerprints.pairs.cardinality(),
-                stats.total_label_value_pairs as u64
-            );
+            let census = index.label_census_by_selectors(&selectors).unwrap();
+            let pairs: usize = census.labels.iter().map(|label| label.values.len()).sum();
+            assert_eq!((census.series_count, census.labels.len(), pairs), expected);
         }
+
+        let census = index
+            .label_census_by_selectors(&[SeriesSelector::parse("scope=yes").unwrap()])
+            .unwrap();
+        let census: Vec<_> = census
+            .labels
+            .iter()
+            .map(|label| (label.name.as_str(), label.values.clone()))
+            .collect();
+        assert_eq!(
+            census,
+            [
+                ("host", vec![("a".to_string(), 1)]),
+                ("scope", vec![("yes".to_string(), 1)]),
+            ]
+        );
     }
 
     #[test]
@@ -1088,16 +1000,32 @@ mod tests {
         );
     }
 
+    /// A name whose values span several scan batches is still one census entry.
     #[test]
-    fn fingerprints_count_each_name_once_across_batches() {
+    fn census_lists_each_name_once_across_batches() {
         let (index, expected) = label_name_fixture();
-        let (stats, fingerprints) = index
-            .stats_and_label_bitmaps_by_selectors(&[], None, 10)
-            .unwrap();
-        assert_eq!(fingerprints.names.cardinality(), expected.len() as u64);
+        let census = index.label_census_by_selectors(&[]).unwrap();
+        assert_eq!(census.series_count, 1200);
+
+        let mut names = AHashMap::new();
+        for label in &census.labels {
+            let series: u64 = label.values.iter().map(|(_, count)| count).sum();
+            assert!(
+                names.insert(label.name.clone(), series).is_none(),
+                "{} listed twice",
+                label.name
+            );
+        }
+        assert_eq!(names, expected);
         assert_eq!(
-            fingerprints.pairs.cardinality(),
-            stats.total_label_value_pairs as u64
+            census
+                .labels
+                .iter()
+                .find(|l| l.name == "wide")
+                .unwrap()
+                .values
+                .len(),
+            1200
         );
     }
 

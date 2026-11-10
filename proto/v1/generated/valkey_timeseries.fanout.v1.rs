@@ -88,13 +88,6 @@ pub struct SampleData {
     #[prost(bytes = "vec", tag = "3")]
     pub data: ::prost::alloc::vec::Vec<u8>,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PostingStat {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "2")]
-    pub count: u64,
-}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum AggregationType {
@@ -588,9 +581,7 @@ pub struct LabelSearchRequest {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StatsRequest {
-    #[prost(string, optional, tag = "1")]
-    pub selected_label: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(message, repeated, tag = "2")]
+    #[prost(message, repeated, tag = "1")]
     pub filters: ::prost::alloc::vec::Vec<SeriesSelector>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -901,26 +892,31 @@ pub struct LabelSearchResponse {
     #[prost(bool, tag = "2")]
     pub has_more: bool,
 }
+/// How many of a shard's matching series carry one value of a label.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ValueCount {
+    #[prost(string, tag = "1")]
+    pub value: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub count: u64,
+}
+/// One label name's values among a shard's matching series.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LabelValueCounts {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub values: ::prost::alloc::vec::Vec<ValueCount>,
+}
+/// A shard's whole label census, untruncated: the coordinator sums the counts
+/// across shards and derives every section of TS.LABELSTATS from the result, so
+/// LIMIT applies to global counts and distinct totals are exact.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StatsResponse {
     #[prost(uint64, tag = "1")]
     pub series_count: u64,
     #[prost(message, repeated, tag = "2")]
-    pub series_count_by_metric_name: ::prost::alloc::vec::Vec<PostingStat>,
-    #[prost(message, repeated, tag = "3")]
-    pub series_count_by_label_name: ::prost::alloc::vec::Vec<PostingStat>,
-    #[prost(message, repeated, tag = "4")]
-    pub series_count_by_label_value_pairs: ::prost::alloc::vec::Vec<PostingStat>,
-    #[prost(message, repeated, tag = "5")]
-    pub series_count_by_focus_label_value: ::prost::alloc::vec::Vec<PostingStat>,
-    /// Serialized roaring bitmaps of label-name and label/value-pair ids. The
-    /// coordinator unions these across shards so that distinct counts are not
-    /// double-counted for series that several shards know about. Populated by the
-    /// fanout handler, not by `From<PostingsStats>`.
-    #[prost(bytes = "vec", tag = "6")]
-    pub labels_bitmap: ::prost::alloc::vec::Vec<u8>,
-    #[prost(bytes = "vec", tag = "7")]
-    pub label_value_pairs_bitmap: ::prost::alloc::vec::Vec<u8>,
+    pub labels: ::prost::alloc::vec::Vec<LabelValueCounts>,
 }
 /// One bucket of a node's interning pool. `key` is the bucket's grouping value —
 /// the external reference count or the string length — and is unused for the

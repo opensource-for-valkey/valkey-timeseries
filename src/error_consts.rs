@@ -179,7 +179,6 @@ pub const READ_BLOCKING_NOT_ALLOWED: &str = "TSDB: blocking TS.READ (with BLOCK)
 pub const READ_CONDITION_VALUE_MUST_BE_A_NUMBER: &str = "TSDB: CONDITION value must be a number";
 
 // Fan-out
-pub const INVALID_POSTINGS_BITMAP: &str = "TSDB: invalid serialized postings bitmap";
 /// A fan-out share stopped because its requester's time budget ran out: the requester
 /// has already answered its client without it.
 pub const FANOUT_REQUESTER_GAVE_UP: &str =

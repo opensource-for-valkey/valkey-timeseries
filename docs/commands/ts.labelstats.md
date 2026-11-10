@@ -38,8 +38,8 @@ instead of over the whole index.
   Every section is ordered by count, highest first; equal counts are ordered by ascending name,
   and a limit that falls inside a run of equal counts keeps the smallest names. In cluster mode
   the limit is applied after the shards' counts are summed, so the sections are exact; each
-  shard therefore sends every name and label-value pair it counts, whatever the limit, and a
-  high-cardinality label costs about one entry per series. A `FILTER` narrows what is counted.
+  shard therefore sends every label-value pair it counts, whatever the limit, and a
+  high-cardinality label costs about one value per series. A `FILTER` narrows what is counted.
 
 - `HASHTAG <hash_tag,...>`
   In cluster mode, restricts fan-out to the nodes owning the comma-separated hash tags. It has no effect on standalone

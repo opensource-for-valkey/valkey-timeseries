@@ -89,8 +89,7 @@ message LabelSearchRequest {
 }
 
 message StatsRequest {
-  optional string selected_label = 1;
-  repeated SeriesSelector filters = 2;
+  repeated SeriesSelector filters = 1;
 }
 
 message MultiRangeRequest {
