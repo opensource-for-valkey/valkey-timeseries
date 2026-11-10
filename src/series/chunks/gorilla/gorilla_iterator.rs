@@ -134,8 +134,10 @@ impl GorillaIterator<'_> {
 
         let (value, leading_bits, trailing_bits) = self.read_value()?;
 
-        self.timestamp += i64::try_from(timestamp_delta)
-            .map_err(|_| decoding_error("Timestamp delta too large"))?;
+        self.timestamp = i64::try_from(timestamp_delta)
+            .ok()
+            .and_then(|delta| self.timestamp.checked_add(delta))
+            .ok_or_else(|| decoding_error("Timestamp delta too large"))?;
 
         self.value = value;
         self.leading_bits = leading_bits;
@@ -158,10 +160,13 @@ impl GorillaIterator<'_> {
 
         let (value, leading_bits, trailing_bits) = self.read_value()?;
 
-        let timestamp_delta = ((prev_timestamp_delta as i64) + timestamp_delta_of_delta) as u64;
+        // Wrapping, as the stream is untrusted and release builds wrap anyway: a corrupt
+        // stream decodes to wrong timestamps (which the load check rejects), never a panic.
+        let timestamp_delta =
+            (prev_timestamp_delta as i64).wrapping_add(timestamp_delta_of_delta) as u64;
 
         self.timestamp_delta = timestamp_delta;
-        self.timestamp = prev_timestamp + timestamp_delta as i64;
+        self.timestamp = prev_timestamp.wrapping_add(timestamp_delta as i64);
         self.leading_bits = leading_bits;
         self.trailing_bits = trailing_bits;
         self.value = value;

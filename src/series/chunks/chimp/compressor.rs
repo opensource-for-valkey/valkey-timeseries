@@ -275,10 +275,14 @@ impl ChimpCompressor {
     /// are stored as raw bit patterns, so payload bits (a Prometheus stale
     /// marker, say) survive the round trip unchanged.
     pub fn add_sample(&mut self, timestamp: Timestamp, value: f64) -> io::Result<()> {
+        let count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("sample count overflows"))?;
         self.write_timestamp(timestamp)?;
         self.write_value(value)?;
         self.last_value = value;
-        self.count += 1;
+        self.count = count;
         #[cfg(test)]
         {
             self.stats.window_reuse = self.chimp.window_reuse.0;

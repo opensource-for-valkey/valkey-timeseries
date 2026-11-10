@@ -82,25 +82,6 @@ pub fn rdb_save_duration(rdb: *mut RedisModuleIO, duration: &Duration) {
     raw::save_signed(rdb, millis);
 }
 
-/// NOTE: represents optional duration as i64, meaning that durations above i64::MAX milliseconds
-/// will be truncated
-pub fn rdb_load_optional_duration(rdb: *mut RedisModuleIO) -> ValkeyResult<Option<Duration>> {
-    let val = raw::load_signed(rdb)?;
-    if val == -1 {
-        return Ok(None);
-    }
-    Ok(Some(Duration::from_millis(val as u64)))
-}
-
-pub fn rdb_save_optional_duration(rdb: *mut RedisModuleIO, duration: &Option<Duration>) {
-    if let Some(duration) = duration {
-        rdb_save_optional_marker(rdb, true);
-        raw::save_signed(rdb, duration.as_millis() as i64);
-    } else {
-        raw::save_signed(rdb, -1);
-    }
-}
-
 pub fn rdb_load_duration(rdb: *mut RedisModuleIO) -> ValkeyResult<Duration> {
     let millis = raw::load_unsigned(rdb)?;
     Ok(Duration::from_millis(millis))
@@ -112,8 +93,14 @@ pub fn rdb_save_usize(rdb: *mut RedisModuleIO, value: usize) {
 }
 
 pub fn rdb_load_usize(rdb: *mut RedisModuleIO) -> ValkeyResult<usize> {
-    let value = raw::load_unsigned(rdb)?;
-    Ok(value as usize)
+    narrow(raw::load_unsigned(rdb)?, "usize")
+}
+
+/// Narrows a loaded integer to the type it was saved from, failing the load on a value that
+/// type cannot hold. An `as` cast would wrap instead: a chunk type of 258 loaded as Gorilla.
+fn narrow<T: TryFrom<V>, V: Copy + std::fmt::Display>(value: V, ty: &str) -> ValkeyResult<T> {
+    T::try_from(value)
+        .map_err(|_| ValkeyError::String(format!("RDB: {value} out of range for {ty}")))
 }
 
 /// Default ceiling for [`rdb_load_len`], used wherever no tighter domain-specific bound applies.
@@ -159,8 +146,7 @@ pub fn rdb_save_u8(rdb: *mut RedisModuleIO, value: u8) {
 }
 
 pub fn rdb_load_u8(rdb: *mut RedisModuleIO) -> ValkeyResult<u8> {
-    let value = raw::load_unsigned(rdb)?;
-    Ok(value as u8)
+    narrow(raw::load_unsigned(rdb)?, "u8")
 }
 
 pub fn rdb_save_i8(rdb: *mut RedisModuleIO, value: i8) {
@@ -168,8 +154,7 @@ pub fn rdb_save_i8(rdb: *mut RedisModuleIO, value: i8) {
 }
 
 pub fn rdb_load_i8(rdb: *mut RedisModuleIO) -> ValkeyResult<i8> {
-    let value = raw::load_signed(rdb)?;
-    Ok(value as i8)
+    narrow(raw::load_signed(rdb)?, "i8")
 }
 
 #[inline]
@@ -179,8 +164,7 @@ pub fn rdb_save_i32(rdb: *mut RedisModuleIO, value: i32) {
 
 #[inline]
 pub fn rdb_load_i32(rdb: *mut RedisModuleIO) -> ValkeyResult<i32> {
-    let value = raw::load_signed(rdb)?;
-    Ok(value as i32)
+    narrow(raw::load_signed(rdb)?, "i32")
 }
 
 #[inline]
@@ -199,8 +183,11 @@ pub fn rdb_save_bool(rdb: *mut RedisModuleIO, val: bool) {
 }
 
 pub fn rdb_load_bool(rdb: *mut RedisModuleIO) -> ValkeyResult<bool> {
-    let bool_val = rdb_load_u8(rdb)?;
-    Ok(bool_val != 0)
+    match rdb_load_u8(rdb)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(ValkeyError::String(format!("Invalid bool: {other}"))),
+    }
 }
 
 pub fn rdb_save_optional_bool(rdb: *mut RedisModuleIO, value: Option<bool>) {
@@ -301,5 +288,21 @@ pub(crate) fn rdb_load_optional_rounding(
         Ok(Some(rounding))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::narrow;
+
+    #[test]
+    fn narrowing_refuses_what_the_type_cannot_hold() {
+        assert_eq!(narrow::<u8, u64>(255, "u8").unwrap(), 255);
+        // `as u8` read 258 as 2 (a chunk type of Gorilla) and 511 as 255.
+        assert!(narrow::<u8, u64>(258, "u8").is_err());
+        assert!(narrow::<u8, u64>(511, "u8").is_err());
+        assert!(narrow::<i8, i64>(-129, "i8").is_err());
+        assert_eq!(narrow::<i32, i64>(-1, "i32").unwrap(), -1);
+        assert!(narrow::<i32, i64>(i64::from(i32::MAX) + 1, "i32").is_err());
     }
 }

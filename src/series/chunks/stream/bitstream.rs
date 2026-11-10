@@ -43,8 +43,13 @@ impl std::hash::Hash for BitStream {
     }
 }
 
+/// Free bits in a partial trailing byte: 0 when the stream is byte-aligned, never all 8 (the
+/// writer starts a byte only to put a bit in it). A count of 8 made `write_byte_raw` shift a
+/// `u8` by 8.
+const MAX_FREE_BITS: u64 = 7;
+
 fn validate_rdb_state(bytes: &[u8], count: u64) -> ValkeyResult<u8> {
-    if count > 8 {
+    if count > MAX_FREE_BITS {
         return Err(ValkeyError::String(format!("Invalid chunk bits: {count}")));
     }
 
@@ -124,7 +129,7 @@ impl BitStream {
         let count = try_read_uvarint(src)
             .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"))?;
 
-        if count > 8 {
+        if count > MAX_FREE_BITS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid bit count",
@@ -440,6 +445,20 @@ mod tests {
         assert!(validate_rdb_state(&[], 0).is_ok());
         assert!(validate_rdb_state(&[0], 0).is_ok());
         assert!(validate_rdb_state(&[0], 1).is_ok());
+    }
+
+    /// The writer leaves 0..=7 free bits; 8 made the next `write_byte_raw` shift a `u8` by 8.
+    #[test]
+    fn a_whole_free_byte_is_rejected() {
+        assert!(validate_rdb_state(&[0], 7).is_ok());
+        assert!(validate_rdb_state(&[0], 8).is_err());
+
+        let mut buf = Vec::new();
+        write_uvarint(&mut buf, 8); // count
+        write_uvarint(&mut buf, 1); // len
+        buf.push(0);
+        let mut src = buf.as_slice();
+        assert!(BitStream::deserialize(&mut src).is_err());
     }
 
     #[test]

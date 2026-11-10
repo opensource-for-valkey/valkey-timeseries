@@ -14,6 +14,10 @@ use crate::series::series_data_type::{
 use crate::series::{SampleDuplicatePolicy, SeriesLink, TimeSeries, TimeseriesId};
 use valkey_module::{ValkeyError, ValkeyResult, raw};
 
+/// Initial reservation caps for the chunk and rule vectors; past them they grow as elements load.
+const MAX_PREALLOCATED_CHUNKS: usize = 1024;
+const MAX_PREALLOCATED_RULES: usize = 16;
+
 pub fn rdb_save_series(series: &TimeSeries, rdb: *mut raw::RedisModuleIO) {
     raw::save_unsigned(rdb, series.id);
     series.labels.to_rdb(rdb);
@@ -80,7 +84,10 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
     // `RESTORE` can reach with a forged DUMP footer, but not while the server loads an RDB or
     // AOF it wrote itself: there the O(1) header checks in the chunk loaders stand alone.
     let verify_streams = !is_loading_active();
-    let mut chunks = Vec::with_capacity(chunks_len);
+    // Reserve from the declared counts only up to a cap: each element is a read that fails on a
+    // short payload, but an uncapped reservation runs first, and a 165-byte payload declaring
+    // 16M chunks asked for ~1.8 GB (an abort wherever the allocator refuses it).
+    let mut chunks = Vec::with_capacity(chunks_len.min(MAX_PREALLOCATED_CHUNKS));
     let mut total_samples: usize = 0;
     // `None` until the first non-empty chunk, not `0`: 0 is a valid timestamp, and using it
     // as the "unset" marker took chunk 1's first timestamp for a series whose data starts at
@@ -118,7 +125,7 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
     let src_series = SeriesLink::rdb_load_optional(rdb)?;
 
     let rules_len = rdb_load_len(rdb, MAX_RDB_COLLECTION_LEN)?;
-    let mut rules = Vec::with_capacity(rules_len);
+    let mut rules = Vec::with_capacity(rules_len.min(MAX_PREALLOCATED_RULES));
     for _ in 0..rules_len {
         let rule = CompactionRule::rdb_load(rdb)?;
         rules.push(rule);
