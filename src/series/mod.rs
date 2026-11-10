@@ -9,6 +9,8 @@ mod guard;
 pub mod index;
 mod ingest_normalize;
 mod link;
+#[cfg(test)]
+mod load_invariant_tests;
 pub mod mrange;
 mod multi_del;
 pub mod nrange;

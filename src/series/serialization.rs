@@ -1,7 +1,10 @@
 use crate::common::rdb::*;
 use crate::common::{Sample, Timestamp};
 use crate::labels::MetricName;
-use crate::series::chunks::{Chunk, ChunkEncoding, ChunkOps, TimeSeriesChunk};
+use crate::series::chunks::{
+    Chunk, ChunkEncoding, ChunkOps, MAX_CHUNK_SIZE, MAX_LOADED_CHUNK_BYTES, TimeSeriesChunk,
+    validate_chunk_size,
+};
 use crate::series::compaction::CompactionRule;
 use crate::series::index::persistence::is_loading_active;
 use crate::series::series_data_type::{
@@ -97,11 +100,16 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
                 ))
             })?;
         }
-        total_samples += chunk.len();
+        total_samples = total_samples
+            .checked_add(chunk.len())
+            .ok_or(ValkeyError::Str("Invalid series: sample count overflows"))?;
         if first_timestamp.is_none() && !chunk.is_empty() {
             first_timestamp = Some(chunk.first_timestamp());
         }
-        last_sample = chunk.last_sample();
+        // An empty chunk has no last sample; it must not erase an earlier chunk's.
+        if let Some(sample) = chunk.last_sample() {
+            last_sample = Some(sample);
+        }
         chunks.push(chunk);
     }
     let first_timestamp = first_timestamp.unwrap_or_default();
@@ -136,9 +144,80 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
         rules,
     };
 
+    check_series_invariants(&ts)
+        .map_err(|e| ValkeyError::String(format!("Invalid series: {e}")))?;
+
     // Assign `_db` from the IO context and count the series toward the current load window
     // (no-op for db-less payloads like RESTORE / TS._RESTORE strings).
     crate::series::index::persistence::observe_series_rdb_load(rdb, &mut ts);
 
     Ok(ts)
+}
+
+/// What the write path maintains for every series it stores, checked once a payload has been
+/// assembled. Each chunk loader checks its own encoding; this covers what only the series sees.
+///
+/// Every rule is something no command can violate, never a tighter limit: a series load error
+/// fails the whole RDB load (or `RESTORE`), so a rule stricter than the write path makes a
+/// server that saved fine unable to restart.
+///
+/// - `chunk_size_bytes` passes `validate_chunk_size`, as `TS.CREATE`, `TS.ALTER` and the config do.
+/// - Retention fits the `i64` milliseconds the commands parse.
+/// - Every chunk has the series' encoding: every chunk is created from it, and `TS.ALTER`
+///   cannot change it (it rejects `ENCODING`; RTS accepts the option and ignores it). A stray
+///   encoding was what let an uncompressed chunk follow a compressed one, which a forged count
+///   turned into an abort in the `FILTER_BY_TS` reverse path. A command that ever converts a
+///   series in place must re-encode every chunk, or relax this rule.
+/// - Every chunk's own budget is at most `MAX_CHUNK_SIZE` and its data at most
+///   `MAX_LOADED_CHUNK_BYTES`. A chunk's `max_size` may still differ from the series' after
+///   `TS.ALTER CHUNK_SIZE`, so it is not compared with `chunk_size_bytes`.
+/// - Non-empty chunks hold non-negative timestamps, ascending with no overlap from one chunk to
+///   the next. Empty chunks are allowed anywhere: a series keeps an empty tail chunk, and they
+///   are harmless elsewhere.
+pub(crate) fn check_series_invariants(ts: &TimeSeries) -> Result<(), String> {
+    if validate_chunk_size(ts.chunk_size_bytes).is_err() {
+        return Err(format!("chunk size {} out of range", ts.chunk_size_bytes));
+    }
+    if ts.retention.as_millis() > i64::MAX as u128 {
+        return Err(format!(
+            "retention {} ms out of range",
+            ts.retention.as_millis()
+        ));
+    }
+    let mut prev_last: Option<Timestamp> = None;
+    for (i, chunk) in ts.chunks.iter().enumerate() {
+        let encoding = chunk.get_encoding();
+        if encoding != ts.chunk_encoding {
+            return Err(format!(
+                "chunk {i} is {encoding} in a {} series",
+                ts.chunk_encoding
+            ));
+        }
+        if chunk.max_size() > MAX_CHUNK_SIZE {
+            return Err(format!(
+                "chunk {i} budget {} out of range",
+                chunk.max_size()
+            ));
+        }
+        if chunk.size() > MAX_LOADED_CHUNK_BYTES {
+            return Err(format!("chunk {i} holds {} bytes", chunk.size()));
+        }
+        if chunk.is_empty() {
+            continue;
+        }
+        let first = chunk.first_timestamp();
+        let last = chunk.last_timestamp();
+        if first < 0 || first > last {
+            return Err(format!("chunk {i} spans {first}..{last}"));
+        }
+        if let Some(prev) = prev_last
+            && first <= prev
+        {
+            return Err(format!(
+                "chunk {i} starts at {first}, not after the previous chunk's {prev}"
+            ));
+        }
+        prev_last = Some(last);
+    }
+    Ok(())
 }

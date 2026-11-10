@@ -16,7 +16,7 @@ use crate::config::DEFAULT_CHUNK_SIZE_BYTES;
 use crate::error::{TsdbError, TsdbResult};
 use crate::iterators::SampleIter;
 use crate::series::chunks::MIN_SAMPLES_FOR_BPS_ESTIMATE;
-use crate::series::chunks::chunk::{Chunk, ChunkEncoding, ChunkOps};
+use crate::series::chunks::chunk::{Chunk, ChunkEncoding, ChunkOps, MAX_LOADED_CHUNK_BYTES};
 use crate::series::chunks::merge::{append_samples, merge_chunk_samples};
 use crate::series::chunks::range_iter::RangeFiltered;
 use crate::series::{DuplicatePolicy, SampleAddResult};
@@ -183,6 +183,12 @@ impl<C: SampleCodec> XorChunk<C> {
     ///
     /// Only for stored chunks: a fan-out chunk can carry samples a series never stores.
     pub(crate) fn check_header(&self) -> Result<(), String> {
+        let bytes = self.data_size();
+        if bytes > MAX_LOADED_CHUNK_BYTES {
+            return Err(format!(
+                "{bytes}-byte stream exceeds the {MAX_LOADED_CHUNK_BYTES}-byte chunk limit"
+            ));
+        }
         self.check_count()?;
         let len = self.len();
         if len == 0 {

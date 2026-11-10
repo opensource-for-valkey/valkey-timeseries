@@ -7,7 +7,7 @@ use crate::common::{SAMPLE_SIZE, Sample, Timestamp};
 use crate::error::{TsdbError, TsdbResult};
 use crate::iterators::SampleIter;
 use crate::series::chunks::merge::merge_chunk_samples;
-use crate::series::chunks::{Chunk, ChunkOps, MAX_CHUNK_SIZE};
+use crate::series::chunks::{Chunk, ChunkOps, MAX_CHUNK_SIZE, MAX_LOADED_CHUNK_BYTES};
 use crate::series::{DuplicatePolicy, SampleAddResult};
 use core::mem::size_of;
 use get_size2::{GetSize, GetSizeTracker};
@@ -480,6 +480,13 @@ impl Chunk for UncompressedChunk {
         // generic guard rejects a corrupt count, and the allocation is capped up front — each
         // sample is a read that fails on a short payload.
         let len = rdb_load_len(rdb, MAX_RDB_COLLECTION_LEN)?;
+        // The same per-chunk size limit as the compressed encodings, checked before the loop.
+        if len.saturating_mul(SAMPLE_SIZE) > MAX_LOADED_CHUNK_BYTES {
+            return Err(ValkeyError::String(format!(
+                "Invalid uncompressed chunk: {len} samples exceed the \
+                 {MAX_LOADED_CHUNK_BYTES}-byte chunk limit"
+            )));
+        }
         let mut samples = Vec::with_capacity(len.min(max_elements));
         for _ in 0..len {
             let ts = raw::load_signed(rdb)?;
