@@ -1311,12 +1311,17 @@ pub(crate) fn is_shard_snapshot_answerable(options: &MRangeOptions) -> bool {
 }
 
 /// Least estimated work (units of [`estimated_defer_work`]) a TS.MRANGE needs before
-/// it is deferred. Deferring adds a block/unblock round trip through the event
-/// loop — ~100 µs measured when the server is otherwise idle, and lost in the
-/// noise under load. Main-thread time runs at ~11 ns per unit (ten series × 100
-/// samples ≈ 11k units ≈ 121 µs inline), so this is where deferring frees
-/// about as much main-thread time as the round trip costs an idle client.
-pub const DEFER_MIN_WORK: usize = 8192;
+/// it is deferred when no other client is competing for the main thread. Deferring adds
+/// a block/unblock round trip through the event loop: 30–40 µs measured for a lone
+/// client, and lost in the noise under load. Main-thread time runs at ~11 ns per unit,
+/// so this keeps a lone request inline until it would hold the main thread for about
+/// 350 µs.
+///
+/// It was 8192, the point where deferring frees as much main-thread time as the round
+/// trip costs. That cost a lone client 15–18 % of its throughput on sixteen-series
+/// queries (190 µs inline), which is too much to pay when nobody is waiting; requests
+/// that do compete are deferred by the contention check whatever their size.
+pub const DEFER_MIN_WORK: usize = 32_768;
 
 /// Sample-equivalents a series costs the main thread on top of its samples when it is
 /// answered inline: opening the key, labels, the reply. Far more than
