@@ -120,9 +120,13 @@ type PayloadResult<T> = Result<T, String>;
 // section. The body versions itself, so neither side's format is pinned to the other's.
 
 /// Appends one per-db section to `buf`: the db number, then the encoded index body.
-fn serialize_postings_section(buf: &mut Vec<u8>, db: i32, postings: &Postings) {
+fn serialize_postings_section(
+    buf: &mut Vec<u8>,
+    db: i32,
+    postings: &Postings,
+) -> PayloadResult<()> {
     write_uvarint(buf, db as u64);
-    serialization::serialize(buf, postings);
+    serialization::serialize(buf, postings)
 }
 
 /// Reads one per-db section, mirroring [`serialize_postings_section`]. `key_budget` is the
@@ -189,7 +193,7 @@ fn build_aux_payload() -> PayloadResult<Option<Vec<u8>>> {
     write_u8(&mut buf, INDEX_AUX_VERSION);
     write_uvarint(&mut buf, locked.len() as u64);
     for (db, postings) in &locked {
-        serialize_postings_section(&mut buf, *db, postings);
+        serialize_postings_section(&mut buf, *db, postings)?;
     }
     Ok(Some(buf))
 }
@@ -211,7 +215,7 @@ fn parse_aux_payload(mut buf: &[u8]) -> PayloadResult<Vec<(i32, Postings)>> {
         ));
     }
 
-    let section_count = try_read_uvarint(buf).map_err(|e| e.to_string())? as usize;
+    let section_count = serialization::read_count(buf, "section count")?;
     let mut sections: Vec<(i32, Postings)> = Vec::with_capacity(section_count.min(16));
     for _ in 0..section_count {
         let prev_db = sections.last().map(|(db, _)| *db);
@@ -743,7 +747,7 @@ mod tests {
     fn build_payload(sections: &[(i32, &Postings)]) -> Vec<u8> {
         let mut body = Vec::new();
         for (db, postings) in sections {
-            serialize_postings_section(&mut body, *db, postings);
+            serialize_postings_section(&mut body, *db, postings).unwrap();
         }
         let mut buf = Vec::new();
         buf.extend_from_slice(INDEX_AUX_MAGIC);

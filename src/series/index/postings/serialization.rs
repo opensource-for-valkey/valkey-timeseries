@@ -38,6 +38,10 @@ use std::collections::BTreeMap;
 /// back to rebuilding the index from the keyspace.
 pub(in crate::series::index) type DecodeResult<T> = Result<T, String>;
 
+/// Encoding fails only on an internal inconsistency; the caller skips persisting the index, which
+/// the next load answers with the per-key rebuild.
+pub(in crate::series::index) type EncodeResult<T> = Result<T, String>;
+
 /// Version of the field layout below, written as the first byte of every body.
 ///
 /// Separate from the envelope's `INDEX_AUX_VERSION`, which versions the framing around the body
@@ -166,13 +170,36 @@ fn check_declared_count(
     Ok(())
 }
 
-pub(in crate::series::index) fn write_bitmap(buf: &mut Vec<u8>, bitmap: &PostingsBitmap) {
+/// Reads a declared element count, rejecting one that does not fit in `usize` rather than
+/// truncating it past [`check_declared_count`]. Exact on the 64-bit targets the module ships for.
+pub(in crate::series::index) fn read_count(buf: &mut &[u8], what: &str) -> DecodeResult<usize> {
+    let count = try_read_uvarint(buf).map_err(|e| e.to_string())?;
+    usize::try_from(count).map_err(|_| format!("{what}: declared count {count} overflows usize"))
+}
+
+/// Writes `bitmap` as a length-prefixed portable blob.
+///
+/// The prefix is written before the blob, from croaring's size calculation, so the decoder can
+/// only frame the stream if the blob takes exactly that many bytes. croaring derives the
+/// appended length from the same calculation, so the check below cannot fail today; it is there
+/// so that a change in how croaring appends (alignment padding ahead of the data, say) fails this
+/// save loudly instead of writing a body that every later load silently discards.
+pub(in crate::series::index) fn write_bitmap(
+    buf: &mut Vec<u8>,
+    bitmap: &PostingsBitmap,
+) -> EncodeResult<()> {
     let size = bitmap.get_serialized_size_in_bytes::<Portable>();
     write_uvarint(buf, size as u64);
     buf.reserve(size);
     let before = buf.len();
     let _ = bitmap.serialize_into_vec::<Portable>(buf);
-    debug_assert_eq!(buf.len() - before, size);
+    let appended = buf.len() - before;
+    if appended != size {
+        return Err(format!(
+            "bitmap serialized to {appended} bytes after declaring {size}"
+        ));
+    }
+    Ok(())
 }
 
 /// Stays permissive about *emptiness*: `all_postings` is legitimately empty for a db with no
@@ -202,7 +229,8 @@ fn split_label_key(key: &IndexKey) -> (&[u8], &[u8]) {
     full.split_at(split_at)
 }
 
-/// Appends the encoded index body to `buf`.
+/// Appends the encoded index body to `buf`. On error `buf` holds a partial body and must be
+/// discarded.
 ///
 /// Stale ids are subtracted here rather than persisted: `mark_ids_as_stale` already cleans
 /// `id_to_key` and `all_postings` at mark time, so the label bitmaps are the only structures
@@ -213,7 +241,10 @@ fn split_label_key(key: &IndexKey) -> (&[u8], &[u8]) {
 /// only costs anything when `stale_ids` is non-empty (rare: the cron GC drains continuously);
 /// entries that become empty are dropped, so the group directory is built in a first pass over
 /// the label index and the entries are written straight into `buf` by a second.
-pub(in crate::series::index) fn serialize(buf: &mut Vec<u8>, postings: &Postings) {
+pub(in crate::series::index) fn serialize(
+    buf: &mut Vec<u8>,
+    postings: &Postings,
+) -> EncodeResult<()> {
     write_u8(buf, BODY_VERSION);
 
     // First, so the decoder has it before the label bitmaps it validates. Needs no stale masking
@@ -221,7 +252,7 @@ pub(in crate::series::index) fn serialize(buf: &mut Vec<u8>, postings: &Postings
     // subset property hold on the written form — every label bitmap below is masked by the same
     // stale set that `all_postings` has already had removed. Hidden ids are written as ordinary
     // ones: their keys are in the snapshot too, and hiding them again is the load's job.
-    write_bitmap(buf, &postings.hidden_ids.union_with(&postings.all_postings));
+    write_bitmap(buf, &postings.hidden_ids.union_with(&postings.all_postings))?;
 
     // label_index in tree iteration order (sorted): cache-friendly ART rebuild on load. Sorted
     // order is also what makes the grouping a single pass — a group's entries are necessarily
@@ -272,7 +303,7 @@ pub(in crate::series::index) fn serialize(buf: &mut Vec<u8>, postings: &Postings
         let cleaned: Cow<PostingsBitmap> = stale.mask_cow(Cow::Borrowed(bitmap));
         debug_assert!(!cleaned.is_empty(), "pass 1 counted an entry pass 2 drops");
         write_byte_slice(buf, suffix);
-        write_bitmap(buf, &cleaned);
+        write_bitmap(buf, &cleaned)?;
     }
 
     // id_to_key in ascending id order: ids share their high epoch bits and increment densely,
@@ -284,6 +315,7 @@ pub(in crate::series::index) fn serialize(buf: &mut Vec<u8>, postings: &Postings
         prev_id = *id;
         write_byte_slice(buf, key.as_ref());
     }
+    Ok(())
 }
 
 /// Reads one index body from `buf`, advancing it past the bytes consumed, and charges the label
@@ -308,13 +340,13 @@ pub(in crate::series::index) fn deserialize(
     // Group directory next (see [`serialize`]), then the entries for each group in the same
     // order. `with_capacity` is clamped: the count comes from the payload, and a corrupt one
     // must not turn into an unbounded allocation before the read that rejects it.
-    let group_count = try_read_uvarint(buf).map_err(|e| e.to_string())? as usize;
+    let group_count = read_count(buf, "label group directory")?;
     check_declared_count("label group directory", group_count, buf, MIN_GROUP_BYTES)?;
     let mut groups: Vec<(&[u8], usize)> = Vec::with_capacity(group_count.min(64));
     let mut entry_count: usize = 0;
     for _ in 0..group_count {
         let prefix = try_read_byte_slice(buf).map_err(|e| e.to_string())?;
-        let count = try_read_uvarint(buf).map_err(|e| e.to_string())? as usize;
+        let count = read_count(buf, "label group")?;
         entry_count = entry_count.saturating_add(count);
         groups.push((prefix, count));
     }
@@ -386,7 +418,7 @@ pub(in crate::series::index) fn deserialize(
     // directory is missing from every `all_postings`-based read. Ids arrive strictly ascending,
     // each checked for membership as it is read, so equal counts at the end mean equal sets
     // without building a second bitmap.
-    let id_count = try_read_uvarint(buf).map_err(|e| e.to_string())? as usize;
+    let id_count = read_count(buf, "id directory")?;
     check_declared_count("id directory", id_count, buf, MIN_ID_ENTRY_BYTES)?;
     let mut id_to_key = BTreeMap::new();
     let mut prev_id: SeriesRef = 0;
@@ -472,7 +504,7 @@ mod tests {
     ) -> Vec<u8> {
         let mut buf = Vec::new();
         write_u8(&mut buf, BODY_VERSION);
-        write_bitmap(&mut buf, all_postings);
+        write_bitmap(&mut buf, all_postings).unwrap();
         write_uvarint(&mut buf, groups.len() as u64);
         for (prefix, count) in groups {
             write_byte_slice(&mut buf, prefix);
@@ -509,7 +541,7 @@ mod tests {
         postings.set_timeseries_key(1, b"ts:1");
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         assert_eq!(buf.first(), Some(&BODY_VERSION));
     }
 
@@ -522,7 +554,7 @@ mod tests {
         postings.set_timeseries_key(1, b"ts:1");
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         buf[0] = BODY_VERSION + 1;
 
         let err = decode_err(&buf);
@@ -540,7 +572,7 @@ mod tests {
         let entry_len = |bitmap: &PostingsBitmap| {
             let mut entry = Vec::new();
             write_byte_slice(&mut entry, b"");
-            write_bitmap(&mut entry, bitmap);
+            write_bitmap(&mut entry, bitmap).unwrap();
             entry.len()
         };
 
@@ -583,7 +615,7 @@ mod tests {
         assert!(postings.optimize_postings(None, usize::MAX).is_none());
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         let mut slice = buf.as_slice();
         let loaded =
             deserialize_standalone(&mut slice).expect("run-optimized postings must round-trip");
@@ -690,7 +722,7 @@ mod tests {
     fn rejects_inflated_group_count() {
         let mut body = Vec::new();
         write_u8(&mut body, BODY_VERSION);
-        write_bitmap(&mut body, &PostingsBitmap::new());
+        write_bitmap(&mut body, &PostingsBitmap::new()).unwrap();
         write_uvarint(&mut body, u32::MAX as u64);
         body.extend_from_slice(&[0u8; 16]);
         let err = decode_err(&body);
@@ -854,7 +886,7 @@ mod tests {
         postings.set_timeseries_key(7, b"ts:7");
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         let mut slice = buf.as_slice();
         let loaded =
             deserialize_standalone(&mut slice).expect("a label-less series must round-trip");
@@ -895,7 +927,7 @@ mod tests {
             .insert(3, b"c".to_vec().into_boxed_slice());
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         let decoded = deserialize_standalone(&mut buf.as_slice()).expect("long keys must decode");
         assert_eq!(decoded.id_to_key.get(&1), Some(&long_key));
         let keys: Vec<String> = decoded
@@ -928,7 +960,7 @@ mod tests {
         }
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         let mut slice = buf.as_slice();
         let loaded =
             deserialize_standalone(&mut slice).expect("realistic prefix sharing must decode");
@@ -965,7 +997,7 @@ mod tests {
         postings.set_timeseries_key(3, b"ts:3");
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         let mut slice = buf.as_slice();
         let loaded = deserialize_standalone(&mut slice).expect("body should round-trip");
 
@@ -993,7 +1025,7 @@ mod tests {
         postings.mark_id_as_stale(2);
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         let mut slice = buf.as_slice();
         let loaded = deserialize_standalone(&mut slice).expect("body should round-trip");
 
@@ -1016,7 +1048,7 @@ mod tests {
         postings.mark_id_as_stale(2);
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         let mut slice = buf.as_slice();
         let loaded = deserialize_standalone(&mut slice).expect("body should round-trip");
 

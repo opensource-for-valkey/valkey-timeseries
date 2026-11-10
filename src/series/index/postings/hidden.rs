@@ -421,7 +421,7 @@ mod tests {
         // reconciliation hides them again when the import is still in progress.
         let postings = hidden_fixture();
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         let loaded =
             deserialize_standalone(&mut buf.as_slice()).expect("the body is self-consistent");
         assert_postings_eq(&loaded, &fixture());
