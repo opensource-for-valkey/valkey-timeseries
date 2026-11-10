@@ -953,16 +953,19 @@ mod tests {
 
         // Verify we can query by labels before rename
         let labels = ts.labels.to_label_vec();
-        let result_before = index.posting_by_labels(&labels).unwrap();
-        assert_eq!(result_before, Some(ts.id));
+        let result_before = index.postings_by_labels(&labels).iter().collect::<Vec<_>>();
+        assert_eq!(result_before, [ts.id]);
 
         // Verify we can query by specific label combinations before rename
         let instance_labels = vec![Label {
             name: "instance".to_string(),
             value: "server1".to_string(),
         }];
-        let postings_before = index.posting_by_labels(&instance_labels).unwrap();
-        assert_eq!(postings_before, Some(ts.id));
+        let postings_before = index
+            .postings_by_labels(&instance_labels)
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(postings_before, [ts.id]);
 
         // Test querying with matchers before rename
         let mut state = ();
@@ -982,18 +985,21 @@ mod tests {
         index.reindex_timeseries(&ts, old_key, new_key);
 
         // Verify the same queries still work after rename
-        let result_after = index.posting_by_labels(&labels).unwrap();
+        let result_after = index.postings_by_labels(&labels).iter().collect::<Vec<_>>();
         assert_eq!(
             result_after,
-            Some(ts.id),
+            [ts.id],
             "Should still find series by labels after rename"
         );
 
         // Verify querying by specific label combinations still works
-        let postings_after = index.posting_by_labels(&instance_labels).unwrap();
+        let postings_after = index
+            .postings_by_labels(&instance_labels)
+            .iter()
+            .collect::<Vec<_>>();
         assert_eq!(
             postings_after,
-            Some(ts.id),
+            [ts.id],
             "Should still find series by instance label after rename"
         );
 

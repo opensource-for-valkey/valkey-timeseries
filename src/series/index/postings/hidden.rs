@@ -180,26 +180,23 @@ impl Postings {
         ids.cardinality()
     }
 
+    /// Whether any id is tombstoned or hidden. When none is, every id a label bitmap holds is
+    /// visible: removing a series takes its id out of the bitmaps as well as `all_postings`.
+    #[inline]
+    pub(in crate::series::index) fn masks_any_ids(&self) -> bool {
+        !self.stale_ids.is_empty() || !self.hidden_ids.is_empty()
+    }
+
     /// How many of `postings`' ids a read may see: neither tombstoned nor hidden. For the readers
     /// that walk the term dictionary directly rather than through `Terms`.
     pub(in crate::series::index) fn visible_cardinality(&self, postings: &PostingsBitmap) -> u64 {
-        if self.stale_ids.is_empty() && self.hidden_ids.is_empty() {
+        if !self.masks_any_ids() {
             return postings.cardinality();
         }
         postings
             .cardinality()
             .saturating_sub(self.stale_ids.stale_count_in(postings))
             .saturating_sub(self.hidden_ids.count_in(postings))
-    }
-
-    /// The ids of `postings` a read may see now, for a set resolved under an earlier lock hold.
-    /// Stays borrowed when nothing is masked.
-    pub(in crate::series::index) fn visible_subset<'a>(
-        &self,
-        postings: &'a PostingsBitmap,
-    ) -> Cow<'a, PostingsBitmap> {
-        self.hidden_ids
-            .mask_cow(self.stale_ids.mask_cow(Cow::Borrowed(postings)))
     }
 
     /// Stops hiding `id`. Returns whether it was hidden. Callers run this before removing the
@@ -326,9 +323,9 @@ mod tests {
     fn a_hidden_series_is_not_a_duplicate_of_a_new_one() {
         let postings = hidden_fixture();
         let unique = [Label::new("only_imported", "x")];
-        assert_eq!(postings.posting_id_by_labels(&unique), None);
+        assert!(postings.postings_by_labels(&unique).is_empty());
         let shared = [Label::new("job", "imported"), Label::new("env", "prod")];
-        assert_eq!(postings.posting_id_by_labels(&shared), None);
+        assert!(postings.postings_by_labels(&shared).is_empty());
     }
 
     #[test]

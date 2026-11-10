@@ -130,8 +130,3 @@ message SampleData {
   CompressionType compression = 2;
   bytes data = 3;
 }
-
-message PostingStat {
-  string name = 1;
-  uint64 count = 2;
-}

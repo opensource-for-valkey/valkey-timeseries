@@ -43,6 +43,11 @@ Label name-value pairs for the series. Names and values must be non-empty, and a
 contain `=` (`TSDB: label name must not contain '='`): no filter could select such a label.
 Values may contain `=`. RedisTimeSeries stores such
 names; see [COMPATIBILITY.md](../../COMPATIBILITY.md) (DIV-0063).
+
+When the labels include `__name__` (including via `METRIC`), the series is identified by its
+full label set, as in Prometheus: creating a second series with exactly the same labels fails
+with `TSDB: duplicate series`. A series whose labels are a subset or superset of an existing
+series' labels is a different series and is created normally.
 </details>
 
 <details open><summary><code>retentionPeriod</code></summary>

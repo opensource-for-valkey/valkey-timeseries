@@ -8,7 +8,7 @@ use crate::error_consts;
 use crate::labels::{InternedLabel, Label, MetricName};
 use crate::parser::metric_name::parse_metric_name;
 use crate::series::chunks::ChunkEncoding;
-use crate::series::index::{get_db_index, next_timeseries_id};
+use crate::series::index::{TimeSeriesIndex, get_db_index, next_timeseries_id};
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
 use crate::series::{
     CompactionRule, SeriesGuard, SeriesGuardMut, SeriesLink, TimeSeries, TimeSeriesOptions,
@@ -135,6 +135,26 @@ pub(crate) fn invalid_series_key_error() -> ValkeyError {
     ValkeyError::Str(error_consts::KEY_NOT_FOUND)
 }
 
+/// Whether a visible series in `index` has exactly `labels`. The index can only name the series
+/// that carry all of them, some with more, so each candidate's full label set is compared. Usually
+/// a per-series label (`host`, `instance`) leaves one candidate.
+///
+/// Each key is resolved under the postings guard and opened after it is released: opening may
+/// lazily expire the key, and the `unlink` callback that follows takes the postings write lock on
+/// this thread.
+fn has_series_with_label_set(ctx: &Context, index: &TimeSeriesIndex, labels: &MetricName) -> bool {
+    let candidates = index.postings_by_labels(&labels.to_label_vec());
+    candidates.iter().any(|id| {
+        let key = index
+            .get_postings()
+            .get_key_by_id(id)
+            .map(|key| create_key_string(ctx, key.as_ref()));
+        key.is_some_and(|key| {
+            matches!(try_get_timeseries(ctx, &key, None), Ok(Some(series)) if series.labels == *labels)
+        })
+    })
+}
+
 pub fn create_series(
     key: &ValkeyString,
     options: TimeSeriesOptions,
@@ -153,15 +173,12 @@ pub fn create_series(
 
     let index = guard.deref();
 
-    // Check if this refers to an existing series (a pre-existing series with the same label-value pairs)
-    // We do this only in the case where we have a __name__ label, signaling that the user is
-    // opting in to Prometheus semantics, meaning a metric name is unique to a series.
-    if ts.labels.get_value(METRIC_NAME_LABEL).is_some() {
-        let labels = ts.labels.to_label_vec();
-        // will return an error if the series already exists
-        if index.series_id_by_labels(&labels).is_some() {
-            return Err(ValkeyError::Str(error_consts::DUPLICATE_SERIES));
-        }
+    // A `__name__` label opts in to Prometheus semantics, where a series *is* its label set: refuse
+    // a second series with exactly the same labels.
+    if ts.labels.get_value(METRIC_NAME_LABEL).is_some()
+        && has_series_with_label_set(ctx, index, &ts.labels)
+    {
+        return Err(ValkeyError::Str(error_consts::DUPLICATE_SERIES));
     }
 
     index.index_timeseries(&ts, key.iter().as_slice());

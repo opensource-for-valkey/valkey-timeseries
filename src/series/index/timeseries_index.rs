@@ -1,23 +1,22 @@
-use ahash::AHashMap;
+use std::borrow::Cow;
+#[cfg(test)]
 use std::collections::BTreeSet;
-use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard};
 
-use super::posting_stats::{PostingStat, PostingsStats, StatsMaxHeap};
+use super::posting_stats::{LabelCensus, LabelValues, PostingsStats, StatsBuilder};
 use super::postings::{Postings, PostingsBitmap};
-use crate::common::acl::{KeyAccess, clone_permissions};
-use crate::common::constants::METRIC_NAME_LABEL;
+use crate::common::acl::KeyAccess;
 use crate::common::context::create_key_string;
-use crate::common::hash::DeterministicHasher;
 use crate::common::sync::{read_lock, write_lock};
 use crate::error_consts;
-use crate::labels::filters::{LabelFilter, SeriesSelector};
-use crate::labels::{Label, SeriesLabel};
+use crate::labels::SeriesLabel;
+#[cfg(test)]
+use crate::labels::filters::LabelFilter;
+use crate::labels::filters::SeriesSelector;
 use crate::series::index::IndexKey;
 use crate::series::{SeriesRef, TimeSeries};
-use croaring::Bitmap64;
-use std::ops::{Bound, ControlFlow, Deref, DerefMut};
+use std::ops::{Bound, Deref, DerefMut};
 use std::time::Duration;
 use valkey_module::{AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString};
 
@@ -28,8 +27,7 @@ pub struct PostingsReadGuard<'a> {
 }
 
 impl<'a> PostingsReadGuard<'a> {
-    /// Creates a new PostingsReadGuard from an RwLockReadGuard
-    pub(crate) fn new(guard: RwLockReadGuard<'a, Postings>) -> Self {
+    fn new(guard: RwLockReadGuard<'a, Postings>) -> Self {
         Self { guard }
     }
 }
@@ -74,26 +72,8 @@ fn next_generation() -> u64 {
     NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The distinct label names and `name=value` pairs a statistics scan observed, as hashed
-/// fingerprints. A fan-out share ships these to the coordinator, which unions the bitmaps and
-/// counts their cardinality: a term present on several shards is then counted once, without
-/// shipping the terms themselves.
-///
-/// The hasher lives here rather than beside the scan, so it exists only when fingerprints are
-/// asked for: the standalone `stats` family passes `None` and hashes nothing.
-#[derive(Default)]
-struct TermFingerprints {
-    hasher: DeterministicHasher,
-    names: Bitmap64,
-    pairs: Bitmap64,
-}
-
-impl TermFingerprints {
-    fn add(&mut self, key: &IndexKey, name: &str) {
-        self.names.add(self.hasher.hash_one(name));
-        self.pairs.add(self.hasher.hash_one(key));
-    }
-}
+/// Label-index keys a statistics scan visits per postings-lock hold.
+const STATS_BATCH_SIZE: usize = 512;
 
 /// How many times [`TimeSeriesIndex::read_without_swap`] runs a read that `SWAPDB` keeps
 /// exchanging the database under before it gives up. One swap during a read is rare; three
@@ -139,12 +119,6 @@ impl TimeSeriesIndex {
     /// a generation of its own.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
-    }
-
-    #[allow(dead_code)]
-    pub fn clear(&self) {
-        let mut inner = write_lock(&self.inner);
-        inner.clear();
     }
 
     // swap the inner value with some other value
@@ -199,6 +173,7 @@ impl TimeSeriesIndex {
         inner.remove_timeseries_for_key(series, key)
     }
 
+    #[cfg(test)]
     pub fn has_id(&self, id: SeriesRef) -> bool {
         let inner = read_lock(&self.inner);
         inner.has_id(id)
@@ -214,76 +189,29 @@ impl TimeSeriesIndex {
         PostingsWriteGuard::new(guard)
     }
 
-    /// Return all series ids corresponding to the given label value pairs
+    /// Every visible series carrying all of `labels` (it may carry others too). A series whose
+    /// label set *is* `labels` is among them; telling it apart needs the candidates' full label
+    /// sets, which the index does not keep.
     pub fn postings_by_labels<T: SeriesLabel>(&self, labels: &[T]) -> PostingsBitmap {
         let inner = read_lock(&self.inner);
         inner.postings_by_labels(labels)
     }
 
-    /// This exists primarily to ensure that we disallow duplicate metric names
-    pub fn posting_by_labels(&self, labels: &[Label]) -> ValkeyResult<Option<SeriesRef>> {
-        let acc = self.postings_by_labels(labels);
-        match acc.cardinality() {
-            0 => Ok(None),
-            1 => Ok(Some(acc.iter().next().expect("cardinality should be 1"))),
-            _ => Err(ValkeyError::Str(error_consts::DUPLICATE_SERIES)),
-        }
-    }
-
-    /// Retrieves the series identifier (ID) corresponding to a specific set of labels.
-    ///
-    /// This method looks up the series ID in the underlying postings index based on the provided
-    /// labels. For instance, if we have a time series with the metric name
-    ///
-    /// `http_requests_total{status="200", method="GET", service="inference"}`,
-    ///
-    /// we can retrieve its series ID by passing the appropriate labels to this function.
-    ///
-    /// ```no_run
-    /// use valkey_timeseries::Label;
-    /// let labels = vec![
-    ///     Label::new("__name__", "http_requests_total"),
-    ///     Label::new("status", "200"),
-    ///     Label::new("method", "GET"),
-    ///     Label::new("service", "inference"),
-    /// ];
-    /// // `index` would be a TimeSeriesIndex obtained via the public API (omitted here).
-    /// // if let Some(series_id) = index.series_id_by_labels(&labels) {
-    /// //     println!("Found series ID: {:?}", series_id);
-    /// // } else {
-    /// //    println!("No series found with the given labels.");
-    /// // }
-    /// ```
-    /// # Arguments
-    ///
-    /// * `labels` - A slice of `Label` objects that describe the series to look up.
-    ///
-    /// # Returns
-    ///
-    /// * `Option<SeriesRef>` - Returns `Some(SeriesRef)` if a matching series ID is found.
-    ///
-    pub fn series_id_by_labels(&self, labels: &[Label]) -> Option<SeriesRef> {
-        let inner = read_lock(&self.inner);
-        inner.posting_id_by_labels(labels)
-    }
-
-    /// `postings_for_filters` assembles a single postings iterator against the series index
-    /// based on the given matchers.
-    #[allow(dead_code)]
+    /// The series matching `selector`. Production reads go through `label_querier` and the
+    /// selector planner directly; this and the two lookups below serve tests.
+    #[cfg(test)]
     pub fn postings_for_selector(&self, selector: &SeriesSelector) -> ValkeyResult<PostingsBitmap> {
-        let mut state = ();
-        self.with_postings(&mut state, move |inner, _| {
-            let postings = inner.postings_for_selector(selector)?;
-            let res = postings.into_owned();
-            Ok(res)
-        })
+        let inner = read_lock(&self.inner);
+        Ok(inner.postings_for_selector(selector)?.into_owned())
     }
 
+    #[cfg(test)]
     pub fn get_label_names(&self) -> BTreeSet<String> {
         let inner = read_lock(&self.inner);
         inner.get_label_names()
     }
 
+    #[cfg(test)]
     pub fn get_label_values(&self, label_name: &str) -> Vec<String> {
         let inner = read_lock(&self.inner);
         inner.get_label_values(label_name)
@@ -299,8 +227,9 @@ impl TimeSeriesIndex {
     ///
     /// Ids the postings still reference but that no longer map to a key are queued for the
     /// stale-id sweep (see `Postings::mark_ids_as_stale` in `postings/stale.rs`) and
-    /// omitted from the result. That repair happens even when the call then fails the ACL
-    /// check, so a caller without access still leaves the index healthier than it found it.
+    /// omitted from the result. That repair covers every matching id even when the call then
+    /// fails the ACL check, so a caller without access still leaves the index healthier than it
+    /// found it.
     pub fn keys_for_selectors(
         &self,
         ctx: &Context,
@@ -311,9 +240,14 @@ impl TimeSeriesIndex {
         let mut dangling_ids: Vec<SeriesRef> = Vec::new();
         let mut acl_denied = false;
 
-        let cloned_perms = acl_permissions.as_ref().map(clone_permissions);
+        // The requested permission decides which "all keys" error a denied caller sees.
+        let wants_write = acl_permissions.as_ref().is_some_and(|perms| {
+            perms.intersects(
+                AclPermissions::INSERT | AclPermissions::UPDATE | AclPermissions::DELETE,
+            )
+        });
         let access = match acl_permissions {
-            Some(perms) => KeyAccess::new(ctx, clone_permissions(&perms)),
+            Some(perms) => KeyAccess::new(ctx, perms),
             None => KeyAccess::unrestricted(),
         };
 
@@ -337,10 +271,14 @@ impl TimeSeriesIndex {
                     dangling_ids.push(series_ref);
                     continue;
                 };
+                if acl_denied {
+                    // The call fails either way; keep looking only for ids to repair.
+                    continue;
+                }
                 let real_key = create_key_string(ctx, key.as_ref());
                 if !access.allows(&real_key) {
                     acl_denied = true;
-                    break;
+                    continue;
                 }
                 keys.push(real_key);
             }
@@ -355,47 +293,23 @@ impl TimeSeriesIndex {
         }
 
         if acl_denied {
-            // The requested permission decides which "all keys" error the caller sees.
-            let all_keys_error = match cloned_perms {
-                Some(perms)
-                    if perms.intersects(
-                        AclPermissions::INSERT | AclPermissions::UPDATE | AclPermissions::DELETE,
-                    ) =>
-                {
-                    error_consts::ALL_KEYS_WRITE_PERMISSION_ERROR
-                }
-                _ => error_consts::ALL_KEYS_READ_PERMISSION_ERROR,
-            };
-            return Err(ValkeyError::Str(all_keys_error));
+            return Err(ValkeyError::Str(if wants_write {
+                error_consts::ALL_KEYS_WRITE_PERMISSION_ERROR
+            } else {
+                error_consts::ALL_KEYS_READ_PERMISSION_ERROR
+            }));
         }
 
         Ok(keys)
     }
 
+    /// How many visible series match every one of `selectors`; `0` when there are none.
     pub fn get_cardinality_by_selectors(
         &self,
         selectors: &[SeriesSelector],
     ) -> ValkeyResult<usize> {
-        if selectors.is_empty() {
-            return Ok(0);
-        }
-
-        let mut state = ();
-
-        self.with_postings(&mut state, move |inner, _state| {
-            let filter = &selectors[0];
-            let first = inner.postings_for_selector(filter)?;
-            if selectors.len() == 1 {
-                return Ok(first.cardinality() as usize);
-            }
-            let mut result = first.into_owned();
-            for selector in &selectors[1..] {
-                let postings = inner.postings_for_selector(selector)?;
-                result.and_inplace(&postings);
-            }
-
-            Ok(result.cardinality() as usize)
-        })
+        let inner = read_lock(&self.inner);
+        Ok(inner.postings_for_selectors(selectors)?.cardinality() as usize)
     }
 
     /// The series matching every one of `selectors` (AND-ed together), or `None` when `selectors`
@@ -403,7 +317,7 @@ impl TimeSeriesIndex {
     ///
     /// For statistics, `None` means "the whole index", while
     /// `Some(empty)` means "a filter was applied and nothing matched".
-    pub fn matching_postings(
+    fn matching_postings(
         &self,
         selectors: &[SeriesSelector],
     ) -> ValkeyResult<Option<PostingsBitmap>> {
@@ -414,20 +328,17 @@ impl TimeSeriesIndex {
         Ok(Some(inner.postings_for_selectors(selectors)?.into_owned()))
     }
 
-    /// Counts and distinct-label fingerprints from one scan with bounded postings-lock
-    /// holds and no module lock required. Both use the same filter and observed terms.
-    pub fn stats_and_label_bitmaps_by_selectors(
+    /// Every label-value pair the series matching `selectors` carry, with how many of them carry
+    /// each, from one scan with bounded postings-lock holds and no module lock required. A
+    /// fan-out shard's statistics: the coordinator sums these and ranks the totals, which a
+    /// shard's own top-N could not establish. Names and values come in index order.
+    pub fn label_census_by_selectors(
         &self,
         selectors: &[SeriesSelector],
-        label: &str,
-        limit: usize,
-    ) -> ValkeyResult<(PostingsStats, (Bitmap64, Bitmap64))> {
+    ) -> ValkeyResult<LabelCensus> {
         self.read_without_swap(|| {
             let matching = self.matching_postings(selectors)?;
-            let mut fingerprints = TermFingerprints::default();
-            let stats =
-                self.collect_stats(matching.as_ref(), label, limit, Some(&mut fingerprints));
-            Ok((stats, (fingerprints.names, fingerprints.pairs)))
+            Ok(self.collect_census(matching.as_ref()))
         })
     }
 
@@ -459,9 +370,10 @@ impl TimeSeriesIndex {
     /// Cardinality statistics over the whole index.
     ///
     /// `label` names the label whose values are broken out in `series_count_by_focus_label_value`
-    /// (the metric name when empty), and `limit` bounds the length of each top-N list.
-    pub fn stats(&self, label: &str, limit: usize) -> PostingsStats {
-        self.collect_stats(None, label, limit, None)
+    /// (the metric name when `Some("")`; the list is `None` when `label` is), and `limit` bounds
+    /// the length of each top-N list.
+    pub fn stats(&self, label: Option<&str>, limit: usize) -> ValkeyResult<PostingsStats> {
+        self.read_without_swap(|| Ok(self.collect_stats(None, label, limit)))
     }
 
     /// [`TimeSeriesIndex::stats`], restricted to the series matching `filters` (AND-ed together).
@@ -470,155 +382,123 @@ impl TimeSeriesIndex {
     /// `label_count` and `total_label_value_pairs` included — so a label carried only by
     /// non-matching series does not appear at all. An empty `filters` slice matches everything and
     /// is equivalent to [`TimeSeriesIndex::stats`].
+    #[cfg(test)]
     pub fn stats_filtered(
         &self,
         filters: &[LabelFilter],
-        label: &str,
+        label: Option<&str>,
         limit: usize,
     ) -> ValkeyResult<PostingsStats> {
         if filters.is_empty() {
-            return Ok(self.stats(label, limit));
+            return self.stats(label, limit);
         }
-
-        let matching = {
-            let inner = read_lock(&self.inner);
-            inner.postings_for_label_filters(filters)?.into_owned()
-        };
-
-        Ok(self.stats_restricted(Some(&matching), label, limit))
+        self.read_without_swap(|| {
+            let matching = {
+                let inner = read_lock(&self.inner);
+                inner.postings_for_label_filters(filters)?.into_owned()
+            };
+            Ok(self.collect_stats(Some(&matching), label, limit))
+        })
     }
 
-    /// [`TimeSeriesIndex::stats`], restricted to the series matching `selectors` (AND-ed together).
-    /// The selector-level counterpart of [`TimeSeriesIndex::stats_filtered`]; an empty `selectors`
-    /// slice matches everything.
+    /// [`TimeSeriesIndex::stats`], restricted to the series matching `selectors` (AND-ed
+    /// together); an empty `selectors` slice matches everything.
     pub fn stats_by_selectors(
         &self,
         selectors: &[SeriesSelector],
-        label: &str,
+        label: Option<&str>,
         limit: usize,
     ) -> ValkeyResult<PostingsStats> {
-        let matching = self.matching_postings(selectors)?;
-        Ok(self.stats_restricted(matching.as_ref(), label, limit))
+        self.read_without_swap(|| {
+            let matching = self.matching_postings(selectors)?;
+            Ok(self.collect_stats(matching.as_ref(), label, limit))
+        })
     }
 
-    /// [`TimeSeriesIndex::stats`] over a pre-resolved set of series — see
-    /// [`TimeSeriesIndex::matching_postings`]. Callers that need more than one statistic over the
-    /// same filter resolve the set once and pass it to each.
-    pub fn stats_restricted(
+    /// [`TimeSeriesIndex::stats`] over a pre-resolved set of series, without the swap check, so
+    /// tests can change the index between resolving the set and scanning.
+    #[cfg(test)]
+    fn stats_restricted(
         &self,
         matching: Option<&PostingsBitmap>,
-        label: &str,
+        label: Option<&str>,
         limit: usize,
     ) -> PostingsStats {
-        self.collect_stats(matching, label, limit, None)
+        self.collect_stats(matching, label, limit)
     }
 
     /// The shared body of the `stats` family. When `matching` is given, each posting list is
-    /// counted through its intersection with that set. Optional fingerprints are collected
-    /// alongside the counts so a fan-out reply cannot describe two different sets of terms.
+    /// counted through its intersection with that set.
     fn collect_stats(
         &self,
         matching: Option<&PostingsBitmap>,
-        label: &str,
+        focus_label: Option<&str>,
         limit: usize,
-        mut fingerprints: Option<&mut TermFingerprints>,
     ) -> PostingsStats {
+        let mut stats = StatsBuilder::new(focus_label, limit);
         if matching.is_some_and(PostingsBitmap::is_empty) {
             // A filter matched nothing, so there are no series, no labels and no label-value pairs
-            // to report. Still report the (empty) focus-label list, as the unfiltered path does.
-            return PostingsStats {
-                series_count_by_focus_label_value: Some(Vec::new()),
-                ..Default::default()
-            };
+            // to report. Still report the (empty) focus-label list when one was asked for.
+            return stats.finish(0);
         }
-        let mut per_label_counts: AHashMap<String, u64> = AHashMap::new();
+        let series_count = self.series_count_within(matching);
+        // Label names may not contain `=`, so a name's keys sit together in the byte-ordered
+        // label index, as the builder needs, and each `IndexKey` holds `name=value` already.
+        self.scan_label_pairs(matching, |name, value, key, count| {
+            stats.add(name, value, key.as_str(), count);
+        });
+        stats.finish(series_count)
+    }
 
-        let mut metric_name_counts = StatsMaxHeap::new(limit);
-        let mut label_name_counts = StatsMaxHeap::new(limit);
-        let mut label_value_pair_counts = StatsMaxHeap::new(limit);
-        let mut focus_label_value_counts = StatsMaxHeap::new(limit);
-
-        let series_count = match matching {
-            // `matching` may have been resolved under an earlier hold: `all_postings` holds what
-            // is visible now, so this also drops a series deleted since.
-            Some(matching) => read_lock(&self.inner)
-                .all_postings
-                .and_cardinality(matching),
-            None => {
-                let inner = read_lock(&self.inner);
-                inner.count() as u64
+    /// [`TimeSeriesIndex::label_census_by_selectors`] over a resolved set of series.
+    fn collect_census(&self, matching: Option<&PostingsBitmap>) -> LabelCensus {
+        if matching.is_some_and(PostingsBitmap::is_empty) {
+            return LabelCensus::default();
+        }
+        let series_count = self.series_count_within(matching);
+        let mut labels: Vec<LabelValues> = Vec::new();
+        self.scan_label_pairs(matching, |name, value, _, count| {
+            let entry = (value.to_owned(), count);
+            match labels.last_mut() {
+                Some(label) if label.name == name => label.values.push(entry),
+                _ => labels.push(LabelValues {
+                    name: name.to_owned(),
+                    values: vec![entry],
+                }),
             }
-        };
-
-        let mut total_label_value_pairs = 0usize;
-
-        // Normalize empty label to the metric-name label once.
-        let focus_label = if label.is_empty() {
-            METRIC_NAME_LABEL
-        } else {
-            label
-        };
-
-        const BATCH_SIZE: usize = 512;
-        let mut iterator = BatchIterator::restricted(self, BATCH_SIZE, matching);
-
-        while !iterator.is_complete() {
-            iterator.next_batch(|key, _, count| {
-                if let Some((name, value)) = key.split() {
-                    if let Some(fingerprints) = fingerprints.as_mut() {
-                        fingerprints.add(key, name);
-                    }
-                    match per_label_counts.get_mut(name) {
-                        Some(existing_count) => {
-                            *existing_count = existing_count.saturating_add(count);
-                        }
-                        _ => {
-                            let _ = per_label_counts.insert(name.to_string(), count);
-                        }
-                    }
-
-                    total_label_value_pairs += 1;
-
-                    let pair = format!("{name}={value}");
-                    label_value_pair_counts.push(PostingStat { name: pair, count });
-
-                    if name == METRIC_NAME_LABEL {
-                        metric_name_counts.push(PostingStat {
-                            name: value.to_string(),
-                            count,
-                        });
-                    }
-
-                    if name == focus_label {
-                        focus_label_value_counts.push(PostingStat {
-                            name: value.to_string(),
-                            count,
-                        });
-                    }
-                }
-                ControlFlow::Continue(())
-            })
-        }
-
-        let label_count = per_label_counts.len();
-
-        let series_count_by_focus_label_value = Some(focus_label_value_counts.into_vec());
-
-        for (name, count) in per_label_counts {
-            label_name_counts.push(PostingStat {
-                name: name.to_string(),
-                count,
-            });
-        }
-
-        PostingsStats {
-            series_count_by_metric_name: metric_name_counts.into_vec(),
-            series_count_by_label_name: label_name_counts.into_vec(),
-            series_count_by_label_value_pairs: label_value_pair_counts.into_vec(),
-            series_count_by_focus_label_value,
-            total_label_value_pairs,
-            label_count,
+        });
+        LabelCensus {
             series_count,
+            labels,
+        }
+    }
+
+    /// How many visible series `matching` holds, or the index when it is `None`. `matching` may
+    /// have been resolved under an earlier hold: `all_postings` holds what is visible now, so
+    /// this also drops a series deleted since.
+    fn series_count_within(&self, matching: Option<&PostingsBitmap>) -> u64 {
+        let inner = read_lock(&self.inner);
+        match matching {
+            Some(matching) => inner.all_postings.and_cardinality(matching),
+            None => inner.count() as u64,
+        }
+    }
+
+    /// Calls `visit(name, value, key, count)` for each label-index key, in key order, with the
+    /// number of visible series (within `matching`, when given) it holds; keys holding none are
+    /// skipped. Gives the postings lock back every [`STATS_BATCH_SIZE`] keys.
+    fn scan_label_pairs(
+        &self,
+        matching: Option<&PostingsBitmap>,
+        mut visit: impl FnMut(&str, &str, &IndexKey, u64),
+    ) {
+        let mut iterator = BatchIterator::new(self, STATS_BATCH_SIZE, matching);
+        while !iterator.is_complete() {
+            iterator.next_batch(|key, count| {
+                if let Some((name, value)) = key.split() {
+                    visit(name, value, key, count);
+                }
+            });
         }
     }
 
@@ -627,8 +507,10 @@ impl TimeSeriesIndex {
         inner.count()
     }
 
-    #[allow(dead_code)]
-    pub fn label_count(&self) -> usize {
+    /// Distinct `name=value` keys in the label index, including keys whose only ids are stale
+    /// and not yet swept.
+    #[cfg(test)]
+    pub fn pair_count(&self) -> usize {
         let inner = read_lock(&self.inner);
         inner.label_index.len()
     }
@@ -669,24 +551,6 @@ impl TimeSeriesIndex {
         inner.mark_ids_as_stale(ids)
     }
 
-    pub fn remove_stale_ids(&self) -> usize {
-        const BATCH_SIZE: usize = 100;
-
-        let mut inner = write_lock(&self.inner);
-        let old_count = inner.stale_ids.cardinality();
-        if old_count == 0 {
-            return 0; // No stale IDs to remove
-        }
-
-        let mut cursor = None;
-        while let Some(new_cursor) = inner.remove_stale_ids(cursor, BATCH_SIZE) {
-            // Continue removing stale IDs in batches
-            cursor = Some(new_cursor);
-        }
-
-        (old_count - inner.stale_ids.cardinality()) as usize // Return number of removed IDs
-    }
-
     pub fn optimize_incremental(
         &self,
         start_prefix: Option<IndexKey>,
@@ -697,14 +561,16 @@ impl TimeSeriesIndex {
     }
 
     /// Optimizes every posting list in one pass, taking the write lock for at most `hold_budget`
-    /// or `max_lists` lists at a time, whichever comes first, so queries and writes interleave.
-    /// Returns `false` if `should_stop` ended the pass early.
+    /// or `max_lists` lists at a time (at least one), whichever comes first, so queries and writes
+    /// interleave. Returns `false` if `should_stop` ended the pass early.
     pub fn optimize_all(
         &self,
         max_lists: usize,
         hold_budget: Duration,
         should_stop: impl Fn() -> bool,
     ) -> bool {
+        // A hold that may optimize no list would return the same cursor forever.
+        let max_lists = max_lists.max(1);
         let mut cursor = None;
         loop {
             if should_stop() {
@@ -723,11 +589,12 @@ impl TimeSeriesIndex {
     }
 }
 
-/// Helper struct for batch iteration over the label index
+/// Walks the label index in batches, one postings-lock hold per batch, reporting each key with
+/// the number of visible series it holds.
 struct BatchIterator<'a> {
     index: &'a TimeSeriesIndex,
     /// When set, posting lists are counted through their intersection with this set rather than
-    /// in full. See [`BatchIterator::restricted`].
+    /// in full. See [`BatchIterator::new`].
     matching: Option<&'a PostingsBitmap>,
     cursor: Option<IndexKey>,
     batch_size: usize,
@@ -735,10 +602,12 @@ struct BatchIterator<'a> {
 }
 
 impl<'a> BatchIterator<'a> {
-    /// An iterator reporting the size of each posting list within `matching` only. `matching` was
-    /// resolved under an earlier lock hold, so each hold applies the visibility current then: an
-    /// id may have been tombstoned or hidden since. Not a point-in-time view.
-    fn restricted(
+    /// With `matching`, each posting list is counted within that set only. It was resolved under
+    /// an earlier lock hold, and an id may have been tombstoned, hidden or removed since, or
+    /// published or revived after that. Each hold counts the ids of `matching` that are visible
+    /// as of then, leaving `matching` itself as it was: not a point-in-time view, but one whose
+    /// later holds are not narrowed by what an earlier hold could not see.
+    fn new(
         index: &'a TimeSeriesIndex,
         batch_size: usize,
         matching: Option<&'a PostingsBitmap>,
@@ -747,24 +616,27 @@ impl<'a> BatchIterator<'a> {
             index,
             matching,
             cursor: None,
-            batch_size,
+            batch_size: batch_size.max(1),
             is_finished: false,
         }
     }
 
-    fn next_batch<F>(&mut self, mut processor: F)
-    where
-        F: FnMut(&IndexKey, &PostingsBitmap, u64) -> ControlFlow<()>,
-    {
+    fn next_batch(&mut self, mut processor: impl FnMut(&IndexKey, u64)) {
         if self.is_finished {
             return;
         }
 
-        let mut processed_in_batch = 0usize;
-
         let inner = read_lock(&self.index.inner);
-        let matching = self.matching.map(|matching| inner.visible_subset(matching));
-        let mut cursor: Option<&IndexKey> = None;
+        // A removed series has left the label bitmaps too, so the set needs narrowing only to
+        // drop tombstoned and hidden ids, and only for this hold: either kind can become visible
+        // again before the next one.
+        let matching = self.matching.map(|matching| {
+            if inner.masks_any_ids() {
+                Cow::Owned(matching.and(&inner.all_postings))
+            } else {
+                Cow::Borrowed(matching)
+            }
+        });
 
         // Resume from the cursor key using an ordered range rather than a prefix scan (a full key
         // used as a prefix only matches itself and its extensions). The cursor key itself is
@@ -774,42 +646,33 @@ impl<'a> BatchIterator<'a> {
             None => (Bound::Unbounded, Bound::Unbounded),
         };
 
+        let mut processed = 0usize;
+        let mut last: Option<&IndexKey> = None;
         for (key, bitmap) in inner.label_index.range::<IndexKey, _>(range) {
-            // Skip the cursor key to ensure forward progress
-            if let Some(ref cursor_key) = self.cursor
-                && key == cursor_key
-            {
+            if self.cursor.as_ref() == Some(key) {
                 continue;
             }
-
-            processed_in_batch += 1;
-
-            let cardinality = match matching.as_deref() {
+            let count = match matching.as_deref() {
                 Some(matching) => bitmap.and_cardinality(matching),
                 None => inner.visible_cardinality(bitmap),
             };
-            if cardinality > 0
-                && let ControlFlow::Break(_) = processor(key, bitmap, cardinality)
-            {
-                self.is_finished = true;
-                return;
+            if count > 0 {
+                processor(key, count);
             }
-
-            cursor = Some(key);
-            if processed_in_batch >= self.batch_size {
+            processed += 1;
+            last = Some(key);
+            if processed == self.batch_size {
                 break;
             }
         }
 
-        if processed_in_batch == 0 || cursor.is_none() {
-            self.cursor = None; // Signal completion
+        // A batch that stops short of `batch_size` has reached the end of the index.
+        if processed < self.batch_size {
             self.is_finished = true;
-        } else if let Some(cursor) = cursor {
-            // Set the cursor to the last processed key to ensure we continue from there in the next batch
-            self.cursor = Some(cursor.clone());
+            self.cursor = None;
+        } else {
+            self.cursor = last.cloned();
         }
-
-        drop(inner);
     }
 
     fn is_complete(&self) -> bool {
@@ -820,6 +683,8 @@ impl<'a> BatchIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::series::index::PostingStat;
+    use ahash::AHashMap;
 
     /// Series 1 and 2 share both labels, and each has a key.
     fn two_series_two_labels() -> TimeSeriesIndex {
@@ -837,11 +702,24 @@ mod tests {
         index
     }
 
+    fn first_series_slots() -> range_set_blaze::RangeSetBlaze<u16> {
+        range_set_blaze::RangeSetBlaze::from_iter([crate::fanout::calculate_hash_slot(b"key1")])
+    }
+
     fn hide_first_series(index: &TimeSeriesIndex) {
-        let slot = crate::fanout::calculate_hash_slot(b"key1");
-        let slots = range_set_blaze::RangeSetBlaze::from_iter([slot]);
         assert_eq!(
-            index.get_postings_mut().hide_indexed_keys_in_slots(&slots),
+            index
+                .get_postings_mut()
+                .hide_indexed_keys_in_slots(&first_series_slots()),
+            1
+        );
+    }
+
+    fn publish_first_series(index: &TimeSeriesIndex) {
+        assert_eq!(
+            index
+                .get_postings_mut()
+                .publish_hidden_in_slots(&first_series_slots()),
             1
         );
     }
@@ -865,7 +743,7 @@ mod tests {
         let matching = matching_all(&index);
         hide_first_series(&index);
 
-        let stats = index.stats_restricted(Some(&matching), "a", 10);
+        let stats = index.stats_restricted(Some(&matching), Some("a"), 10);
         assert_eq!(stats.series_count, 1);
         assert_eq!(pair_count(&stats, "a=x"), 1);
     }
@@ -876,7 +754,7 @@ mod tests {
         let matching = matching_all(&index);
         index.mark_id_as_stale(1);
 
-        let stats = index.stats_restricted(Some(&matching), "a", 10);
+        let stats = index.stats_restricted(Some(&matching), Some("a"), 10);
         assert_eq!(stats.series_count, 1);
         assert_eq!(pair_count(&stats, "a=x"), 1);
     }
@@ -893,7 +771,7 @@ mod tests {
         ]);
         index.remove_timeseries(&removed);
 
-        let stats = index.stats_restricted(Some(&matching), "a", 10);
+        let stats = index.stats_restricted(Some(&matching), Some("a"), 10);
         assert_eq!(stats.series_count, 1);
     }
 
@@ -901,19 +779,54 @@ mod tests {
     fn a_restricted_scan_applies_visibility_at_each_lock_hold() {
         let index = two_series_two_labels();
         let matching = matching_all(&index);
-        let mut iterator = BatchIterator::restricted(&index, 1, Some(&matching));
+        let mut iterator = BatchIterator::new(&index, 1, Some(&matching));
 
         let mut counts = Vec::new();
-        iterator.next_batch(|_, _, count| {
-            counts.push(count);
-            ControlFlow::Continue(())
-        });
+        iterator.next_batch(|_, count| counts.push(count));
         hide_first_series(&index);
-        iterator.next_batch(|_, _, count| {
-            counts.push(count);
-            ControlFlow::Continue(())
-        });
+        iterator.next_batch(|_, count| counts.push(count));
         assert_eq!(counts, [2, 1], "the second hold sees the series hidden");
+    }
+
+    /// Visibility is applied per hold, not accumulated: a series an earlier hold saw hidden counts
+    /// again once its import publishes it.
+    #[test]
+    fn a_restricted_scan_counts_a_series_published_after_an_earlier_hold_hid_it() {
+        let index = two_series_two_labels();
+        let matching = matching_all(&index);
+        let mut iterator = BatchIterator::new(&index, 1, Some(&matching));
+
+        let mut counts = Vec::new();
+        hide_first_series(&index);
+        iterator.next_batch(|_, count| counts.push(count));
+        publish_first_series(&index);
+        iterator.next_batch(|_, count| counts.push(count));
+        assert_eq!(counts, [1, 2], "the second hold sees the series published");
+    }
+
+    /// Likewise for a stale mark that re-indexing the series revokes.
+    #[test]
+    fn a_restricted_scan_counts_a_series_revived_after_an_earlier_hold_saw_it_stale() {
+        let index = two_series_two_labels();
+        let matching = matching_all(&index);
+        let mut iterator = BatchIterator::new(&index, 1, Some(&matching));
+
+        let mut counts = Vec::new();
+        index.mark_id_as_stale(1);
+        iterator.next_batch(|_, count| counts.push(count));
+        let mut revived = TimeSeries::new();
+        revived.id = 1;
+        revived.labels = crate::labels::MetricName::new(&[
+            crate::labels::Label::new("a", "x"),
+            crate::labels::Label::new("b", "x"),
+        ]);
+        index.get_postings_mut().index_timeseries(&revived, b"key1");
+        iterator.next_batch(|_, count| counts.push(count));
+        assert_eq!(
+            counts,
+            [1, 2],
+            "the second hold sees the series alive again"
+        );
     }
 
     fn index_with_posting(id: SeriesRef, label: &str, value: &str) -> TimeSeriesIndex {
@@ -928,8 +841,10 @@ mod tests {
         index
     }
 
+    /// The census a shard ships and the stats a standalone read ranks see the same series and
+    /// terms: both apply the filter and leave out tombstoned ids.
     #[test]
-    fn stats_and_fingerprints_share_the_filter_and_stale_id_mask() {
+    fn census_and_stats_share_the_filter_and_stale_id_mask() {
         let index = index_with_posting(1, "host", "a");
         {
             let mut postings = index.get_postings_mut();
@@ -952,8 +867,8 @@ mod tests {
                 .map(|s| SeriesSelector::parse(s).unwrap())
                 .into_iter()
                 .collect();
-            let (stats, (names, pairs)) = index
-                .stats_and_label_bitmaps_by_selectors(&selectors, "host", 10)
+            let stats = index
+                .stats_by_selectors(&selectors, Some("host"), 10)
                 .unwrap();
             assert_eq!(
                 (
@@ -963,9 +878,26 @@ mod tests {
                 ),
                 expected
             );
-            assert_eq!(names.cardinality(), stats.label_count as u64);
-            assert_eq!(pairs.cardinality(), stats.total_label_value_pairs as u64);
+            let census = index.label_census_by_selectors(&selectors).unwrap();
+            let pairs: usize = census.labels.iter().map(|label| label.values.len()).sum();
+            assert_eq!((census.series_count, census.labels.len(), pairs), expected);
         }
+
+        let census = index
+            .label_census_by_selectors(&[SeriesSelector::parse("scope=yes").unwrap()])
+            .unwrap();
+        let census: Vec<_> = census
+            .labels
+            .iter()
+            .map(|label| (label.name.as_str(), label.values.clone()))
+            .collect();
+        assert_eq!(
+            census,
+            [
+                ("host", vec![("a".to_string(), 1)]),
+                ("scope", vec![("yes".to_string(), 1)]),
+            ]
+        );
     }
 
     #[test]
@@ -975,7 +907,7 @@ mod tests {
         let mut attempts = 0;
         let stats = index
             .read_without_swap(|| {
-                let stats = index.stats("host", 10);
+                let stats = index.stats(Some("host"), 10)?;
                 attempts += 1;
                 if attempts == 1 {
                     index.swap(&other);
@@ -1006,6 +938,160 @@ mod tests {
             panic!("expected the swapped-database error, got {result:?}");
         };
         assert_eq!(message, error_consts::DATABASE_SWAPPED_DURING_READ);
+    }
+
+    fn names_and_counts(stats: &[PostingStat]) -> Vec<(String, u64)> {
+        stats
+            .iter()
+            .map(|stat| (stat.name.clone(), stat.count))
+            .collect()
+    }
+
+    /// Label names chosen so their `name=` key prefixes sort differently from the names
+    /// themselves (`a.b=` < `a=` < `ab=` as bytes, `a` < `a.b` < `ab` as strings), and one
+    /// name with more values than a scan batch holds, so its run spans several holds.
+    fn label_name_fixture() -> (TimeSeriesIndex, AHashMap<String, u64>) {
+        let index = TimeSeriesIndex::new();
+        let mut expected: AHashMap<String, u64> = AHashMap::new();
+        {
+            let mut postings = index.get_postings_mut();
+            for id in 1..=1200u64 {
+                let mut labels = vec![
+                    ("__name__".to_string(), format!("m{}", id % 7)),
+                    ("wide".to_string(), format!("v{id}")),
+                ];
+                if id % 2 == 0 {
+                    labels.push(("a".to_string(), format!("{}", id % 5)));
+                }
+                if id % 3 == 0 {
+                    labels.push(("a.b".to_string(), format!("{}", id % 4)));
+                }
+                if id % 5 == 0 {
+                    labels.push(("ab".to_string(), "x".to_string()));
+                }
+                for (name, value) in labels {
+                    postings.add_posting_for_label_value(id, &name, &value);
+                    *expected.entry(name).or_default() += 1;
+                }
+                postings
+                    .id_to_key
+                    .insert(id, format!("key{id}").into_bytes().into_boxed_slice());
+            }
+        }
+        (index, expected)
+    }
+
+    #[test]
+    fn label_name_counts_sum_each_run_across_batches() {
+        let (index, expected) = label_name_fixture();
+        let stats = index.stats(None, usize::MAX).unwrap();
+
+        let mut model: Vec<(String, u64)> = expected.into_iter().collect();
+        model.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        assert_eq!(names_and_counts(&stats.series_count_by_label_name), model);
+        assert_eq!(stats.label_count, model.len());
+        assert_eq!(stats.series_count, 1200);
+
+        // A smaller limit keeps a prefix of the full ranking.
+        let top = index.stats(None, 3).unwrap();
+        assert_eq!(
+            names_and_counts(&top.series_count_by_label_name),
+            model[..3]
+        );
+    }
+
+    /// A name whose values span several scan batches is still one census entry.
+    #[test]
+    fn census_lists_each_name_once_across_batches() {
+        let (index, expected) = label_name_fixture();
+        let census = index.label_census_by_selectors(&[]).unwrap();
+        assert_eq!(census.series_count, 1200);
+
+        let mut names = AHashMap::new();
+        for label in &census.labels {
+            let series: u64 = label.values.iter().map(|(_, count)| count).sum();
+            assert!(
+                names.insert(label.name.clone(), series).is_none(),
+                "{} listed twice",
+                label.name
+            );
+        }
+        assert_eq!(names, expected);
+        assert_eq!(
+            census
+                .labels
+                .iter()
+                .find(|l| l.name == "wide")
+                .unwrap()
+                .values
+                .len(),
+            1200
+        );
+    }
+
+    #[test]
+    fn focus_list_follows_the_label_argument() {
+        let (index, _) = label_name_fixture();
+
+        let without = index.stats(None, 5).unwrap();
+        assert!(without.series_count_by_focus_label_value.is_none());
+
+        let metric = index.stats(Some(""), 5).unwrap();
+        assert_eq!(
+            metric.series_count_by_focus_label_value.as_deref(),
+            Some(metric.series_count_by_metric_name.as_slice())
+        );
+        assert_eq!(metric.series_count_by_metric_name.len(), 5);
+
+        let ab = index.stats(Some("a.b"), 10).unwrap();
+        assert_eq!(
+            names_and_counts(&ab.series_count_by_focus_label_value.unwrap()),
+            [
+                ("0".to_string(), 100),
+                ("1".to_string(), 100),
+                ("2".to_string(), 100),
+                ("3".to_string(), 100)
+            ]
+        );
+
+        let missing = index.stats(Some("missing"), 10).unwrap();
+        assert_eq!(missing.series_count_by_focus_label_value, Some(Vec::new()));
+
+        let none_matched = index
+            .stats_by_selectors(&[SeriesSelector::parse("ab=nope").unwrap()], None, 10)
+            .unwrap();
+        assert!(none_matched.series_count_by_focus_label_value.is_none());
+        assert_eq!(none_matched.series_count, 0);
+    }
+
+    #[test]
+    fn a_batch_iterator_finishes_on_a_short_batch() {
+        let index = two_series_two_labels();
+        let mut iterator = BatchIterator::new(&index, 3, None);
+        let mut keys = Vec::new();
+        iterator.next_batch(|key, _| keys.push(key.as_str().to_owned()));
+        assert!(iterator.is_complete(), "two keys fit in one batch of three");
+        assert_eq!(keys, ["a=x", "b=x"]);
+
+        let mut iterator = BatchIterator::new(&index, 0, None);
+        let mut batches = 0;
+        while !iterator.is_complete() {
+            iterator.next_batch(|_, _| {});
+            batches += 1;
+            assert!(batches <= 3, "a zero batch size still makes progress");
+        }
+    }
+
+    #[test]
+    fn optimize_all_with_a_zero_list_budget_still_finishes() {
+        let index = two_series_two_labels();
+        let holds = std::cell::Cell::new(0);
+        let finished = index.optimize_all(0, Duration::from_secs(1), || {
+            holds.set(holds.get() + 1);
+            assert!(holds.get() <= 10, "the pass made no progress");
+            false
+        });
+        assert!(finished);
     }
 
     #[test]

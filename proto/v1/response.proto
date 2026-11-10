@@ -89,18 +89,24 @@ message LabelSearchResponse {
   bool has_more = 2;
 }
 
+// How many of a shard's matching series carry one value of a label.
+message ValueCount {
+  string value = 1;
+  uint64 count = 2;
+}
+
+// One label name's values among a shard's matching series.
+message LabelValueCounts {
+  string name = 1;
+  repeated ValueCount values = 2;
+}
+
+// A shard's whole label census, untruncated: the coordinator sums the counts
+// across shards and derives every section of TS.LABELSTATS from the result, so
+// LIMIT applies to global counts and distinct totals are exact.
 message StatsResponse {
   uint64 series_count = 1;
-  repeated PostingStat series_count_by_metric_name = 2;
-  repeated PostingStat series_count_by_label_name = 3;
-  repeated PostingStat series_count_by_label_value_pairs = 4;
-  repeated PostingStat series_count_by_focus_label_value = 5;
-  // Serialized roaring bitmaps of label-name and label/value-pair ids. The
-  // coordinator unions these across shards so that distinct counts are not
-  // double-counted for series that several shards know about. Populated by the
-  // fanout handler, not by `From<PostingsStats>`.
-  bytes labels_bitmap = 6;
-  bytes label_value_pairs_bitmap = 7;
+  repeated LabelValueCounts labels = 2;
 }
 // One bucket of a node's interning pool. `key` is the bucket's grouping value —
 // the external reference count or the string length — and is unused for the

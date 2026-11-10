@@ -4,9 +4,8 @@ use super::generated::{
     AggregatorConfig as FanoutAggregatorConfig, BucketAlignmentType, BucketTimestampType,
     ComparisonOperator as FanoutComparisonOperator, CompressionType as FanoutChunkEncoding,
     DateRange, GroupPartialSeries, GroupingOptions as FanoutGroupingOptions, Label as FanoutLabel,
-    MetaDateRangeFilter as FanoutMetaDateRangeFilter, MultiRangeRequest,
-    PostingStat as FanoutPostingStat, RangeRequest, ReducePartialState, Sample as FanoutSample,
-    SeriesSelector as FanoutSeriesSelector, StatsResponse,
+    MetaDateRangeFilter as FanoutMetaDateRangeFilter, MultiRangeRequest, RangeRequest,
+    ReducePartialState, Sample as FanoutSample, SeriesSelector as FanoutSeriesSelector,
     TimestampFilter as FanoutTimestampFilter, ValueComparisonFilter as FanoutValueComparisonFilter,
     ValueRange as FanoutValueFilter,
 };
@@ -24,11 +23,7 @@ use crate::series::request_types::{
     RangeOptions, ValueComparisonFilter,
 };
 use crate::series::{TimestampRange, ValueFilter};
-use crate::{
-    aggregators::BucketTimestamp,
-    error_consts,
-    series::index::{PostingStat, PostingsStats},
-};
+use crate::{aggregators::BucketTimestamp, error_consts};
 use smallvec::SmallVec;
 use valkey_module::{ValkeyError, ValkeyResult, ValkeyValue};
 
@@ -113,95 +108,6 @@ impl TryFrom<DateRange> for TimestampRange {
     /// peer, so an inverted range is a message to refuse, not an invariant.
     fn try_from(value: DateRange) -> Result<Self, Self::Error> {
         TimestampRange::from_timestamps(value.start, value.end)
-    }
-}
-
-impl From<FanoutPostingStat> for PostingStat {
-    fn from(value: FanoutPostingStat) -> Self {
-        PostingStat {
-            name: value.name,
-            count: value.count,
-        }
-    }
-}
-
-impl From<PostingStat> for FanoutPostingStat {
-    fn from(value: PostingStat) -> Self {
-        FanoutPostingStat {
-            name: value.name,
-            count: value.count,
-        }
-    }
-}
-
-impl From<PostingsStats> for StatsResponse {
-    fn from(value: PostingsStats) -> Self {
-        StatsResponse {
-            series_count_by_metric_name: value
-                .series_count_by_metric_name
-                .into_iter()
-                .map(|s| s.into())
-                .collect(),
-            series_count_by_label_name: value
-                .series_count_by_label_name
-                .into_iter()
-                .map(|s| s.into())
-                .collect(),
-            series_count_by_label_value_pairs: value
-                .series_count_by_label_value_pairs
-                .into_iter()
-                .map(|s| s.into())
-                .collect(),
-            series_count_by_focus_label_value: value
-                .series_count_by_focus_label_value
-                .map(|v| v.into_iter().map(|s| s.into()).collect())
-                .unwrap_or_default(),
-            series_count: value.series_count,
-            // Left empty here on purpose: `PostingsStats` does not carry the
-            // bitmaps. `LabelStatsFanoutCommand::get_local_response` fills both
-            // in from the combined postings scan right after this conversion,
-            // and the coordinator unions them across shards to avoid
-            // double-counting. They are live wire fields, not vestigial ones.
-            labels_bitmap: vec![],
-            label_value_pairs_bitmap: vec![],
-        }
-    }
-}
-
-impl From<StatsResponse> for PostingsStats {
-    fn from(value: StatsResponse) -> Self {
-        let focused = if value.series_count_by_focus_label_value.is_empty() {
-            None
-        } else {
-            Some(
-                value
-                    .series_count_by_focus_label_value
-                    .into_iter()
-                    .map(|s| s.into())
-                    .collect(),
-            )
-        };
-        PostingsStats {
-            series_count_by_metric_name: value
-                .series_count_by_metric_name
-                .into_iter()
-                .map(|s| s.into())
-                .collect(),
-            series_count_by_label_name: value
-                .series_count_by_label_name
-                .into_iter()
-                .map(|s| s.into())
-                .collect(),
-            series_count_by_label_value_pairs: value
-                .series_count_by_label_value_pairs
-                .into_iter()
-                .map(|s| s.into())
-                .collect(),
-            series_count_by_focus_label_value: focused,
-            total_label_value_pairs: 0,
-            label_count: 0,
-            series_count: value.series_count,
-        }
     }
 }
 

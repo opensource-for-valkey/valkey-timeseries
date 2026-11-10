@@ -45,16 +45,11 @@ pub fn ts_labelstats_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
     }
 
     let index = get_timeseries_index(ctx);
-    let selected_label = options.label.as_deref().unwrap_or("");
-    let mut stats = index.stats_by_selectors(&options.filters, selected_label, options.limit)?;
-    if options.label.is_none() {
-        // `seriesCountByFocusLabelValue` is reported only when a focus label was asked for. The
-        // index defaults the focus to the metric name, which without `LABEL` would just repeat
-        // `seriesCountByMetricName`; the cluster path drops it for the same reason, and the two
-        // replies have to have the same shape. `LABEL ""` still counts as asking, and still
-        // focuses on the metric name.
-        stats.series_count_by_focus_label_value = None;
-    }
+    // `seriesCountByFocusLabelValue` is reported only when a focus label was asked for: without
+    // `LABEL` the index skips it. `LABEL ""` still counts as asking, and focuses on the metric
+    // name.
+    let stats =
+        index.stats_by_selectors(&options.filters, options.label.as_deref(), options.limit)?;
     let reply_ctx = ReplyContext::new(ctx.ctx);
 
     reply_with_postings_stats(&reply_ctx, &stats);

@@ -38,11 +38,6 @@ impl StaleSet {
         self.ids.is_empty()
     }
 
-    #[inline]
-    pub(in crate::series::index) fn cardinality(&self) -> u64 {
-        self.ids.cardinality()
-    }
-
     /// Bytes the tombstone bitmap's roaring containers occupy.
     #[inline]
     pub(in crate::series::index) fn heap_size(&self) -> usize {

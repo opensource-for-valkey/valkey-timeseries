@@ -360,6 +360,43 @@ class TestTsStats(ValkeyTimeSeriesTestCaseBase):
         for i in range(len(pair_counts) - 1):
             assert pair_counts[i] >= pair_counts[i + 1]
 
+    def test_stats_lists_are_ranked_by_count_then_name(self):
+        """Every list is ordered by series count, highest first, ties by ascending name, with
+        names chosen so that index (lexicographic) order disagrees with count order. A LIMIT
+        that cuts through a tie keeps the smallest names."""
+        counts = {'aaa': 1, 'mmm': 3, 'zzz': 6, 'bbb': 3, 'ccc': 3}
+        n = 0
+        for label, count in counts.items():
+            for _ in range(count):
+                self.client.execute_command('TS.CREATE', f'rank:{n}', 'LABELS', '__name__', label,
+                                            label, '1', 'k', label, 'id', str(n))
+                n += 1
+
+        def ranked(entries):
+            out = []
+            for entry in entries:
+                name, count = next(iter(entry.items())) if isinstance(entry, dict) else entry
+                out.append((name.decode() if isinstance(name, bytes) else name, int(count)))
+            return out
+
+        expected = [('zzz', 6), ('bbb', 3), ('ccc', 3), ('mmm', 3), ('aaa', 1)]
+        stats = self.get_stats(label='k')
+        assert ranked(stats['seriesCountByMetricName']) == expected
+        assert ranked(stats['seriesCountByFocusLabelValue']) == expected
+        assert ranked(stats['seriesCountByLabelValuePair'])[:3] == [
+            ('__name__=zzz', 6), ('k=zzz', 6), ('zzz=1', 6)]
+        assert ranked(stats['labelValueCountByLabelName'])[:4] == [
+            ('__name__', 16), ('id', 16), ('k', 16), ('zzz', 6)]
+
+        stats = self.get_stats(limit=3, label='k')
+        assert ranked(stats['seriesCountByMetricName']) == expected[:3]
+        assert ranked(stats['labelValueCountByLabelName']) == [
+            ('__name__', 16), ('id', 16), ('k', 16)]
+
+        stats = self.get_stats(limit=5)
+        assert ranked(stats['seriesCountByLabelValuePair']) == [
+            ('__name__=zzz', 6), ('k=zzz', 6), ('zzz=1', 6), ('__name__=bbb', 3), ('__name__=ccc', 3)]
+
     def test_stats_with_maximum_limit(self):
         """Test TS.LABELSTATS with maximum allowed limit"""
         # Create many series
