@@ -307,9 +307,10 @@ impl FanoutClientCommand for MRangeFanoutCommand {
         }
     }
 
-    // `reply` only merges the shard responses and writes them.
+    // `reply` only merges the shard responses and writes them, so it may run on the reply
+    // lane; a small one stays on the main thread, where it costs less than the hand-off.
     fn should_reply_off_main_thread(&self) -> bool {
-        true
+        self.reply_work() >= REPLY_INLINE_BUDGET
     }
 
     fn reply(&mut self, ctx: &ReplyContext) -> Status {
@@ -341,7 +342,54 @@ impl FanoutClientCommand for MRangeFanoutCommand {
     }
 }
 
+/// Reply work, in the sample-sized units of [`MRangeFanoutCommand::reply_work`], below
+/// which [`MRangeFanoutCommand::reply`] runs on the main thread. A sample costs the reply
+/// about 100 ns, so this holds the main thread for about 16 µs, less than the hand-off to
+/// the reply lane costs. Measured on 1 and 3 primaries: up to about 130 units, replying
+/// in place took 5–25 % less CPU per command and left throughput and other clients'
+/// latency alone; at 220–250 units, 8 connections saw the median latency rise 8–14 %;
+/// from about 400, throughput fell 4–13 % and other clients stalled.
+const REPLY_INLINE_BUDGET: usize = 160;
+
+/// What a series or group costs the reply beyond its samples: name, reply framing, sort.
+const REPLY_PER_ENTRY_WORK: usize = 12;
+
+/// What a partial bucket costs: merging the shards' states and reducing them, about four
+/// times writing a sample.
+const REPLY_PARTIAL_BUCKET_WORK: usize = 4;
+
 impl MRangeFanoutCommand {
+    /// What [`Self::reply`] has to merge and write, in sample-sized units: every sample
+    /// and partial bucket the shards sent, plus a share per series or group and per label.
+    /// Sized by what came in, not what goes out, since a GROUPBY or a coordinator-side
+    /// aggregation costs what it reads. A compressed column counts as its upper bound
+    /// ([`column_samples`]), which errs towards the reply lane.
+    fn reply_work(&self) -> usize {
+        let wire_entries: usize = self
+            .series
+            .iter()
+            .map(|(series, _)| REPLY_PER_ENTRY_WORK + series.labels.len())
+            .sum();
+        let local_entries: usize = self
+            .local_series
+            .iter()
+            .map(|series| REPLY_PER_ENTRY_WORK + series.labels.len())
+            .sum();
+        let partials: usize = self
+            .group_partials
+            .iter()
+            .map(|p| {
+                let buckets = p.bucket_timestamps.len() * (p.column_count as usize).max(1);
+                REPLY_PER_ENTRY_WORK + buckets * REPLY_PARTIAL_BUCKET_WORK
+            })
+            .sum();
+        shard_payload_work(&self.series)
+            + local_series_work(&self.local_series)
+            + wire_entries
+            + local_entries
+            + partials
+    }
+
     /// Resolve symbol-table label refs (if the shard used them) and fold the
     /// response into accumulated state. Split out from `on_response` so it can
     /// be driven directly in tests without constructing a `NodeInfo`.
@@ -1124,6 +1172,72 @@ mod tests {
             response_work(&compressed),
             compressed.columns[0].data.len() / 4
         );
+    }
+
+    /// The reply is written on the main thread only while merging and writing it costs
+    /// less than handing it to the reply lane, whichever kind of share it came from.
+    #[test]
+    fn test_only_small_replies_stay_on_the_main_thread() {
+        let run = |n: i64| -> Vec<Sample> {
+            (0..n)
+                .map(|i| Sample {
+                    timestamp: i * 1000,
+                    value: i as f64,
+                })
+                .collect()
+        };
+        let command = |series: usize, per_series: i64, local: bool| {
+            let mut command = MRangeFanoutCommand::new(mrange_options(0, 1_000_000));
+            let results: Vec<MRangeSeriesResult> = (0..series)
+                .map(|i| series_result(&format!("k{i}"), None, run(per_series)))
+                .collect();
+            if local {
+                command.ingest_local(results);
+            } else {
+                let responses = results.into_iter().map(|r| (to_response(r), false));
+                command.series.extend(responses);
+            }
+            command
+        };
+
+        assert!(!MRangeFanoutCommand::default().should_reply_off_main_thread());
+        for local in [true, false] {
+            assert_eq!(
+                command(4, 16, local).reply_work(),
+                4 * (16 + REPLY_PER_ENTRY_WORK)
+            );
+            assert!(!command(1, 1, local).should_reply_off_main_thread());
+            assert!(!command(4, 16, local).should_reply_off_main_thread());
+            // Many samples, however they are spread, and many series, however short.
+            assert!(command(10, 10, local).should_reply_off_main_thread());
+            assert!(command(1, 1000, local).should_reply_off_main_thread());
+            assert!(command(100, 1, local).should_reply_off_main_thread());
+        }
+
+        // Labels are written too.
+        let labels = [("a", "1"), ("b", "2"), ("c", "3")];
+        let mut labelled = MRangeFanoutCommand::default();
+        labelled.ingest_local(vec![series_result_with_labels("k", run(16), &labels)]);
+        assert_eq!(labelled.reply_work(), 16 + REPLY_PER_ENTRY_WORK + 3);
+
+        // A partial bucket is merged and reduced, which costs more than writing a sample.
+        let partials = |groups: usize, buckets: i64| MRangeFanoutCommand {
+            group_partials: (0..groups)
+                .map(|g| GroupPartialSeries {
+                    group_label_value: format!("g{g}"),
+                    bucket_timestamps: (0..buckets).collect(),
+                    column_count: 1,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            partials(2, 10).reply_work(),
+            2 * (REPLY_PER_ENTRY_WORK + 10 * REPLY_PARTIAL_BUCKET_WORK)
+        );
+        assert!(!partials(2, 10).should_reply_off_main_thread());
+        assert!(partials(10, 10).should_reply_off_main_thread());
     }
 
     fn series_result_with_labels(
