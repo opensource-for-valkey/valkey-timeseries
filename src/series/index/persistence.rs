@@ -152,14 +152,17 @@ fn deserialize_postings_section(
 /// Serializes every non-empty db index into a single payload buffer, or `None` if there is no
 /// series to persist. Fails if any db's postings lock is contended (possible fork-time writer:
 /// skip persisting entirely rather than risk deadlock or write a torn snapshot).
+///
+/// Every lock is taken, and the empty dbs dropped, before anything is written, so the section
+/// count is known up front and each section is serialized straight into the one buffer. In the
+/// BGSAVE child all of it is fresh allocation; staging the sections and copying them behind the
+/// header held the payload two to three times over.
 fn build_aux_payload() -> PayloadResult<Option<Vec<u8>>> {
     let map = TIMESERIES_INDEX.pin();
     let mut dbs: Vec<i32> = map.keys().copied().collect();
     dbs.sort_unstable();
 
-    let mut sections: Vec<u8> = Vec::new();
-    let mut section_count: u64 = 0;
-
+    let mut locked = Vec::with_capacity(dbs.len());
     for db in dbs {
         let Some(index) = map.get(&db) else {
             continue;
@@ -174,19 +177,20 @@ fn build_aux_payload() -> PayloadResult<Option<Vec<u8>>> {
         if postings.id_to_key.is_empty() {
             continue;
         }
-        serialize_postings_section(&mut sections, db, &postings);
-        section_count += 1;
+        locked.push((db, postings));
     }
 
-    if section_count == 0 {
+    if locked.is_empty() {
         return Ok(None);
     }
 
-    let mut buf = Vec::with_capacity(sections.len() + 16);
+    let mut buf = Vec::new();
     buf.extend_from_slice(INDEX_AUX_MAGIC);
     write_u8(&mut buf, INDEX_AUX_VERSION);
-    write_uvarint(&mut buf, section_count);
-    buf.extend_from_slice(&sections);
+    write_uvarint(&mut buf, locked.len() as u64);
+    for (db, postings) in &locked {
+        serialize_postings_section(&mut buf, *db, postings);
+    }
     Ok(Some(buf))
 }
 

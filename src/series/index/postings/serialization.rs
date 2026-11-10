@@ -189,6 +189,19 @@ pub(in crate::series::index) fn read_bitmap(buf: &mut &[u8]) -> DecodeResult<Pos
         .ok_or_else(|| "corrupt roaring bitmap blob".to_string())
 }
 
+/// Splits a label key *after* its first `=`, so that `prefix + suffix` reproduces the key byte for
+/// byte, whatever it contains — a value with an `=` in it, or a key with none at all. Nothing here
+/// has to agree with `IndexKey::for_label_value` about where the name ends.
+fn split_label_key(key: &IndexKey) -> (&[u8], &[u8]) {
+    // `as_str` strips the NUL sentinel; `IndexKey::from(&[u8])` re-appends it on load.
+    let full = key.as_str().as_bytes();
+    let split_at = full
+        .iter()
+        .position(|b| *b == b'=')
+        .map_or(full.len(), |i| i + 1);
+    full.split_at(split_at)
+}
+
 /// Appends the encoded index body to `buf`.
 ///
 /// Stale ids are subtracted here rather than persisted: `mark_ids_as_stale` already cleans
@@ -198,8 +211,8 @@ pub(in crate::series::index) fn read_bitmap(buf: &mut &[u8]) -> DecodeResult<Pos
 /// in the RDB (a fork can land mid-ASM-export, before the engine's lazy delete) is resurrected
 /// by the post-load count-verification scan, matching the keyspace either way. The subtraction
 /// only costs anything when `stale_ids` is non-empty (rare: the cron GC drains continuously);
-/// entries that become empty are dropped, so each group's count is written only once its
-/// entries have been serialized.
+/// entries that become empty are dropped, so the group directory is built in a first pass over
+/// the label index and the entries are written straight into `buf` by a second.
 pub(in crate::series::index) fn serialize(buf: &mut Vec<u8>, postings: &Postings) {
     write_u8(buf, BODY_VERSION);
 
@@ -216,31 +229,22 @@ pub(in crate::series::index) fn serialize(buf: &mut Vec<u8>, postings: &Postings
     // and no other group's prefix can fall between them (a prefix never contains `=` except as
     // its last byte, so no prefix is a prefix of another).
     let stale: &StaleSet = &postings.stale_ids;
-    // Group directory: (prefix, entry count) pairs, one per distinct label name.
+    // The entries both passes write, decided without masking so the first pass copies nothing:
+    // an entry survives iff stale masking leaves its bitmap non-empty.
+    let live_entries = || {
+        postings.label_index.iter().filter(|(_, bitmap)| {
+            !bitmap.is_empty()
+                && (stale.is_empty() || bitmap.cardinality() > stale.stale_count_in(bitmap))
+        })
+    };
+
+    // Pass 1, the group directory: (prefix, entry count) pairs, one per distinct label name.
+    // Small — one per label name, not per value — so it is staged and then copied.
     let mut groups: Vec<u8> = Vec::new();
     let mut group_count: u64 = 0;
-    let mut entries: Vec<u8> = Vec::new();
     let mut open_group: Option<(&[u8], u64)> = None;
-    for (key, bitmap) in postings.label_index.iter() {
-        if bitmap.is_empty() {
-            continue;
-        }
-
-        let cleaned: Cow<PostingsBitmap> = stale.mask_cow(Cow::Borrowed(bitmap));
-        if cleaned.is_empty() {
-            continue;
-        }
-        // `as_str` strips the NUL sentinel; `IndexKey::from(&[u8])` re-appends it on load.
-        let full = key.as_str().as_bytes();
-        // Split *after* the first `=` so that `prefix + suffix` reproduces the key byte for
-        // byte, whatever it contains — a value with an `=` in it, or a key with none at all.
-        // Nothing here has to agree with `IndexKey::for_label_value` about where the name ends.
-        let split_at = full
-            .iter()
-            .position(|b| *b == b'=')
-            .map_or(full.len(), |i| i + 1);
-        let (prefix, suffix) = full.split_at(split_at);
-
+    for (key, _) in live_entries() {
+        let (prefix, _) = split_label_key(key);
         match open_group {
             Some((open, ref mut count)) if open == prefix => *count += 1,
             _ => {
@@ -252,18 +256,24 @@ pub(in crate::series::index) fn serialize(buf: &mut Vec<u8>, postings: &Postings
                 open_group = Some((prefix, 1));
             }
         }
-        write_byte_slice(&mut entries, suffix);
-        write_bitmap(&mut entries, &cleaned);
     }
     if let Some((open, count)) = open_group {
         write_byte_slice(&mut groups, open);
         write_uvarint(&mut groups, count);
         group_count += 1;
     }
-
     write_uvarint(buf, group_count);
     buf.extend_from_slice(&groups);
-    buf.extend_from_slice(&entries);
+    drop(groups);
+
+    // Pass 2, the entries, in the same order, written in place.
+    for (key, bitmap) in live_entries() {
+        let (_, suffix) = split_label_key(key);
+        let cleaned: Cow<PostingsBitmap> = stale.mask_cow(Cow::Borrowed(bitmap));
+        debug_assert!(!cleaned.is_empty(), "pass 1 counted an entry pass 2 drops");
+        write_byte_slice(buf, suffix);
+        write_bitmap(buf, &cleaned);
+    }
 
     // id_to_key in ascending id order: ids share their high epoch bits and increment densely,
     // so varint deltas stay small.
@@ -967,6 +977,33 @@ mod tests {
             assert_eq!(ka, kb);
             assert_eq!(va, vb);
         }
+    }
+
+    /// The group directory and the entries are written by separate passes, which must agree on
+    /// which entries stale masking empties — including one in the middle of a group, and a group
+    /// that empties entirely.
+    #[test]
+    fn stale_emptied_entries_drop_out_of_their_group() {
+        let mut postings = Postings::default();
+        for (id, value) in [(1, "a"), (2, "b"), (3, "c")] {
+            postings.add_posting_for_label_value(id, "job", value);
+            postings.set_timeseries_key(id, format!("ts:{id}").as_bytes());
+        }
+        postings.add_posting_for_label_value(2, "only", "two");
+        postings.mark_id_as_stale(2);
+
+        let mut buf = Vec::new();
+        serialize(&mut buf, &postings);
+        let mut slice = buf.as_slice();
+        let loaded = deserialize_standalone(&mut slice).expect("body should round-trip");
+
+        assert!(slice.is_empty(), "decoder must consume exactly the body");
+        let keys: Vec<String> = loaded
+            .label_index
+            .iter()
+            .map(|(k, _)| k.as_str().to_string())
+            .collect();
+        assert_eq!(keys, ["job=a", "job=c"]);
     }
 
     #[test]
