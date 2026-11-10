@@ -440,12 +440,15 @@ fn estimated_samples_in_range(series: &TimeSeries, start: Timestamp, end: Timest
         .clamp(1, series.total_samples.max(1))
 }
 
-/// Sample-equivalents charged per series on top of its samples: iterator setup,
-/// chunk lookup, result and label construction cost about as much as decoding
-/// this many samples (a ten-series MRANGE over 100 samples each measured ~80 µs
-/// per series), so a handful of series with short windows is still worth
-/// spreading across the pool.
-const PER_SERIES_WORK: usize = 1024;
+/// Sample-equivalents charged per series on top of its samples, for deciding whether a
+/// request's decode is worth dispatching to the pool: iterator setup, chunk lookup, result
+/// and label construction. Measured at 0.3–0.6 µs a series against ~15 ns a decoded sample.
+///
+/// This was 1024, from a figure that counted everything a series costs the main thread
+/// (opening the key, the reply), most of which is outside the parallel section. It sent any
+/// four series to the pool, where sixteen series of 100 samples take 35 µs against 29 µs
+/// in a plain loop, and sixteen of 16 samples 31 µs against 10 µs.
+const PER_SERIES_WORK: usize = 32;
 
 /// Work estimate for a set of series over the request's range.
 fn estimated_work(metas: &[MRangeSeriesMeta], options: &RangeOptions) -> usize {
@@ -454,6 +457,17 @@ fn estimated_work(metas: &[MRangeSeriesMeta], options: &RangeOptions) -> usize {
         .iter()
         .map(|m| PER_SERIES_WORK + estimated_samples_in_range(m.series, start, end))
         .sum()
+}
+
+/// `work` for a decode whose samples are also wire-encoded when `compress`: encoding a
+/// sample costs about what decoding it does, so the same series are worth the pool at
+/// half the size.
+fn work_with_encoding(work: usize, compress: bool) -> usize {
+    if compress {
+        work.saturating_mul(2)
+    } else {
+        work
+    }
 }
 
 pub(crate) fn sort_mrange_results(results: &mut [MRangeSeriesResult], is_grouped: bool) {
@@ -477,7 +491,8 @@ fn handle_non_grouped(
         .as_ref()
         .is_some_and(|a| a.is_multi());
 
-    let threads = request_par_threads(metas.len(), estimated_work(&metas, &options.range));
+    let work = work_with_encoding(estimated_work(&metas, &options.range), compress);
+    let threads = request_par_threads(metas.len(), work);
     metas
         .into_par_rayon()
         .num_threads(threads)
@@ -1198,7 +1213,7 @@ pub(crate) fn is_shard_snapshot_answerable(options: &MRangeOptions) -> bool {
     snapshot_supports(&options.range)
 }
 
-/// Least estimated work (units of [`estimated_work`]) a TS.MRANGE needs before
+/// Least estimated work (units of [`estimated_defer_work`]) a TS.MRANGE needs before
 /// it is deferred. Deferring adds a block/unblock round trip through the event
 /// loop — ~100 µs measured when the server is otherwise idle, and lost in the
 /// noise under load. Main-thread time runs at ~11 ns per unit (ten series × 100
@@ -1206,7 +1221,13 @@ pub(crate) fn is_shard_snapshot_answerable(options: &MRangeOptions) -> bool {
 /// about as much main-thread time as the round trip costs an idle client.
 pub const DEFER_MIN_WORK: usize = 8192;
 
-/// Like [`estimated_work`], but a non-aggregated COUNT caps each series'
+/// Sample-equivalents a series costs the main thread on top of its samples when it is
+/// answered inline: opening the key, labels, the reply. Far more than
+/// [`PER_SERIES_WORK`], which counts only the decode's share.
+const DEFER_PER_SERIES_WORK: usize = 1024;
+
+/// Main-thread work a request would cost answered inline, in the units
+/// [`DEFER_MIN_WORK`] is set in. A non-aggregated COUNT caps each series'
 /// samples: the decode stops there, deferred or not.
 fn estimated_defer_work(guards: &[(SeriesGuard, ValkeyString)], options: &MRangeOptions) -> usize {
     let (start, end) = options.range.get_timestamp_range();
@@ -1216,7 +1237,9 @@ fn estimated_defer_work(guards: &[(SeriesGuard, ValkeyString)], options: &MRange
     };
     guards
         .iter()
-        .map(|(guard, _)| PER_SERIES_WORK + estimated_samples_in_range(guard, start, end).min(cap))
+        .map(|(guard, _)| {
+            DEFER_PER_SERIES_WORK + estimated_samples_in_range(guard, start, end).min(cap)
+        })
         .sum()
 }
 
@@ -1366,7 +1389,7 @@ pub(crate) fn decode_shard_snapshots(
         .iter()
         .map(|s| PER_SERIES_WORK + s.snapshot.estimated_samples())
         .sum();
-    let threads = request_par_threads(series.len(), work);
+    let threads = request_par_threads(series.len(), work_with_encoding(work, compress));
     // The decode runs after the lock is released, so it is where a requester that
     // has given up stops this share, as `handle_non_grouped` does under the lock.
     let deadline = ReadDeadline::new(expired);
@@ -2769,5 +2792,28 @@ mod tests {
         let mut aggregated = raw.clone();
         aggregated.range.aggregation = limit_test_aggregations().remove(1);
         assert_eq!(chunks(&aggregated, Some(SampleLimit::Head(2))), all);
+    }
+
+    /// The pool is entered for the decode's own work, not per matched series: a handful of
+    /// short series stays on the calling thread, and wire encoding halves the size at which
+    /// the same series are worth dispatching.
+    #[test]
+    fn test_small_multi_series_decodes_stay_sequential() {
+        let series: Vec<TimeSeries> = (0..64)
+            .map(|_| {
+                let samples: Vec<(i64, f64)> = (0..100).map(|i| (i * 10, i as f64)).collect();
+                make_series(&samples)
+            })
+            .collect();
+        let range = RangeOptions::with_range(0, 10_000).unwrap();
+        let threads = |count: usize, compress: bool| {
+            let metas: Vec<_> = series[..count].iter().map(|s| meta(s, "k", None)).collect();
+            let work = work_with_encoding(estimated_work(&metas, &range), compress);
+            request_par_threads(metas.len(), work)
+        };
+        assert_eq!(threads(4, false), 1);
+        assert_eq!(threads(16, false), 1);
+        assert_eq!(threads(16, true), 0);
+        assert_eq!(threads(64, false), 0);
     }
 }
