@@ -1,12 +1,16 @@
 # Fan-out compatibility handshake
 
-## Payload: optional push-down, echoed back
+## Payload: push-down is binding
 
-A request asks a shard to do optional work. For example, `MultiRangeRequest` carries
-`apply_aggregation`, `apply_group_reduce` and `apply_count` (`proto/v1/request.proto`). The shard
-echoes the work it actually did in the response's `applied_*` fields
-(`proto/v1/response.proto`), and the coordinator finishes whatever the shard didn't do for that
-shard's slice.
+A request can ask a shard to do part of the work. For example, `MultiRangeRequest` carries
+`apply_aggregation`, `apply_group_reduce` and `apply_count` (`proto/v1/request.proto`). A shard does
+exactly what it is asked, and nothing echoes it back: the coordinator expects buckets under
+`apply_aggregation` and group partials alone under `apply_group_reduce`, and rejects a share of any
+other shape.
+
+No released version predates these flags, so no shard can ignore them. A push-down added after a
+release will need a way to tell an older shard's answer apart, or a bit in `required_features`
+(below) so an older shard refuses the request instead of answering it wrongly.
 
 ## Envelope: `required_features`
 

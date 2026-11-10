@@ -99,6 +99,9 @@ message MultiRangeRequest {
   bool with_labels = 4;
   repeated string selected_labels = 5;
   bool is_reverse = 6;
+  // Push-down: binding on the shard, which answers with exactly the work asked for
+  // (buckets, group partials alone, a COUNT pre-filter). There is no echo; the
+  // coordinator rejects a share of the wrong shape.
   bool apply_aggregation = 7;
   bool apply_group_reduce = 8;
   bool apply_count = 9;

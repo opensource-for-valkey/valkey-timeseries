@@ -598,6 +598,9 @@ pub struct MultiRangeRequest {
     pub selected_labels: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(bool, tag = "6")]
     pub is_reverse: bool,
+    /// Push-down: binding on the shard, which answers with exactly the work asked for
+    /// (buckets, group partials alone, a COUNT pre-filter). There is no echo; the
+    /// coordinator rejects a share of the wrong shape.
     #[prost(bool, tag = "7")]
     pub apply_aggregation: bool,
     #[prost(bool, tag = "8")]
@@ -800,7 +803,7 @@ pub struct SeriesRangeResponse {
     /// Label storage, used in place of `labels`: parallel arrays, one entry per
     /// label, indexing into `MultiRangeResponse.symbol_table_names` /
     /// `symbol_table_values`. Interning is unconditional, so there is no
-    /// `applied_*` flag; non-empty ref arrays are themselves the signal.
+    /// flag; non-empty ref arrays are themselves the signal.
     ///
     /// Both arrays empty means there is nothing to resolve — either the series has
     /// no labels, or it carries them in `labels` directly. A decoder must leave
@@ -850,18 +853,12 @@ pub struct MultiRangeResponse {
     pub series: ::prost::alloc::vec::Vec<SeriesRangeResponse>,
     #[prost(message, repeated, tag = "2")]
     pub group_partials: ::prost::alloc::vec::Vec<GroupPartialSeries>,
-    #[prost(bool, tag = "3")]
-    pub applied_aggregation: bool,
-    #[prost(bool, tag = "4")]
-    pub applied_group_reduce: bool,
-    #[prost(bool, tag = "5")]
-    pub applied_count: bool,
     /// Dictionaries `SeriesRangeResponse.label_name_refs`/`label_value_refs`
     /// index into. Label interning is unconditional, so these are populated
     /// whenever `series` carries any labels; empty otherwise.
-    #[prost(string, repeated, tag = "6")]
+    #[prost(string, repeated, tag = "3")]
     pub symbol_table_names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "7")]
+    #[prost(string, repeated, tag = "4")]
     pub symbol_table_values: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// QUERYINDEX returns key names verbatim, including invalid UTF-8 and interior NULs.

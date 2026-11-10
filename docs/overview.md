@@ -232,14 +232,11 @@ column-wise with the same `REDUCE` type.
 per group partial) — most valuable for `TS.MREVRANGE … COUNT n` ("last n points") queries. The coordinator always
 re-applies `COUNT` as the final authority.
 
-Mixed-version clusters are handled by a compatibility handshake (`fanout-compatibility-handshake.md`): shards
-echo which push-down flags they honored, and the coordinator compensates per response — data from a peer that did not
-apply push-down is aggregated and pre-reduced coordinator-side before merging. Rolling upgrades therefore need no
-special configuration; a lagging node only costs extra transfer and coordinator CPU for its own slice of each query.
+The push-down flags are binding: a shard answers with exactly the work it was asked for, and the coordinator rejects a
+share of the wrong shape rather than repairing it.
 
 Push-down is controlled by the boolean config `ts-fanout-aggregation-pushdown` (default `yes`, changeable at runtime
-via `CONFIG SET`). Only the coordinator consults it; shards obey the request. It is not a mixed-version safety knob —
-version skew is handled automatically by the handshake above — but an emergency/diagnostic escape hatch: flipping it
-off reverts queries to coordinator-side aggregation without a module rollback. The exception is
+via `CONFIG SET`). Only the coordinator consults it; shards obey the request. It is an emergency/diagnostic escape
+hatch: flipping it off reverts queries to coordinator-side aggregation without a module rollback. The exception is
 a query with `EMPTY`, which pushes down regardless: how far it fills depends on what each series
 holds outside the query window, which only its shard can see.

@@ -63,12 +63,6 @@ pub static FANOUT_IGNORED_UNKNOWN_SENDER: AtomicU64 = AtomicU64::new(0);
 pub static FANOUT_IGNORED_DUPLICATE: AtomicU64 = AtomicU64::new(0);
 /// Answers dropped because the operation had already completed (after an abort, say).
 pub static FANOUT_IGNORED_AFTER_COMPLETION: AtomicU64 = AtomicU64::new(0);
-/// `TS.MRANGE` series aggregated on the coordinator because their shard ignored aggregation
-/// push-down (an older peer).
-pub static FANOUT_PUSHDOWN_FALLBACK_SERIES: AtomicU64 = AtomicU64::new(0);
-/// `TS.MRANGE` series reduced into group partials on the coordinator because their shard ignored
-/// group-reduce push-down.
-pub static FANOUT_PUSHDOWN_GROUP_FALLBACK_SERIES: AtomicU64 = AtomicU64::new(0);
 
 /// Time from the start of an operation to its result, on every path that produces one.
 pub static FANOUT_DURATION: LazyLock<BucketHistogram> = duration_histogram();
@@ -263,16 +257,6 @@ static COUNTERS: &[(&str, &AtomicU64, &str)] = &[
         "ignored_after_completion",
         &FANOUT_IGNORED_AFTER_COMPLETION,
         "Shard answers dropped because the fanout operation had already completed",
-    ),
-    (
-        "pushdown_fallback_series",
-        &FANOUT_PUSHDOWN_FALLBACK_SERIES,
-        "TS.MRANGE series aggregated on the coordinator because their shard ignored aggregation push-down",
-    ),
-    (
-        "pushdown_group_fallback_series",
-        &FANOUT_PUSHDOWN_GROUP_FALLBACK_SERIES,
-        "TS.MRANGE series reduced on the coordinator because their shard ignored group-reduce push-down",
     ),
     (
         "served_ok",

@@ -270,8 +270,6 @@ As coordinator:
 | `fanout_ignored_unknown_sender_total` | counter | Peer answers dropped because their sender is not a remote target of the request |
 | `fanout_ignored_duplicate_total` | counter | Peer answers dropped because their sender had already answered |
 | `fanout_ignored_after_completion_total` | counter | Shard answers dropped because the operation had already completed (after an abort, say) |
-| `fanout_pushdown_fallback_series_total` | counter | `TS.MRANGE` series aggregated on the coordinator because their shard ignored aggregation push-down (an older peer) |
-| `fanout_pushdown_group_fallback_series_total` | counter | `TS.MRANGE` series reduced on the coordinator because their shard ignored group-reduce push-down |
 
 One timed-out fan-out usually counts once in both `client_timeouts` and `rpc_timeouts` (whichever
 deadline reaches the client first wins), so don't add them. Local-only fan-outs have no RPC, so
