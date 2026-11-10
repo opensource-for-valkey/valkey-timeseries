@@ -120,30 +120,53 @@ type PayloadResult<T> = Result<T, String>;
 // section. The body versions itself, so neither side's format is pinned to the other's.
 
 /// Appends one per-db section to `buf`: the db number, then the encoded index body.
-fn serialize_postings_section(buf: &mut Vec<u8>, db: i32, postings: &Postings) {
+fn serialize_postings_section(
+    buf: &mut Vec<u8>,
+    db: i32,
+    postings: &Postings,
+) -> PayloadResult<()> {
     write_uvarint(buf, db as u64);
-    serialization::serialize(buf, postings);
+    serialization::serialize(buf, postings)
 }
 
-/// Reads one per-db section, mirroring [`serialize_postings_section`].
-fn deserialize_postings_section(buf: &mut &[u8]) -> PayloadResult<(i32, Postings)> {
+/// Reads one per-db section, mirroring [`serialize_postings_section`]. `key_budget` is the
+/// payload-wide one (see [`serialization::KeyBudget`]); `prev_db` is the previous section's db.
+///
+/// `build_aux_payload` writes dbs sorted and once each, so a db that does not follow `prev_db` is
+/// rejected before its body is decoded: a repeated one would otherwise be allocated in full only
+/// for a later section to replace it on install.
+fn deserialize_postings_section(
+    buf: &mut &[u8],
+    prev_db: Option<i32>,
+    key_budget: &mut serialization::KeyBudget,
+) -> PayloadResult<(i32, Postings)> {
     let db = try_read_uvarint(buf).map_err(|e| e.to_string())?;
     let db = i32::try_from(db).map_err(|_| format!("invalid db number {db}"))?;
-    let postings = serialization::deserialize(buf)?;
+    if let Some(prev) = prev_db
+        && db <= prev
+    {
+        return Err(format!(
+            "db sections out of order: db {db} follows db {prev}"
+        ));
+    }
+    let postings = serialization::deserialize(buf, key_budget)?;
     Ok((db, postings))
 }
 
 /// Serializes every non-empty db index into a single payload buffer, or `None` if there is no
 /// series to persist. Fails if any db's postings lock is contended (possible fork-time writer:
 /// skip persisting entirely rather than risk deadlock or write a torn snapshot).
+///
+/// Every lock is taken, and the empty dbs dropped, before anything is written, so the section
+/// count is known up front and each section is serialized straight into the one buffer. In the
+/// BGSAVE child all of it is fresh allocation; staging the sections and copying them behind the
+/// header held the payload two to three times over.
 fn build_aux_payload() -> PayloadResult<Option<Vec<u8>>> {
     let map = TIMESERIES_INDEX.pin();
     let mut dbs: Vec<i32> = map.keys().copied().collect();
     dbs.sort_unstable();
 
-    let mut sections: Vec<u8> = Vec::new();
-    let mut section_count: u64 = 0;
-
+    let mut locked = Vec::with_capacity(dbs.len());
     for db in dbs {
         let Some(index) = map.get(&db) else {
             continue;
@@ -158,23 +181,27 @@ fn build_aux_payload() -> PayloadResult<Option<Vec<u8>>> {
         if postings.id_to_key.is_empty() {
             continue;
         }
-        serialize_postings_section(&mut sections, db, &postings);
-        section_count += 1;
+        locked.push((db, postings));
     }
 
-    if section_count == 0 {
+    if locked.is_empty() {
         return Ok(None);
     }
 
-    let mut buf = Vec::with_capacity(sections.len() + 16);
+    let mut buf = Vec::new();
     buf.extend_from_slice(INDEX_AUX_MAGIC);
     write_u8(&mut buf, INDEX_AUX_VERSION);
-    write_uvarint(&mut buf, section_count);
-    buf.extend_from_slice(&sections);
+    write_uvarint(&mut buf, locked.len() as u64);
+    for (db, postings) in &locked {
+        serialize_postings_section(&mut buf, *db, postings)?;
+    }
     Ok(Some(buf))
 }
 
 fn parse_aux_payload(mut buf: &[u8]) -> PayloadResult<Vec<(i32, Postings)>> {
+    // Taken from the whole payload before any of it is read, and shared by every section: each
+    // is decoded before any is installed, so per-section budgets would compound.
+    let mut key_budget = serialization::KeyBudget::for_payload(buf.len());
     let buf = &mut buf;
 
     let magic = try_read_byte_slice_exact(buf, INDEX_AUX_MAGIC.len())?;
@@ -188,10 +215,11 @@ fn parse_aux_payload(mut buf: &[u8]) -> PayloadResult<Vec<(i32, Postings)>> {
         ));
     }
 
-    let section_count = try_read_uvarint(buf).map_err(|e| e.to_string())? as usize;
-    let mut sections = Vec::with_capacity(section_count.min(16));
+    let section_count = serialization::read_count(buf, "section count")?;
+    let mut sections: Vec<(i32, Postings)> = Vec::with_capacity(section_count.min(16));
     for _ in 0..section_count {
-        sections.push(deserialize_postings_section(buf)?);
+        let prev_db = sections.last().map(|(db, _)| *db);
+        sections.push(deserialize_postings_section(buf, prev_db, &mut key_budget)?);
     }
     if !buf.is_empty() {
         return Err(format!("{} trailing bytes after payload", buf.len()));
@@ -719,7 +747,7 @@ mod tests {
     fn build_payload(sections: &[(i32, &Postings)]) -> Vec<u8> {
         let mut body = Vec::new();
         for (db, postings) in sections {
-            serialize_postings_section(&mut body, *db, postings);
+            serialize_postings_section(&mut body, *db, postings).unwrap();
         }
         let mut buf = Vec::new();
         buf.extend_from_slice(INDEX_AUX_MAGIC);
@@ -790,7 +818,7 @@ mod tests {
     #[test]
     fn label_name_is_written_once_per_group() {
         let mut postings = Postings::default();
-        for i in 0..200u64 {
+        for i in 1..=200u64 {
             let mut bitmap = PostingsBitmap::new();
             bitmap.add(i);
             postings
@@ -800,9 +828,12 @@ mod tests {
                     bitmap,
                 )
                 .unwrap();
-            // Every posted id must be in `all_postings`; the decoder rejects bodies where a
-            // label bitmap names an id the membership set does not.
+            // Every posted id must be a member with a directory entry: the decoder rejects
+            // bodies whose label bitmaps, `all_postings` and directory disagree.
             postings.all_postings.add(i);
+            postings
+                .id_to_key
+                .insert(i, format!("ts:{i}").into_bytes().into_boxed_slice());
         }
 
         let payload = build_payload(&[(0, &postings)]);
@@ -830,6 +861,10 @@ mod tests {
                 .try_insert(IndexKey::from(*key), bitmap)
                 .unwrap();
             postings.all_postings.add(i as u64 + 1);
+            postings.id_to_key.insert(
+                i as u64 + 1,
+                format!("ts:{i}").into_bytes().into_boxed_slice(),
+            );
         }
 
         let payload = build_payload(&[(0, &postings)]);
@@ -909,6 +944,85 @@ mod tests {
         let mut payload = build_payload(&[(0, &postings)]);
         payload.push(0xAB);
         assert!(parse_aux_payload(&payload).is_err());
+    }
+
+    /// A section that expands well past the ratio on its own bytes: a 4 KiB label name over 200
+    /// single-id values, every entry rebuilding the name.
+    fn amplifying_postings() -> Postings {
+        let name = "n".repeat(4096);
+        let mut postings = Postings::default();
+        for id in 1..=200u64 {
+            let mut bitmap = PostingsBitmap::new();
+            bitmap.add(id);
+            postings
+                .label_index
+                .try_insert(IndexKey::for_label_value(&name, &id.to_string()), bitmap)
+                .unwrap();
+            postings.all_postings.add(id);
+            postings
+                .id_to_key
+                .insert(id, id.to_string().into_bytes().into_boxed_slice());
+        }
+        postings
+    }
+
+    /// Cheap bytes that expand into nothing: one series under a 64 KiB key name.
+    fn padding_postings() -> Postings {
+        let mut postings = Postings::default();
+        postings.all_postings.add(1);
+        postings
+            .id_to_key
+            .insert(1, vec![b'k'; 64 * 1024].into_boxed_slice());
+        postings
+    }
+
+    fn label_key_bytes(sections: &[(i32, Postings)]) -> usize {
+        sections
+            .iter()
+            .flat_map(|(_, p)| p.label_index.iter().map(|(k, _)| k.len()))
+            .sum()
+    }
+
+    /// The expansion budget is one per payload. Sized per section from the bytes remaining at its
+    /// start, every amplifying section could spend against the same trailing padding, and the
+    /// total grew with the section count: eight of these decoded to ~40x the payload.
+    #[test]
+    fn expansion_budget_does_not_compound_across_sections() {
+        let amplifying = amplifying_postings();
+        let padding = padding_postings();
+
+        let alone = build_payload(&[(0, &amplifying)]);
+        let err = parse_aux_payload(&alone)
+            .err()
+            .expect("must be rejected alone");
+        assert!(err.contains("expand past"), "unexpected rejection: {err}");
+
+        // One section against the padding stays inside the ratio for the payload as a whole.
+        let padded = build_payload(&[(0, &amplifying), (1, &padding)]);
+        let sections = parse_aux_payload(&padded).expect("within the payload-wide budget");
+        assert!(label_key_bytes(&sections) <= padded.len() * 16);
+
+        let mut many: Vec<(i32, &Postings)> = (0..8).map(|db| (db, &amplifying)).collect();
+        many.push((8, &padding));
+        let payload = build_payload(&many);
+        let err = parse_aux_payload(&payload)
+            .err()
+            .expect("sections must not each get the padding's budget");
+        assert!(err.contains("expand past"), "unexpected rejection: {err}");
+    }
+
+    /// The writer emits each db once, in ascending order. A repeated db is decoded only for a
+    /// later section to replace it on install, so it is rejected before its body is read.
+    #[test]
+    fn rejects_repeated_or_unordered_db_sections() {
+        let postings = sample_postings();
+        for dbs in [[0, 0], [3, 1]] {
+            let payload = build_payload(&[(dbs[0], &postings), (dbs[1], &postings)]);
+            let err = parse_aux_payload(&payload)
+                .err()
+                .unwrap_or_else(|| panic!("dbs {dbs:?} must be rejected"));
+            assert!(err.contains("out of order"), "unexpected rejection: {err}");
+        }
     }
 
     /// The repair-scan scenario: the reconciliation sweep marks an id stale, then the keyspace

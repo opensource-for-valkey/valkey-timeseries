@@ -38,6 +38,10 @@ use std::collections::BTreeMap;
 /// back to rebuilding the index from the keyspace.
 pub(in crate::series::index) type DecodeResult<T> = Result<T, String>;
 
+/// Encoding fails only on an internal inconsistency; the caller skips persisting the index, which
+/// the next load answers with the per-key rebuild.
+pub(in crate::series::index) type EncodeResult<T> = Result<T, String>;
+
 /// Version of the field layout below, written as the first byte of every body.
 ///
 /// Separate from the envelope's `INDEX_AUX_VERSION`, which versions the framing around the body
@@ -78,14 +82,13 @@ pub(in crate::series::index) const BODY_VERSION: u8 = 1;
 /// leaves room to spare while still rejecting a wildly corrupt length.
 const MAX_BITMAP_BLOB_BYTES: usize = 256 * 1024 * 1024;
 
-/// How much label-key data the body may expand into, as a multiple of the bytes it was decoded
-/// from.
+/// How much label-key data a payload may expand into, as a multiple of the bytes it was decoded
+/// from. Enforced through a [`KeyBudget`] shared by every body in the payload.
 ///
 /// This is the bound that closes prefix-fanout amplification, and neither a per-key cap nor an
-/// entry count closes it alone (nor is needed beside it): the directory writes a group's prefix *once* and the decoder
-/// rebuilds it *per entry*, so `n` minimum-size entries under one long prefix cost `n * 32`
-/// bytes of payload but `n * prefix.len()` bytes of memory. At the per-key ceiling above that
-/// ratio reaches 2048x.
+/// entry count closes it alone (nor is needed beside it): the directory writes a group's prefix
+/// *once* and the decoder rebuilds it *per entry*, so `n` minimum-size entries under one long
+/// prefix cost `n * MIN_ENTRY_BYTES` bytes of payload but `n * prefix.len()` bytes of memory.
 ///
 /// Prefix sharing is real compression, so the honest ratio is above 1 — but not by much, because
 /// a group's per-entry cost is dominated by its bitmap, which no amount of sharing shrinks. Real
@@ -93,13 +96,59 @@ const MAX_BITMAP_BLOB_BYTES: usize = 256 * 1024 * 1024;
 /// single-byte values.
 const MAX_KEY_EXPANSION_RATIO: usize = 16;
 
+/// The label-key bytes still allowed to be reconstructed, out of [`MAX_KEY_EXPANSION_RATIO`]
+/// times a whole payload.
+///
+/// One budget per payload, not per body: the payload's sections are decoded back to back before
+/// any is installed, so a budget sized from the bytes remaining at each body's start would let
+/// every section spend against the same trailing bytes, and the total expansion would grow with
+/// the number of sections rather than staying within the ratio.
+pub(in crate::series::index) struct KeyBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl KeyBudget {
+    /// The budget for a payload of `encoded_len` bytes, taken before any of it is decoded.
+    /// Saturates rather than wrapping; only reachable on a 32-bit target, where the result is
+    /// already past the address space.
+    pub(in crate::series::index) fn for_payload(encoded_len: usize) -> Self {
+        Self {
+            limit: encoded_len.saturating_mul(MAX_KEY_EXPANSION_RATIO),
+            used: 0,
+        }
+    }
+
+    /// Fails if `len` more bytes would cross the limit, without spending them.
+    fn check(&self, len: usize) -> DecodeResult<()> {
+        if self.used.saturating_add(len) > self.limit {
+            return Err(format!(
+                "label index keys expand past {} bytes, {MAX_KEY_EXPANSION_RATIO}x the encoded payload",
+                self.limit
+            ));
+        }
+        Ok(())
+    }
+
+    /// Spends `len` bytes, failing if they cross the limit.
+    fn charge(&mut self, len: usize) -> DecodeResult<()> {
+        self.check(len)?;
+        self.used += len;
+        Ok(())
+    }
+}
+
 /// Cheapest possible group-directory entry: a one-byte zero length and a one-byte count.
 const MIN_GROUP_BYTES: usize = 2;
 
 /// Cheapest possible label entry: a one-byte zero-length suffix, a one-byte blob length, and the
-/// smallest non-empty portable `Bitmap64` (8-byte bucket count, 4-byte high word, 18-byte
-/// single-element roaring32). Pinned by `min_entry_bytes_matches_encoder`.
-const MIN_ENTRY_BYTES: usize = 1 + 1 + 30;
+/// smallest non-empty portable `Bitmap64` the encoder writes: an 8-byte bucket count, a 4-byte
+/// high word, and a 15-byte roaring32 holding a single run container (run cookie, run flags,
+/// key/cardinality, run count, one run). That is the shape `run_optimize` gives any bucket that
+/// is one run of four or more consecutive ids — ordinary for series created together — and it
+/// undercuts the 18-byte single-element array container by three bytes. Pinned by
+/// `min_entry_bytes_is_the_cheapest_encoder_shape`.
+const MIN_ENTRY_BYTES: usize = 1 + 1 + 27;
 
 /// Cheapest possible id-directory entry: a one-byte delta varint and a one-byte zero length.
 const MIN_ID_ENTRY_BYTES: usize = 2;
@@ -123,13 +172,36 @@ fn check_declared_count(
     Ok(())
 }
 
-pub(in crate::series::index) fn write_bitmap(buf: &mut Vec<u8>, bitmap: &PostingsBitmap) {
+/// Reads a declared element count, rejecting one that does not fit in `usize` rather than
+/// truncating it past [`check_declared_count`]. Exact on the 64-bit targets the module ships for.
+pub(in crate::series::index) fn read_count(buf: &mut &[u8], what: &str) -> DecodeResult<usize> {
+    let count = try_read_uvarint(buf).map_err(|e| e.to_string())?;
+    usize::try_from(count).map_err(|_| format!("{what}: declared count {count} overflows usize"))
+}
+
+/// Writes `bitmap` as a length-prefixed portable blob.
+///
+/// The prefix is written before the blob, from croaring's size calculation, so the decoder can
+/// only frame the stream if the blob takes exactly that many bytes. croaring derives the
+/// appended length from the same calculation, so the check below cannot fail today; it is there
+/// so that a change in how croaring appends (alignment padding ahead of the data, say) fails this
+/// save loudly instead of writing a body that every later load silently discards.
+pub(in crate::series::index) fn write_bitmap(
+    buf: &mut Vec<u8>,
+    bitmap: &PostingsBitmap,
+) -> EncodeResult<()> {
     let size = bitmap.get_serialized_size_in_bytes::<Portable>();
     write_uvarint(buf, size as u64);
     buf.reserve(size);
     let before = buf.len();
     let _ = bitmap.serialize_into_vec::<Portable>(buf);
-    debug_assert_eq!(buf.len() - before, size);
+    let appended = buf.len() - before;
+    if appended != size {
+        return Err(format!(
+            "bitmap serialized to {appended} bytes after declaring {size}"
+        ));
+    }
+    Ok(())
 }
 
 /// Stays permissive about *emptiness*: `all_postings` is legitimately empty for a db with no
@@ -146,7 +218,19 @@ pub(in crate::series::index) fn read_bitmap(buf: &mut &[u8]) -> DecodeResult<Pos
         .ok_or_else(|| "corrupt roaring bitmap blob".to_string())
 }
 
-/// Appends the encoded index body to `buf`.
+/// Splits a label key *after* its first `=`, so that `prefix + suffix` reproduces the key byte for
+/// byte, whatever it contains — a value with an `=` in it, or a key with none at all. The offset
+/// is the one [`IndexKey::split`] has cached, but the load does not depend on where it falls: any
+/// split point reproduces the key.
+fn split_label_key(key: &IndexKey) -> (&[u8], &[u8]) {
+    // `as_str` strips the NUL sentinel; `IndexKey::from(&[u8])` re-appends it on load.
+    let full = key.as_str().as_bytes();
+    let split_at = key.split().map_or(full.len(), |(name, _)| name.len() + 1);
+    full.split_at(split_at)
+}
+
+/// Appends the encoded index body to `buf`. On error `buf` holds a partial body and must be
+/// discarded.
 ///
 /// Stale ids are subtracted here rather than persisted: `mark_ids_as_stale` already cleans
 /// `id_to_key` and `all_postings` at mark time, so the label bitmaps are the only structures
@@ -155,9 +239,12 @@ pub(in crate::series::index) fn read_bitmap(buf: &mut &[u8]) -> DecodeResult<Pos
 /// in the RDB (a fork can land mid-ASM-export, before the engine's lazy delete) is resurrected
 /// by the post-load count-verification scan, matching the keyspace either way. The subtraction
 /// only costs anything when `stale_ids` is non-empty (rare: the cron GC drains continuously);
-/// entries that become empty are dropped, so each group's count is written only once its
-/// entries have been serialized.
-pub(in crate::series::index) fn serialize(buf: &mut Vec<u8>, postings: &Postings) {
+/// entries that become empty are dropped, so the group directory is built in a first pass over
+/// the label index and the entries are written straight into `buf` by a second.
+pub(in crate::series::index) fn serialize(
+    buf: &mut Vec<u8>,
+    postings: &Postings,
+) -> EncodeResult<()> {
     write_u8(buf, BODY_VERSION);
 
     // First, so the decoder has it before the label bitmaps it validates. Needs no stale masking
@@ -165,7 +252,7 @@ pub(in crate::series::index) fn serialize(buf: &mut Vec<u8>, postings: &Postings
     // subset property hold on the written form — every label bitmap below is masked by the same
     // stale set that `all_postings` has already had removed. Hidden ids are written as ordinary
     // ones: their keys are in the snapshot too, and hiding them again is the load's job.
-    write_bitmap(buf, &postings.hidden_ids.union_with(&postings.all_postings));
+    write_bitmap(buf, &postings.hidden_ids.union_with(&postings.all_postings))?;
 
     // label_index in tree iteration order (sorted): cache-friendly ART rebuild on load. Sorted
     // order is also what makes the grouping a single pass — a group's entries are necessarily
@@ -173,31 +260,22 @@ pub(in crate::series::index) fn serialize(buf: &mut Vec<u8>, postings: &Postings
     // and no other group's prefix can fall between them (a prefix never contains `=` except as
     // its last byte, so no prefix is a prefix of another).
     let stale: &StaleSet = &postings.stale_ids;
-    // Group directory: (prefix, entry count) pairs, one per distinct label name.
+    // The entries both passes write, decided without masking so the first pass copies nothing:
+    // an entry survives iff stale masking leaves its bitmap non-empty.
+    let live_entries = || {
+        postings.label_index.iter().filter(|(_, bitmap)| {
+            !bitmap.is_empty()
+                && (stale.is_empty() || bitmap.cardinality() > stale.stale_count_in(bitmap))
+        })
+    };
+
+    // Pass 1, the group directory: (prefix, entry count) pairs, one per distinct label name.
+    // Small — one per label name, not per value — so it is staged and then copied.
     let mut groups: Vec<u8> = Vec::new();
     let mut group_count: u64 = 0;
-    let mut entries: Vec<u8> = Vec::new();
     let mut open_group: Option<(&[u8], u64)> = None;
-    for (key, bitmap) in postings.label_index.iter() {
-        if bitmap.is_empty() {
-            continue;
-        }
-
-        let cleaned: Cow<PostingsBitmap> = stale.mask_cow(Cow::Borrowed(bitmap));
-        if cleaned.is_empty() {
-            continue;
-        }
-        // `as_str` strips the NUL sentinel; `IndexKey::from(&[u8])` re-appends it on load.
-        let full = key.as_str().as_bytes();
-        // Split *after* the first `=` so that `prefix + suffix` reproduces the key byte for
-        // byte, whatever it contains — a value with an `=` in it, or a key with none at all.
-        // Nothing here has to agree with `IndexKey::for_label_value` about where the name ends.
-        let split_at = full
-            .iter()
-            .position(|b| *b == b'=')
-            .map_or(full.len(), |i| i + 1);
-        let (prefix, suffix) = full.split_at(split_at);
-
+    for (key, _) in live_entries() {
+        let (prefix, _) = split_label_key(key);
         match open_group {
             Some((open, ref mut count)) if open == prefix => *count += 1,
             _ => {
@@ -209,18 +287,24 @@ pub(in crate::series::index) fn serialize(buf: &mut Vec<u8>, postings: &Postings
                 open_group = Some((prefix, 1));
             }
         }
-        write_byte_slice(&mut entries, suffix);
-        write_bitmap(&mut entries, &cleaned);
     }
     if let Some((open, count)) = open_group {
         write_byte_slice(&mut groups, open);
         write_uvarint(&mut groups, count);
         group_count += 1;
     }
-
     write_uvarint(buf, group_count);
     buf.extend_from_slice(&groups);
-    buf.extend_from_slice(&entries);
+    drop(groups);
+
+    // Pass 2, the entries, in the same order, written in place.
+    for (key, bitmap) in live_entries() {
+        let (_, suffix) = split_label_key(key);
+        let cleaned: Cow<PostingsBitmap> = stale.mask_cow(Cow::Borrowed(bitmap));
+        debug_assert!(!cleaned.is_empty(), "pass 1 counted an entry pass 2 drops");
+        write_byte_slice(buf, suffix);
+        write_bitmap(buf, &cleaned)?;
+    }
 
     // id_to_key in ascending id order: ids share their high epoch bits and increment densely,
     // so varint deltas stay small.
@@ -231,12 +315,18 @@ pub(in crate::series::index) fn serialize(buf: &mut Vec<u8>, postings: &Postings
         prev_id = *id;
         write_byte_slice(buf, key.as_ref());
     }
+    Ok(())
 }
 
-/// Reads one index body from `buf`, advancing it past the bytes consumed.
+/// Reads one index body from `buf`, advancing it past the bytes consumed, and charges the label
+/// keys it rebuilds to `key_budget` — which the caller sizes from, and shares across, the whole
+/// payload the body sits in (see [`KeyBudget`]).
 ///
 /// Assumes hostile input; see the decode limits above for what is bounded and why.
-pub(in crate::series::index) fn deserialize(buf: &mut &[u8]) -> DecodeResult<Postings> {
+pub(in crate::series::index) fn deserialize(
+    buf: &mut &[u8],
+    key_budget: &mut KeyBudget,
+) -> DecodeResult<Postings> {
     let version = try_read_u8(buf).map_err(|e| e.to_string())?;
     if version != BODY_VERSION {
         return Err(format!(
@@ -244,24 +334,19 @@ pub(in crate::series::index) fn deserialize(buf: &mut &[u8]) -> DecodeResult<Pos
         ));
     }
 
-    // Budget for reconstructed label-key bytes, taken before any of the body proper is read.
-    // `buf` may extend past this section (the caller decodes sections back to back), which only
-    // ever makes the budget more generous, never tighter than the section deserves.
-    let key_budget = buf.len().saturating_mul(MAX_KEY_EXPANSION_RATIO);
-
     // Leads the body so each label bitmap can be checked against it as it is read.
     let all_postings = read_bitmap(buf)?;
 
     // Group directory next (see [`serialize`]), then the entries for each group in the same
     // order. `with_capacity` is clamped: the count comes from the payload, and a corrupt one
     // must not turn into an unbounded allocation before the read that rejects it.
-    let group_count = try_read_uvarint(buf).map_err(|e| e.to_string())? as usize;
+    let group_count = read_count(buf, "label group directory")?;
     check_declared_count("label group directory", group_count, buf, MIN_GROUP_BYTES)?;
     let mut groups: Vec<(&[u8], usize)> = Vec::with_capacity(group_count.min(64));
     let mut entry_count: usize = 0;
     for _ in 0..group_count {
         let prefix = try_read_byte_slice(buf).map_err(|e| e.to_string())?;
-        let count = try_read_uvarint(buf).map_err(|e| e.to_string())? as usize;
+        let count = read_count(buf, "label group")?;
         entry_count = entry_count.saturating_add(count);
         groups.push((prefix, count));
     }
@@ -271,34 +356,24 @@ pub(in crate::series::index) fn deserialize(buf: &mut &[u8]) -> DecodeResult<Pos
 
     let mut label_index = PostingsIndex::new();
     let mut key_bytes: Vec<u8> = Vec::new();
-    let mut key_bytes_used: usize = 0;
     for (prefix, count) in groups {
         for _ in 0..count {
             let suffix = try_read_byte_slice(buf).map_err(|e| e.to_string())?;
-            // Charged before the key is built, so no allocation outruns the budget.
+            // Checked before the key is built, so no allocation outruns the budget.
             let key_len = prefix.len() + suffix.len();
-            if key_bytes_used.saturating_add(key_len) > key_budget {
-                return Err(format!(
-                    "label index keys expand past {key_budget} bytes, {MAX_KEY_EXPANSION_RATIO}x the encoded body"
-                ));
-            }
+            key_budget.check(key_len)?;
             key_bytes.clear();
             key_bytes.reserve(key_len);
             key_bytes.extend_from_slice(prefix);
             key_bytes.extend_from_slice(suffix);
             let key = IndexKey::from(key_bytes.as_slice());
 
-            // Charged again after construction, at the built length: `IndexKey::from` converts
+            // Charged after construction, at the built length: `IndexKey::from` converts
             // lossily, and each invalid byte expands into a 3-byte U+FFFD. Charging only the
             // encoded length would leave the budget short by 3x on a payload of invalid UTF-8,
             // which is free for an attacker to produce. The check above bounds this one
-            // allocation to 3x what it was charged.
-            key_bytes_used = key_bytes_used.saturating_add(key.len());
-            if key_bytes_used > key_budget {
-                return Err(format!(
-                    "label index keys expand past {key_budget} bytes, {MAX_KEY_EXPANSION_RATIO}x the encoded body"
-                ));
-            }
+            // allocation to 3x what it was checked against.
+            key_budget.charge(key.len())?;
 
             let bitmap = read_bitmap(buf)?;
             // `serialize` drops entries whose bitmap is empty, before and after stale masking,
@@ -320,24 +395,58 @@ pub(in crate::series::index) fn deserialize(buf: &mut &[u8]) -> DecodeResult<Pos
                     key.as_str()
                 ));
             }
-            label_index
-                .try_insert(key, bitmap)
-                .map_err(|e| format!("label index insert failed: {e}"))?;
+            // The writer emits each key once. A repeat — within a group, or across two groups
+            // whose prefix and suffix split the same bytes differently — would replace the
+            // earlier bitmap and silently drop its membership, while the directory and
+            // `all_postings` stay intact and the post-load digest still matches.
+            match label_index.try_insert(key, bitmap) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    return Err(format!(
+                        "duplicate label index entry {}",
+                        String::from_utf8_lossy(&key_bytes)
+                    ));
+                }
+                Err(e) => return Err(format!("label index insert failed: {e}")),
+            }
         }
     }
 
-    let id_count = try_read_uvarint(buf).map_err(|e| e.to_string())? as usize;
+    // The directory must name exactly the ids in `all_postings`: the writer folds hidden ids into
+    // the written set, and stale ids leave both at mark time, so any disagreement is corruption.
+    // An id only in `all_postings` is a phantom member resolving to no key; one only in the
+    // directory is missing from every `all_postings`-based read. Ids arrive strictly ascending,
+    // each checked for membership as it is read, so equal counts at the end mean equal sets
+    // without building a second bitmap.
+    let id_count = read_count(buf, "id directory")?;
     check_declared_count("id directory", id_count, buf, MIN_ID_ENTRY_BYTES)?;
     let mut id_to_key = BTreeMap::new();
     let mut prev_id: SeriesRef = 0;
     for _ in 0..id_count {
         let delta = try_read_uvarint(buf).map_err(|e| e.to_string())?;
+        // Zero would repeat the previous id (overwriting its key) or, first, yield id 0, which
+        // the allocator reserves for "unassigned".
+        if delta == 0 {
+            return Err(format!("id directory: zero delta after id {prev_id}"));
+        }
         let id = prev_id
             .checked_add(delta)
             .ok_or_else(|| "series id overflow".to_string())?;
         prev_id = id;
+        if !all_postings.contains(id) {
+            return Err(format!(
+                "id directory entry {id} is absent from all_postings"
+            ));
+        }
         let key = try_read_byte_slice(buf).map_err(|e| e.to_string())?;
         id_to_key.insert(id, key.to_vec().into_boxed_slice());
+    }
+    let members = all_postings.cardinality();
+    if id_to_key.len() as u64 != members {
+        return Err(format!(
+            "all_postings holds {members} ids but the id directory names {}",
+            id_to_key.len()
+        ));
     }
 
     Ok(Postings {
@@ -348,6 +457,14 @@ pub(in crate::series::index) fn deserialize(buf: &mut &[u8]) -> DecodeResult<Pos
         hidden_ids: HiddenSet::default(),
         all_postings,
     })
+}
+
+/// [`deserialize`] for a body that is a whole payload on its own, so the key budget is sized from
+/// the body alone.
+#[cfg(test)]
+pub(in crate::series::index) fn deserialize_standalone(buf: &mut &[u8]) -> DecodeResult<Postings> {
+    let mut key_budget = KeyBudget::for_payload(buf.len());
+    deserialize(buf, &mut key_budget)
 }
 
 #[cfg(test)]
@@ -387,7 +504,7 @@ mod tests {
     ) -> Vec<u8> {
         let mut buf = Vec::new();
         write_u8(&mut buf, BODY_VERSION);
-        write_bitmap(&mut buf, all_postings);
+        write_bitmap(&mut buf, all_postings).unwrap();
         write_uvarint(&mut buf, groups.len() as u64);
         for (prefix, count) in groups {
             write_byte_slice(&mut buf, prefix);
@@ -409,7 +526,7 @@ mod tests {
 
     fn decode_err(body: &[u8]) -> String {
         let mut slice = body;
-        match deserialize(&mut slice) {
+        match deserialize_standalone(&mut slice) {
             Err(e) => e,
             Ok(_) => panic!("hostile body must be rejected"),
         }
@@ -424,7 +541,7 @@ mod tests {
         postings.set_timeseries_key(1, b"ts:1");
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         assert_eq!(buf.first(), Some(&BODY_VERSION));
     }
 
@@ -437,7 +554,7 @@ mod tests {
         postings.set_timeseries_key(1, b"ts:1");
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         buf[0] = BODY_VERSION + 1;
 
         let err = decode_err(&buf);
@@ -448,19 +565,69 @@ mod tests {
     }
 
     /// [`MIN_ENTRY_BYTES`] is important for the entry-count check, and it is derived from a
-    /// croaring format detail. Pin it against what the encoder actually writes.
+    /// croaring format detail. Pin it against what the encoder actually writes, for every shape
+    /// that can be the cheapest: if it exceeds any of them, valid snapshots are rejected.
     #[test]
-    fn min_entry_bytes_matches_encoder() {
-        let mut entry = Vec::new();
-        write_byte_slice(&mut entry, b"");
-        let mut bitmap = PostingsBitmap::new();
-        bitmap.add(1);
-        write_bitmap(&mut entry, &bitmap);
-        assert_eq!(
-            entry.len(),
-            MIN_ENTRY_BYTES,
-            "cheapest encodable label entry must match MIN_ENTRY_BYTES"
+    fn min_entry_bytes_is_the_cheapest_encoder_shape() {
+        let entry_len = |bitmap: &PostingsBitmap| {
+            let mut entry = Vec::new();
+            write_byte_slice(&mut entry, b"");
+            write_bitmap(&mut entry, bitmap).unwrap();
+            entry.len()
+        };
+
+        let singleton_array = bitmap_of(&[1]);
+        let mut single_run = bitmap_of(&[1, 2, 3, 4]);
+        assert!(
+            single_run.run_optimize(),
+            "four consecutive ids must become a run"
         );
+
+        let shapes = [
+            ("singleton array", entry_len(&singleton_array)),
+            ("single run", entry_len(&single_run)),
+        ];
+        for (shape, len) in shapes {
+            assert!(
+                MIN_ENTRY_BYTES <= len,
+                "{shape} entry is {len} bytes, under MIN_ENTRY_BYTES ({MIN_ENTRY_BYTES})"
+            );
+        }
+        let cheapest = shapes.iter().map(|(_, len)| *len).min().unwrap();
+        assert_eq!(
+            cheapest, MIN_ENTRY_BYTES,
+            "MIN_ENTRY_BYTES must equal the cheapest encodable label entry"
+        );
+    }
+
+    /// The shape the cron's `run_optimize` leaves behind: a handful of series created together,
+    /// sharing many labels, so every bitmap is one short run. Near the minimum entry size with no
+    /// trailing slack, this is what an entry-size bound set above the run shape rejects.
+    #[test]
+    fn round_trips_run_optimized_postings() {
+        let mut postings = Postings::default();
+        for id in 1..=4u64 {
+            for label in 0..20 {
+                postings.add_posting_for_label_value(id, &format!("label{label}"), "v");
+            }
+            postings.set_timeseries_key(id, format!("t{id}").as_bytes());
+        }
+        assert!(postings.optimize_postings(None, usize::MAX).is_none());
+
+        let mut buf = Vec::new();
+        serialize(&mut buf, &postings).unwrap();
+        let mut slice = buf.as_slice();
+        let loaded =
+            deserialize_standalone(&mut slice).expect("run-optimized postings must round-trip");
+
+        assert!(slice.is_empty(), "decoder must consume exactly the body");
+        assert_eq!(loaded.id_to_key, postings.id_to_key);
+        assert_eq!(loaded.all_postings, postings.all_postings);
+        assert_eq!(loaded.label_index.len(), postings.label_index.len());
+        for ((ka, va), (kb, vb)) in loaded.label_index.iter().zip(postings.label_index.iter()) {
+            assert_eq!(ka, kb);
+            assert_eq!(va, vb);
+        }
     }
 
     /// The amplification this hardening exists for: one long group prefix, rebuilt once per
@@ -520,7 +687,7 @@ mod tests {
     fn rejects_a_long_prefix_fanned_out_before_building_the_key() {
         let prefix = vec![b'x'; 64 * 1024];
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..64)
-            .map(|i| (vec![b'0' + (i % 10) as u8], min_bitmap_blob()))
+            .map(|i| (format!("{i:02}").into_bytes(), min_bitmap_blob()))
             .collect();
         let body = hostile_body(
             &live_ids(),
@@ -555,7 +722,7 @@ mod tests {
     fn rejects_inflated_group_count() {
         let mut body = Vec::new();
         write_u8(&mut body, BODY_VERSION);
-        write_bitmap(&mut body, &PostingsBitmap::new());
+        write_bitmap(&mut body, &PostingsBitmap::new()).unwrap();
         write_uvarint(&mut body, u32::MAX as u64);
         body.extend_from_slice(&[0u8; 16]);
         let err = decode_err(&body);
@@ -610,6 +777,102 @@ mod tests {
         );
     }
 
+    fn blob_of(ids: &[u64]) -> Vec<u8> {
+        let mut blob = Vec::new();
+        let _ = bitmap_of(ids).serialize_into_vec::<Portable>(&mut blob);
+        blob
+    }
+
+    /// A directory id that `all_postings` lacks would answer `has_id` while every
+    /// `all_postings`-based read, subtractive predicates included, misses it.
+    #[test]
+    fn rejects_directory_id_absent_from_all_postings() {
+        let body = hostile_body(
+            &PostingsBitmap::new(),
+            &[],
+            &[],
+            1,
+            &[(1, b"ts:1".to_vec())],
+        );
+        let err = decode_err(&body);
+        assert!(
+            err.contains("entry 1 is absent from all_postings"),
+            "unexpected rejection: {err}"
+        );
+    }
+
+    /// The other direction: a member every bitmap agrees on, resolving to no key.
+    #[test]
+    fn rejects_member_without_directory_entry() {
+        let body = hostile_body(
+            &live_ids(),
+            &[(b"job=".to_vec(), 1)],
+            &[(b"web".to_vec(), min_bitmap_blob())],
+            0,
+            &[],
+        );
+        let err = decode_err(&body);
+        assert!(
+            err.contains("all_postings holds 1 ids but the id directory names 0"),
+            "unexpected rejection: {err}"
+        );
+    }
+
+    /// A zero delta either repeats the previous id, overwriting its key, or (first) yields id 0,
+    /// the allocator's "unassigned" sentinel.
+    #[test]
+    fn rejects_zero_id_delta() {
+        let repeated = hostile_body(
+            &bitmap_of(&[1, 2]),
+            &[],
+            &[],
+            2,
+            &[(1, b"ts:1".to_vec()), (1, b"ts:2".to_vec())],
+        );
+        let id_zero = hostile_body(&bitmap_of(&[0]), &[], &[], 1, &[(0, b"ts:0".to_vec())]);
+        for body in [repeated, id_zero] {
+            let err = decode_err(&body);
+            assert!(err.contains("zero delta"), "unexpected rejection: {err}");
+        }
+    }
+
+    /// A repeated label key used to replace the earlier bitmap, losing its membership while the
+    /// directory and `all_postings` (and so the post-load digest) stayed intact. It must be
+    /// rejected, not merged — whether the repeat is within a group or split differently across
+    /// two.
+    #[test]
+    fn rejects_duplicate_label_keys() {
+        let all = bitmap_of(&[1, 2]);
+        let ids = [(1, b"ts:1".to_vec()), (2, b"ts:2".to_vec())];
+        let within_group = hostile_body(
+            &all,
+            &[(b"job=".to_vec(), 2)],
+            &[
+                (b"web".to_vec(), blob_of(&[1])),
+                (b"web".to_vec(), blob_of(&[2])),
+            ],
+            2,
+            &ids,
+        );
+        let across_groups = hostile_body(
+            &all,
+            &[(b"jo".to_vec(), 1), (b"job=".to_vec(), 1)],
+            &[
+                (b"b=web".to_vec(), blob_of(&[1])),
+                (b"web".to_vec(), blob_of(&[2])),
+            ],
+            2,
+            &ids,
+        );
+        for body in [within_group, across_groups] {
+            let err = decode_err(&body);
+            assert!(
+                err.contains("duplicate label index entry job=web"),
+                "unexpected rejection: {err}"
+            );
+        }
+    }
+
     /// The shape most at risk from a subset check written in the wrong direction: a series with
     /// no labels is in `all_postings` and `id_to_key` but in no label bitmap at all, which
     /// [`Postings::count`] treats as a first-class member.
@@ -623,9 +886,10 @@ mod tests {
         postings.set_timeseries_key(7, b"ts:7");
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         let mut slice = buf.as_slice();
-        let loaded = deserialize(&mut slice).expect("a label-less series must round-trip");
+        let loaded =
+            deserialize_standalone(&mut slice).expect("a label-less series must round-trip");
 
         assert!(slice.is_empty(), "decoder must consume exactly the body");
         assert_eq!(loaded.count(), 2);
@@ -663,8 +927,8 @@ mod tests {
             .insert(3, b"c".to_vec().into_boxed_slice());
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
-        let decoded = deserialize(&mut buf.as_slice()).expect("long keys must decode");
+        serialize(&mut buf, &postings).unwrap();
+        let decoded = deserialize_standalone(&mut buf.as_slice()).expect("long keys must decode");
         assert_eq!(decoded.id_to_key.get(&1), Some(&long_key));
         let keys: Vec<String> = decoded
             .label_index
@@ -692,12 +956,14 @@ mod tests {
                 .try_insert(IndexKey::for_label_value(&name, &format!("{i}")), bitmap)
                 .unwrap();
             postings.all_postings.add(i + 1);
+            postings.set_timeseries_key(i + 1, format!("{i}").as_bytes());
         }
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         let mut slice = buf.as_slice();
-        let loaded = deserialize(&mut slice).expect("realistic prefix sharing must decode");
+        let loaded =
+            deserialize_standalone(&mut slice).expect("realistic prefix sharing must decode");
         assert_eq!(loaded.label_index.len(), postings.label_index.len());
 
         let key_bytes: usize = loaded.label_index.iter().map(|(k, _)| k.len()).sum();
@@ -731,9 +997,9 @@ mod tests {
         postings.set_timeseries_key(3, b"ts:3");
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         let mut slice = buf.as_slice();
-        let loaded = deserialize(&mut slice).expect("body should round-trip");
+        let loaded = deserialize_standalone(&mut slice).expect("body should round-trip");
 
         assert!(slice.is_empty(), "decoder must consume exactly the body");
         assert_eq!(loaded.id_to_key, postings.id_to_key);
@@ -743,6 +1009,33 @@ mod tests {
             assert_eq!(ka, kb);
             assert_eq!(va, vb);
         }
+    }
+
+    /// The group directory and the entries are written by separate passes, which must agree on
+    /// which entries stale masking empties — including one in the middle of a group, and a group
+    /// that empties entirely.
+    #[test]
+    fn stale_emptied_entries_drop_out_of_their_group() {
+        let mut postings = Postings::default();
+        for (id, value) in [(1, "a"), (2, "b"), (3, "c")] {
+            postings.add_posting_for_label_value(id, "job", value);
+            postings.set_timeseries_key(id, format!("ts:{id}").as_bytes());
+        }
+        postings.add_posting_for_label_value(2, "only", "two");
+        postings.mark_id_as_stale(2);
+
+        let mut buf = Vec::new();
+        serialize(&mut buf, &postings).unwrap();
+        let mut slice = buf.as_slice();
+        let loaded = deserialize_standalone(&mut slice).expect("body should round-trip");
+
+        assert!(slice.is_empty(), "decoder must consume exactly the body");
+        let keys: Vec<String> = loaded
+            .label_index
+            .iter()
+            .map(|(k, _)| k.as_str().to_string())
+            .collect();
+        assert_eq!(keys, ["job=a", "job=c"]);
     }
 
     #[test]
@@ -755,9 +1048,9 @@ mod tests {
         postings.mark_id_as_stale(2);
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
+        serialize(&mut buf, &postings).unwrap();
         let mut slice = buf.as_slice();
-        let loaded = deserialize(&mut slice).expect("body should round-trip");
+        let loaded = deserialize_standalone(&mut slice).expect("body should round-trip");
 
         assert!(loaded.stale_ids.is_empty(), "stale set is not persisted");
         assert!(!loaded.all_postings.contains(2));

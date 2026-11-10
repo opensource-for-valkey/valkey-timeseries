@@ -218,7 +218,7 @@ impl Postings {
 
 #[cfg(test)]
 mod tests {
-    use super::super::serialization::{deserialize, serialize};
+    use super::super::serialization::{deserialize_standalone, serialize};
     use super::super::test_support::{assert_postings_eq, make_series};
     use super::*;
     use crate::labels::Label;
@@ -421,8 +421,9 @@ mod tests {
         // reconciliation hides them again when the import is still in progress.
         let postings = hidden_fixture();
         let mut buf = Vec::new();
-        serialize(&mut buf, &postings);
-        let loaded = deserialize(&mut buf.as_slice()).expect("the body is self-consistent");
+        serialize(&mut buf, &postings).unwrap();
+        let loaded =
+            deserialize_standalone(&mut buf.as_slice()).expect("the body is self-consistent");
         assert_postings_eq(&loaded, &fixture());
         assert_eq!(loaded.hidden_ids, HiddenSet::default());
     }
