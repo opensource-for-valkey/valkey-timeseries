@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::hash::BuildHasher;
@@ -699,7 +700,7 @@ struct BatchIterator<'a> {
     index: &'a TimeSeriesIndex,
     /// When set, posting lists are counted through their intersection with this set rather than
     /// in full. See [`BatchIterator::new`].
-    matching: Option<PostingsBitmap>,
+    matching: Option<&'a PostingsBitmap>,
     cursor: Option<IndexKey>,
     batch_size: usize,
     is_finished: bool,
@@ -707,17 +708,18 @@ struct BatchIterator<'a> {
 
 impl<'a> BatchIterator<'a> {
     /// With `matching`, each posting list is counted within that set only. It was resolved under
-    /// an earlier lock hold, so each hold first narrows it, in place, to `all_postings` — the ids
-    /// neither tombstoned nor hidden — as of then: an id may have been tombstoned, hidden or
-    /// removed since. Not a point-in-time view, and the set only shrinks.
+    /// an earlier lock hold, and an id may have been tombstoned, hidden or removed since, or
+    /// published or revived after that. Each hold counts the ids of `matching` that are visible
+    /// as of then, leaving `matching` itself as it was: not a point-in-time view, but one whose
+    /// later holds are not narrowed by what an earlier hold could not see.
     fn new(
         index: &'a TimeSeriesIndex,
         batch_size: usize,
-        matching: Option<&PostingsBitmap>,
+        matching: Option<&'a PostingsBitmap>,
     ) -> Self {
         Self {
             index,
-            matching: matching.cloned(),
+            matching,
             cursor: None,
             batch_size: batch_size.max(1),
             is_finished: false,
@@ -730,9 +732,16 @@ impl<'a> BatchIterator<'a> {
         }
 
         let inner = read_lock(&self.index.inner);
-        if let Some(matching) = self.matching.as_mut() {
-            matching.and_inplace(&inner.all_postings);
-        }
+        // A removed series has left the label bitmaps too, so the set needs narrowing only to
+        // drop tombstoned and hidden ids, and only for this hold: either kind can become visible
+        // again before the next one.
+        let matching = self.matching.map(|matching| {
+            if inner.masks_any_ids() {
+                Cow::Owned(matching.and(&inner.all_postings))
+            } else {
+                Cow::Borrowed(matching)
+            }
+        });
 
         // Resume from the cursor key using an ordered range rather than a prefix scan (a full key
         // used as a prefix only matches itself and its extensions). The cursor key itself is
@@ -748,7 +757,7 @@ impl<'a> BatchIterator<'a> {
             if self.cursor.as_ref() == Some(key) {
                 continue;
             }
-            let count = match self.matching.as_ref() {
+            let count = match matching.as_deref() {
                 Some(matching) => bitmap.and_cardinality(matching),
                 None => inner.visible_cardinality(bitmap),
             };
@@ -797,11 +806,24 @@ mod tests {
         index
     }
 
+    fn first_series_slots() -> range_set_blaze::RangeSetBlaze<u16> {
+        range_set_blaze::RangeSetBlaze::from_iter([crate::fanout::calculate_hash_slot(b"key1")])
+    }
+
     fn hide_first_series(index: &TimeSeriesIndex) {
-        let slot = crate::fanout::calculate_hash_slot(b"key1");
-        let slots = range_set_blaze::RangeSetBlaze::from_iter([slot]);
         assert_eq!(
-            index.get_postings_mut().hide_indexed_keys_in_slots(&slots),
+            index
+                .get_postings_mut()
+                .hide_indexed_keys_in_slots(&first_series_slots()),
+            1
+        );
+    }
+
+    fn publish_first_series(index: &TimeSeriesIndex) {
+        assert_eq!(
+            index
+                .get_postings_mut()
+                .publish_hidden_in_slots(&first_series_slots()),
             1
         );
     }
@@ -868,6 +890,47 @@ mod tests {
         hide_first_series(&index);
         iterator.next_batch(|_, count| counts.push(count));
         assert_eq!(counts, [2, 1], "the second hold sees the series hidden");
+    }
+
+    /// Visibility is applied per hold, not accumulated: a series an earlier hold saw hidden counts
+    /// again once its import publishes it.
+    #[test]
+    fn a_restricted_scan_counts_a_series_published_after_an_earlier_hold_hid_it() {
+        let index = two_series_two_labels();
+        let matching = matching_all(&index);
+        let mut iterator = BatchIterator::new(&index, 1, Some(&matching));
+
+        let mut counts = Vec::new();
+        hide_first_series(&index);
+        iterator.next_batch(|_, count| counts.push(count));
+        publish_first_series(&index);
+        iterator.next_batch(|_, count| counts.push(count));
+        assert_eq!(counts, [1, 2], "the second hold sees the series published");
+    }
+
+    /// Likewise for a stale mark that re-indexing the series revokes.
+    #[test]
+    fn a_restricted_scan_counts_a_series_revived_after_an_earlier_hold_saw_it_stale() {
+        let index = two_series_two_labels();
+        let matching = matching_all(&index);
+        let mut iterator = BatchIterator::new(&index, 1, Some(&matching));
+
+        let mut counts = Vec::new();
+        index.mark_id_as_stale(1);
+        iterator.next_batch(|_, count| counts.push(count));
+        let mut revived = TimeSeries::new();
+        revived.id = 1;
+        revived.labels = crate::labels::MetricName::new(&[
+            crate::labels::Label::new("a", "x"),
+            crate::labels::Label::new("b", "x"),
+        ]);
+        index.get_postings_mut().index_timeseries(&revived, b"key1");
+        iterator.next_batch(|_, count| counts.push(count));
+        assert_eq!(
+            counts,
+            [1, 2],
+            "the second hold sees the series alive again"
+        );
     }
 
     fn index_with_posting(id: SeriesRef, label: &str, value: &str) -> TimeSeriesIndex {

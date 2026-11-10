@@ -180,10 +180,17 @@ impl Postings {
         ids.cardinality()
     }
 
+    /// Whether any id is tombstoned or hidden. When none is, every id a label bitmap holds is
+    /// visible: removing a series takes its id out of the bitmaps as well as `all_postings`.
+    #[inline]
+    pub(in crate::series::index) fn masks_any_ids(&self) -> bool {
+        !self.stale_ids.is_empty() || !self.hidden_ids.is_empty()
+    }
+
     /// How many of `postings`' ids a read may see: neither tombstoned nor hidden. For the readers
     /// that walk the term dictionary directly rather than through `Terms`.
     pub(in crate::series::index) fn visible_cardinality(&self, postings: &PostingsBitmap) -> u64 {
-        if self.stale_ids.is_empty() && self.hidden_ids.is_empty() {
+        if !self.masks_any_ids() {
             return postings.cardinality();
         }
         postings
