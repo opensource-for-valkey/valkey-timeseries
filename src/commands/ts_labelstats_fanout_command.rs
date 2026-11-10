@@ -76,8 +76,10 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
         //
         // Every entry is returned, untruncated: a shard's local top-K cannot establish the global
         // one (a value second everywhere can win overall), so the coordinator applies LIMIT after
-        // summing. The fingerprint bitmaps already cost a few bytes per term, so the lists add a
-        // constant factor, not a new order of size.
+        // summing. The reply is linear in the shard's distinct terms either way, since the
+        // fingerprint bitmaps hold one hash per term, but a `name=value` string and its count
+        // is several times a hash: a high-cardinality label (a per-series `host` or `uid`) puts
+        // about one string per series on the wire and in the coordinator's merge maps.
         let (stats, fingerprints) = get_db_index(ctx.db()).stats_and_label_bitmaps_by_selectors(
             &matchers,
             req.selected_label.as_deref(),
