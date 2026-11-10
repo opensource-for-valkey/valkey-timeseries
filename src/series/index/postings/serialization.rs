@@ -110,6 +110,8 @@ pub(in crate::series::index) struct KeyBudget {
 
 impl KeyBudget {
     /// The budget for a payload of `encoded_len` bytes, taken before any of it is decoded.
+    /// Saturates rather than wrapping; only reachable on a 32-bit target, where the result is
+    /// already past the address space.
     pub(in crate::series::index) fn for_payload(encoded_len: usize) -> Self {
         Self {
             limit: encoded_len.saturating_mul(MAX_KEY_EXPANSION_RATIO),
@@ -217,15 +219,13 @@ pub(in crate::series::index) fn read_bitmap(buf: &mut &[u8]) -> DecodeResult<Pos
 }
 
 /// Splits a label key *after* its first `=`, so that `prefix + suffix` reproduces the key byte for
-/// byte, whatever it contains — a value with an `=` in it, or a key with none at all. Nothing here
-/// has to agree with `IndexKey::for_label_value` about where the name ends.
+/// byte, whatever it contains — a value with an `=` in it, or a key with none at all. The offset
+/// is the one [`IndexKey::split`] has cached, but the load does not depend on where it falls: any
+/// split point reproduces the key.
 fn split_label_key(key: &IndexKey) -> (&[u8], &[u8]) {
     // `as_str` strips the NUL sentinel; `IndexKey::from(&[u8])` re-appends it on load.
     let full = key.as_str().as_bytes();
-    let split_at = full
-        .iter()
-        .position(|b| *b == b'=')
-        .map_or(full.len(), |i| i + 1);
+    let split_at = key.split().map_or(full.len(), |(name, _)| name.len() + 1);
     full.split_at(split_at)
 }
 
