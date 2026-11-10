@@ -743,3 +743,50 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
                                         'GROUPBY', 'sensor', 'REDUCE', 'max')
         assert len(result) == 1
         assert result[0][0] == b'sensor=tagged'
+
+    @pytest.mark.parametrize("pushdown", ["yes", "no"])
+    def test_mrange_cme_groupby_drops_series_without_the_group_label(self, pushdown):
+        """A series lacking the GROUPBY label belongs to no group, whoever does the grouping.
+
+        With push-down off the coordinator groups what the shards send. A missing label
+        value and an empty one look the same on the wire, so a shard that sent such a
+        series had it grouped under the empty value ('region='), where standalone, the
+        push-down path and RedisTimeSeries all leave it out.
+        """
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        series = {
+            'g:{slot1}:a': ('region', 'east'),
+            'g:{slot2}:b': ('region', 'west'),
+            'g:{slot3}:c': ('region', 'east'),
+            'g:{slot1}:d': None,
+            'g:{slot2}:e': None,
+            'g:{slot3}:f': None,
+        }
+        for value, (key, label) in enumerate(series.items(), start=1):
+            labels = ['kind', 'grp'] + (list(label) if label else [])
+            cluster_client.execute_command('TS.CREATE', key, 'LABELS', *labels)
+            cluster_client.execute_command('TS.ADD', key, 1000, value)
+
+        client = self.new_client_for_primary(0)
+        config = 'ts.ts-fanout-aggregation-pushdown'
+        client.execute_command('CONFIG', 'SET', config, pushdown)
+        try:
+            queries = {
+                'plain': [],
+                'aggregated': ['AGGREGATION', 'max', 1000],
+                # FILTER_BY_TS takes the shard's live read instead of its snapshots.
+                'filter_by_ts': ['FILTER_BY_TS', 1000],
+            }
+            for name, extra in queries.items():
+                result = client.execute_command('TS.MRANGE', '-', '+', *extra,
+                                                'FILTER', 'kind=grp',
+                                                'GROUPBY', 'region', 'REDUCE', 'sum')
+                groups = {entry[0]: [float(v) for _, v in entry[2]] for entry in result}
+                # east = a + c = 1 + 3, west = b = 2; d, e and f are in no group.
+                assert groups == {b'region=east': [4.0], b'region=west': [2.0]}, (name, result)
+
+            # Without GROUPBY every series still answers.
+            result = client.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'kind=grp')
+            assert len(result) == len(series)
+        finally:
+            client.execute_command('CONFIG', 'SET', config, 'yes')

@@ -423,6 +423,10 @@ fn process_mrange(
         // We remove grouping from the options here. The full request options are available in the done
         // handler, so we can use them to group the series.
         if is_clustered {
+            // A series without the label belongs to no group, so it is not sent at all:
+            // on the wire a missing value and an empty one look the same, and the
+            // coordinator would group it under the empty value.
+            metas.retain(|meta| meta.group_label_value.is_some());
             options.grouping = None;
         }
     }
@@ -1438,11 +1442,23 @@ fn snapshot_series(
 ) -> Vec<SnapshotSeries> {
     guards
         .iter()
+        .filter(|(guard, _)| takes_part(guard, options))
         .map(|(guard, key)| {
             let latest = get_latest(&options.range, ctx, guard);
             snapshot_one(guard, key.as_slice().to_vec(), latest, options, limit)
         })
         .collect()
+}
+
+/// Whether `series` contributes to the answer at all. Under GROUPBY a series without the
+/// label belongs to no group, so it is neither copied nor, on a shard, sent: on the wire a
+/// missing value and an empty one look the same, and the coordinator would group it
+/// under the empty value.
+fn takes_part(series: &TimeSeries, options: &MRangeOptions) -> bool {
+    options
+        .grouping
+        .as_ref()
+        .is_none_or(|grouping| series.label_value(&grouping.group_label).is_some())
 }
 
 /// One series' [`SnapshotSeries`]: everything [`decode_snapshot`] needs of it for `options`
@@ -3074,5 +3090,61 @@ mod tests {
         assert_eq!(member.range.count, None);
         assert!(member.grouping.is_some());
         assert!(is_snapshot_answerable(&options));
+    }
+
+    fn labelled_series(labels: &[(&str, &str)]) -> TimeSeries {
+        let options = crate::series::TimeSeriesOptions {
+            labels: Some(labels.iter().map(|(n, v)| Label::new(*n, *v)).collect()),
+            ..Default::default()
+        };
+        let mut series = TimeSeries::with_options(options).unwrap();
+        let _ = series.add(100, 1.0, None);
+        series
+    }
+
+    /// A shard sends the coordinator only the series that carry the GROUPBY label: one
+    /// without it belongs to no group, and would otherwise arrive looking like a member
+    /// of the empty-valued one. An empty value that is really there is a group.
+    #[test]
+    fn test_shard_omits_series_without_the_group_label() {
+        let us = labelled_series(&[("kind", "cpu"), ("region", "us")]);
+        let blank = labelled_series(&[("kind", "cpu"), ("region", "")]);
+        let unlabelled = labelled_series(&[("kind", "cpu")]);
+        let grouped = MRangeOptions {
+            range: RangeOptions::with_range(0, 500).unwrap(),
+            grouping: Some(RangeGroupingOptions {
+                aggregation: AggregatorConfig::new(AggregationType::Sum, None).unwrap(),
+                group_label: "region".into(),
+            }),
+            ..Default::default()
+        };
+        let mut plain = grouped.clone();
+        plain.grouping = None;
+
+        assert!(takes_part(&us, &grouped));
+        assert!(takes_part(&blank, &grouped));
+        assert!(!takes_part(&unlabelled, &grouped));
+        assert!(takes_part(&unlabelled, &plain));
+
+        // The live path a shard takes under FILTER_BY_TS applies the same rule.
+        let metas = || {
+            vec![
+                meta(&us, "a", None),
+                meta(&blank, "b", None),
+                meta(&unlabelled, "c", None),
+            ]
+        };
+        let sent =
+            process_mrange(metas(), grouped, MRangeScope::RemoteShard, None, &|| false).unwrap();
+        assert_eq!(keys_of(&sent), vec!["a", "b"]);
+        let groups: Vec<_> = sent
+            .iter()
+            .map(|r| r.group_label_value.as_deref())
+            .collect();
+        assert!(groups.contains(&Some("us")) && groups.contains(&Some("")));
+
+        let sent =
+            process_mrange(metas(), plain, MRangeScope::RemoteShard, None, &|| false).unwrap();
+        assert_eq!(keys_of(&sent), vec!["a", "b", "c"]);
     }
 }
