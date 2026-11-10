@@ -10,14 +10,16 @@ use crate::commands::utils::{
     MRangeReplyShape, get_multi_command_targets, reply_with_mrange_series_results,
 };
 use crate::common::context::key_for_display;
+use crate::common::logging::log_warning;
 use crate::common::metrics::fanout as fanout_metrics;
 use crate::common::replies::ReplyContext;
 use crate::common::threads::{IntoParRayon, IterIntoParRayon, request_par_threads};
 use crate::common::{MultiSample, Sample};
+use crate::fanout::serialization::{Deserialized, Serialized};
 use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
 use crate::iterators::{KWayMerge, RowReducer, SampleReducer, create_sample_iterator_adapter};
-use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
+use crate::series::chunks::{ChunkOps, TimeSeriesChunk, UncompressedChunk};
 use crate::series::mrange::{
     MRangeScope, SampleLimit, build_mrange_grouped_labels, collect_rows, collect_samples,
     decode_group_partials, decode_shard_snapshots, group_partial_reducer,
@@ -43,6 +45,9 @@ pub struct MRangeFanoutCommand {
     /// peer that ignored the request flag) which the coordinator must
     /// aggregate itself.
     series: Vec<(SeriesRangeResponse, bool)>,
+    /// This node's own series, as decoded ([`MRangeShare::Local`]). Shaped as the request
+    /// asked: bucketed whenever `pushdown` is set.
+    local_series: Vec<MRangeSeriesResult>,
     group_partials: Vec<GroupPartialSeries>,
     /// Shard-side aggregation push-down: shards return buckets instead of raw
     /// samples. Latched at construction so a concurrent `CONFIG SET` cannot
@@ -89,6 +94,7 @@ impl MRangeFanoutCommand {
         Self {
             options,
             series: Vec::with_capacity(8),
+            local_series: Vec::new(),
             group_partials: Vec::new(),
             pushdown,
             pushdown_group,
@@ -97,9 +103,80 @@ impl MRangeFanoutCommand {
     }
 }
 
+/// One node's share of a TS.MRANGE.
+pub enum MRangeShare {
+    /// A peer's answer, or this node's for a peer: the wire message.
+    Wire(MultiRangeResponse),
+    /// The coordinator's own per-series results, handed over as decoded. They never leave
+    /// the process, so encoding the samples and interning the labels would only be undone
+    /// by the coordinator: about 8 ns a sample, measured.
+    Local(LocalMRangeShare),
+}
+
+/// [`MRangeShare::Local`]: the series, and the push-down echoes a wire message would carry.
+pub struct LocalMRangeShare {
+    series: Vec<MRangeSeriesResult>,
+    applied_aggregation: bool,
+    applied_count: bool,
+}
+
+/// Per-series results as the wire message a peer is sent.
+fn series_to_wire(
+    series: Vec<MRangeSeriesResult>,
+    applied_aggregation: bool,
+    applied_count: bool,
+) -> ValkeyResult<MultiRangeResponse> {
+    let mut serialized: Vec<SeriesRangeResponse> = series
+        .into_iter()
+        .map(|x| x.try_into())
+        .collect::<Result<_, _>>()?;
+
+    // Unconditional: the ref arrays are self-describing, so no request
+    // opt-in or response echo is needed to make this decodable.
+    let (symbol_table_names, symbol_table_values) =
+        fanout_codec::symbol_table::intern_labels(&mut serialized);
+
+    Ok(MultiRangeResponse {
+        series: serialized,
+        group_partials: Vec::new(),
+        applied_aggregation,
+        applied_group_reduce: false,
+        applied_count,
+        symbol_table_names,
+        symbol_table_values,
+    })
+}
+
+impl Serialized for MRangeShare {
+    fn serialize(&self, dest: &mut Vec<u8>) {
+        match self {
+            MRangeShare::Wire(response) => response.serialize(dest),
+            // Not reached: only the coordinator's own share is `Local`, and that is never
+            // serialized. Kept correct all the same.
+            MRangeShare::Local(local) => {
+                let wire = series_to_wire(
+                    local.series.clone(),
+                    local.applied_aggregation,
+                    local.applied_count,
+                );
+                match wire {
+                    Ok(response) => response.serialize(dest),
+                    Err(e) => log_warning(format!("mrange: local share not serializable: {e}")),
+                }
+            }
+        }
+    }
+}
+
+impl Deserialized for MRangeShare {
+    fn deserialize(buf: &[u8]) -> ValkeyResult<Self> {
+        MultiRangeResponse::deserialize(buf).map(MRangeShare::Wire)
+    }
+}
+
 impl FanoutClientCommand for MRangeFanoutCommand {
     type Request = MultiRangeRequest;
-    type Response = MultiRangeResponse;
+    type Response = MRangeShare;
 
     fn name() -> &'static str {
         "cmd:mrange"
@@ -108,7 +185,7 @@ impl FanoutClientCommand for MRangeFanoutCommand {
     fn get_local_response(
         ctx: &FanoutContext,
         req: MultiRangeRequest,
-    ) -> ValkeyResult<MultiRangeResponse> {
+    ) -> ValkeyResult<MRangeShare> {
         let apply_aggregation = req.apply_aggregation;
         let apply_group_reduce = req.apply_group_reduce;
         let apply_count = req.apply_count;
@@ -155,7 +232,8 @@ impl FanoutClientCommand for MRangeFanoutCommand {
                 let ctx = ctx.lock_unexpired()?;
                 process_mrange_group_partials(&ctx, options, limit, &expired)?
             };
-            return Ok(MultiRangeResponse {
+            // Partials are small and already in their wire shape; nothing to skip.
+            return Ok(MRangeShare::Wire(MultiRangeResponse {
                 series: Vec::new(),
                 group_partials: partials.into_iter().map(Into::into).collect(),
                 // Compatibility echo: group reduce implies the per-series
@@ -166,7 +244,7 @@ impl FanoutClientCommand for MRangeFanoutCommand {
                 // No `series` in this branch, so nothing to intern.
                 symbol_table_names: Vec::new(),
                 symbol_table_values: Vec::new(),
-            });
+            }));
         }
 
         if !apply_aggregation {
@@ -197,26 +275,14 @@ impl FanoutClientCommand for MRangeFanoutCommand {
             process_mrange_query(&ctx, options, scope, limit, &expired)?
         };
 
-        // Convert MRangeSeriesResult to SeriesResponse
-        let mut serialized: Vec<SeriesRangeResponse> = series
-            .into_iter()
-            .map(|x| x.try_into())
-            .collect::<Result<_, _>>()?;
-
-        // Unconditional: the ref arrays are self-describing, so no request
-        // opt-in or response echo is needed to make this decodable.
-        let (symbol_table_names, symbol_table_values) =
-            fanout_codec::symbol_table::intern_labels(&mut serialized);
-
-        Ok(MultiRangeResponse {
-            series: serialized,
-            group_partials: Vec::new(),
-            applied_aggregation: apply_aggregation,
-            applied_group_reduce: false,
-            applied_count: apply_count,
-            symbol_table_names,
-            symbol_table_values,
-        })
+        if ctx.is_local_share() {
+            return Ok(MRangeShare::Local(LocalMRangeShare {
+                series,
+                applied_aggregation: apply_aggregation,
+                applied_count: apply_count,
+            }));
+        }
+        series_to_wire(series, apply_aggregation, apply_count).map(MRangeShare::Wire)
     }
 
     fn get_targets(&self, ctx: &Context) -> FanoutTarget {
@@ -232,7 +298,13 @@ impl FanoutClientCommand for MRangeFanoutCommand {
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
-        self.ingest_response(resp).map_err(Into::into)
+        match resp {
+            MRangeShare::Wire(resp) => self.ingest_response(resp).map_err(Into::into),
+            MRangeShare::Local(local) => {
+                self.ingest_local(local.series);
+                Ok(())
+            }
+        }
     }
 
     // `reply` only merges the shard responses and writes them.
@@ -292,6 +364,17 @@ impl MRangeFanoutCommand {
         Ok(())
     }
 
+    /// Fold in this node's own series. A series parsed from the wire always carries a group
+    /// label value, empty when it has none, and these are given the same shape so that both
+    /// group alike.
+    fn ingest_local(&mut self, series: Vec<MRangeSeriesResult>) {
+        self.local_series
+            .extend(series.into_iter().map(|mut series| {
+                series.group_label_value.get_or_insert_default();
+                series
+            }));
+    }
+
     /// Post-process the accumulated shard responses into the final reply
     /// series, compensating per response for shards that did not honor the
     /// push-down flags (compatibility handshake): raw series are aggregated
@@ -302,7 +385,9 @@ impl MRangeFanoutCommand {
         series: Vec<(SeriesRangeResponse, bool)>,
         mut group_partials: Vec<GroupPartialSeries>,
     ) -> ValkeyResult<Vec<MRangeSeriesResult>> {
-        let series = normalize_response_series(series, &self.options, self.pushdown)?;
+        let mut series = normalize_response_series(series, &self.options, self.pushdown)?;
+        // This node's own series need no normalizing: it shaped them as it asked itself to.
+        let mut local = std::mem::take(&mut self.local_series);
         if self.pushdown && !is_multi_aggregation(&self.options) {
             // Single-aggregation push-down: every series is bucketed after
             // normalization, so clear aggregation to skip re-aggregation. The
@@ -318,12 +403,17 @@ impl MRangeFanoutCommand {
             // Shards honoring apply_group_reduce sent partials and no series;
             // any series present are tagged per-series data from a peer that
             // did not — pre-reduce them locally into equivalent partials.
+            // This node answers a group reduce with partials, so it has no series here; if
+            // it ever does, they take the same route as a peer's.
+            for result in local.drain(..) {
+                series.push(result.try_into()?);
+            }
             group_partials.extend(compensate_group_partials(series, &self.options)?);
             handle_group_partials(group_partials, &self.options)
         } else if self.options.grouping.is_some() {
-            handle_grouping(series, &self.options)
+            handle_grouping(series, local, &self.options)
         } else {
-            let mut results = handle_basic(series, &self.options)?;
+            let mut results = handle_basic(series, local, &self.options)?;
             // Authoritative EXCLUDEEMPTY pass. Shards already drop empty series
             // when they honor `exclude_empty`, but a peer that ignores the field
             // (or coordinator-side aggregation that empties a series) must not
@@ -470,18 +560,45 @@ fn compensate_group_partials(
         .collect())
 }
 
+/// A series on its way into the reply: a peer's, still to be parsed, or this node's own.
+enum ShareSeries {
+    Wire(SeriesRangeResponse),
+    Local(MRangeSeriesResult),
+}
+
 fn handle_basic(
     series: Vec<SeriesRangeResponse>,
+    local: Vec<MRangeSeriesResult>,
     options: &MRangeOptions,
 ) -> ValkeyResult<Vec<MRangeSeriesResult>> {
-    let threads = request_par_threads(series.len(), shard_payload_work_plain(&series));
-    series
+    let work = shard_payload_work_plain(&series) + local_series_work(&local);
+    let shares: Vec<ShareSeries> = series
+        .into_iter()
+        .map(ShareSeries::Wire)
+        .chain(local.into_iter().map(ShareSeries::Local))
+        .collect();
+    let threads = request_par_threads(shares.len(), work);
+    shares
         .into_par_rayon()
         .num_threads(threads)
-        .map(MRangeSeriesResult::try_from) // Explicit conversion
+        .map(|share| match share {
+            ShareSeries::Wire(response) => MRangeSeriesResult::try_from(response),
+            ShareSeries::Local(result) => Ok(result),
+        })
         .into_fallible()
         .map(|series| process_series_samples(series, options))
         .collect()
+}
+
+/// [`shard_payload_work_plain`] for series that were never encoded.
+fn local_series_work(series: &[MRangeSeriesResult]) -> usize {
+    series
+        .iter()
+        .map(|result| match &result.data {
+            SeriesResultData::Chunk(chunk) => chunk.len(),
+            SeriesResultData::Rows(rows) => rows.len(),
+        })
+        .sum()
 }
 
 /// Work estimate for decoding shard responses, in sample-sized units. Only feeds
@@ -526,20 +643,23 @@ struct GroupData {
 /// Apply GROUPBY/REDUCE to the series coming from remote nodes
 fn handle_grouping(
     series: Vec<SeriesRangeResponse>,
+    local: Vec<MRangeSeriesResult>,
     options: &MRangeOptions,
 ) -> ValkeyResult<Vec<MRangeSeriesResult>> {
     let group_options = options
         .grouping
         .as_ref()
         .expect("Grouping options should be present");
-    let work = shard_payload_work_plain(&series);
-    let threads = request_par_threads(series.len(), work);
-    let results = series
+    let wire_work = shard_payload_work_plain(&series);
+    let work = wire_work + local_series_work(&local);
+    let threads = request_par_threads(series.len(), wire_work);
+    let mut results: Vec<MRangeSeriesResult> = series
         .into_par_rayon()
         .num_threads(threads)
         .map(MRangeSeriesResult::try_from)
         .into_fallible()
         .collect()?;
+    results.extend(local);
     let grouped_by_key = construct_group_map(results);
 
     let threads = request_par_threads(grouped_by_key.len(), work);
@@ -940,6 +1060,21 @@ mod tests {
     use crate::series::request_types::{
         AggregationOptions, AggregatorConfig, RangeGroupingOptions, RangeOptions,
     };
+
+    /// The merge over peers' series alone, as most of these tests exercise it.
+    fn handle_basic(
+        series: Vec<SeriesRangeResponse>,
+        options: &MRangeOptions,
+    ) -> ValkeyResult<Vec<MRangeSeriesResult>> {
+        super::handle_basic(series, Vec::new(), options)
+    }
+
+    fn handle_grouping(
+        series: Vec<SeriesRangeResponse>,
+        options: &MRangeOptions,
+    ) -> ValkeyResult<Vec<MRangeSeriesResult>> {
+        super::handle_grouping(series, Vec::new(), options)
+    }
 
     fn samples(pairs: &[(i64, f64)]) -> Vec<Sample> {
         pairs
@@ -2654,5 +2789,162 @@ mod tests {
 
         assert_eq!(cmd.series.len(), 1);
         assert!(cmd.series[0].0.labels.is_empty());
+    }
+
+    /// The coordinator's own share reaches the reply the same whether it is handed over
+    /// as decoded or goes through the wire message a peer's does: raw, bucketed and
+    /// multi-column series, grouped or not, with series that lack the group label.
+    #[test]
+    fn test_local_share_matches_wire_share() {
+        let raw: Vec<(&str, Option<&str>, Vec<Sample>)> = vec![
+            (
+                "a",
+                Some("us"),
+                samples(&[(0, 1.0), (10, 3.0), (110, 5.0), (250, 9.0)]),
+            ),
+            (
+                "b",
+                Some("eu"),
+                samples(&[(5, 2.0), (120, 4.0), (260, 6.0)]),
+            ),
+            (
+                "c",
+                Some("us"),
+                samples(&[(20, 7.0), (130, f64::NAN), (300, 8.0)]),
+            ),
+            ("d", None, samples(&[(15, 2.5), (140, 1.5)])),
+            ("e", Some("eu"), Vec::new()),
+        ];
+        let grouping = || RangeGroupingOptions {
+            aggregation: AggregatorConfig::new(AggregationType::Sum, None).unwrap(),
+            group_label: "region".into(),
+        };
+        let describe = |results: Vec<MRangeSeriesResult>| -> Vec<String> {
+            let mut out: Vec<String> = results
+                .iter()
+                .map(|r| {
+                    let data = match &r.data {
+                        SeriesResultData::Chunk(_) => format!("{:?}", result_samples(r)),
+                        SeriesResultData::Rows(rows) => format!("{rows:?}"),
+                    };
+                    format!(
+                        "{:?} {:?} {:?} {:?} {data}",
+                        r.key, r.group_label_value, r.labels, r.sources
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        };
+
+        for aggregation in [
+            None,
+            Some(avg_aggregation(100)),
+            Some(multi_aggregation(100)),
+        ] {
+            for pushdown in [false, true] {
+                if pushdown && aggregation.is_none() {
+                    continue;
+                }
+                for grouped in [false, true] {
+                    for (is_reverse, count) in [(false, None), (true, None), (true, Some(2))] {
+                        for (with_labels, exclude_empty) in [(false, false), (true, !grouped)] {
+                            let mut options = mrange_options(0, 1000);
+                            options.range.aggregation = aggregation.clone();
+                            options.range.count = count;
+                            options.is_reverse = is_reverse;
+                            options.with_labels = with_labels;
+                            options.exclude_empty = exclude_empty;
+                            options.grouping = grouped.then(grouping);
+                            let is_multi = is_multi_aggregation(&options);
+
+                            // What a shard answers with: ascending, COUNT withheld, and
+                            // bucketed when the aggregation was pushed down to it.
+                            let mut shard_options = options.clone();
+                            shard_options.range.count = None;
+                            shard_options.is_reverse = false;
+                            let shard_results: Vec<MRangeSeriesResult> = raw
+                                .iter()
+                                .map(|(key, group, data)| {
+                                    let mut result = series_result(key, *group, data.clone());
+                                    if pushdown && is_multi {
+                                        let rows = aggregate_rows_ascending(
+                                            data.iter().copied(),
+                                            &shard_options,
+                                        )
+                                        .collect();
+                                        result.data = SeriesResultData::Rows(rows);
+                                    } else if pushdown {
+                                        result = series_result(
+                                            key,
+                                            *group,
+                                            shard_aggregate(data.clone(), &shard_options),
+                                        );
+                                    }
+                                    if with_labels {
+                                        result.labels = vec![
+                                            crate::labels::Label::new(
+                                                "region",
+                                                group.unwrap_or(""),
+                                            ),
+                                            crate::labels::Label::new("id", key),
+                                        ];
+                                    }
+                                    result
+                                })
+                                .collect();
+
+                            // How many of the series arrive as this node's own share.
+                            let run = |local_count: usize| {
+                                let mut command = MRangeFanoutCommand {
+                                    options: options.clone(),
+                                    pushdown,
+                                    ..Default::default()
+                                };
+                                let (local, wire) = shard_results.split_at(local_count);
+                                let wire = series_to_wire(wire.to_vec(), pushdown, false).unwrap();
+                                command.ingest_response(wire).unwrap();
+                                command.ingest_local(local.to_vec());
+                                let series = std::mem::take(&mut command.series);
+                                describe(command.process_responses(series, Vec::new()).unwrap())
+                            };
+                            let case = format!(
+                                "aggregation={aggregation:?} pushdown={pushdown} grouped={grouped} \
+                                 reverse={is_reverse} count={count:?} labels={with_labels} \
+                                 exclude_empty={exclude_empty}"
+                            );
+                            let all_wire = run(0);
+                            assert!(!all_wire.is_empty(), "{case}");
+                            assert_eq!(run(shard_results.len()), all_wire, "all local: {case}");
+                            assert_eq!(run(2), all_wire, "mixed: {case}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A local share is never serialized, but if one were it would be the message a peer
+    /// gets, echoes included.
+    #[test]
+    fn test_local_share_serializes_as_the_wire_message() {
+        let data = samples(&[(0, 1.0), (10, 3.0)]);
+        let series = vec![series_result("a", Some("us"), data)];
+        let mut local = Vec::new();
+        MRangeShare::Local(LocalMRangeShare {
+            series: series.clone(),
+            applied_aggregation: true,
+            applied_count: true,
+        })
+        .serialize(&mut local);
+        let mut wire = Vec::new();
+        series_to_wire(series, true, true)
+            .unwrap()
+            .serialize(&mut wire);
+        assert_eq!(local, wire);
+        assert!(matches!(
+            MRangeShare::deserialize(&local),
+            Ok(MRangeShare::Wire(response)) if response.applied_aggregation && response.series.len() == 1
+        ));
     }
 }
