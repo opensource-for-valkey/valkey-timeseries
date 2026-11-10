@@ -24,8 +24,8 @@ use sha2::{Digest, Sha256};
 
 use crate::fixture::{Fixture, hex};
 use crate::scenario::{
-    Aggregator, Case, CaseKind, KeyDistribution, RangeWindow, Reducer, Scenario, SeriesSpec,
-    ValueBand,
+    Aggregation, Aggregator, Case, CaseKind, KeyDistribution, RangeWindow, Reducer, Scenario,
+    SeriesSpec, ValueBand,
 };
 
 /// Which product a setup stream targets.
@@ -560,6 +560,7 @@ pub fn aggregate(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn aggregate_streams(
     fixture: &Fixture,
     case: &Case,
@@ -699,11 +700,14 @@ fn mget_streams(fixture: &Fixture, case: &Case, label: usize, cycle: usize) -> V
     streams
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mrange_streams(
     fixture: &Fixture,
     case: &Case,
     label: usize,
     window: &RangeWindow,
+    aggregation: Option<Aggregation>,
+    withlabels: bool,
     cycle: usize,
 ) -> Vec<Stream> {
     let connections = case.connections as usize;
@@ -719,28 +723,47 @@ fn mrange_streams(
         // timestamps, so jittered fixtures still get exact expectations.
         let first = &fixture.series[matched[0]];
         let (from, to, _) = window_bounds(&first.samples, window);
-        let (from_arg, to_arg) = window_args(window, from, to);
-        let args: [&[u8]; 5] = [
-            b"TS.MRANGE",
-            from_arg.as_bytes(),
-            to_arg.as_bytes(),
-            b"FILTER",
-            filter.as_bytes(),
-        ];
+        // `ALIGN start` rejects the `-` shorthand, so aggregated reads always
+        // send explicit bounds.
+        let (from_arg, to_arg) = match aggregation {
+            Some(_) => (from.to_string(), to.to_string()),
+            None => window_args(window, from, to),
+        };
+        let bucket = aggregation.map(|a| bucket_ms(from, to, a.buckets));
+        let bucket_arg = bucket.map(|b| b.to_string()).unwrap_or_default();
+        let mut args: Vec<&[u8]> = vec![b"TS.MRANGE", from_arg.as_bytes(), to_arg.as_bytes()];
+        if withlabels {
+            args.push(b"WITHLABELS");
+        }
+        if let Some(a) = aggregation {
+            args.extend([
+                b"ALIGN".as_slice(),
+                b"start",
+                b"AGGREGATION",
+                a.aggregator.as_arg().as_bytes(),
+                bucket_arg.as_bytes(),
+            ]);
+        }
+        args.extend([b"FILTER".as_slice(), filter.as_bytes()]);
         let frame = cache.frame(&args, || {
             let mut expected: Vec<(String, usize, i64, i64)> = matched
                 .iter()
                 .map(|&i| {
                     let s = &fixture.series[i];
-                    let (f, t) = match window {
-                        RangeWindow::Full {} => (i64::MIN, i64::MAX),
+                    let (f, t) = match (window, aggregation) {
+                        (RangeWindow::Full {}, None) => (i64::MIN, i64::MAX),
                         _ => (from, to),
                     };
-                    let count = s
-                        .samples
-                        .iter()
-                        .filter(|x| x.timestamp >= f && x.timestamp <= t)
-                        .count();
+                    // Aggregated: one entry per non-empty bucket, stamped
+                    // with its start, which lies inside `[from, to]` too.
+                    let count = match (aggregation, bucket) {
+                        (Some(a), Some(b)) => aggregate(&s.samples, f, t, b, a.aggregator).len(),
+                        _ => s
+                            .samples
+                            .iter()
+                            .filter(|x| x.timestamp >= f && x.timestamp <= t)
+                            .count(),
+                    };
                     (s.key.clone(), count, f, t)
                 })
                 .collect();
@@ -922,9 +945,22 @@ pub fn build_case(scenario: &Scenario, fixture: &Fixture, case: &Case) -> CaseTr
             0,
             total,
         ),
-        CaseKind::Mrange { label, window } => (
+        CaseKind::Mrange {
+            label,
+            window,
+            aggregation,
+            withlabels,
+        } => (
             preload_stream(fixture),
-            mrange_streams(fixture, case, *label, window, scenario.read_cycle_requests),
+            mrange_streams(
+                fixture,
+                case,
+                *label,
+                window,
+                *aggregation,
+                *withlabels,
+                scenario.read_cycle_requests,
+            ),
             0,
             total,
         ),
@@ -1289,6 +1325,54 @@ mod tests {
             text.contains("GROUPBY\r\n$2\r\nl1\r\n$6\r\nREDUCE\r\n$3\r\nsum\r\n"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn aggregated_mrange_carries_bucket_counts() {
+        let f = fixture("mrange-agg", 25, 3);
+        let s = scenario(
+            serde_json::json!([
+                {"id": "mra", "kind": "mrange", "label": 1, "window": {"type": "full"},
+                 "withlabels": true, "aggregation": {"aggregator": "max", "buckets": 2}},
+                {"id": "mrl", "kind": "mrange", "label": 1, "window": {"type": "full"},
+                 "withlabels": true}
+            ]),
+            25,
+            3,
+        );
+        let mra = build_case(&s, &f, &s.cases[0]);
+        let text = String::from_utf8(mra.workload[0].frames[0].bytes.clone()).unwrap();
+        assert!(
+            text.starts_with(
+                "*11\r\n$9\r\nTS.MRANGE\r\n$13\r\n1700000000000\r\n$13\r\n1700000002000\r\n\
+                 $10\r\nWITHLABELS\r\n$5\r\nALIGN\r\n$5\r\nstart\r\n$11\r\nAGGREGATION\r\n\
+                 $3\r\nmax\r\n$4\r\n1001\r\n$6\r\nFILTER\r\n"
+            ),
+            "aggregated windows must carry explicit bounds: {text}"
+        );
+        let Expect::MultiSeries(entries) = &*mra.workload[0].frames[0].expect else {
+            panic!()
+        };
+        // 3 samples 1 s apart in 1,001 ms buckets: {0, 1} {2}.
+        assert!(
+            entries
+                .iter()
+                .all(|(_, n, f, t)| *n == 2 && *f == 1_700_000_000_000 && *t == 1_700_000_002_000),
+            "{entries:?}"
+        );
+
+        let mrl = build_case(&s, &f, &s.cases[1]);
+        let text = String::from_utf8(mrl.workload[0].frames[0].bytes.clone()).unwrap();
+        assert!(
+            text.starts_with(
+                "*6\r\n$9\r\nTS.MRANGE\r\n$1\r\n-\r\n$1\r\n+\r\n$10\r\nWITHLABELS\r\n$6\r\nFILTER\r\n"
+            ),
+            "{text}"
+        );
+        let Expect::MultiSeries(entries) = &*mrl.workload[0].frames[0].expect else {
+            panic!()
+        };
+        assert!(entries.iter().all(|(_, n, _, _)| *n == 3), "{entries:?}");
     }
 
     #[test]

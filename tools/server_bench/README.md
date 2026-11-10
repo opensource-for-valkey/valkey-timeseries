@@ -96,9 +96,11 @@ malformed selectors are rejected. A scenario names:
     `{1e300, 1e301}`, makes the command a scan with no output: the decode cost alone);
   - `aggregate {window, aggregator, buckets, reverse, filter_by_value}` — `ALIGN start AGGREGATION
     <min|max|count|sum|avg> <bucket>` with the bucket sized to yield about `buckets` points;
-  - `queryindex {label}`, `mget {label}`, `mrange {label, window}` — label queries on
-    `l<label>=<value>`; the value cycles deterministically, and selectivity follows the
-    label's cardinality (100 → 1 %, 10 → 10 %, 1 → 100 %);
+  - `queryindex {label}`, `mget {label}`, `mrange {label, window, aggregation, withlabels}` —
+    label queries on `l<label>=<value>`; the value cycles deterministically, and selectivity
+    follows the label's cardinality (100 → 1 %, 10 → 10 %, 1 → 100 %). `mrange` takes an
+    optional `aggregation: {aggregator, buckets}` (`ALIGN start AGGREGATION`, checked as an
+    exact bucket count per series) and `withlabels: true`;
   - `groupby {label, group_label, window, aggregator, buckets, reducer}` — `TS.MRANGE ...
     GROUPBY l<group_label> REDUCE <reducer>`; output cardinality is the number of distinct
     group values among the matched series;
@@ -122,7 +124,9 @@ point / range / memory), `agg` (the core fixture; scan-only probe, count/min/sum
 `docs/plans/aggregation-performance-plan.md`), `range` (the core fixture; raw RANGE windows with RESP3 twins,
 `head100`, GET as a control — the profile behind
 `docs/plans/range-performance-plan.md`), `query` (aggregations, label queries at
-1/10/100 % selectivity, 10 and 100 groups), the encoding variants `core-gorilla` and `core-uncompressed`, and the
+1/10/100 % selectivity, 10 and 100 groups), `mrange` (the query fixture; raw MRANGE from
+10 × 10 to 100k samples per reply, `head100`, WITHLABELS and RESP3 twins, lone (c1) against
+contended (c8) reads, per-series aggregation, GROUPBY at c1 and c8), the encoding variants `core-gorilla` and `core-uncompressed`, and the
 dataset/shape variants `core-counter`, `core-noisy`, `core-jitter`, `core-shallow`
 (100,000 × 10) and `core-deep` (1 × 1,000,000), and the value-shape pair `values-quantized`
 (`drift_q2`) and `values-counter` (`counter`): the core fixture with only the cases value shape

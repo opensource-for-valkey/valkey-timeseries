@@ -269,9 +269,20 @@ pub enum CaseKind {
     QueryIndex { label: usize },
     /// `TS.MGET FILTER l<label>=<value>`: last sample of every matched series.
     Mget { label: usize },
-    /// `TS.MRANGE <window> FILTER l<label>=<value>` — raw samples of every
+    /// `TS.MRANGE <window> [WITHLABELS] [ALIGN start AGGREGATION <agg> <bucket>]
+    /// FILTER l<label>=<value>` — raw samples (or per-series buckets) of every
     /// matched series over the window.
-    Mrange { label: usize, window: RangeWindow },
+    Mrange {
+        label: usize,
+        window: RangeWindow,
+        /// Per-series aggregation, bucket sized to yield about `buckets`
+        /// points, as for `aggregate`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        aggregation: Option<Aggregation>,
+        /// `WITHLABELS`: every entry carries the series' full label set.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        withlabels: bool,
+    },
     /// `TS.MRANGE <window> AGGREGATION ... FILTER l<label>=<value> GROUPBY
     /// l<group_label> REDUCE <reducer>`; output cardinality is the number of
     /// distinct `l<group_label>` values among the matched series.
@@ -284,6 +295,15 @@ pub enum CaseKind {
         buckets: usize,
         reducer: Reducer,
     },
+}
+
+/// `ALIGN start AGGREGATION <aggregator> <bucket>`, the bucket sized to yield
+/// about `buckets` points over the window.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Aggregation {
+    pub aggregator: Aggregator,
+    pub buckets: usize,
 }
 
 /// `FILTER_BY_VALUE min max`, inclusive on both ends as both products define it.
@@ -596,9 +616,21 @@ impl Scenario {
                 CaseKind::QueryIndex { label } | CaseKind::Mget { label } => {
                     check_label(&case.id, *label, f.label_cardinality.len())?;
                 }
-                CaseKind::Mrange { label, window } => {
+                CaseKind::Mrange {
+                    label,
+                    window,
+                    aggregation,
+                    ..
+                } => {
                     check_label(&case.id, *label, f.label_cardinality.len())?;
                     check_window(&case.id, window, f.samples_per_series)?;
+                    if let Some(a) = aggregation {
+                        ensure!(
+                            a.buckets >= 1,
+                            "case {}: buckets must be at least 1",
+                            case.id
+                        );
+                    }
                 }
                 CaseKind::GroupBy {
                     label,
@@ -698,11 +730,25 @@ mod tests {
             {"id": "qi", "kind": "queryindex", "label": 1},
             {"id": "mg", "kind": "mget", "label": 2},
             {"id": "mr", "kind": "mrange", "label": 1, "window": {"type": "recent", "points": 5}},
+            {"id": "mra", "kind": "mrange", "label": 1, "window": {"type": "full"}, "withlabels": true,
+             "aggregation": {"aggregator": "avg", "buckets": 4}},
             {"id": "gb", "kind": "groupby", "label": 0, "group_label": 1, "window": {"type": "full"},
              "aggregator": "sum", "buckets": 4, "reducer": "sum"}
         ]);
         let s = parse(v).unwrap();
         assert!(s.cases.iter().all(|c| c.kind.is_read()));
+        assert_eq!(
+            s.cases[4].kind,
+            CaseKind::Mrange {
+                label: 1,
+                window: RangeWindow::Full {},
+                aggregation: Some(Aggregation {
+                    aggregator: Aggregator::Avg,
+                    buckets: 4
+                }),
+                withlabels: true,
+            }
+        );
         assert_eq!(
             s.commands(),
             vec![
@@ -732,6 +778,47 @@ mod tests {
             {"id": "agg", "kind": "aggregate", "window": {"type": "full"}, "aggregator": "median", "buckets": 10}
         ]);
         assert!(parse(v).is_err());
+
+        let mut v = minimal();
+        v["cases"] = serde_json::json!([
+            {"id": "mra", "kind": "mrange", "label": 1, "window": {"type": "full"},
+             "aggregation": {"aggregator": "avg", "buckets": 0}}
+        ]);
+        assert!(parse(v).unwrap_err().to_string().contains("buckets"));
+
+        let mut v = minimal();
+        v["cases"] = serde_json::json!([
+            {"id": "mra", "kind": "mrange", "label": 1, "window": {"type": "full"},
+             "aggregation": {"aggregator": "avg", "buckets": 4, "reverse": true}}
+        ]);
+        assert!(parse(v).is_err());
+    }
+
+    /// Every committed profile parses and validates, so a typo in one fails
+    /// `cargo test` rather than the first run that picks it.
+    #[test]
+    fn committed_profiles_validate() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scenarios");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let s: Scenario =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            s.validate()
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert_eq!(
+                path.file_stem().unwrap().to_str().unwrap(),
+                s.name,
+                "{}: name must match the file name",
+                path.display()
+            );
+            seen += 1;
+        }
+        assert!(seen > 0, "no profiles under {}", dir.display());
     }
 
     #[test]
