@@ -25,7 +25,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::mem::size_of;
 use valkey_module::digest::Digest;
-use valkey_module::{RedisModuleIO, ValkeyResult};
+use valkey_module::{RedisModuleIO, ValkeyError, ValkeyResult};
 
 /// The most a partial range read reserves before decoding, in samples (4 KiB).
 ///
@@ -46,6 +46,11 @@ pub trait SampleCodec: Clone + Debug + PartialEq + Hash + GetSize + Sized {
     /// The encoding this codec implements.
     const ENCODING: ChunkEncoding;
 
+    /// The fewest stream bits any sample can take, the first included. A loaded header that
+    /// claims more samples than `bit_len() / MIN_SAMPLE_BITS` cannot be honest, which bounds
+    /// every `len()`-driven loop or allocation by the size of the payload.
+    const MIN_SAMPLE_BITS: usize;
+
     /// An empty codec whose stream will not allocate past `max_size` (plus a few bytes of
     /// slack) while the payload stays within budget; past it, growth resumes doubling. See
     /// `BitStream::set_soft_cap`.
@@ -57,6 +62,8 @@ pub trait SampleCodec: Clone + Debug + PartialEq + Hash + GetSize + Sized {
     fn iter(&self) -> Self::Iter<'_>;
     /// The encoded bytes written so far.
     fn bytes(&self) -> &[u8];
+    /// The encoded bits written so far, excluding the free bits of the trailing byte.
+    fn bit_len(&self) -> usize;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -151,6 +158,83 @@ impl<C: SampleCodec> XorChunk<C> {
         let span = last.saturating_sub(first).max(1) as u128;
         let part = (hi - lo) as u128 + 1;
         ((len as u128 * part / span) as usize + 1).min(len)
+    }
+
+    /// The sample count must fit the stream: no samples in an empty stream, and no more than
+    /// `bit_len() / MIN_SAMPLE_BITS`. The count comes from the payload and every reader trusts
+    /// it: 2^60 reached `Vec::with_capacity`, and 0 over a full stream made the next append
+    /// continue someone else's bits. The bound caps every `len()`-driven loop and allocation at
+    /// a small multiple of the payload. O(1); run on every load and deserialize.
+    pub(crate) fn check_count(&self) -> Result<(), String> {
+        let len = self.len();
+        let bits = self.encoder.bit_len();
+        if len == 0 && bits != 0 {
+            return Err(format!("empty chunk with a {bits}-bit stream"));
+        }
+        if len > bits / C::MIN_SAMPLE_BITS {
+            return Err(format!("{len} samples cannot fit in a {bits}-bit stream"));
+        }
+        Ok(())
+    }
+
+    /// [`check_count`](Self::check_count), plus the persisted first and last timestamps in the
+    /// domain the write path stores: non-negative and ordered. O(1); run on every RDB load.
+    /// Agreement with the stream itself is [`verify_stream`](Self::verify_stream).
+    ///
+    /// Only for stored chunks: a fan-out chunk can carry samples a series never stores.
+    pub(crate) fn check_header(&self) -> Result<(), String> {
+        self.check_count()?;
+        let len = self.len();
+        if len == 0 {
+            return Ok(());
+        }
+        let first = self.first_timestamp();
+        let last = self.last_timestamp();
+        if first < 0 {
+            return Err(format!("negative first timestamp {first}"));
+        }
+        if first > last || (len == 1 && first != last) {
+            return Err(format!(
+                "timestamps {first}..{last} do not fit {len} samples"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Decodes the whole stream and requires the header to be exactly what encoding those
+    /// samples produces: count, first and last timestamp, last value, the encoder's tail state,
+    /// the free-bit count and the padding bits. The decoded timestamps must be non-negative and
+    /// strictly increasing, as every write path leaves them.
+    ///
+    /// The encoders are deterministic, so re-encoding is the one comparison that covers all of
+    /// it, including tail state (Chimp's stored value, Gorilla's window) that only shapes the
+    /// *next* append: a false `stored_val` made acknowledged appends read back as garbage. It
+    /// costs a decode plus an encode of the chunk, so `rdb_load_series` runs it only outside
+    /// RDB loading. Call [`check_header`](Self::check_header) first; it bounds the loop.
+    pub(crate) fn verify_stream(&self) -> Result<(), String> {
+        let mut rebuilt = C::with_soft_cap(self.max_size);
+        let mut prev: Option<Timestamp> = None;
+        for item in self.encoder.iter() {
+            let sample = item.map_err(|e| format!("undecodable stream: {e}"))?;
+            if sample.timestamp < 0 {
+                return Err(format!("negative timestamp {}", sample.timestamp));
+            }
+            if prev.is_some_and(|p| sample.timestamp <= p) {
+                return Err(format!(
+                    "timestamp {} does not follow {}",
+                    sample.timestamp,
+                    prev.unwrap_or_default()
+                ));
+            }
+            prev = Some(sample.timestamp);
+            rebuilt
+                .push(&sample)
+                .map_err(|e| format!("cannot re-encode sample: {e}"))?;
+        }
+        if rebuilt != self.encoder {
+            return Err("header disagrees with the encoded samples".to_owned());
+        }
+        Ok(())
     }
 }
 
@@ -393,7 +477,11 @@ impl<C: SampleCodec> Chunk for XorChunk<C> {
         let max_size = rdb_load_usize(rdb)?;
         let mut encoder = C::rdb_load(rdb)?;
         encoder.set_soft_cap(max_size);
-        Ok(Self { encoder, max_size })
+        let chunk = Self { encoder, max_size };
+        chunk.check_header().map_err(|e| {
+            ValkeyError::String(format!("Invalid {} chunk: {e}", C::ENCODING.name()))
+        })?;
+        Ok(chunk)
     }
 
     fn serialize(&self, dest: &mut Vec<u8>) {
@@ -406,10 +494,14 @@ impl<C: SampleCodec> Chunk for XorChunk<C> {
         let max_size = try_read_uvarint(&mut buf).map_err(|_| TsdbError::ChunkDecoding)?;
         let mut encoder = C::deserialize(buf)?;
         encoder.set_soft_cap(max_size as usize);
-        Ok(Self {
+        let chunk = Self {
             encoder,
             max_size: max_size as usize,
-        })
+        };
+        chunk.check_count().map_err(|e| {
+            TsdbError::DecodingError(format!("invalid {} chunk: {e}", C::ENCODING.name()))
+        })?;
+        Ok(chunk)
     }
 
     fn debug_digest(&self, dig: &mut Digest) {

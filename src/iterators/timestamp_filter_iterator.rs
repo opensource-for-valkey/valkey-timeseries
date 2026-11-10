@@ -147,9 +147,9 @@ impl<'a> TimestampFilterIterator<'a> {
             buf.clear();
             buf.extend(it);
         } else {
-            let mut buf = Vec::with_capacity(chunk.len());
-            buf.extend(it);
-            self.buffer = Cow::Owned(buf);
+            // No reservation from `chunk.len()`: that is the persisted count, and a hostile one
+            // (2^60) aborted the process here. Growth from the decode is a handful of regrowths.
+            self.buffer = Cow::Owned(it.collect());
         }
     }
 

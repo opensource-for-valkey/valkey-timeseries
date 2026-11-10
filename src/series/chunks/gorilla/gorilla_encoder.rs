@@ -49,7 +49,7 @@ impl Hash for GorillaEncoder {
         self.trailing_bits.hash(state);
         self.timestamp_delta.hash(state);
         self.last_ts.hash(state);
-        hash_f64(self.num_samples as f64, state);
+        hash_f64(self.last_value, state);
     }
 }
 
@@ -189,7 +189,6 @@ impl GorillaEncoder {
     }
 
     /// Bits written so far, counting the partial trailing byte exactly.
-    #[cfg(test)]
     pub(crate) fn stream_bit_len(&self) -> usize {
         self.writer.len() * 8 - self.writer.count as usize
     }
@@ -203,6 +202,20 @@ impl GorillaEncoder {
 
     pub(crate) fn shrink_to_fit(&mut self) {
         self.writer.shrink_to_fit()
+    }
+
+    /// Overwrites the rolling window, as a forged payload could.
+    #[cfg(test)]
+    pub(crate) fn set_window_for_test(&mut self, leading: u8, trailing: u8, delta: i64) {
+        self.leading_bits = leading;
+        self.trailing_bits = trailing;
+        self.timestamp_delta = delta;
+    }
+
+    /// The bit stream, for tests that forge one.
+    #[cfg(test)]
+    pub(crate) fn stream_mut_for_test(&mut self) -> &mut BitStream {
+        &mut self.writer
     }
 
     /// Keeps only the first `len` bytes of the stream while leaving `num_samples` and the
@@ -309,26 +322,18 @@ impl GorillaEncoder {
 }
 
 impl PartialEq<Self> for GorillaEncoder {
+    /// Field for field, with `last_value` compared by bit pattern: a NaN last sample must
+    /// equal itself, or a chunk could never match its own re-encoding (see
+    /// `XorChunk::verify_stream`).
     fn eq(&self, other: &Self) -> bool {
-        if self.num_samples != other.num_samples {
-            return false;
-        }
-        if self.last_ts != other.last_ts {
-            return false;
-        }
-        if self.last_value != other.last_value {
-            return false;
-        }
-        if self.leading_bits != other.leading_bits {
-            return false;
-        }
-        if self.trailing_bits != other.trailing_bits {
-            return false;
-        }
-        if self.timestamp_delta != other.timestamp_delta {
-            return false;
-        }
-        self.writer == other.writer
+        self.num_samples == other.num_samples
+            && self.first_ts == other.first_ts
+            && self.last_ts == other.last_ts
+            && self.last_value.to_bits() == other.last_value.to_bits()
+            && self.leading_bits == other.leading_bits
+            && self.trailing_bits == other.trailing_bits
+            && self.timestamp_delta == other.timestamp_delta
+            && self.writer == other.writer
     }
 }
 

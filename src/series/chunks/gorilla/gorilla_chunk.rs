@@ -18,6 +18,9 @@ pub type GorillaChunkIterator<'a> = RangeFiltered<GorillaIterator<'a>>;
 impl SampleCodec for GorillaEncoder {
     type Iter<'a> = GorillaIterator<'a>;
     const ENCODING: ChunkEncoding = ChunkEncoding::Gorilla;
+    /// The first sample is a varint timestamp plus a raw 64-bit value; every later one is at
+    /// least a one-bit delta-of-delta plus a one-bit "same value".
+    const MIN_SAMPLE_BITS: usize = 2;
 
     fn with_soft_cap(max_size: usize) -> Self {
         GorillaEncoder::with_soft_cap(max_size)
@@ -34,6 +37,9 @@ impl SampleCodec for GorillaEncoder {
     }
     fn bytes(&self) -> &[u8] {
         self.buf()
+    }
+    fn bit_len(&self) -> usize {
+        self.stream_bit_len()
     }
     fn len(&self) -> usize {
         self.num_samples
@@ -159,10 +165,10 @@ mod tests {
 
     /// A corrupt persisted sample count must surface as an error, not an abort.
     ///
-    /// `get_range` sizes its result from `num_samples`, which comes straight out of the RDB
-    /// or serialized stream. `Vec::with_capacity(usize::MAX)` aborts the process on
-    /// capacity overflow (and a merely huge count aborts on allocation failure); the
-    /// fallible reserve turns both into a `DecodingError` the caller can report.
+    /// `deserialize` (like `load_rdb`) refuses a count the stream cannot hold. A chunk that
+    /// gets one in memory anyway still errors in `get_range`, which sizes its result from
+    /// `num_samples`: `Vec::with_capacity(usize::MAX)` would abort the process, and the
+    /// fallible reserve turns that into a `DecodingError` the caller can report.
     #[test]
     fn test_get_range_with_a_corrupt_sample_count_is_an_error_not_an_abort() {
         let mut chunk = GorillaChunk::with_max_size(1024);
@@ -171,19 +177,16 @@ mod tests {
         }
         chunk.encoder.num_samples = usize::MAX;
 
-        // Direct read, and a read after the count has round-tripped through `deserialize`.
         let mut buf = Vec::new();
         chunk.serialize(&mut buf);
-        let loaded = GorillaChunk::deserialize(&buf).unwrap();
-        assert_eq!(loaded.len(), usize::MAX);
+        match GorillaChunk::deserialize(&buf) {
+            Err(TsdbError::DecodingError(msg)) => assert!(msg.contains("cannot fit"), "{msg}"),
+            other => panic!("expected the count to be refused, got {other:?}"),
+        }
 
-        for (label, chunk) in [("in-memory", &chunk), ("deserialized", &loaded)] {
-            match chunk.get_range(i64::MIN, i64::MAX) {
-                Err(TsdbError::DecodingError(msg)) => {
-                    assert!(msg.contains("cannot reserve"), "{label}: {msg}")
-                }
-                other => panic!("{label}: expected a decoding error, got {other:?}"),
-            }
+        match chunk.get_range(i64::MIN, i64::MAX) {
+            Err(TsdbError::DecodingError(msg)) => assert!(msg.contains("cannot reserve"), "{msg}"),
+            other => panic!("expected a decoding error, got {other:?}"),
         }
     }
 

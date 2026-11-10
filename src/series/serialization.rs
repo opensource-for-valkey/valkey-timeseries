@@ -3,6 +3,7 @@ use crate::common::{Sample, Timestamp};
 use crate::labels::MetricName;
 use crate::series::chunks::{Chunk, ChunkEncoding, ChunkOps, TimeSeriesChunk};
 use crate::series::compaction::CompactionRule;
+use crate::series::index::persistence::is_loading_active;
 use crate::series::series_data_type::{
     MIN_TIMESERIES_TYPE_ENCODING_VERSION, TIMESERIES_TYPE_ENCODING_VERSION,
     is_supported_encoding_version,
@@ -70,6 +71,12 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
     let chunk_encoding = ChunkEncoding::try_from(rdb_load_string(rdb)?)?;
     let chunk_size_bytes = rdb_load_usize(rdb)?;
     let chunks_len = rdb_load_len(rdb, MAX_RDB_COLLECTION_LEN)?;
+    // A compressed chunk's header (count, bounds, last value, encoder tail state) is only
+    // checked against its stream by decoding it, which costs a decode and an encode of every
+    // sample. That runs for `RESTORE` and a slot import's `TS._RESTORE`, which any client with
+    // `RESTORE` can reach with a forged DUMP footer, but not while the server loads an RDB or
+    // AOF it wrote itself: there the O(1) header checks in the chunk loaders stand alone.
+    let verify_streams = !is_loading_active();
     let mut chunks = Vec::with_capacity(chunks_len);
     let mut total_samples: usize = 0;
     // `None` until the first non-empty chunk, not `0`: 0 is a valid timestamp, and using it
@@ -82,6 +89,14 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
 
     for _ in 0..chunks_len {
         let chunk = TimeSeriesChunk::load_rdb(rdb, enc_ver)?;
+        if verify_streams {
+            chunk.verify_stream().map_err(|e| {
+                ValkeyError::String(format!(
+                    "Invalid {} chunk: {e}",
+                    chunk.get_encoding().name()
+                ))
+            })?;
+        }
         total_samples += chunk.len();
         if first_timestamp.is_none() && !chunk.is_empty() {
             first_timestamp = Some(chunk.first_timestamp());

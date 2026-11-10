@@ -21,6 +21,9 @@ pub type ChimpChunkIterator<'a> = RangeFiltered<ChimpIterator<'a>>;
 impl SampleCodec for ChimpCompressor {
     type Iter<'a> = ChimpIterator<'a>;
     const ENCODING: ChunkEncoding = ChunkEncoding::Chimp;
+    /// The first sample is a varint timestamp plus a raw 64-bit value; every later one is at
+    /// least a one-bit delta-of-delta plus a three-bit repeat.
+    const MIN_SAMPLE_BITS: usize = 4;
 
     fn with_soft_cap(max_size: usize) -> Self {
         ChimpCompressor::with_soft_cap(max_size)
@@ -37,6 +40,9 @@ impl SampleCodec for ChimpCompressor {
     }
     fn bytes(&self) -> &[u8] {
         ChimpCompressor::bytes(self)
+    }
+    fn bit_len(&self) -> usize {
+        self.len_bits() as usize
     }
     fn len(&self) -> usize {
         self.count() as usize

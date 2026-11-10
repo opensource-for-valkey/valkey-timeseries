@@ -200,6 +200,17 @@ impl TimeSeriesChunk {
     pub fn is_compressed(&self) -> bool {
         !matches!(self, TimeSeriesChunk::Uncompressed(_))
     }
+
+    /// Whether a loaded compressed chunk's header is exactly what its stream encodes; see
+    /// `XorChunk::verify_stream`. An uncompressed chunk has no header to disagree with, and its
+    /// loader already requires strictly increasing timestamps.
+    pub(crate) fn verify_stream(&self) -> Result<(), String> {
+        match self {
+            TimeSeriesChunk::Uncompressed(_) => Ok(()),
+            TimeSeriesChunk::Gorilla(chunk) => chunk.verify_stream(),
+            TimeSeriesChunk::Chimp(chunk) => chunk.verify_stream(),
+        }
+    }
 }
 
 impl Default for TimeSeriesChunk {
