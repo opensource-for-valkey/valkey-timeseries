@@ -353,24 +353,58 @@ pub(in crate::series::index) fn deserialize(
                     key.as_str()
                 ));
             }
-            label_index
-                .try_insert(key, bitmap)
-                .map_err(|e| format!("label index insert failed: {e}"))?;
+            // The writer emits each key once. A repeat — within a group, or across two groups
+            // whose prefix and suffix split the same bytes differently — would replace the
+            // earlier bitmap and silently drop its membership, while the directory and
+            // `all_postings` stay intact and the post-load digest still matches.
+            match label_index.try_insert(key, bitmap) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    return Err(format!(
+                        "duplicate label index entry {}",
+                        String::from_utf8_lossy(&key_bytes)
+                    ));
+                }
+                Err(e) => return Err(format!("label index insert failed: {e}")),
+            }
         }
     }
 
+    // The directory must name exactly the ids in `all_postings`: the writer folds hidden ids into
+    // the written set, and stale ids leave both at mark time, so any disagreement is corruption.
+    // An id only in `all_postings` is a phantom member resolving to no key; one only in the
+    // directory is missing from every `all_postings`-based read. Ids arrive strictly ascending,
+    // each checked for membership as it is read, so equal counts at the end mean equal sets
+    // without building a second bitmap.
     let id_count = try_read_uvarint(buf).map_err(|e| e.to_string())? as usize;
     check_declared_count("id directory", id_count, buf, MIN_ID_ENTRY_BYTES)?;
     let mut id_to_key = BTreeMap::new();
     let mut prev_id: SeriesRef = 0;
     for _ in 0..id_count {
         let delta = try_read_uvarint(buf).map_err(|e| e.to_string())?;
+        // Zero would repeat the previous id (overwriting its key) or, first, yield id 0, which
+        // the allocator reserves for "unassigned".
+        if delta == 0 {
+            return Err(format!("id directory: zero delta after id {prev_id}"));
+        }
         let id = prev_id
             .checked_add(delta)
             .ok_or_else(|| "series id overflow".to_string())?;
         prev_id = id;
+        if !all_postings.contains(id) {
+            return Err(format!(
+                "id directory entry {id} is absent from all_postings"
+            ));
+        }
         let key = try_read_byte_slice(buf).map_err(|e| e.to_string())?;
         id_to_key.insert(id, key.to_vec().into_boxed_slice());
+    }
+    let members = all_postings.cardinality();
+    if id_to_key.len() as u64 != members {
+        return Err(format!(
+            "all_postings holds {members} ids but the id directory names {}",
+            id_to_key.len()
+        ));
     }
 
     Ok(Postings {
@@ -611,7 +645,7 @@ mod tests {
     fn rejects_a_long_prefix_fanned_out_before_building_the_key() {
         let prefix = vec![b'x'; 64 * 1024];
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..64)
-            .map(|i| (vec![b'0' + (i % 10) as u8], min_bitmap_blob()))
+            .map(|i| (format!("{i:02}").into_bytes(), min_bitmap_blob()))
             .collect();
         let body = hostile_body(
             &live_ids(),
@@ -701,6 +735,102 @@ mod tests {
         );
     }
 
+    fn blob_of(ids: &[u64]) -> Vec<u8> {
+        let mut blob = Vec::new();
+        let _ = bitmap_of(ids).serialize_into_vec::<Portable>(&mut blob);
+        blob
+    }
+
+    /// A directory id that `all_postings` lacks would answer `has_id` while every
+    /// `all_postings`-based read, subtractive predicates included, misses it.
+    #[test]
+    fn rejects_directory_id_absent_from_all_postings() {
+        let body = hostile_body(
+            &PostingsBitmap::new(),
+            &[],
+            &[],
+            1,
+            &[(1, b"ts:1".to_vec())],
+        );
+        let err = decode_err(&body);
+        assert!(
+            err.contains("entry 1 is absent from all_postings"),
+            "unexpected rejection: {err}"
+        );
+    }
+
+    /// The other direction: a member every bitmap agrees on, resolving to no key.
+    #[test]
+    fn rejects_member_without_directory_entry() {
+        let body = hostile_body(
+            &live_ids(),
+            &[(b"job=".to_vec(), 1)],
+            &[(b"web".to_vec(), min_bitmap_blob())],
+            0,
+            &[],
+        );
+        let err = decode_err(&body);
+        assert!(
+            err.contains("all_postings holds 1 ids but the id directory names 0"),
+            "unexpected rejection: {err}"
+        );
+    }
+
+    /// A zero delta either repeats the previous id, overwriting its key, or (first) yields id 0,
+    /// the allocator's "unassigned" sentinel.
+    #[test]
+    fn rejects_zero_id_delta() {
+        let repeated = hostile_body(
+            &bitmap_of(&[1, 2]),
+            &[],
+            &[],
+            2,
+            &[(1, b"ts:1".to_vec()), (1, b"ts:2".to_vec())],
+        );
+        let id_zero = hostile_body(&bitmap_of(&[0]), &[], &[], 1, &[(0, b"ts:0".to_vec())]);
+        for body in [repeated, id_zero] {
+            let err = decode_err(&body);
+            assert!(err.contains("zero delta"), "unexpected rejection: {err}");
+        }
+    }
+
+    /// A repeated label key used to replace the earlier bitmap, losing its membership while the
+    /// directory and `all_postings` (and so the post-load digest) stayed intact. It must be
+    /// rejected, not merged — whether the repeat is within a group or split differently across
+    /// two.
+    #[test]
+    fn rejects_duplicate_label_keys() {
+        let all = bitmap_of(&[1, 2]);
+        let ids = [(1, b"ts:1".to_vec()), (2, b"ts:2".to_vec())];
+        let within_group = hostile_body(
+            &all,
+            &[(b"job=".to_vec(), 2)],
+            &[
+                (b"web".to_vec(), blob_of(&[1])),
+                (b"web".to_vec(), blob_of(&[2])),
+            ],
+            2,
+            &ids,
+        );
+        let across_groups = hostile_body(
+            &all,
+            &[(b"jo".to_vec(), 1), (b"job=".to_vec(), 1)],
+            &[
+                (b"b=web".to_vec(), blob_of(&[1])),
+                (b"web".to_vec(), blob_of(&[2])),
+            ],
+            2,
+            &ids,
+        );
+        for body in [within_group, across_groups] {
+            let err = decode_err(&body);
+            assert!(
+                err.contains("duplicate label index entry job=web"),
+                "unexpected rejection: {err}"
+            );
+        }
+    }
+
     /// The shape most at risk from a subset check written in the wrong direction: a series with
     /// no labels is in `all_postings` and `id_to_key` but in no label bitmap at all, which
     /// [`Postings::count`] treats as a first-class member.
@@ -784,6 +914,7 @@ mod tests {
                 .try_insert(IndexKey::for_label_value(&name, &format!("{i}")), bitmap)
                 .unwrap();
             postings.all_postings.add(i + 1);
+            postings.set_timeseries_key(i + 1, format!("{i}").as_bytes());
         }
 
         let mut buf = Vec::new();

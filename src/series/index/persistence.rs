@@ -810,7 +810,7 @@ mod tests {
     #[test]
     fn label_name_is_written_once_per_group() {
         let mut postings = Postings::default();
-        for i in 0..200u64 {
+        for i in 1..=200u64 {
             let mut bitmap = PostingsBitmap::new();
             bitmap.add(i);
             postings
@@ -820,9 +820,12 @@ mod tests {
                     bitmap,
                 )
                 .unwrap();
-            // Every posted id must be in `all_postings`; the decoder rejects bodies where a
-            // label bitmap names an id the membership set does not.
+            // Every posted id must be a member with a directory entry: the decoder rejects
+            // bodies whose label bitmaps, `all_postings` and directory disagree.
             postings.all_postings.add(i);
+            postings
+                .id_to_key
+                .insert(i, format!("ts:{i}").into_bytes().into_boxed_slice());
         }
 
         let payload = build_payload(&[(0, &postings)]);
@@ -850,6 +853,10 @@ mod tests {
                 .try_insert(IndexKey::from(*key), bitmap)
                 .unwrap();
             postings.all_postings.add(i as u64 + 1);
+            postings.id_to_key.insert(
+                i as u64 + 1,
+                format!("ts:{i}").into_bytes().into_boxed_slice(),
+            );
         }
 
         let payload = build_payload(&[(0, &postings)]);
