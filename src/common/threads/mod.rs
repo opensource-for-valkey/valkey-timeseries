@@ -131,6 +131,30 @@ pub fn lane_workers() -> usize {
     crate::config::num_threads().clamp(2, 8)
 }
 
+/// Fewer items than this, or less work than [`PARALLEL_MIN_WORK`], and a request
+/// runs its parallel section sequentially on the calling thread.
+pub const PARALLEL_MIN_ITEMS: usize = 2;
+
+/// Minimum amount of work — in samples, or sample-sized units of shard payload —
+/// before dispatching to the shared pool pays for itself. Dispatch plus join costs on
+/// the order of 10–20 µs; decoding a sample costs well under 0.1 µs, so below a few
+/// thousand samples the sequential path wins. Measured, not derived: a one-series
+/// TS.MRANGE over 100 samples went from 342 µs to 269 µs when it stopped
+/// dispatching at all (paired A/B, three trials).
+pub const PARALLEL_MIN_WORK: usize = 4096;
+
+/// The `num_threads` argument for a per-request parallel section (`*_rayon`):
+/// `1` (orx-parallel's sequential fast path, no dispatch) unless there are at least
+/// [`PARALLEL_MIN_ITEMS`] items and [`PARALLEL_MIN_WORK`] units of work, else `0`
+/// (auto, bounded by the pool size).
+pub fn request_par_threads(items: usize, work: usize) -> usize {
+    if items < PARALLEL_MIN_ITEMS || work < PARALLEL_MIN_WORK {
+        1
+    } else {
+        0
+    }
+}
+
 /// The message a panic was raised with, for logging a panic that was caught.
 pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     payload
@@ -240,6 +264,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::{PARALLEL_MIN_ITEMS, PARALLEL_MIN_WORK, request_par_threads};
     use super::{SingleFlight, ThreadRole, current_role, join, set_thread_role};
     use super::{spawn_background, spawn_background_single};
     use orx_parallel::{Par, ParCollection, Parallelizable, Pool};
@@ -343,5 +368,16 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the run never ended");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn small_requests_stay_sequential() {
+        assert_eq!(request_par_threads(1, usize::MAX), 1);
+        assert_eq!(request_par_threads(1000, PARALLEL_MIN_WORK - 1), 1);
+        assert_eq!(
+            request_par_threads(PARALLEL_MIN_ITEMS, PARALLEL_MIN_WORK),
+            0
+        );
+        assert_eq!(request_par_threads(1000, 1_000_000), 0);
     }
 }

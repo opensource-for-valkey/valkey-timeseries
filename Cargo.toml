@@ -57,6 +57,8 @@ statrs = { version = "0.19.1", default-features = false, features = ["std"] }
 welch-sde = "0.1.0"
 regex-syntax = "0.8.11"
 crc16 = "0.4.0"
+# Only for the `benchmark_dataset` tool (fixture checksums); pulled in by `test-utils`.
+sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 # Self-dependency so benches, tests and the compression_report bin all see the
@@ -139,6 +141,11 @@ name = "fleet_loader"
 path = "tools/fleet_loader.rs"
 required-features = ["fleet-loader", "enable-system-alloc"]
 
+[[bin]]
+name = "benchmark_dataset"
+path = "tools/benchmark_dataset.rs"
+required-features = ["test-utils", "enable-system-alloc"]
+
 [features]
 default = ["min-valkey-compatibility-version-8-0", "croaring/alloc"]
 enable-system-alloc = ["valkey-module/enable-system-alloc"]
@@ -146,7 +153,7 @@ min-valkey-compatibility-version-8-0 = ["valkey-module/min-valkey-compatibility-
 use-redismodule-api = [] # We don't support this feature flag which is why it is empty.
 # Exposes src/tests (data generators, chunk helpers) to benchmarks and tools.
 # Enabled automatically for dev targets via the self dev-dependency above.
-# The generators in src/tests are the only users of these two.
-test-utils = ["dep:bon", "dep:rand_distr"]
+# The generators in src/tests are the only users of bon and rand_distr.
+test-utils = ["dep:bon", "dep:rand_distr", "dep:sha2"]
 # tools/fleet_loader: the fleet generator plus a Valkey client to load it with.
 fleet-loader = ["test-utils", "dep:redis"]

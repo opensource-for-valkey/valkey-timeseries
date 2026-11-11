@@ -30,11 +30,39 @@
 # Optional caller-supplied input:
 #   COMPAT_REF_PY   bash array holding the python interpreter to use
 #                   (e.g. COMPAT_REF_PY=(uv run python3)). Defaults to (python3).
+#   COMPAT_REFERENCE_COMPOSE_FILE / COMPAT_REFERENCE_COMPOSE_PROJECT
+#                   Docker mode only: run the `reference` service of another compose
+#                   file and/or under another compose project (see the overrides
+#                   section below). Unset means docker-compose.compat.yml under the
+#                   default project — the build.sh / fuzz.sh behaviour.
+#   COMPAT_REFERENCE_NOTIFY_KEYSPACE_EVENTS
+#                   Binary mode only: the reference's notify-keyspace-events. Unset
+#                   means KEA, as the compat compose service runs it; set it empty for
+#                   a benchmark, which the docker overlay does for its own service.
 # ---------------------------------------------------------------------------
 
 # Resolved once, from this file's location, so the caller's cwd is irrelevant.
 _COMPAT_REF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-_COMPAT_REF_COMPOSE_FILE="$_COMPAT_REF_ROOT/docker-compose.compat.yml"
+
+# --- docker deployment overrides -------------------------------------------
+# Narrowly scoped: a caller may point Docker mode at a different compose file and/or
+# compose project, e.g. the benchmark overlay (docker-compose.bench.yml), which
+# `extends` the canonical reference service so the image pin is inherited rather
+# than duplicated. Defaults are the compat harness file and compose's own default
+# project name, so build.sh and fuzz.sh behave exactly as before. The service name is
+# not overridable: whatever file is used must define a `reference` service.
+COMPAT_REFERENCE_COMPOSE_FILE="${COMPAT_REFERENCE_COMPOSE_FILE:-$_COMPAT_REF_ROOT/docker-compose.compat.yml}"
+COMPAT_REFERENCE_COMPOSE_PROJECT="${COMPAT_REFERENCE_COMPOSE_PROJECT:-}"
+
+# `docker compose` invocation with the file/project selection applied. Usage:
+#   _compat_ref_compose up -d --wait reference
+_compat_ref_compose() {
+    if [ -n "$COMPAT_REFERENCE_COMPOSE_PROJECT" ]; then
+        docker compose -f "$COMPAT_REFERENCE_COMPOSE_FILE" -p "$COMPAT_REFERENCE_COMPOSE_PROJECT" "$@"
+    else
+        docker compose -f "$COMPAT_REFERENCE_COMPOSE_FILE" "$@"
+    fi
+}
 
 # --- pin -------------------------------------------------------------------
 # Must track the image pinned in docker-compose.compat.yml. Bump both together, in
@@ -70,6 +98,11 @@ fi
 _compat_ref_log()  { printf '\033[1;34m==>\033[0m reference: %s\n' "$*" >&2; }
 _compat_ref_warn() { printf '\033[1;33mwarn:\033[0m reference: %s\n' "$*" >&2; }
 _compat_ref_err()  { printf '\033[1;31merror:\033[0m reference: %s\n' "$*" >&2; }
+
+# A URL fit for logs: any password in `scheme://user:password@host` masked.
+_compat_ref_redact_url() {
+    printf '%s' "$1" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)([^:@/]*):[^@/]*@#\1\2:***@#; s#^([A-Za-z][A-Za-z0-9+.-]*://)[^:@/]+@#\1***@#'
+}
 
 # ---------------------------------------------------------------------------
 # supported distro/arch matrix
@@ -492,7 +525,7 @@ _compat_ref_start_binary() {
         --logfile "$COMPAT_REFERENCE_WORKDIR/reference.log" \
         --loadmodule "$_COMPAT_REF_CACHE_DIR/redistimeseries.so" \
         --enable-debug-command yes \
-        --notify-keyspace-events KEA \
+        --notify-keyspace-events "${COMPAT_REFERENCE_NOTIFY_KEYSPACE_EVENTS-KEA}" \
         --maxmemory-policy noeviction \
         --save "" \
         --appendonly no &
@@ -530,16 +563,17 @@ _compat_ref_start_docker() {
 
     port="${COMPAT_REFERENCE_PORT:-16379}"
 
-    # A container someone else started stays up afterwards; only stop what we start.
-    already="$(docker compose -f "$_COMPAT_REF_COMPOSE_FILE" ps -q reference 2>/dev/null || true)"
-
-    _compat_ref_log "starting the pinned reference container on port $port"
-    if ! COMPAT_REFERENCE_PORT="$port" \
-        docker compose -f "$_COMPAT_REF_COMPOSE_FILE" up -d --wait reference; then
-        _compat_ref_err "could not start the reference container (is Docker running?)"
+    if [ ! -f "$COMPAT_REFERENCE_COMPOSE_FILE" ]; then
+        _compat_ref_err "compose file not found: $COMPAT_REFERENCE_COMPOSE_FILE"
         return 1
     fi
 
+    # A container someone else started stays up afterwards; only stop what we start.
+    already="$(_compat_ref_compose ps -q reference 2>/dev/null || true)"
+
+    # Ownership is claimed *before* `up`, not after it succeeds: a container that was
+    # created but never became healthy is still ours to stop, otherwise a failed
+    # start leaks it (and, for a project-scoped overlay, its port) past our teardown.
     COMPAT_REFERENCE_KIND="docker"
     if [ -n "$already" ]; then
         _compat_ref_log "container was already running — leaving it up on exit"
@@ -547,6 +581,17 @@ _compat_ref_start_docker() {
     else
         COMPAT_REFERENCE_OWNED=1
     fi
+
+    _compat_ref_log "starting the pinned reference container on port $port"
+    if [ "$COMPAT_REFERENCE_COMPOSE_FILE" != "$_COMPAT_REF_ROOT/docker-compose.compat.yml" ] ||
+       [ -n "$COMPAT_REFERENCE_COMPOSE_PROJECT" ]; then
+        _compat_ref_log "compose file $COMPAT_REFERENCE_COMPOSE_FILE${COMPAT_REFERENCE_COMPOSE_PROJECT:+ (project $COMPAT_REFERENCE_COMPOSE_PROJECT)}"
+    fi
+    if ! COMPAT_REFERENCE_PORT="$port" _compat_ref_compose up -d --wait reference; then
+        _compat_ref_err "could not start the reference container (is Docker running?)"
+        return 1
+    fi
+
     COMPAT_REFERENCE_URL="redis://127.0.0.1:$port"
 
     if ! _compat_ref_wait_ping "$COMPAT_REFERENCE_URL" 30; then
@@ -568,9 +613,9 @@ compat_reference_start() {
     if [ -n "$COMPAT_REFERENCE_URL" ]; then
         COMPAT_REFERENCE_KIND="external"
         COMPAT_REFERENCE_OWNED=0
-        _compat_ref_log "using external reference $COMPAT_REFERENCE_URL"
+        _compat_ref_log "using external reference $(_compat_ref_redact_url "$COMPAT_REFERENCE_URL")"
         if ! _compat_ref_wait_ping "$COMPAT_REFERENCE_URL" 5; then
-            _compat_ref_err "COMPAT_REFERENCE_URL=$COMPAT_REFERENCE_URL is not reachable"
+            _compat_ref_err "COMPAT_REFERENCE_URL=$(_compat_ref_redact_url "$COMPAT_REFERENCE_URL") is not reachable"
             return 1
         fi
         _compat_ref_validate_pin "$COMPAT_REFERENCE_URL" || return 1
@@ -605,7 +650,7 @@ compat_reference_stop() {
             ;;
         docker)
             _compat_ref_log "stopping reference container"
-            docker compose -f "$_COMPAT_REF_COMPOSE_FILE" stop reference >/dev/null 2>&1
+            _compat_ref_compose stop reference >/dev/null 2>&1
             ;;
     esac
 

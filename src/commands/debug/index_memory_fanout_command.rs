@@ -80,7 +80,7 @@ impl FanoutClientCommand for IndexMemoryFanoutCommand {
     type Response = IndexMemoryResponse;
 
     fn name() -> &'static str {
-        "cmd::index_memory"
+        "cmd:index_memory"
     }
 
     /// Walks the index without the GIL: it takes only the postings read locks, which rank

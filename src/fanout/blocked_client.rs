@@ -7,7 +7,7 @@ use metered::Counter;
 use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::panic::{self, AssertUnwindSafe};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use valkey_module::{
     Context, Status, ValkeyError, ValkeyModule_BlockClient,
     ValkeyModule_BlockedClientMeasureTimeEnd, ValkeyModule_BlockedClientMeasureTimeStart,
@@ -22,6 +22,10 @@ where
 {
     op: OP,
     result: FanoutResult,
+    /// The reply was already written through a thread-safe context
+    /// ([`FanoutBlockedClient::reply_off_main_thread`]); the server appends it after
+    /// [`reply_callback`] runs, so the callback must write nothing.
+    answered: bool,
 }
 
 impl<OP> BlockedClientPrivateData<OP>
@@ -32,9 +36,13 @@ where
         Self {
             op: operation,
             result,
+            answered: false,
         }
     }
     fn reply(&mut self, ctx: &ReplyContext) -> Status {
+        if self.answered {
+            return Status::Ok;
+        }
         match self.result.as_ref() {
             Ok(_) => self.op.reply(ctx),
             Err(err) => {
@@ -52,6 +60,8 @@ pub(super) struct FanoutBlockedClient<T: FanoutClientCommand> {
     data: Option<Box<BlockedClientPrivateData<T>>>,
     time_measurement_ongoing: bool,
     is_blocked: bool,
+    /// When the server times the client out ([`timeout_callback`]).
+    deadline: Instant,
 }
 
 // SAFETY: `inner` is a raw pointer to a `ValkeyModuleBlockedClient`, which is safe to hand off
@@ -97,6 +107,7 @@ where
             time_measurement_ongoing: false,
             data: None,
             is_blocked: true,
+            deadline: Instant::now() + Duration::from_millis(timeout_ms as u64),
         };
 
         res.measure_time_start();
@@ -106,6 +117,49 @@ where
     pub(super) fn set_private_data(&mut self, op: T, result: FanoutResult) {
         let private_data = Box::new(BlockedClientPrivateData::new(op, result));
         self.data = Some(private_data);
+    }
+
+    /// Writes `op`'s reply from the calling thread, through a thread-safe context bound to
+    /// this client, and marks the client answered so [`reply_callback`] adds nothing: the
+    /// server appends that context's output to the client after the callback runs. The
+    /// client is unblocked, as on the main-thread path, when the last handle is dropped.
+    ///
+    /// Only for an `op` whose `reply` just writes the reply (no keyspace access, no ACL
+    /// checks), which is what `FanoutClientCommand::should_reply_off_main_thread` promises.
+    ///
+    /// Past the client's deadline this builds nothing and leaves the reply to
+    /// [`reply_callback`], which the server runs only if it has not timed the client out yet:
+    /// a client that has had the timeout error costs no reply. Returns `op` once its reply is
+    /// written, for the caller to drop off the main thread, and `None` when `op` went to the
+    /// main thread instead.
+    pub(super) fn reply_off_main_thread(&mut self, mut op: T) -> Option<T> {
+        if Instant::now() >= self.deadline {
+            metrics::FANOUT_REPLY_EXPIRED.incr();
+            self.set_private_data(op, Ok(()));
+            return None;
+        }
+        // SAFETY: `inner` is this client's live handle until `unblock`, which cannot run
+        // while the caller holds `&mut self`. A thread-safe context bound to a blocked client
+        // may be used from any thread and needs no GIL for replies; it inherits the client's
+        // protocol, so RESP3 detection works through it.
+        unsafe {
+            let ctx = raw::RedisModule_GetThreadSafeContext.unwrap()(self.inner.cast());
+            let reply_ctx = ReplyContext::new(ctx);
+            // As in [`reply_callback`]: `reply` is the command's own code, so a panic in it
+            // becomes this client's error reply rather than a lost one.
+            if panic::catch_unwind(AssertUnwindSafe(|| op.reply(&reply_ctx))).is_err() {
+                log_error(format!("fanout: replying to '{}' panicked", T::name()));
+                reply_ctx.reply_error_string(&format!(
+                    "Internal error in fanout operation '{}'",
+                    T::name()
+                ));
+            }
+            raw::RedisModule_FreeThreadSafeContext.unwrap()(ctx);
+        }
+        let mut answered = BlockedClientPrivateData::new(T::default(), Ok(()));
+        answered.answered = true;
+        self.data = Some(Box::new(answered));
+        Some(op)
     }
 
     fn unblock(&mut self) {

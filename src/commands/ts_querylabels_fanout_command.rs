@@ -37,7 +37,7 @@ impl FanoutClientCommand for QueryLabelsFanoutCommand {
     type Response = StringListResponse;
 
     fn name() -> &'static str {
-        "querylabels"
+        "cmd:query_labels"
     }
 
     fn get_local_response(

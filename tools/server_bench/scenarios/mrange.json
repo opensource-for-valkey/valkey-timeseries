@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "name": "mrange",
+  "description": "TS.MRANGE profile: the query fixture (1,000 series x 1,000 samples, labels at 1 %/10 %/100 % selectivity). Raw reads from 10 x 10 (per-command fixed cost) to 1,000 x 100 and 100 x 1,000 (100k samples per reply); `head100` against `recent100` separates decoding the samples a window discards; a WITHLABELS twin isolates label emission and a RESP3 twin the wire format; c1 cases measure a lone query (the subject defers standalone MRANGE off the main thread past a work threshold, so a lone small and a lone large read take different paths) against c8 under contention; per-series aggregation (avg, ~100 buckets) at 10 % and 100 %; GROUPBY/REDUCE over 10 groups at c1 and c8. Plan defaults: 5 trials, 5 s warm-up, 30 s reads.",
+  "fixture": {
+    "series": 1000,
+    "samples_per_series": 1000,
+    "workload": "drift",
+    "timestamp_model": "regular",
+    "label_cardinality": [
+      1,
+      10,
+      100
+    ],
+    "label_value_len": 8,
+    "key_prefix": "bench",
+    "interval_ms": 1000
+  },
+  "series": {
+    "chunk_size": 4096,
+    "duplicate_policy": "BLOCK",
+    "encoding": {
+      "subject": "chimp",
+      "reference": "compressed"
+    }
+  },
+  "protocol": "resp2",
+  "trials": 5,
+  "warmup_seconds": 5,
+  "read_duration_seconds": 30,
+  "read_cycle_requests": 100000,
+  "min_write_seconds": 30,
+  "settle_seconds": 3,
+  "cases": [
+    {
+      "id": "mrange_recent10_1pct_c8",
+      "kind": "mrange",
+      "label": 2,
+      "window": {
+        "type": "recent",
+        "points": 10
+      },
+      "connections": 8
+    },
+    {
+      "id": "mrange_recent100_1pct_c8",
+      "kind": "mrange",
+      "label": 2,
+      "window": {
+        "type": "recent",
+        "points": 100
+      },
+      "connections": 8
+    },
+    {
+      "id": "mrange_recent100_10pct_c8",
+      "kind": "mrange",
+      "label": 1,
+      "window": {
+        "type": "recent",
+        "points": 100
+      },
+      "connections": 8
+    },
+    {
+      "id": "mrange_recent100_100pct_c8",
+      "kind": "mrange",
+      "label": 0,
+      "window": {
+        "type": "recent",
+        "points": 100
+      },
+      "connections": 8
+    },
+    {
+      "id": "mrange_head100_10pct_c8",
+      "kind": "mrange",
+      "label": 1,
+      "window": {
+        "type": "head",
+        "points": 100
+      },
+      "connections": 8
+    },
+    {
+      "id": "mrange_recent100_10pct_withlabels_c8",
+      "kind": "mrange",
+      "label": 1,
+      "window": {
+        "type": "recent",
+        "points": 100
+      },
+      "withlabels": true,
+      "connections": 8
+    },
+    {
+      "id": "mrange_full_1pct_c1",
+      "kind": "mrange",
+      "label": 2,
+      "window": {
+        "type": "full"
+      },
+      "connections": 1
+    },
+    {
+      "id": "mrange_full_1pct_c8",
+      "kind": "mrange",
+      "label": 2,
+      "window": {
+        "type": "full"
+      },
+      "connections": 8
+    },
+    {
+      "id": "mrange_full_10pct_c1",
+      "kind": "mrange",
+      "label": 1,
+      "window": {
+        "type": "full"
+      },
+      "connections": 1
+    },
+    {
+      "id": "mrange_full_10pct_c8",
+      "kind": "mrange",
+      "label": 1,
+      "window": {
+        "type": "full"
+      },
+      "connections": 8
+    },
+    {
+      "id": "mrange_full_10pct_resp3_c8",
+      "kind": "mrange",
+      "label": 1,
+      "window": {
+        "type": "full"
+      },
+      "protocol": "resp3",
+      "connections": 8
+    },
+    {
+      "id": "mrange_agg_avg100_10pct_c8",
+      "kind": "mrange",
+      "label": 1,
+      "window": {
+        "type": "full"
+      },
+      "aggregation": {
+        "aggregator": "avg",
+        "buckets": 100
+      },
+      "connections": 8
+    },
+    {
+      "id": "mrange_agg_avg100_100pct_c8",
+      "kind": "mrange",
+      "label": 0,
+      "window": {
+        "type": "full"
+      },
+      "aggregation": {
+        "aggregator": "avg",
+        "buckets": 100
+      },
+      "connections": 8
+    },
+    {
+      "id": "groupby_10groups_c1",
+      "kind": "groupby",
+      "label": 0,
+      "group_label": 1,
+      "window": {
+        "type": "full"
+      },
+      "aggregator": "avg",
+      "buckets": 100,
+      "reducer": "sum",
+      "connections": 1
+    },
+    {
+      "id": "groupby_10groups_c8",
+      "kind": "groupby",
+      "label": 0,
+      "group_label": 1,
+      "window": {
+        "type": "full"
+      },
+      "aggregator": "avg",
+      "buckets": 100,
+      "reducer": "sum",
+      "connections": 8
+    }
+  ]
+}

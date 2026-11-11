@@ -117,6 +117,21 @@ Smaller reads, `TS.CARD` without `FILTER_BY_RANGE`, and any of these commands is
 
 **Migration impact.** Applications that issue these commands against large standalone deployments should treat the queue-full error as transient and retry, rather than as an empty result. Applications that need the reply to reflect a single instant should issue the command inside `MULTI`, which keeps it in one lock hold. Small datasets, and filters narrow enough to match at most 512 series by equality, are unaffected.
 
+### Standalone background `TS.MRANGE` (`TS.MREVRANGE`)
+
+**What differs.** On a server with cluster mode disabled, a `TS.MRANGE` or `TS.MREVRANGE` read is answered off the main thread when it reads enough samples to pay for the hand-off, or when other clients' range reads are arriving at the same time. The matching series are copied under the command, so the reply is the same point-in-time answer an inline read gives; decoding, `GROUPBY` reduction and the reply then run on a bounded pool of background workers. Meanwhile the client is blocked, which is visible to an operator:
+
+- `CLIENT LIST` and `CLIENT INFO` show the client with `flags=b`, and `INFO clients` counts it in `blocked_clients`. Alerts and dashboards that treat `blocked_clients` as a backlog of blocking-list or stream readers will also count these reads.
+- `CLIENT UNBLOCK` does not release such a client: the read has no timeout to end it early. `CLIENT KILL` does, and stops the decode.
+- `INFO commandstats`, latency tracking and the slow log count the time the read spends being decoded and answered, as for an inline read. Time spent waiting for a worker is not counted, as a blocking command's wait never is.
+- The workers' load is reported by `exec_mrange_queued`, `exec_mrange_running` and `exec_mrange_rejected_total` in `TS._DEBUG METRICS`. A read that finds the queue full is answered on the main thread instead, never refused.
+
+A read inside `MULTI`, a script, or a module call is always answered inline on the main thread.
+
+**Why.** Decoding and writing a large multi-series reply on the main thread stalls every other client for as long as it runs. Answering it in the background keeps the server responsive; the blocked state is how a module answers a client from another thread.
+
+**Migration impact.** None for applications: the reply and its ordering are unchanged. Operators who monitor `blocked_clients` should expect it to rise during range reads, and can tell these clients apart by the command (`cmd=ts.mrange` or `cmd=ts.mrevrange`) in `CLIENT LIST`.
+
 ### Persistence and on-disk format
 
 **What differs.** The persistence format used to store series state (across RDB, AOF, and any internal format) does not match RedisTimeSeries's.

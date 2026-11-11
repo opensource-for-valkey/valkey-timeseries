@@ -459,24 +459,6 @@ pub fn is_debug_mode_enabled() -> bool {
     IS_DEBUG_MODE.load(Ordering::Relaxed)
 }
 
-/// Runtime toggle for shard-side aggregation push-down in MRANGE fanout
-/// (`ts-fanout-aggregation-pushdown`, default on). Consulted by the
-/// coordinator only; shards obey the request flag.
-///
-/// Its remaining purpose is an emergency/diagnostic escape hatch for the
-/// push-down code path itself: flipping it off at runtime routes every query
-/// back through the older coordinator-side aggregation path without a module
-/// rollback — useful to mitigate a latent push-down bug or a pathological
-/// resource case, or to A/B isolate whether an issue lives in push-down.
-///
-/// The exception is a query with `EMPTY`, which pushes down regardless: its answer depends on what
-/// lies outside the query window, and the coordinator cannot see that.
-pub static FANOUT_AGGREGATION_PUSHDOWN: AtomicBool = AtomicBool::new(true);
-
-pub fn is_fanout_aggregation_pushdown_enabled() -> bool {
-    FANOUT_AGGREGATION_PUSHDOWN.load(Ordering::Relaxed)
-}
-
 /// Runtime toggle for persisting the postings index as an RDB aux field
 /// (`ts-index-persist`, default on; see docs/postings-index-persistence.md).
 /// Gates both save and load: with it off, BGSAVE writes no aux payload and
@@ -814,10 +796,6 @@ fn read_index_build_max_memory() -> ConfigValue {
     ConfigValue::Integer(index_build_max_memory())
 }
 
-fn read_fanout_aggregation_pushdown() -> ConfigValue {
-    ConfigValue::Boolean(is_fanout_aggregation_pushdown_enabled())
-}
-
 fn read_index_persist() -> ConfigValue {
     ConfigValue::Boolean(is_index_persist_enabled())
 }
@@ -1076,19 +1054,6 @@ pub static CONFIGS: &[ConfigDesc] = &[
         },
     },
     ConfigDesc {
-        name: "ts-fanout-aggregation-pushdown",
-        read: read_fanout_aggregation_pushdown,
-        kind: ConfigType::Boolean,
-        default: ConfigValue::Boolean(true),
-        min: None,
-        max: None,
-        flags: ConfigurationFlags::DEFAULT,
-        description: "Push MRANGE aggregation down to shards during cluster fanout",
-        storage: ConfigStorage::Bool {
-            cell: || &FANOUT_AGGREGATION_PUSHDOWN,
-        },
-    },
-    ConfigDesc {
         name: "ts-index-persist",
         read: read_index_persist,
         kind: ConfigType::Boolean,
@@ -1314,7 +1279,6 @@ mod tests {
         ("ts-fanout-command-timeout", "5000"),
         ("ts-cluster-map-expiration-ms", "750"),
         ("ts-index-build-max-memory", "268435456"),
-        ("ts-fanout-aggregation-pushdown", "yes"),
         ("ts-index-persist", "yes"),
         ("debug-mode", "no"),
     ];

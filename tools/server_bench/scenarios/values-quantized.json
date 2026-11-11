@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "name": "values-quantized",
+  "description": "Value-shape sweep: the core drift gauge rounded to two decimals (drift_q2); encode, decode, aggregation and memory cases, GET as a placement control.",
+  "fixture": {
+    "series": 1000,
+    "samples_per_series": 1000,
+    "workload": "drift_q2",
+    "timestamp_model": "regular",
+    "label_cardinality": [
+      1,
+      10,
+      100
+    ],
+    "label_value_len": 8,
+    "key_prefix": "bench",
+    "interval_ms": 1000
+  },
+  "series": {
+    "chunk_size": 4096,
+    "duplicate_policy": "BLOCK",
+    "encoding": {
+      "subject": "chimp",
+      "reference": "compressed"
+    }
+  },
+  "protocol": "resp2",
+  "trials": 5,
+  "warmup_seconds": 5,
+  "read_duration_seconds": 30,
+  "read_cycle_requests": 100000,
+  "min_write_seconds": 30,
+  "settle_seconds": 3,
+  "cases": [
+    {
+      "id": "add_c8_p16",
+      "kind": "add",
+      "connections": 8,
+      "pipeline": 16
+    },
+    {
+      "id": "madd16_4ps_c8_p1",
+      "kind": "madd",
+      "batch": 16,
+      "samples_per_series": 4,
+      "connections": 8,
+      "pipeline": 1
+    },
+    {
+      "id": "get_uniform_c8",
+      "kind": "get",
+      "distribution": {
+        "type": "uniform"
+      },
+      "connections": 8
+    },
+    {
+      "id": "range_full_nomatch_c8",
+      "kind": "range",
+      "window": {
+        "type": "full"
+      },
+      "filter_by_value": {
+        "min": 1e+300,
+        "max": 1e+301
+      },
+      "connections": 8
+    },
+    {
+      "id": "range_full_c8",
+      "kind": "range",
+      "window": {
+        "type": "full"
+      },
+      "connections": 8
+    },
+    {
+      "id": "range_recent100_c8",
+      "kind": "range",
+      "window": {
+        "type": "recent",
+        "points": 100
+      },
+      "connections": 8
+    },
+    {
+      "id": "agg_sum100_c8",
+      "kind": "aggregate",
+      "window": {
+        "type": "full"
+      },
+      "aggregator": "sum",
+      "buckets": 100,
+      "connections": 8
+    },
+    {
+      "id": "agg_max100_c8",
+      "kind": "aggregate",
+      "window": {
+        "type": "full"
+      },
+      "aggregator": "max",
+      "buckets": 100,
+      "connections": 8
+    },
+    {
+      "id": "memory",
+      "kind": "memory"
+    }
+  ]
+}

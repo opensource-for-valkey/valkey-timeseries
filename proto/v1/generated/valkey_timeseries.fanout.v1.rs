@@ -598,16 +598,16 @@ pub struct MultiRangeRequest {
     pub selected_labels: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(bool, tag = "6")]
     pub is_reverse: bool,
+    /// A shard always aggregates each series and pre-applies COUNT. GROUPBY/REDUCE
+    /// is the one choice the coordinator makes: with this set, the shard answers with
+    /// group partials alone; without it, with per-series buckets. There is no echo;
+    /// the coordinator rejects a share of the wrong shape.
     #[prost(bool, tag = "7")]
-    pub apply_aggregation: bool,
-    #[prost(bool, tag = "8")]
     pub apply_group_reduce: bool,
-    #[prost(bool, tag = "9")]
-    pub apply_count: bool,
     /// EXCLUDEEMPTY: shards drop series with no reported samples before shipping.
-    /// Purely a transfer optimization — the coordinator re-applies the filter, so a
-    /// peer that ignores this field still produces the same reply.
-    #[prost(bool, tag = "10")]
+    /// The coordinator re-applies the filter, which coordinator-side processing
+    /// could otherwise undo.
+    #[prost(bool, tag = "8")]
     pub exclude_empty: bool,
 }
 /// TS._DEBUG STRINGPOOLSTATS: each shard reports its own interning pool, which
@@ -800,7 +800,7 @@ pub struct SeriesRangeResponse {
     /// Label storage, used in place of `labels`: parallel arrays, one entry per
     /// label, indexing into `MultiRangeResponse.symbol_table_names` /
     /// `symbol_table_values`. Interning is unconditional, so there is no
-    /// `applied_*` flag; non-empty ref arrays are themselves the signal.
+    /// flag; non-empty ref arrays are themselves the signal.
     ///
     /// Both arrays empty means there is nothing to resolve — either the series has
     /// no labels, or it carries them in `labels` directly. A decoder must leave
@@ -850,18 +850,12 @@ pub struct MultiRangeResponse {
     pub series: ::prost::alloc::vec::Vec<SeriesRangeResponse>,
     #[prost(message, repeated, tag = "2")]
     pub group_partials: ::prost::alloc::vec::Vec<GroupPartialSeries>,
-    #[prost(bool, tag = "3")]
-    pub applied_aggregation: bool,
-    #[prost(bool, tag = "4")]
-    pub applied_group_reduce: bool,
-    #[prost(bool, tag = "5")]
-    pub applied_count: bool,
     /// Dictionaries `SeriesRangeResponse.label_name_refs`/`label_value_refs`
     /// index into. Label interning is unconditional, so these are populated
     /// whenever `series` carries any labels; empty otherwise.
-    #[prost(string, repeated, tag = "6")]
+    #[prost(string, repeated, tag = "3")]
     pub symbol_table_names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "7")]
+    #[prost(string, repeated, tag = "4")]
     pub symbol_table_values: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// QUERYINDEX returns key names verbatim, including invalid UTF-8 and interior NULs.

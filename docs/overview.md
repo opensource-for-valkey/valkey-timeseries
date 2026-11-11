@@ -224,6 +224,10 @@ shard), and the coordinator merges and finalizes them per bucket. The remaining 
 `none`) fall back to per-series bucket transport; `first`, `last`, `rate`, `irate` and `increase` are not accepted as
 reducers. `COUNT` and reversal (`TS.MREVRANGE`) are always applied at the coordinator.
 
+Grouped `TS.MRANGE`/`TS.MREVRANGE` results can differ in trailing floating-point digits between cluster and standalone
+deployments, for example with `REDUCE std.s`: the reduction pipelines can accumulate values and combine partial states
+in different orders. Bit-for-bit equality is not guaranteed; compare floating-point results with a numerical tolerance.
+
 Multi-aggregation queries (`AGGREGATION avg,max,count …`) participate in both push-downs: per-series buckets travel as
 one compressed chunk per aggregation column, and group partials carry one reducer state per column per bucket, reduced
 column-wise with the same `REDUCE` type.
@@ -232,14 +236,7 @@ column-wise with the same `REDUCE` type.
 per group partial) — most valuable for `TS.MREVRANGE … COUNT n` ("last n points") queries. The coordinator always
 re-applies `COUNT` as the final authority.
 
-Mixed-version clusters are handled by a compatibility handshake (`fanout-compatibility-handshake.md`): shards
-echo which push-down flags they honored, and the coordinator compensates per response — data from a peer that did not
-apply push-down is aggregated and pre-reduced coordinator-side before merging. Rolling upgrades therefore need no
-special configuration; a lagging node only costs extra transfer and coordinator CPU for its own slice of each query.
-
-Push-down is controlled by the boolean config `ts-fanout-aggregation-pushdown` (default `yes`, changeable at runtime
-via `CONFIG SET`). Only the coordinator consults it; shards obey the request. It is not a mixed-version safety knob —
-version skew is handled automatically by the handshake above — but an emergency/diagnostic escape hatch: flipping it
-off reverts queries to coordinator-side aggregation without a module rollback. The exception is
-a query with `EMPTY`, which pushes down regardless: how far it fills depends on what each series
-holds outside the query window, which only its shard can see.
+Push-down is always on, with no config to turn it off: the coordinator never aggregates raw samples. `EMPTY` depends on
+it, since how far a series fills depends on what it holds outside the query window, which only its shard can see. A
+shard answers with exactly the work it was asked for, and the coordinator rejects a share of the wrong shape rather
+than repairing it.

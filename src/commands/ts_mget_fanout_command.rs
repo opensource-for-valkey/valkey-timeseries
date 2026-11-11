@@ -30,7 +30,7 @@ impl FanoutClientCommand for MGetFanoutCommand {
     type Response = MultiGetResponse;
 
     fn name() -> &'static str {
-        "mget"
+        "cmd:mget"
     }
 
     fn get_targets(&self, ctx: &Context) -> FanoutTarget {

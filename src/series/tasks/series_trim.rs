@@ -2,7 +2,9 @@ use crate::common::context::{get_current_db, set_current_db};
 use crate::common::logging::{log_debug, log_warning};
 use crate::common::metrics::task::{self as metrics, TaskRun};
 use crate::common::sync::lock;
-use crate::common::threads::{LockGil, ParMutRayon, SingleFlight, spawn_task_single};
+use crate::common::threads::{
+    LockGil, ParMutRayon, SingleFlight, request_par_threads, spawn_task_single,
+};
 use crate::is_shutting_down;
 use crate::series::tasks::utils::{SeriesBatch, fetch_series_batch, find_next_db};
 use orx_parallel::Par;
@@ -118,8 +120,10 @@ fn trim_series(ctx: &Context, db: i32, cursor: u64) -> (usize, i32) {
 
     let processed = batch.len();
 
+    let threads = request_par_threads(batch.len(), batch.iter().map(|s| s.total_samples).sum());
     let total_deletes: usize = batch
         .par_mut_rayon()
+        .num_threads(threads)
         .map(|series| match series.trim() {
             Ok(deletes) => deletes,
             Err(_) => {

@@ -1,8 +1,7 @@
+use crate::common::replies::reply_with_sample;
 use crate::series::{get_latest_compaction_sample, with_timeseries};
 use valkey_module::ValkeyError::WrongArity;
-use valkey_module::{
-    AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
-};
+use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 acl_categories!(TS_GET, "ts.get", "fast read timeseries");
 /// TS.GET key [LATEST]
@@ -34,7 +33,8 @@ pub fn ts_get_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 
     let key = &args[1];
-    let sample = with_timeseries(ctx, key, Some(AclPermissions::ACCESS), |series| {
+    // No module-side ACL check: the key spec covers `key` (see TS.RANGE).
+    let sample = with_timeseries(ctx, key, None, |series| {
         if latest && let Some(value) = get_latest_compaction_sample(ctx, series) {
             Ok(Some(value))
         } else {
@@ -42,5 +42,13 @@ pub fn ts_get_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         }
     })?;
 
-    Ok(sample.map_or_else(|| ValkeyValue::Array(vec![]), Into::into))
+    // Reply directly rather than through a `ValkeyValue` tree: no allocation
+    // for the row, and the same helper every other sample reply uses.
+    match sample {
+        Some(sample) => {
+            reply_with_sample(ctx, &sample);
+            Ok(ValkeyValue::NoReply)
+        }
+        None => Ok(ValkeyValue::Array(vec![])),
+    }
 }

@@ -228,9 +228,15 @@ counters stay at zero, `refresh_interval_seconds` at 0 and `age_seconds` at -1.
 | `exec_fanout_queued` | gauge | Jobs waiting for a worker on the `ts-fanout-request` lane (peer requests and local fan-out shares) |
 | `exec_fanout_running` | gauge | Jobs a worker is running on the `ts-fanout-request` lane |
 | `exec_fanout_rejected_total` | counter | Jobs refused because the `ts-fanout-request` queue was full (answered as busy) |
+| `exec_fanout_reply_queued` | gauge | Fan-out replies waiting for a worker on the `ts-fanout-reply` lane |
+| `exec_fanout_reply_running` | gauge | Fan-out replies a worker is building on the `ts-fanout-reply` lane |
+| `exec_fanout_reply_rejected_total` | counter | Fan-out replies the full `ts-fanout-reply` queue refused, built on the main thread instead |
 | `exec_analysis_queued` | gauge | Jobs waiting for a worker on the `ts-analysis` lane |
 | `exec_analysis_running` | gauge | Jobs a worker is running on the `ts-analysis` lane |
 | `exec_analysis_rejected_total` | counter | Jobs refused because the `ts-analysis` queue was full |
+| `exec_mrange_queued` | gauge | Standalone `TS.MRANGE` reads waiting for a worker on the `ts-mrange` lane |
+| `exec_mrange_running` | gauge | Standalone `TS.MRANGE` reads a worker is decoding and answering on the `ts-mrange` lane |
+| `exec_mrange_rejected_total` | counter | Standalone `TS.MRANGE` reads the full `ts-mrange` queue refused, answered on the main thread instead |
 
 #### `fanout`
 
@@ -261,13 +267,12 @@ As coordinator:
 | `fanout_send_failures_total` | counter | Requests the cluster bus refused to send |
 | `fanout_local_share_busy_total` | counter | Local shares refused because the fan-out lane's queue was full |
 | `fanout_local_share_expired_total` | counter | Local shares that waited in the queue past the deadline |
+| `fanout_reply_expired_total` | counter | Replies the `ts-fanout-reply` lane did not build because the client's deadline had passed (left to the main thread, which skips a client already timed out) |
 | `fanout_error_decode_failures_total` | counter | Error responses from peers that could not be decoded |
 | `fanout_ignored_unknown_request_total` | counter | Peer answers dropped because their request is no longer in flight (it timed out, say) |
 | `fanout_ignored_unknown_sender_total` | counter | Peer answers dropped because their sender is not a remote target of the request |
 | `fanout_ignored_duplicate_total` | counter | Peer answers dropped because their sender had already answered |
 | `fanout_ignored_after_completion_total` | counter | Shard answers dropped because the operation had already completed (after an abort, say) |
-| `fanout_pushdown_fallback_series_total` | counter | `TS.MRANGE` series aggregated on the coordinator because their shard ignored aggregation push-down (an older peer) |
-| `fanout_pushdown_group_fallback_series_total` | counter | `TS.MRANGE` series reduced on the coordinator because their shard ignored group-reduce push-down |
 
 One timed-out fan-out usually counts once in both `client_timeouts` and `rpc_timeouts` (whichever
 deadline reaches the client first wins), so don't add them. Local-only fan-outs have no RPC, so
@@ -466,8 +471,20 @@ TS._DEBUG METRICS exec
 8) (integer) 0
 9) "exec_fanout_rejected_total"
 10) (integer) 0
-11) "exec_fanout_running"
+11) "exec_fanout_reply_queued"
 12) (integer) 0
+13) "exec_fanout_reply_rejected_total"
+14) (integer) 0
+15) "exec_fanout_reply_running"
+16) (integer) 0
+17) "exec_fanout_running"
+18) (integer) 0
+19) "exec_mrange_queued"
+20) (integer) 0
+21) "exec_mrange_rejected_total"
+22) (integer) 0
+23) "exec_mrange_running"
+24) (integer) 0
 ```
 
 Start a clean window, then read one section with descriptions:
@@ -498,7 +515,7 @@ An array with one map of 5 fields per request:
 | Field           | Type    | Description                                                             |
 |-----------------|---------|-------------------------------------------------------------------------|
 | `id`            | string  | The request id (a string: ids span the full unsigned 64-bit range)      |
-| `command`       | string  | The fan-out operation, such as `mrange`                                 |
+| `command`       | string  | The fan-out operation, such as `cmd:mrange`                             |
 | `ageMs`         | integer | Milliseconds since the request was sent                                 |
 | `remoteTargets` | integer | Peers the request was sent to                                           |
 | `outstanding`   | integer | Peers that have not answered yet                                        |
@@ -531,10 +548,10 @@ first:
 |---------------|---------|-----------------------------------------------------------------------------|
 | `sender`      | string  | The node id of the requester                                                |
 | `id`          | string  | The request id (a string: ids span the full unsigned 64-bit range); unique per sender only |
-| `command`     | string  | The fan-out operation, such as `mrange` or `mdel`                           |
+| `command`     | string  | The fan-out operation, such as `cmd:mrange` or `cmd:mdel`                   |
 | `ageMs`       | integer | Milliseconds since the request arrived                                      |
 | `state`       | string  | `queued` while it waits for a fan-out worker, `running` once one has it     |
-| `cancellable` | boolean | Whether the requester may cancel it: reads may be, writes such as `mdel` never are |
+| `cancellable` | boolean | Whether the requester may cancel it: reads may be, writes such as `cmd:mdel` never are |
 | `cancelled`   | boolean | Whether the requester has cancelled it; a cancelled request stops at its next check and is not answered |
 
 Reads and writes are both counted. A request leaves as soon as it has been answered or dropped,
@@ -727,7 +744,6 @@ TS._DEBUG LIST_CONFIGS [VERBOSE]
 | `ts-num-threads`               | integer  | 8               | Number of worker threads for parallel query processing                                  |
 | `ts-fanout-command-timeout`    | duration | —               | Timeout (ms) for fanout (cluster scatter/gather) commands                               |
 | `ts-cluster-map-expiration-ms` | duration | —               | How long (ms) cluster slot-map entries are cached; `0` disables caching                 |
-| `ts-fanout-aggregation-pushdown` | boolean | `yes`          | Shard-side aggregation/reduce push-down for clustered MRANGE. Not needed for rolling upgrades (version skew is handled automatically); disable only as an emergency/diagnostic revert to the coordinator-side path. Queries with `EMPTY` push down regardless. |
 
 ### Examples
 

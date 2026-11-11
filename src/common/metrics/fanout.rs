@@ -31,6 +31,8 @@ pub static FANOUT_SETUP_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub static FANOUT_LOCAL_SHARE_BUSY: AtomicU64 = AtomicU64::new(0);
 /// Local shares that waited in the queue past the deadline and were answered with a timeout.
 pub static FANOUT_LOCAL_SHARE_EXPIRED: AtomicU64 = AtomicU64::new(0);
+/// Replies the reply lane left to the main thread because the client's deadline had passed.
+pub static FANOUT_REPLY_EXPIRED: AtomicU64 = AtomicU64::new(0);
 /// Commands refused because the client could not be blocked (MULTI, a script, a module call).
 pub static FANOUT_BLOCKING_DENIED: AtomicU64 = AtomicU64::new(0);
 /// Requests the cluster bus refused to send.
@@ -61,12 +63,6 @@ pub static FANOUT_IGNORED_UNKNOWN_SENDER: AtomicU64 = AtomicU64::new(0);
 pub static FANOUT_IGNORED_DUPLICATE: AtomicU64 = AtomicU64::new(0);
 /// Answers dropped because the operation had already completed (after an abort, say).
 pub static FANOUT_IGNORED_AFTER_COMPLETION: AtomicU64 = AtomicU64::new(0);
-/// `TS.MRANGE` series aggregated on the coordinator because their shard ignored aggregation
-/// push-down (an older peer).
-pub static FANOUT_PUSHDOWN_FALLBACK_SERIES: AtomicU64 = AtomicU64::new(0);
-/// `TS.MRANGE` series reduced into group partials on the coordinator because their shard ignored
-/// group-reduce push-down.
-pub static FANOUT_PUSHDOWN_GROUP_FALLBACK_SERIES: AtomicU64 = AtomicU64::new(0);
 
 /// Time from the start of an operation to its result, on every path that produces one.
 pub static FANOUT_DURATION: LazyLock<BucketHistogram> = duration_histogram();
@@ -193,6 +189,11 @@ static COUNTERS: &[(&str, &AtomicU64, &str)] = &[
         "Local fanout shares that waited in the queue past the deadline",
     ),
     (
+        "reply_expired",
+        &FANOUT_REPLY_EXPIRED,
+        "Fanout replies not built on the reply lane because the client's deadline had passed",
+    ),
+    (
         "blocking_denied",
         &FANOUT_BLOCKING_DENIED,
         "Fanout commands refused because the client could not be blocked (MULTI, script, module call)",
@@ -256,16 +257,6 @@ static COUNTERS: &[(&str, &AtomicU64, &str)] = &[
         "ignored_after_completion",
         &FANOUT_IGNORED_AFTER_COMPLETION,
         "Shard answers dropped because the fanout operation had already completed",
-    ),
-    (
-        "pushdown_fallback_series",
-        &FANOUT_PUSHDOWN_FALLBACK_SERIES,
-        "TS.MRANGE series aggregated on the coordinator because their shard ignored aggregation push-down",
-    ),
-    (
-        "pushdown_group_fallback_series",
-        &FANOUT_PUSHDOWN_GROUP_FALLBACK_SERIES,
-        "TS.MRANGE series reduced on the coordinator because their shard ignored group-reduce push-down",
     ),
     (
         "served_ok",

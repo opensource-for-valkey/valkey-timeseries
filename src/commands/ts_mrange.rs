@@ -1,10 +1,61 @@
 use crate::commands::parse_mrange_options;
 use crate::commands::ts_mrange_fanout_command::MRangeFanoutCommand;
 use crate::commands::utils::{MRangeReplyShape, reply_with_mrange_series_results};
+use crate::common::context::is_blocking_denied;
+use crate::common::replies::{IntoRawCtx, ThreadSafeReplyContext, block_client};
+use crate::common::threads::{BoundedExecutor, Capacity, ExecutorStats, lane_workers};
 use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, is_clustered};
-use crate::series::mrange::process_mrange_query;
-use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString};
+use crate::series::mrange::{
+    LocalMRange, MRangeScope, decode_snapshot_series, is_snapshot_answerable, local_mrange_query,
+    process_mrange_query,
+};
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
+
+/// Deferred TS.MRANGE jobs waiting for a worker before new requests run inline.
+const MRANGE_QUEUE_CAPACITY: usize = 256;
+
+/// The lane deferred TS.MRANGE requests decode and reply on. A [`BoundedExecutor`]
+/// rather than the shared pool: a pool job may not be spawned unbounded, and a large
+/// decode would hold a shared worker that GIL holders wait on (R2 in `common::threads`).
+static MRANGE_EXECUTOR: BoundedExecutor = BoundedExecutor::new(
+    "ts-mrange",
+    lane_workers,
+    Capacity::Fixed(MRANGE_QUEUE_CAPACITY),
+);
+
+/// The load on the deferred TS.MRANGE lane, for `TS._DEBUG METRICS`. Never starts the workers.
+pub(crate) fn mrange_lane_stats() -> ExecutorStats {
+    MRANGE_EXECUTOR.stats()
+}
+
+/// Window within which another client's TS.MRANGE marks the main thread as
+/// contended. Under contention the block/unblock round trip is hidden by other
+/// clients' work, and deferring even a one-series request measured 1.2–1.3×
+/// throughput at 16 connections; with no other client it costs a lone small
+/// request ~11 %.
+const CONTENTION_WINDOW_MICROS: u64 = 1_000;
+
+/// The client and arrival time (µs since [`CONTENTION_EPOCH`]) of the last TS.MRANGE.
+/// Only the main thread touches these; atomics just make the statics `Sync`.
+static LAST_MRANGE_CLIENT: AtomicU64 = AtomicU64::new(0);
+static LAST_MRANGE_MICROS: AtomicU64 = AtomicU64::new(0);
+static CONTENTION_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Records this request and reports whether a different client's TS.MRANGE
+/// arrived within [`CONTENTION_WINDOW_MICROS`]. Comparing clients matters: one
+/// client issuing back-to-back requests arrives just as often, and gains nothing.
+fn mrange_contended(ctx: &Context) -> bool {
+    let client = ctx.get_client_id();
+    // `+ 1` keeps 0 free as "no previous request".
+    let now = CONTENTION_EPOCH.elapsed().as_micros() as u64 + 1;
+    let last_client = LAST_MRANGE_CLIENT.swap(client, Ordering::Relaxed);
+    let last = LAST_MRANGE_MICROS.swap(now, Ordering::Relaxed);
+    last != 0 && last_client != client && now - last <= CONTENTION_WINDOW_MICROS
+}
 
 acl_categories!(TS_MRANGE, "ts.mrange", "read timeseries");
 /// TS.MRANGE fromTimestamp toTimestamp
@@ -62,7 +113,61 @@ fn mrange_internal(ctx: &Context, args: Vec<ValkeyString>, reverse: bool) -> Val
         return operation.exec(ctx);
     }
 
+    // Off the main thread when that pays (see `mrange_deferred`), which needs a client that
+    // can be blocked and a query a snapshot can answer.
+    if !is_blocking_denied(ctx) && is_snapshot_answerable(&options) {
+        return mrange_deferred(ctx, options);
+    }
+
     let shape = MRangeReplyShape::from_options(&options);
-    let result_rows = process_mrange_query(ctx, options, false, None, &|| false)?;
+    let result_rows = process_mrange_query(ctx, options, MRangeScope::Client, None, &|| false)?;
     reply_with_mrange_series_results(ctx, &result_rows, &shape)
+}
+
+/// A non-clustered TS.MRANGE answered off the main thread: the chunks are copied under the
+/// command, the client is blocked, and the decode, any GROUPBY reduce and the reply run on the
+/// [`MRANGE_EXECUTOR`] lane through a thread-safe reply context, as TS.OUTLIERS does.
+///
+/// Answers inline unless other clients keep the main thread busy
+/// ([`mrange_contended`]) or the request carries enough work to pay for the
+/// block/unblock round trip ([`DEFER_MIN_WORK`](crate::series::mrange::DEFER_MIN_WORK));
+/// then snapshots on the main thread and decodes and replies on the
+/// [`MRANGE_EXECUTOR`] lane.
+///
+/// The lane slot is reserved before the client is blocked; when the lane is full the
+/// request is answered inline instead, since deferring is only an optimization. There is
+/// no timeout, as there is none inline; a client that disconnects stops the decode.
+fn mrange_deferred(
+    ctx: &Context,
+    options: crate::series::request_types::MRangeOptions,
+) -> ValkeyResult {
+    let shape = MRangeReplyShape::from_options(&options);
+    let contended = mrange_contended(ctx);
+    let (slot, series) = match local_mrange_query(ctx, &options, contended, || {
+        MRANGE_EXECUTOR.try_reserve().ok()
+    })? {
+        LocalMRange::Answered(rows) => {
+            return reply_with_mrange_series_results(ctx, &rows, &shape);
+        }
+        LocalMRange::Deferred(slot, series) => (slot, series),
+    };
+    let blocked_client = block_client(ctx);
+    slot.spawn(move || {
+        let thread_ctx = ThreadSafeReplyContext::with_blocked_client(blocked_client);
+        // A client that disconnects stops the decode: nobody would read the reply.
+        let gone = thread_ctx.disconnected();
+        let rows = match decode_snapshot_series(series, &options, &|| gone.load(Ordering::Relaxed))
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                let _ = thread_ctx.reply(Err(err));
+                return;
+            }
+        };
+        // Through `into_raw`, which marks the client answered: otherwise dropping
+        // `thread_ctx` would append an error after the complete reply.
+        let reply_ctx = Context::new((&thread_ctx).into_raw());
+        let _ = reply_with_mrange_series_results(&reply_ctx, &rows, &shape);
+    });
+    Ok(ValkeyValue::NoReply)
 }

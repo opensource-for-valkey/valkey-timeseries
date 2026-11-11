@@ -266,7 +266,7 @@ impl FanoutClientCommand for MetricsFanoutCommand {
     type Response = DebugMetricsResponse;
 
     fn name() -> &'static str {
-        "cmd::debug_metrics"
+        "cmd:debug_metrics"
     }
 
     /// Reads atomics and the registries; takes no GIL and holds no keys.

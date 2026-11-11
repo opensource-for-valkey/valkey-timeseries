@@ -2,7 +2,7 @@ use super::chunks::utils::{filter_samples_by_value, filter_timestamp_slice};
 use super::{SampleAddResult, SampleDuplicatePolicy, TimeSeriesOptions, ValueFilter};
 use crate::common::hash::IntMap;
 use crate::common::rounding::RoundingStrategy;
-use crate::common::threads::{IntoParRayon, ParMutRayon, ParRayon};
+use crate::common::threads::{IntoParRayon, ParMutRayon, ParRayon, request_par_threads};
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::config::DEFAULT_CHUNK_SIZE_BYTES;
@@ -511,16 +511,20 @@ impl TimeSeries {
     pub(crate) fn split_chunks_if_needed(&mut self) -> TsdbResult<()> {
         // Almost every merge ends here with nothing to split: decide that with a scan
         // before entering a parallel section.
-        if !self.chunks.iter().any(Self::needs_split) {
+        let to_split = self.chunks.iter().filter(|c| Self::needs_split(c)).count();
+        if to_split == 0 {
             return Ok(());
         }
 
         let errored: AtomicBool = AtomicBool::new(false);
 
         // todo: track error, but allow partials
+        // A split re-encodes two half chunks (~thousands of samples), so a
+        // handful of them is worth the pool; one is not.
         let mut new_chunks = if self.is_compressed() {
             self.chunks
                 .par_mut_rayon()
+                .num_threads(request_par_threads(to_split, to_split * SPLIT_WORK))
                 .filter(|c| Self::needs_split(c))
                 .flat_map(|chunks| {
                     if let Ok(mut split_chunk) = chunks.split() {
@@ -733,6 +737,10 @@ impl TimeSeries {
                 [meta] => meta_fetch(meta),
                 _ => slice
                     .par_rayon()
+                    .num_threads(request_par_threads(
+                        slice.len(),
+                        slice.iter().map(|m| m.chunk.len()).sum(),
+                    ))
                     .map(|meta| meta_fetch(meta))
                     .into_fallible()
                     .flat_map(|r| r)
@@ -799,6 +807,41 @@ impl TimeSeries {
     pub fn range_iter(&self, start: Timestamp, end: Timestamp) -> SeriesSampleIterator<'_> {
         let start = start.max(self.get_min_timestamp());
         SeriesSampleIterator::new(self, start, end, false)
+    }
+
+    /// Copy the chunks `[start, end]` touches, for decoding after this series
+    /// is no longer borrowed. See [`RangeSnapshot`]. Ported from the promql
+    /// branch (9c845860e) for the deferred TS.MRANGE experiment.
+    pub fn snapshot_range(&self, start: Timestamp, end: Timestamp) -> RangeSnapshot {
+        self.snapshot_range_keeping(start, end, SnapshotKeep::All)
+    }
+
+    /// [`Self::snapshot_range`], copying no more chunks than `keep` can reach: the copy
+    /// runs under the lock, and a COUNT that only reads one end of the window has no use
+    /// for the rest of it.
+    pub fn snapshot_range_keeping(
+        &self,
+        start: Timestamp,
+        end: Timestamp,
+        keep: SnapshotKeep,
+    ) -> RangeSnapshot {
+        let start = start.max(self.get_min_timestamp());
+        let chunks = if start > end || self.is_empty() || !self.overlaps(start, end) {
+            Vec::new()
+        } else {
+            match self.get_chunk_index_bounds(start, end) {
+                Some((first, last)) => keep.trim(&self.chunks[first..=last], start, end).to_vec(),
+                None => Vec::new(),
+            }
+        };
+        RangeSnapshot {
+            start,
+            end,
+            chunks,
+            series_extent: (!self.is_empty())
+                .then(|| (self.first_timestamp, self.last_timestamp())),
+            series_total_samples: self.total_samples,
+        }
     }
 
     /// Iterate the samples physically stored in `[start, end]`, **without** clamping `start`
@@ -978,11 +1021,14 @@ impl TimeSeries {
                 deleted_samples
             }
             (true, [one]) => remove_internal(one, start_ts, end_ts)?,
-            (true, many) => many
-                .into_par_rayon()
-                .map(|chunk| remove_internal(chunk, start_ts, end_ts))
-                .into_fallible()
-                .sum()?,
+            (true, many) => {
+                let threads = request_par_threads(many.len(), many.iter().map(|c| c.len()).sum());
+                many.into_par_rayon()
+                    .num_threads(threads)
+                    .map(|chunk| remove_internal(chunk, start_ts, end_ts))
+                    .into_fallible()
+                    .sum()?
+            }
         };
 
         // Remove empty chunks
@@ -1206,9 +1252,14 @@ impl TimeSeries {
 
     pub fn optimize(&mut self) {
         // todo: merge chunks if possible
-        self.chunks.par_mut_rayon().for_each(|chunk| {
-            let _ = chunk.optimize();
-        });
+        let threads =
+            request_par_threads(self.chunks.len(), self.chunks.iter().map(|c| c.len()).sum());
+        self.chunks
+            .par_mut_rayon()
+            .num_threads(threads)
+            .for_each(|chunk| {
+                let _ = chunk.optimize();
+            });
     }
 
     #[cfg(test)]
@@ -1378,6 +1429,10 @@ pub(super) fn find_last_ge_index(chunks: &[TimeSeriesChunk], ts: Timestamp) -> (
     }
 }
 
+/// Sample-equivalents a chunk split is worth in the dispatch decision: both
+/// halves are re-encoded, so it is roughly one chunk's worth of samples.
+const SPLIT_WORK: usize = 2048;
+
 fn get_range_parallel(
     chunks: &[TimeSeriesChunk],
     start: Timestamp,
@@ -1388,10 +1443,143 @@ fn get_range_parallel(
         [chunk] => chunk.get_range(start, end),
         _ => chunks
             .into_par_rayon()
+            .num_threads(request_par_threads(
+                chunks.len(),
+                chunks.iter().map(|c| c.len()).sum(),
+            ))
             .map(|chunk| chunk.get_range(start, end))
             .into_fallible()
             .flat_map(|x| x)
             .collect(),
+    }
+}
+
+/// The compressed chunks a range read needs, copied out of a series so they
+/// can be decoded after the series — and whatever guards it — are released.
+///
+/// A chunk is a few KB of compressed bytes; its decoded samples are several
+/// times that. Copying chunks on the main thread and decoding elsewhere turns
+/// main-thread time proportional to the decode into time proportional to the
+/// memcpy. Only the chunks overlapping the range are copied.
+pub struct RangeSnapshot {
+    /// Already clamped to the series' retention floor, as a live range read would.
+    start: Timestamp,
+    end: Timestamp,
+    chunks: Vec<TimeSeriesChunk>,
+    /// The series' first and last stored timestamps when it was copied; `None` for an
+    /// empty series.
+    series_extent: Option<(Timestamp, Timestamp)>,
+    /// Samples the series stored when it was copied.
+    series_total_samples: usize,
+}
+
+impl RangeSnapshot {
+    /// Samples in the copied chunks — an upper bound on the range's samples,
+    /// since the edge chunks may reach past it.
+    pub fn estimated_samples(&self) -> usize {
+        self.chunks.iter().map(|c| c.len()).sum()
+    }
+
+    /// The samples in `[start, end]`, decoded on demand, descending when
+    /// `is_reverse`. The same iterator type a live range read uses, so the
+    /// aggregation pipeline built over it compiles to the same loop.
+    pub fn sample_iter(&self, is_reverse: bool) -> SeriesSampleIterator<'_> {
+        SeriesSampleIterator::over_chunks(&self.chunks, self.start, self.end, is_reverse)
+    }
+
+    /// [`Self::sample_iter`], ascending, reading nothing older than `floor`.
+    pub(crate) fn sample_iter_from(&self, floor: Option<Timestamp>) -> SeriesSampleIterator<'_> {
+        let start = self.start.max(floor.unwrap_or(Timestamp::MIN));
+        SeriesSampleIterator::over_chunks(&self.chunks, start, self.end, false)
+    }
+
+    /// The window's samples older than `floor`, newest first.
+    pub(crate) fn samples_before(&self, floor: Timestamp) -> SeriesSampleIterator<'_> {
+        SeriesSampleIterator::over_chunks(
+            &self.chunks,
+            self.start,
+            floor.saturating_sub(1).min(self.end),
+            true,
+        )
+    }
+
+    /// The window's lower bound, clamped to the retention floor.
+    pub(crate) fn start(&self) -> Timestamp {
+        self.start
+    }
+
+    /// The series' last stored timestamp when it was copied; `None` for an empty series.
+    pub(crate) fn series_last_timestamp(&self) -> Option<Timestamp> {
+        self.series_extent.map(|(_, last)| last)
+    }
+
+    /// The series' first and last stored timestamps when it was copied.
+    pub(crate) fn series_extent(&self) -> Option<(Timestamp, Timestamp)> {
+        self.series_extent
+    }
+
+    /// Samples the series stored when it was copied, in and out of the window.
+    pub(crate) fn series_total_samples(&self) -> usize {
+        self.series_total_samples
+    }
+
+    #[cfg(test)]
+    pub(crate) fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+}
+
+/// How much of a window a [`RangeSnapshot`] has to hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotKeep {
+    /// Every chunk the window touches.
+    All,
+    /// Only the reader's first this-many stored samples of the window will be used.
+    Oldest(usize),
+    /// Only the last this-many.
+    Newest(usize),
+}
+
+impl SnapshotKeep {
+    /// The chunks of `chunks` (those `[start, end]` touches, in order) that hold the kept
+    /// samples. Only a chunk lying wholly inside the window is counted, at its full length:
+    /// an edge chunk may hold samples outside it, so it is kept and counted for nothing.
+    fn trim(
+        self,
+        chunks: &[TimeSeriesChunk],
+        start: Timestamp,
+        end: Timestamp,
+    ) -> &[TimeSeriesChunk] {
+        let inside = |c: &TimeSeriesChunk| {
+            if !c.is_empty() && c.first_timestamp() >= start && c.last_timestamp() <= end {
+                c.len()
+            } else {
+                0
+            }
+        };
+        match self {
+            SnapshotKeep::All => chunks,
+            SnapshotKeep::Oldest(count) => {
+                let mut have = 0usize;
+                for (i, chunk) in chunks.iter().enumerate() {
+                    have = have.saturating_add(inside(chunk));
+                    if have >= count {
+                        return &chunks[..=i];
+                    }
+                }
+                chunks
+            }
+            SnapshotKeep::Newest(count) => {
+                let mut have = 0usize;
+                for (i, chunk) in chunks.iter().enumerate().rev() {
+                    have = have.saturating_add(inside(chunk));
+                    if have >= count {
+                        return &chunks[i..];
+                    }
+                }
+                chunks
+            }
+        }
     }
 }
 

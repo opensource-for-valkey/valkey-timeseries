@@ -194,6 +194,16 @@ impl UncompressedChunk {
         Some((start_idx, end_idx))
     }
 
+    /// The sample count recorded in a chunk's [`ChunkOps::serialize`] output,
+    /// read from its header without decoding the samples. `None` if the header
+    /// is truncated.
+    pub(crate) fn serialized_sample_count(buf: &[u8]) -> Option<usize> {
+        let mut buf = buf.get(1..)?; // encoding flag
+        try_read_uvarint(&mut buf).ok()?; // max_size
+        try_read_uvarint(&mut buf).ok()?; // max_elements
+        try_read_uvarint(&mut buf).ok().map(|len| len as usize)
+    }
+
     fn serialize_raw(&self, buf: &mut Vec<u8>) {
         write_uvarint(buf, self.max_size as u64);
         write_uvarint(buf, self.max_elements as u64);

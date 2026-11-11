@@ -614,7 +614,7 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
             [entry] = coordinator.execute_command('TS._DEBUG', 'INFLIGHT')
             fields = {entry[i].decode(): entry[i + 1] for i in range(0, len(entry), 2)}
             assert list(fields) == ['id', 'command', 'ageMs', 'remoteTargets', 'outstanding']
-            assert fields['command'] == b'mrange'
+            assert fields['command'] == b'cmd:mrange'
             assert int(fields['id'])
             assert fields['remoteTargets'] == self.CLUSTER_SIZE - 1
             assert 1 <= fields['outstanding'] <= self.CLUSTER_SIZE - 1

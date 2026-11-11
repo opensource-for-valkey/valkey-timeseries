@@ -55,7 +55,7 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
     type Response = StatsResponse;
 
     fn name() -> &'static str {
-        "label_stats"
+        "cmd:label_stats"
     }
 
     fn get_local_response(ctx: &FanoutContext, req: StatsRequest) -> ValkeyResult<StatsResponse> {

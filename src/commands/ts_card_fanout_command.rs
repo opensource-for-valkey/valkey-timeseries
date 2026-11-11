@@ -33,7 +33,7 @@ impl FanoutClientCommand for CardFanoutCommand {
     type Response = CountResponse;
 
     fn name() -> &'static str {
-        "card"
+        "cmd:card"
     }
 
     fn get_local_response(

@@ -33,6 +33,9 @@ pub struct FanoutContext {
     deadline: OnceLock<Instant>,
     /// Set by the requester's cancel message, if this request can get one.
     cancelled: OnceLock<Arc<AtomicBool>>,
+    /// Whether this is the coordinator's own share, answered in memory rather
+    /// than serialized for another node ([`Self::local_share`]).
+    local_share: bool,
 }
 
 impl FanoutContext {
@@ -48,7 +51,21 @@ impl FanoutContext {
             ctx: &MODULE_CONTEXT,
             deadline: OnceLock::new(),
             cancelled: OnceLock::new(),
+            local_share: false,
         }
+    }
+
+    /// Marks this as the coordinator's own share: its response reaches the
+    /// coordinator in memory and never crosses the network.
+    pub fn local_share(mut self) -> Self {
+        self.local_share = true;
+        self
+    }
+
+    /// Whether this is the coordinator's own share ([`Self::local_share`]), so its
+    /// response need not be shaped for the wire.
+    pub fn is_local_share(&self) -> bool {
+        self.local_share
     }
 
     /// Record when the requester stops waiting for this answer. Reads walking the
@@ -190,5 +207,13 @@ mod tests {
         let ctx = FanoutContext::new(Some(String::new()), 0);
         assert!(ctx.user().is_none());
         assert_eq!(ctx.db(), 0);
+    }
+
+    #[test]
+    fn test_fanout_context_is_remote_unless_marked_local() {
+        assert!(!FanoutContext::new(None, 0).is_local_share());
+        let local = FanoutContext::new(Some("alice".to_owned()), 3).local_share();
+        assert!(local.is_local_share());
+        assert_eq!((local.user(), local.db()), (Some("alice"), 3));
     }
 }

@@ -100,6 +100,43 @@ class TestTimeSeriesACL(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(Exception, match="No permissions to access a key"):
             no_read_client.execute_command('TS.RANGE', 'ts:acl:range_test', '-', '+')
 
+    def test_key_spec_commands_are_denied_by_the_server(self):
+        """The single-key read commands rely on the server's key-spec ACL check.
+
+        TS.GET, TS.RANGE, TS.REVRANGE and TS.INFO declare a key spec, so the server
+        refuses a denied key before the handler runs and the module skips its own
+        per-request ACL resolve (docs/plans/range-performance-plan.md, phase 3). This
+        pins the server-side denial for every one of them, and that a command whose
+        keys are only known at runtime (TS.MRANGE) still fails closed in the module.
+        """
+        self.client.execute_command('TS.CREATE', 'ts:acl:denied', 'LABELS', 'acl', 'ks')
+        self.client.execute_command('TS.CREATE', 'ts:acl:allowed', 'LABELS', 'acl', 'ks')
+        for key in ('ts:acl:denied', 'ts:acl:allowed'):
+            self.client.execute_command('TS.ADD', key, 1000, 1.0)
+        self.create_test_user('keyspec_user', 'password123', [
+            '+@all', '~ts:acl:allowed', '&*'
+        ])
+        client = self.get_user_client('keyspec_user', 'password123')
+
+        single_key = [
+            ['TS.GET', '{}'],
+            ['TS.GET', '{}', 'LATEST'],
+            ['TS.RANGE', '{}', '-', '+'],
+            ['TS.REVRANGE', '{}', '-', '+'],
+            ['TS.INFO', '{}'],
+        ]
+        for template in single_key:
+            allowed = [a.format('ts:acl:allowed') for a in template]
+            assert client.execute_command(*allowed) is not None, allowed
+            denied = [a.format('ts:acl:denied') for a in template]
+            with pytest.raises(ResponseError, match="No permissions to access a key"):
+                client.execute_command(*denied)
+
+        # Runtime-key commands cannot lean on a key spec: the module's own check
+        # stays, with its own error text.
+        with pytest.raises(ResponseError, match="doesn't have read permission"):
+            client.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'acl=ks')
+
     def test_ts_nrange_acl_permissions(self):
         """TS.NRANGE fails closed when the user cannot read *every* key it names."""
         # Two series under different prefixes, so a key pattern can cover one but not the other.

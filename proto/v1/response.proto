@@ -22,7 +22,7 @@ message SeriesRangeResponse {
   // Label storage, used in place of `labels`: parallel arrays, one entry per
   // label, indexing into `MultiRangeResponse.symbol_table_names` /
   // `symbol_table_values`. Interning is unconditional, so there is no
-  // `applied_*` flag; non-empty ref arrays are themselves the signal.
+  // flag; non-empty ref arrays are themselves the signal.
   //
   // Both arrays empty means there is nothing to resolve — either the series has
   // no labels, or it carries them in `labels` directly. A decoder must leave
@@ -58,14 +58,11 @@ message GroupPartialSeries {
 message MultiRangeResponse {
   repeated SeriesRangeResponse series = 1;
   repeated GroupPartialSeries group_partials = 2;
-  bool applied_aggregation = 3;
-  bool applied_group_reduce = 4;
-  bool applied_count = 5;
   // Dictionaries `SeriesRangeResponse.label_name_refs`/`label_value_refs`
   // index into. Label interning is unconditional, so these are populated
   // whenever `series` carries any labels; empty otherwise.
-  repeated string symbol_table_names = 6;
-  repeated string symbol_table_values = 7;
+  repeated string symbol_table_names = 3;
+  repeated string symbol_table_values = 4;
 }
 
 // QUERYINDEX returns key names verbatim, including invalid UTF-8 and interior NULs.

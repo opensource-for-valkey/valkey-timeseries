@@ -4,10 +4,10 @@ use crate::series::TimeSeries;
 use crate::series::chunks::{ChunkOps, TimeSeriesChunk};
 use crate::series::request_types::RangeOptions;
 
-/// An iterator over samples in a TimeSeries within a specified timestamp range.
-/// Supports both forward and reverse iteration.
+/// An iterator over samples in a TimeSeries — or a copy of its chunks — within a
+/// specified timestamp range. Supports both forward and reverse iteration.
 pub struct SeriesSampleIterator<'a> {
-    series: &'a TimeSeries,
+    chunks: &'a [TimeSeriesChunk],
     is_reverse: bool,
     /// Buffer for reverse iteration
     buffer: Vec<Sample>,
@@ -38,18 +38,31 @@ impl<'a> SeriesSampleIterator<'a> {
         end: Timestamp,
         is_reverse: bool,
     ) -> Self {
+        Self::over_chunks(&series.chunks, start, end, is_reverse)
+    }
+
+    /// Iterates `chunks` — a series' chunks or a copy of them, in order — the same
+    /// way. `start` must already be clamped to the series' retention floor.
+    pub(crate) fn over_chunks(
+        chunks: &'a [TimeSeriesChunk],
+        start: Timestamp,
+        end: Timestamp,
+        is_reverse: bool,
+    ) -> Self {
         // Match TimestampRange semantics: an inverted window contains no samples.
         // Marking it done here prevents every iterator caller from having to rely
         // on its underlying chunk encoding to handle the range safely.
-        let chunks_done = series.chunks.is_empty() || start > end;
-        let chunk_index: usize = if is_reverse && !series.is_empty() {
-            series.chunks.len() - 1
+        let chunks_done = chunks.is_empty() || start > end;
+        // Empty chunks are skipped while scanning, so starting a reverse scan at the
+        // last chunk of a series with no samples still yields nothing.
+        let chunk_index: usize = if is_reverse && !chunks.is_empty() {
+            chunks.len() - 1
         } else {
             0
         };
 
         let mut this = Self {
-            series,
+            chunks,
             start,
             end,
             chunk_index,
@@ -71,7 +84,7 @@ impl<'a> SeriesSampleIterator<'a> {
         }
         if self.is_reverse {
             loop {
-                let chunk = &self.series.chunks[self.chunk_index];
+                let chunk = &self.chunks[self.chunk_index];
                 // An empty chunk reports `last_timestamp() == 0`, which is not "before the
                 // window": skip it below instead of ending the scan, as the forward arm does.
                 if !chunk.is_empty() && chunk.last_timestamp() < self.start {
@@ -92,9 +105,9 @@ impl<'a> SeriesSampleIterator<'a> {
                 }
             }
         } else {
-            let len = self.series.chunks.len();
+            let len = self.chunks.len();
             while self.chunk_index < len {
-                let chunk = &self.series.chunks[self.chunk_index];
+                let chunk = &self.chunks[self.chunk_index];
                 if chunk.first_timestamp() > self.end {
                     self.chunk_index = len + 1;
                     self.chunks_done = true;
