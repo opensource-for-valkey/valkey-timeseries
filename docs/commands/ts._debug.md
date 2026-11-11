@@ -479,6 +479,12 @@ TS._DEBUG METRICS exec
 16) (integer) 0
 17) "exec_fanout_running"
 18) (integer) 0
+19) "exec_mrange_queued"
+20) (integer) 0
+21) "exec_mrange_rejected_total"
+22) (integer) 0
+23) "exec_mrange_running"
+24) (integer) 0
 ```
 
 Start a clean window, then read one section with descriptions:

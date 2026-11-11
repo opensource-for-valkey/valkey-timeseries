@@ -2,6 +2,7 @@ use crate::commands::command_parser::{parse_timestamp, parse_value_arg};
 use crate::common::acl::KeyAccess;
 use crate::common::block_on_keys::signal_timeseries_ready;
 use crate::common::context::notify_keyspace_event;
+use crate::common::logging::log_warning;
 use crate::common::replies::{reply_error_string, reply_with_array, reply_with_integer};
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
@@ -234,8 +235,14 @@ fn parse_args<'a>(
                 Err(ValkeyError::WrongType) => {
                     SampleAddResult::Error(error_consts::INVALID_TIMESERIES_KEY)
                 }
+                // ACL refusals (`KeyAccess::check`) and lookup failures arrive here.
                 Err(ValkeyError::Str(err)) => SampleAddResult::Error(err),
-                Err(_) => SampleAddResult::Error(error_consts::PERMISSION_DENIED),
+                // Nothing on this path builds another error; should one appear, it is
+                // not a permission problem, so do not report it as one.
+                Err(err) => {
+                    log_warning(format!("TS.MADD: opening a series failed: {err}"));
+                    SampleAddResult::Error(error_consts::INTERNAL_ERROR)
+                }
             };
         }
 

@@ -397,6 +397,9 @@ fn filter_series_by_date_range<'a>(
         .iter()
         .map(|guard| guard.0.as_ref())
         .iter_into_par_rayon()
+        // Work is counted in series, not samples: each check is a bounds lookup over a
+        // series' chunks, cheap enough that a sequential pass beats the pool below a few
+        // thousand series.
         .num_threads(request_par_threads(series.len(), series.len()))
         .filter_map(|ts| {
             if matches_date_range(ts, start, end, exclude) {
