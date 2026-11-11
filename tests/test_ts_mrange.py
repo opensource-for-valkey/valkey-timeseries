@@ -1,6 +1,11 @@
-from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
+from valkey_timeseries_test_case import (
+    ValkeyTimeSeriesTestCaseBase,
+    ValkeyTimeSeriesTestCaseDebugMode,
+)
 from valkeytestframework.conftest import resource_port_tracker
+from valkeytestframework.util.waiters import wait_for_equal, wait_for_true
 from valkey import ResponseError
+import threading
 import time
 import pytest
 
@@ -637,3 +642,80 @@ class TestTimeSeriesMRange(ValkeyTimeSeriesTestCaseBase):
             with pytest.raises(ResponseError, match="missing HASHTAG argument"):
                 self.client.execute_command(command, self.start_ts, self.start_ts + 100,
                                             'FILTER', 'sensor=temp', 'HASHTAG')
+
+
+class TestTimeSeriesMRangeDeferred(ValkeyTimeSeriesTestCaseDebugMode):
+    """A standalone TS.MRANGE large enough to pay for it is answered off the main thread: the
+    client is blocked while a ts-mrange lane worker decodes and replies."""
+
+    SERIES = 64
+    SAMPLES = 2000
+
+    def load(self, prefix='d'):
+        """SERIES x SAMPLES samples under `group=<prefix>`: 64 * (1024 + 2000) work units,
+        past the threshold above which a lone read is deferred."""
+        pipe = self.client.pipeline(transaction=False)
+        for i in range(self.SERIES):
+            key = f'{prefix}:{i}'
+            pipe.execute_command('TS.CREATE', key, 'LABELS', 'group', prefix)
+            args = []
+            for j in range(self.SAMPLES):
+                args += [key, 1000 + j, j % 97]
+            pipe.execute_command('TS.MADD', *args)
+        pipe.execute()
+
+    def usec_per_call(self, run, times=10):
+        self.client.execute_command('CONFIG', 'RESETSTAT')
+        for _ in range(times):
+            run()
+        return self.client.info('commandstats')['cmdstat_ts.mrange']['usec_per_call']
+
+    def test_deferred_mrange_reports_its_lane_time(self):
+        """INFO commandstats (and so latency tracking and the slow log) counts the decode a
+        deferred read does on the lane, about as much as the same read inline."""
+        self.load()
+        query = ('TS.MRANGE', '-', '+', 'AGGREGATION', 'sum', 1_000_000, 'FILTER', 'group=d')
+
+        def deferred():
+            self.client.execute_command(*query)
+
+        def inline():
+            # MULTI keeps the read on the main thread.
+            pipe = self.client.pipeline(transaction=True)
+            pipe.execute_command(*query)
+            pipe.execute()
+
+        deferred_usec = self.usec_per_call(deferred)
+        inline_usec = self.usec_per_call(inline)
+        # Counting only the main thread's share (taking the snapshot) reports a few percent.
+        assert deferred_usec >= inline_usec / 2, (deferred_usec, inline_usec)
+
+    def test_killed_clients_leave_nothing_blocked(self):
+        """Clients killed while their deferred reads queue or run are let go: nothing stays
+        blocked, the lane drains, and the next read is answered."""
+        self.load()
+        query = ('TS.MRANGE', '-', '+', 'FILTER', 'group=d')
+        readers = [self.server.get_new_client() for _ in range(16)]
+        ids = [reader.client_id() for reader in readers]
+
+        def run(reader):
+            try:
+                reader.execute_command(*query)
+            except Exception:  # noqa: BLE001 - killed mid-read, as intended
+                pass
+
+        threads = [threading.Thread(target=run, args=(r,), daemon=True) for r in readers]
+        for thread in threads:
+            thread.start()
+        wait_for_true(lambda: self.client.info('clients')['blocked_clients'] > 0, timeout=15)
+        for client_id in ids:
+            self.client.execute_command('CLIENT', 'KILL', 'ID', client_id)
+        for thread in threads:
+            thread.join(timeout=15)
+
+        wait_for_equal(lambda: self.client.info('clients')['blocked_clients'], 0, timeout=15)
+        wait_for_true(lambda: self.debug_metrics()['exec_mrange_running'] == 0
+                      and self.debug_metrics()['exec_mrange_queued'] == 0, timeout=15)
+        result = self.client.execute_command(*query)
+        assert len(result) == self.SERIES
+        assert all(len(series[2]) == self.SAMPLES for series in result)

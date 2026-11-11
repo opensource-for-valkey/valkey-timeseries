@@ -84,6 +84,7 @@ pub(crate) use analysis_runner::analysis_lane_stats;
 pub use command_parser::*;
 pub use debug::ts_debug_cmd;
 pub use ts_mget::*;
+pub(crate) use ts_mrange::mrange_lane_stats;
 pub use ts_restore::*;
 use valkey_module::ValkeyResult;
 

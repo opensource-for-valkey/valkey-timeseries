@@ -447,7 +447,7 @@ fn process_mrange(
     }
 
     let mut items = if is_grouped {
-        handle_grouping(metas, options)?
+        handle_grouping(metas, options, &ReadDeadline::new(&|| false))?
     } else {
         handle_non_grouped(metas, options, false, None, &ReadDeadline::new(&|| false))
     };
@@ -677,9 +677,13 @@ fn handle_non_grouped(
         .collect()
 }
 
+/// GROUPBY/REDUCE over `metas`. `deadline` is asked before each member series is bucketed and
+/// before each group is merged; once it has passed, the rest is skipped and the caller's
+/// [`ReadDeadline::finish`] turns the read into an error.
 fn handle_grouping<M: GroupMember>(
     metas: Vec<M>,
     options: MRangeOptions,
+    deadline: &ReadDeadline,
 ) -> ValkeyResult<Vec<MRangeSeriesResult>> {
     // Callers only reach this function after confirming `options.grouping.is_some()`
     // (see `process_mrange`); a `None` here would mean that invariant broke.
@@ -730,7 +734,12 @@ fn handle_grouping<M: GroupMember>(
         let mut rows: Vec<Vec<Sample>> = series_refs
             .par_rayon()
             .num_threads(series_threads)
-            .map(|meta| series_bucket_rows(*meta, &options.range))
+            .map(|meta| {
+                if deadline.passed() {
+                    return Vec::new();
+                }
+                series_bucket_rows(*meta, &options.range)
+            })
             .collect();
         let mut rows = rows.drain(..);
         for (label_value, group_data, grid) in dense {
@@ -751,6 +760,9 @@ fn handle_grouping<M: GroupMember>(
         .iter_into_par_rayon()
         .num_threads(threads)
         .map(|(label_value, group_data)| {
+            if deadline.passed() {
+                return MRangeSeriesResult::default();
+            }
             let grouping = options
                 .grouping
                 .as_ref()
@@ -1747,28 +1759,29 @@ fn decode_snapshot(
     }
 }
 
-/// The off-thread half: decode every snapshot through the same pipeline
-/// `handle_non_grouped` uses, apply EXCLUDEEMPTY, sort by key. For GROUPBY, reduce the
-/// groups as `handle_grouping` does and sort by group; the snapshots must then have been
-/// taken with [`group_member_options`].
+/// The off-thread half of a deferred standalone read: decode every snapshot through the same
+/// pipeline `handle_non_grouped` uses, apply EXCLUDEEMPTY, sort by key. For GROUPBY, reduce
+/// the groups as `handle_grouping` does and sort by group; the snapshots must then have been
+/// taken with [`group_member_options`]. Fails only once `expired` reports the client gone,
+/// with the work left skipped.
 pub(crate) fn decode_snapshot_series(
     series: Vec<SnapshotSeries>,
     options: &MRangeOptions,
-) -> Vec<MRangeSeriesResult> {
+    expired: &(dyn Fn() -> bool + Sync),
+) -> ValkeyResult<Vec<MRangeSeriesResult>> {
     if options.grouping.is_some() {
-        // The live path's reduce, with snapshots for members. It only fails without
-        // grouping options, which this branch has.
-        let mut items = handle_grouping(series, options.clone()).unwrap_or_default();
+        // The live path's reduce, with snapshots for members.
+        let deadline = ReadDeadline::new(expired);
+        let items = handle_grouping(series, options.clone(), &deadline)?;
+        let mut items = deadline.finish(items)?;
         sort_mrange_results(&mut items, true);
-        return items;
+        return Ok(items);
     }
-    // The shard decode with nothing pushed down and no requester to give up: COUNT and
-    // the direction are in `options`, and the samples go straight to the reply.
-    // Only an expired deadline fails that decode, and this one has none.
-    let mut items =
-        decode_shard_snapshots(series, options, None, false, &|| false).unwrap_or_default();
+    // The shard decode with nothing pushed down: COUNT and the direction are in `options`,
+    // and the samples go straight to the reply.
+    let mut items = decode_shard_snapshots(series, options, None, false, expired)?;
     sort_mrange_results(&mut items, false);
-    items
+    Ok(items)
 }
 
 #[cfg(test)]
@@ -2023,7 +2036,8 @@ mod tests {
         });
 
         let metas = vec![meta(&s1, "a", Some("us")), meta(&s2, "b", Some("us"))];
-        let results = handle_grouping(metas, options.clone()).unwrap();
+        let results =
+            handle_grouping(metas, options.clone(), &ReadDeadline::new(&|| false)).unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, b"region=us");
@@ -2038,7 +2052,7 @@ mod tests {
         options.is_reverse = true;
         options.range.count = Some(2);
         let metas = vec![meta(&s1, "a", Some("us")), meta(&s2, "b", Some("us"))];
-        let results = handle_grouping(metas, options).unwrap();
+        let results = handle_grouping(metas, options, &ReadDeadline::new(&|| false)).unwrap();
         let rows = rows_of(&results[0]);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].timestamp, 200);
@@ -2151,7 +2165,7 @@ mod tests {
         let s2 = make_series(&[(0, 8.0), (120, 12.0), (250, 7.0)]);
         let metas = || vec![meta(&s1, "a", Some("us")), meta(&s2, "b", Some("us"))];
         let samples = |options: MRangeOptions| {
-            let results = handle_grouping(metas(), options).unwrap();
+            let results = handle_grouping(metas(), options, &ReadDeadline::new(&|| false)).unwrap();
             assert_eq!(results.len(), 1);
             match &results[0].data {
                 SeriesResultData::Chunk(chunk) => {
@@ -2306,7 +2320,7 @@ mod tests {
                             }
                         })
                         .collect();
-                    let deferred = decode_snapshot_series(snapshots, &options);
+                    let deferred = decode_snapshot_series(snapshots, &options, &|| false).unwrap();
                     let metas = vec![meta(&s1, "a", None), meta(&s2, "b", None)];
                     let mut live = handle_non_grouped(
                         metas,
@@ -2826,6 +2840,57 @@ mod tests {
         }
     }
 
+    /// A deferred read whose client has gone stops and fails, grouped or not, rather than
+    /// finishing or answering with whatever it got through.
+    #[test]
+    fn test_deferred_decode_stops_once_the_client_is_gone() {
+        let (s1, s2) = (multi_chunk_series(0.0), multi_chunk_series(100.0));
+        let grouping = RangeGroupingOptions {
+            aggregation: AggregatorConfig::new(AggregationType::Sum, None).unwrap(),
+            group_label: "g".into(),
+        };
+        for grouped in [false, true] {
+            let options = MRangeOptions {
+                range: RangeOptions {
+                    date_range: crate::series::TimestampRange::from_timestamps(0, 3000).unwrap(),
+                    ..Default::default()
+                },
+                grouping: grouped.then(|| grouping.clone()),
+                ..Default::default()
+            };
+            let snapshots = || -> Vec<SnapshotSeries> {
+                [(&s1, "a"), (&s2, "b")]
+                    .into_iter()
+                    .map(|(series, key)| {
+                        let (start, end) = options.range.get_timestamp_range();
+                        SnapshotSeries {
+                            key: key.into(),
+                            labels: Vec::new(),
+                            snapshot: series.snapshot_range(start, end),
+                            latest: None,
+                            empty_fill: range_empty_fill_bounds(
+                                series,
+                                &options.range,
+                                false,
+                                false,
+                            ),
+                            group_label_value: Some("x".into()),
+                        }
+                    })
+                    .collect()
+            };
+
+            let answered = decode_snapshot_series(snapshots(), &options, &|| false).unwrap();
+            assert!(!answered.is_empty(), "grouped={grouped}");
+            let err = decode_snapshot_series(snapshots(), &options, &|| true).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                error_consts::FANOUT_REQUESTER_GAVE_UP,
+                "grouped={grouped}"
+            );
+        }
+    }
+
     /// The standalone deferred path, which carries COUNT and the direction in its options:
     /// same answer as the live path, from a snapshot trimmed to what COUNT reaches.
     #[test]
@@ -2860,7 +2925,8 @@ mod tests {
                                 snapshot_one(series, (*key).into(), None, &options, None)
                             })
                             .collect();
-                        let deferred = decode_snapshot_series(snapshots, &options);
+                        let deferred =
+                            decode_snapshot_series(snapshots, &options, &|| false).unwrap();
                         let metas = fixtures
                             .iter()
                             .map(|(series, key)| meta(series, key, None))
@@ -3035,7 +3101,8 @@ mod tests {
                                     snapshot
                                 })
                                 .collect();
-                            let deferred = decode_snapshot_series(snapshots, &options);
+                            let deferred =
+                                decode_snapshot_series(snapshots, &options, &|| false).unwrap();
 
                             let metas = fixtures
                                 .iter()
@@ -3046,7 +3113,12 @@ mod tests {
                                     group_label_value: group.map(String::from),
                                 })
                                 .collect();
-                            let mut live = handle_grouping(metas, options.clone()).unwrap();
+                            let mut live = handle_grouping(
+                                metas,
+                                options.clone(),
+                                &ReadDeadline::new(&|| false),
+                            )
+                            .unwrap();
                             sort_mrange_results(&mut live, true);
 
                             let case = format!(

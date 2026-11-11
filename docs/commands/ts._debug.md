@@ -234,6 +234,9 @@ counters stay at zero, `refresh_interval_seconds` at 0 and `age_seconds` at -1.
 | `exec_analysis_queued` | gauge | Jobs waiting for a worker on the `ts-analysis` lane |
 | `exec_analysis_running` | gauge | Jobs a worker is running on the `ts-analysis` lane |
 | `exec_analysis_rejected_total` | counter | Jobs refused because the `ts-analysis` queue was full |
+| `exec_mrange_queued` | gauge | Standalone `TS.MRANGE` reads waiting for a worker on the `ts-mrange` lane |
+| `exec_mrange_running` | gauge | Standalone `TS.MRANGE` reads a worker is decoding and answering on the `ts-mrange` lane |
+| `exec_mrange_rejected_total` | counter | Standalone `TS.MRANGE` reads the full `ts-mrange` queue refused, answered on the main thread instead |
 
 #### `fanout`
 

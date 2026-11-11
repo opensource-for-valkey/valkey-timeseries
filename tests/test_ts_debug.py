@@ -1063,7 +1063,8 @@ class TestDebugMetrics(ValkeyTimeSeriesTestCaseDebugMode):
                    'rdb_save_failures_total', 'rdb_saves_total']
     EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
                     'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_reply_queued',
-                    'exec_fanout_reply_rejected_total', 'exec_fanout_reply_running', 'exec_fanout_running']
+                    'exec_fanout_reply_rejected_total', 'exec_fanout_reply_running', 'exec_fanout_running',
+                    'exec_mrange_queued', 'exec_mrange_rejected_total', 'exec_mrange_running']
     TASKS = ['retention_trim', 'tombstone_sweep', 'optimize_index']
     ASM_TASKS = ['optimize']
     TASK_FIELDS = ('started_total', 'completed_total', 'skipped_inflight_total',

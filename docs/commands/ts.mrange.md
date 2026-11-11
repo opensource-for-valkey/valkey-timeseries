@@ -427,6 +427,9 @@ O(n×m×k) where:
 - When using `GROUPBY`, series are grouped by the specified label value
 - Aggregation is applied before grouping when both are specified
 - `LATEST` is useful when you have compaction rules and want aggregated data without querying compacted series directly
+- On a server with cluster mode disabled, a large read (or any read while other clients' `TS.MRANGE`/`TS.MREVRANGE`
+  reads are arriving) is decoded and answered off the main thread. The reply is unchanged, but the client is blocked
+  meanwhile: see [Standalone background `TS.MRANGE`](../../COMPATIBILITY.md#standalone-background-tsmrange-tsmrevrange)
 
 ## See Also
 

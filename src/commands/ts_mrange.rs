@@ -3,7 +3,7 @@ use crate::commands::ts_mrange_fanout_command::MRangeFanoutCommand;
 use crate::commands::utils::{MRangeReplyShape, reply_with_mrange_series_results};
 use crate::common::context::is_blocking_denied;
 use crate::common::replies::{IntoRawCtx, ThreadSafeReplyContext, block_client};
-use crate::common::threads::{BoundedExecutor, Capacity, lane_workers};
+use crate::common::threads::{BoundedExecutor, Capacity, ExecutorStats, lane_workers};
 use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, is_clustered};
 use crate::series::mrange::{
@@ -26,6 +26,11 @@ static MRANGE_EXECUTOR: BoundedExecutor = BoundedExecutor::new(
     lane_workers,
     Capacity::Fixed(MRANGE_QUEUE_CAPACITY),
 );
+
+/// The load on the deferred TS.MRANGE lane, for `TS._DEBUG METRICS`. Never starts the workers.
+pub(crate) fn mrange_lane_stats() -> ExecutorStats {
+    MRANGE_EXECUTOR.stats()
+}
 
 /// Window within which another client's TS.MRANGE marks the main thread as
 /// contended. Under contention the block/unblock round trip is hidden by other
@@ -130,7 +135,8 @@ fn mrange_internal(ctx: &Context, args: Vec<ValkeyString>, reverse: bool) -> Val
 /// [`MRANGE_EXECUTOR`] lane.
 ///
 /// The lane slot is reserved before the client is blocked; when the lane is full the
-/// request is answered inline instead, since deferring is only an optimization.
+/// request is answered inline instead, since deferring is only an optimization. There is
+/// no timeout, as there is none inline; a client that disconnects stops the decode.
 fn mrange_deferred(
     ctx: &Context,
     options: crate::series::request_types::MRangeOptions,
@@ -148,7 +154,16 @@ fn mrange_deferred(
     let blocked_client = block_client(ctx);
     slot.spawn(move || {
         let thread_ctx = ThreadSafeReplyContext::with_blocked_client(blocked_client);
-        let rows = decode_snapshot_series(series, &options);
+        // A client that disconnects stops the decode: nobody would read the reply.
+        let gone = thread_ctx.disconnected();
+        let rows = match decode_snapshot_series(series, &options, &|| gone.load(Ordering::Relaxed))
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                let _ = thread_ctx.reply(Err(err));
+                return;
+            }
+        };
         // Through `into_raw`, which marks the client answered: otherwise dropping
         // `thread_ctx` would append an error after the complete reply.
         let reply_ctx = Context::new((&thread_ctx).into_raw());
