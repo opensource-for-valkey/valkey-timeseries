@@ -3,9 +3,6 @@ from valkey import ValkeyCluster
 from valkeytestframework.conftest import resource_port_tracker
 from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCase
 
-# Full config name for CONFIG SET (module prefix `ts` + config name).
-PUSHDOWN_CONFIG = 'ts.ts-fanout-aggregation-pushdown'
-
 
 class TestTimeSeriesMultiAggregationClustered(ValkeyTimeSeriesClusterTestCase):
     """Cluster integration tests for multi-aggregation over TS.MRANGE /
@@ -38,12 +35,6 @@ class TestTimeSeriesMultiAggregationClustered(ValkeyTimeSeriesClusterTestCase):
         cluster_client.execute_command('TS.ADD', 'm:{slot1}:b', 2000, 20.0)
         # d (eu): bucket[1000,2000)=avg 5/max 5
         cluster_client.execute_command('TS.ADD', 'm:{slot2}:d', 1000, 5.0)
-
-    def set_pushdown(self, value):
-        """Toggle the coordinator-side aggregation push-down on every primary."""
-        for i in range(self.CLUSTER_SIZE):
-            client = self.new_client_for_primary(i)
-            client.execute_command('CONFIG', 'SET', PUSHDOWN_CONFIG, value)
 
     @staticmethod
     def series_by_key(result):
@@ -200,8 +191,8 @@ class TestTimeSeriesMultiAggregationClustered(ValkeyTimeSeriesClusterTestCase):
         # latest bucket of the group is ts 2000 (c only) -> 6, 6
         assert rows == [[2000, b'6', b'6']]
 
-    def test_last_empty_carry_with_pushdown_on_and_off(self):
-        """A `last` column carries through gaps whether shards or the coordinator aggregate."""
+    def test_last_empty_carry(self):
+        """A `last` column carries through gaps."""
         cluster_client = self.new_cluster_client()
         for timestamp, value in ((0, 1), (100, 2)):
             cluster_client.execute_command('TS.ADD', 'ts:{slot1}:carry', timestamp, value,
@@ -210,12 +201,10 @@ class TestTimeSeriesMultiAggregationClustered(ValkeyTimeSeriesClusterTestCase):
         client = self.new_client_for_primary(0)
         expected = [[0, b'1', b'1'], [25, b'1', b'0'], [50, b'1', b'0'], [75, b'1', b'0'],
                     [100, b'2', b'2']]
-        for pushdown in ('yes', 'no'):
-            self.set_pushdown(pushdown)
-            result = client.execute_command('TS.MRANGE', 0, 100,
-                                            'AGGREGATION', 'last,sum', 25, 'EMPTY',
-                                            'FILTER', 'k=carry')
-            assert result[0][2] == expected, f'pushdown={pushdown}'
+        result = client.execute_command('TS.MRANGE', 0, 100,
+                                        'AGGREGATION', 'last,sum', 25, 'EMPTY',
+                                        'FILTER', 'k=carry')
+        assert result[0][2] == expected
 
     @pytest.mark.parametrize('command, window, aggregation, expected', [
         pytest.param('TS.MRANGE', (50, 75), ('last', 25),
@@ -230,42 +219,24 @@ class TestTimeSeriesMultiAggregationClustered(ValkeyTimeSeriesClusterTestCase):
                       [250, b'2', b'0']],
                      id='multi-aggregation'),
     ])
-    def test_empty_reaches_past_the_window_with_pushdown_off(self, command, window, aggregation,
-                                                             expected):
-        """EMPTY needs what lies outside the window, which only shards can see.
-
-        With the config off, a query that does not need that still aggregates on the
-        coordinator, but one with EMPTY has to be answered as on a standalone server.
-        """
+    def test_empty_reaches_past_the_window(self, command, window, aggregation, expected):
+        """EMPTY needs what lies outside the window, which only shards can see, and is
+        answered as on a standalone server."""
         cluster_client = self.new_cluster_client()
         for timestamp, value in ((0, 1), (100, 2), (300, 3)):
             cluster_client.execute_command('TS.ADD', 'ts:{slot1}:edge', timestamp, value,
                                            'LABELS', 'k', 'edge')
 
-        self.set_pushdown('no')
         result = self.new_client_for_primary(0).execute_command(
             command, *window, 'AGGREGATION', *aggregation, 'EMPTY', 'FILTER', 'k=edge')
 
         assert result[0][2] == expected
 
-    def test_aggregation_without_empty_still_honors_pushdown_off(self):
-        """The config keeps its meaning elsewhere: shards send raw samples."""
-        cluster_client = self.new_cluster_client()
-        for timestamp, value in ((0, 1), (10, 2), (100, 3)):
-            cluster_client.execute_command('TS.ADD', 'ts:{slot1}:raw', timestamp, value,
-                                           'LABELS', 'k', 'raw')
-
-        self.set_pushdown('no')
-        result = self.new_client_for_primary(0).execute_command(
-            'TS.MRANGE', 0, 100, 'AGGREGATION', 'sum', 25, 'FILTER', 'k=raw')
-
-        assert result[0][2] == [[0, b'3'], [100, b'3']]
-
-    def test_multi_aggregation_pushdown_on_off_equivalence(self):
-        """Push-down on and off must produce identical results. Toggling the
-        coordinator config off restores the legacy raw-sample flow where the
-        coordinator aggregates; results must match the pushed-down path."""
+    def test_mrange_matches_per_series_range(self):
+        """Each series in an aggregated MRANGE is what TS.RANGE / TS.REVRANGE answers for
+        that key alone, which a single node computes as a standalone server does."""
         self.setup_clustered_data()
+        cluster_client: ValkeyCluster = self.new_cluster_client()
         client = self.new_client_for_primary(0)
 
         queries = [
@@ -273,20 +244,18 @@ class TestTimeSeriesMultiAggregationClustered(ValkeyTimeSeriesClusterTestCase):
              'FILTER', 'kind=~".+"'),
             ('TS.MREVRANGE', '-', '+', 'AGGREGATION', 'sum,min', 1000,
              'COUNT', 2, 'FILTER', 'region=us'),
-            ('TS.MRANGE', '-', '+', 'AGGREGATION', 'avg,max', 1000,
-             'FILTER', 'region=us', 'GROUPBY', 'region', 'REDUCE', 'sum'),
+            ('TS.MRANGE', '-', '+', 'AGGREGATION', 'avg', 1000, 'FILTER', 'kind=~".+"'),
+            ('TS.MREVRANGE', 1000, 2500, 'AGGREGATION', 'max', 500, 'EMPTY',
+             'COUNT', 3, 'FILTER', 'kind=~".+"'),
         ]
-
-        try:
-            self.set_pushdown('yes')
-            with_pushdown = [client.execute_command(*q) for q in queries]
-            self.set_pushdown('no')
-            without_pushdown = [client.execute_command(*q) for q in queries]
-        finally:
-            self.set_pushdown('yes')
-
-        for q, on, off in zip(queries, with_pushdown, without_pushdown):
-            assert on == off, f"push-down mismatch for {q[0]} {q[4]}"
+        for query in queries:
+            single = 'TS.RANGE' if query[0] == 'TS.MRANGE' else 'TS.REVRANGE'
+            args = query[1:query.index('FILTER')]
+            result = client.execute_command(*query)
+            assert result, query
+            for key, _labels, rows in result:
+                expected = cluster_client.execute_command(single, key, *args)
+                assert rows == expected, (query, key)
 
     def test_mrange_cme_multi_aggregation_empty(self):
         """A multi-aggregation query matching no series returns an empty list."""

@@ -744,14 +744,19 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         assert len(result) == 1
         assert result[0][0] == b'sensor=tagged'
 
-    @pytest.mark.parametrize("pushdown", ["yes", "no"])
-    def test_mrange_cme_groupby_drops_series_without_the_group_label(self, pushdown):
+    @pytest.mark.parametrize("reducer, east, west", [
+        # Partial states: each shard groups its own members.
+        pytest.param('sum', 4.0, 2.0, id='partials'),
+        # No partial states for `any`: the coordinator groups per-series buckets.
+        pytest.param('any>2', 1.0, 0.0, id='per-series'),
+    ])
+    def test_mrange_cme_groupby_drops_series_without_the_group_label(self, reducer, east, west):
         """A series lacking the GROUPBY label belongs to no group, whoever does the grouping.
 
-        With push-down off the coordinator groups what the shards send. A missing label
-        value and an empty one look the same on the wire, so a shard that sent such a
-        series had it grouped under the empty value ('region='), where standalone, the
-        push-down path and RedisTimeSeries all leave it out.
+        When the coordinator groups what the shards send, a missing label value and an
+        empty one look the same on the wire, so a shard that sent such a series had it
+        grouped under the empty value ('region='), where standalone, the partials path and
+        RedisTimeSeries all leave it out.
         """
         cluster_client: ValkeyCluster = self.new_cluster_client()
         series = {
@@ -768,25 +773,20 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
             cluster_client.execute_command('TS.ADD', key, 1000, value)
 
         client = self.new_client_for_primary(0)
-        config = 'ts.ts-fanout-aggregation-pushdown'
-        client.execute_command('CONFIG', 'SET', config, pushdown)
-        try:
-            queries = {
-                'plain': [],
-                'aggregated': ['AGGREGATION', 'max', 1000],
-                # FILTER_BY_TS takes the shard's live read instead of its snapshots.
-                'filter_by_ts': ['FILTER_BY_TS', 1000],
-            }
-            for name, extra in queries.items():
-                result = client.execute_command('TS.MRANGE', '-', '+', *extra,
-                                                'FILTER', 'kind=grp',
-                                                'GROUPBY', 'region', 'REDUCE', 'sum')
-                groups = {entry[0]: [float(v) for _, v in entry[2]] for entry in result}
-                # east = a + c = 1 + 3, west = b = 2; d, e and f are in no group.
-                assert groups == {b'region=east': [4.0], b'region=west': [2.0]}, (name, result)
+        queries = {
+            'plain': [],
+            'aggregated': ['AGGREGATION', 'max', 1000],
+            # FILTER_BY_TS takes the shard's live read instead of its snapshots.
+            'filter_by_ts': ['FILTER_BY_TS', 1000],
+        }
+        for name, extra in queries.items():
+            result = client.execute_command('TS.MRANGE', '-', '+', *extra,
+                                            'FILTER', 'kind=grp',
+                                            'GROUPBY', 'region', 'REDUCE', reducer)
+            groups = {entry[0]: [float(v) for _, v in entry[2]] for entry in result}
+            # east = a and c (1, 3), west = b (2); d, e and f are in no group.
+            assert groups == {b'region=east': [east], b'region=west': [west]}, (name, result)
 
-            # Without GROUPBY every series still answers.
-            result = client.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'kind=grp')
-            assert len(result) == len(series)
-        finally:
-            client.execute_command('CONFIG', 'SET', config, 'yes')
+        # Without GROUPBY every series still answers.
+        result = client.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'kind=grp')
+        assert len(result) == len(series)

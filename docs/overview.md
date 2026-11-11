@@ -232,11 +232,7 @@ column-wise with the same `REDUCE` type.
 per group partial) — most valuable for `TS.MREVRANGE … COUNT n` ("last n points") queries. The coordinator always
 re-applies `COUNT` as the final authority.
 
-The push-down flags are binding: a shard answers with exactly the work it was asked for, and the coordinator rejects a
-share of the wrong shape rather than repairing it.
-
-Push-down is controlled by the boolean config `ts-fanout-aggregation-pushdown` (default `yes`, changeable at runtime
-via `CONFIG SET`). Only the coordinator consults it; shards obey the request. It is an emergency/diagnostic escape
-hatch: flipping it off reverts queries to coordinator-side aggregation without a module rollback. The exception is
-a query with `EMPTY`, which pushes down regardless: how far it fills depends on what each series
-holds outside the query window, which only its shard can see.
+Push-down is always on, with no config to turn it off: the coordinator never aggregates raw samples. `EMPTY` depends on
+it, since how far a series fills depends on what it holds outside the query window, which only its shard can see. A
+shard answers with exactly the work it was asked for, and the coordinator rejects a share of the wrong shape rather
+than repairing it.

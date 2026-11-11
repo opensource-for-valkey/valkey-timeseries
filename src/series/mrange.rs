@@ -142,8 +142,7 @@ impl GroupMember for SnapshotSeries {
     }
 }
 
-/// Head/tail pre-filter applied shard-side under COUNT push-down
-/// (`apply_count`). Tail is used for reverse queries: shards stream
+/// Head/tail pre-filter a shard applies for COUNT. Tail is used for reverse queries: shards stream
 /// ascending, so the last `n` items are the first `n` in requested order.
 /// The coordinator always re-applies COUNT, so this only bounds transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

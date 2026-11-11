@@ -4,7 +4,6 @@ use super::fanout_codec::generated::{
     SeriesRangeResponse,
 };
 use crate::aggregators::EmptyFillBounds;
-use crate::aggregators::MultiAggregateIterator;
 use crate::aggregators::{PartialReducer, PartialState};
 use crate::commands::utils::{
     MRangeReplyShape, get_multi_command_targets, reply_with_mrange_series_results,
@@ -20,10 +19,10 @@ use crate::fanout::{FanoutCommandResult, FanoutContext};
 use crate::iterators::{KWayMerge, RowReducer, SampleReducer, create_sample_iterator_adapter};
 use crate::series::chunks::{ChunkOps, TimeSeriesChunk, UncompressedChunk};
 use crate::series::mrange::{
-    MRangeScope, SampleLimit, build_mrange_grouped_labels, collect_rows, collect_samples,
-    decode_group_partials, decode_shard_snapshots, group_partial_reducer,
-    is_shard_snapshot_answerable, process_mrange_group_partials, process_mrange_query,
-    snapshot_shard_group_partials, snapshot_shard_mrange, sort_mrange_results,
+    MRangeScope, SampleLimit, build_mrange_grouped_labels, collect_rows, decode_group_partials,
+    decode_shard_snapshots, group_partial_reducer, is_shard_snapshot_answerable,
+    process_mrange_group_partials, process_mrange_query, snapshot_shard_group_partials,
+    snapshot_shard_mrange, sort_mrange_results,
 };
 use crate::series::request_types::{
     MRangeOptions, MRangeSeriesResult, RangeGroupingOptions, SeriesResultData,
@@ -37,63 +36,36 @@ use valkey_module::{Context, Status, ValkeyError, ValkeyResult};
 #[derive(Default)]
 pub struct MRangeFanoutCommand {
     options: MRangeOptions,
-    /// The peers' per-series answers. A shard does all the push-down work it is asked
-    /// for, so these are bucketed whenever `pushdown` is set, and absent under
-    /// `pushdown_group`, which is answered with `group_partials` alone.
+    /// The peers' per-series answers: bucketed whenever the query aggregates (one column per
+    /// aggregation), and absent under `pushdown_group`, which is answered with
+    /// `group_partials` alone.
     series: Vec<SeriesRangeResponse>,
     /// This node's own series, as decoded ([`MRangeShare::Local`]). Shaped like the
     /// peers' answers.
     local_series: Vec<MRangeSeriesResult>,
     group_partials: Vec<GroupPartialSeries>,
-    /// Shard-side aggregation push-down: shards return buckets instead of raw
-    /// samples. Latched at construction so a concurrent `CONFIG SET` cannot
-    /// desynchronize request generation and reply handling within one command.
-    pushdown: bool,
-    /// GROUPBY/REDUCE push-down: shards pre-reduce their local group members
-    /// per bucket and return partial states. Only latched for decomposable
-    /// reducers; others fall back to per-series bucket transport.
+    /// GROUPBY/REDUCE push-down: shards pre-reduce their local group members per bucket
+    /// and return partial states. Only for reducers that decompose into them; the others
+    /// get per-series buckets, which the coordinator reduces.
     pushdown_group: bool,
-    /// COUNT push-down: shards apply COUNT as a head/tail pre-filter. The
-    /// coordinator always re-applies COUNT, so this only bounds transfer.
-    pushdown_count: bool,
 }
 
 impl MRangeFanoutCommand {
+    /// Shards always aggregate each series and pre-apply COUNT; only GROUPBY/REDUCE has a
+    /// choice of transport. Multi-aggregation ships one chunk per aggregation column
+    /// (`SeriesRangeResponse.columns`), and its group partials carry `column_count` states
+    /// per bucket, reduced column-wise.
     pub fn new(options: MRangeOptions) -> Self {
-        let config_enabled = crate::config::is_fanout_aggregation_pushdown_enabled();
-        // Both push-downs support multi-aggregation: per-series buckets ship
-        // as one chunk per aggregation column (SeriesRangeResponse.columns),
-        // and group partials carry `column_count` states per bucket
-        // (GroupPartialSeries), reduced column-wise with the same REDUCE type.
-        //
-        // EMPTY always pushes down, config or not. How far it fills depends on what the series
-        // holds outside the query window, which only the shard holding it can see: bucketing the
-        // raw samples here would lose every row and `last` value that depends on that.
-        let pushdown = options
-            .range
-            .aggregation
+        let pushdown_group = options
+            .grouping
             .as_ref()
-            .is_some_and(|aggregation| config_enabled || aggregation.report_empty);
-        let pushdown_group = config_enabled
-            && options
-                .grouping
-                .as_ref()
-                .is_some_and(|g| PartialReducer::for_config(&g.aggregation).is_some());
-        // COUNT can only be pre-applied shard-side when the shard streams the
-        // same unit the coordinator counts: raw samples (no aggregation) or
-        // pushed-down buckets. Under coordinator-side aggregation (multi),
-        // truncating raw samples would corrupt partial buckets.
-        let pushdown_count = config_enabled
-            && options.range.count.is_some()
-            && (options.range.aggregation.is_none() || pushdown);
+            .is_some_and(|g| PartialReducer::for_config(&g.aggregation).is_some());
         Self {
             options,
             series: Vec::with_capacity(8),
             local_series: Vec::new(),
             group_partials: Vec::new(),
-            pushdown,
             pushdown_group,
-            pushdown_count,
         }
     }
 }
@@ -160,25 +132,19 @@ impl FanoutClientCommand for MRangeFanoutCommand {
         ctx: &FanoutContext,
         req: MultiRangeRequest,
     ) -> ValkeyResult<MRangeShare> {
-        let apply_aggregation = req.apply_aggregation;
         let apply_group_reduce = req.apply_group_reduce;
-        let apply_count = req.apply_count;
         let mut options: MRangeOptions = req.try_into()?;
         // COUNT push-down: capture the requested direction and count before
         // they are reset below. The shard streams ascending, so a reverse
         // query keeps the tail (= first `count` in requested order); the
         // coordinator re-applies COUNT as the final authority either way.
-        let limit = if apply_count {
-            options.range.count.map(|n| {
-                if options.is_reverse {
-                    SampleLimit::Tail(n)
-                } else {
-                    SampleLimit::Head(n)
-                }
-            })
-        } else {
-            None
-        };
+        let limit = options.range.count.map(|n| {
+            if options.is_reverse {
+                SampleLimit::Tail(n)
+            } else {
+                SampleLimit::Head(n)
+            }
+        });
         // These (along with grouping) will be handled after gathering all
         // results. Shards always aggregate/encode ascending; the coordinator
         // reverses bucket order and applies the authoritative COUNT.
@@ -216,11 +182,6 @@ impl FanoutClientCommand for MRangeFanoutCommand {
             }));
         }
 
-        if !apply_aggregation {
-            // Push-down off: return raw samples; the coordinator aggregates.
-            options.range.aggregation = None;
-        }
-
         // Process the MRange query locally. When snapshots can stand in for the
         // series, the GIL is held only to resolve and copy them, and the decode
         // runs after it is released; either way the results are owned, so the
@@ -256,9 +217,7 @@ impl FanoutClientCommand for MRangeFanoutCommand {
 
     fn generate_request(&self) -> MultiRangeRequest {
         let mut request = serialize_request(&self.options);
-        request.apply_aggregation = self.pushdown;
         request.apply_group_reduce = self.pushdown_group;
-        request.apply_count = self.pushdown_count;
         request
     }
 
@@ -385,8 +344,9 @@ impl MRangeFanoutCommand {
     }
 
     /// Post-process the accumulated shard responses into the final reply series. Every
-    /// share is shaped as the request asked: bucketed under `pushdown`, partials alone under
-    /// `pushdown_group`. A share of the wrong shape is an error, not something to repair.
+    /// share is shaped as the request asked: bucketed when the query aggregates (rows under
+    /// multi-aggregation), partials alone under `pushdown_group`. A share of the wrong shape
+    /// is an error, not something to repair.
     fn process_responses(
         &mut self,
         series: Vec<SeriesRangeResponse>,
@@ -406,14 +366,25 @@ impl MRangeFanoutCommand {
                 group_partials.len()
             )));
         }
-        if self.pushdown && !is_multi_aggregation(&self.options) {
-            // Single-aggregation push-down: every series is bucketed after
-            // normalization, so clear aggregation to skip re-aggregation. The
-            // remaining post-processing (GROUPBY reduce, reverse, COUNT)
-            // operates on the buckets. Multi-aggregation keeps its options
-            // (needed for the column count and the multi/data-variant branch);
-            // its helpers detect already-bucketed rows by the `Rows` variant
-            // and skip re-aggregation without clearing.
+        // Multi-aggregation buckets travel as one column per aggregation (none for a series
+        // with no buckets), so a single column is a series the shard did not bucket.
+        if is_multi_aggregation(&self.options) {
+            let unbucketed = series.iter().filter(|s| s.columns.len() == 1).count()
+                + local
+                    .iter()
+                    .filter(|s| matches!(s.data, SeriesResultData::Chunk(_)))
+                    .count();
+            if unbucketed > 0 {
+                return Err(ValkeyError::String(format!(
+                    "TSDB: invalid TS.MRANGE share: {unbucketed} series answered a multi-aggregation without its buckets"
+                )));
+            }
+        }
+        if !is_multi_aggregation(&self.options) {
+            // Every series arrives bucketed, so clear a single aggregation to keep it from
+            // being applied again: what remains (GROUPBY reduce, reverse, COUNT) works on
+            // the buckets. Multi-aggregation keeps its options for the column count and
+            // the row branch; its rows are never aggregated again either.
             self.options.range.aggregation = None;
         }
 
@@ -710,38 +681,13 @@ fn is_multi_aggregation(options: &MRangeOptions) -> bool {
         .is_some_and(|a| a.is_multi())
 }
 
-/// Coordinator-side multi-aggregation of one series' raw (already filtered,
-/// ascending) samples into rows. Reverse/COUNT are NOT applied here; callers
-/// decide per context.
-fn aggregate_rows_ascending<'a>(
-    samples: impl Iterator<Item = Sample> + 'a,
-    options: &MRangeOptions,
-) -> MultiAggregateIterator<impl Iterator<Item = Sample> + 'a> {
-    let aggregation = options
-        .range
-        .aggregation
-        .as_ref()
-        .expect("multi-aggregation requires aggregation options");
-    let (start_ts, end_ts) = options.range.get_timestamp_range();
-    let aligned_timestamp = aggregation
-        .alignment
-        .get_aligned_timestamp(start_ts, end_ts);
-    MultiAggregateIterator::new(samples, aggregation, aligned_timestamp)
-}
-
-/// Ascending multi-aggregation rows for one series, whichever way it arrived:
-/// already-bucketed rows under aggregation push-down, or raw samples the
-/// coordinator aggregates itself in the legacy/config-off path. Reverse/COUNT
-/// are applied downstream.
-fn series_rows_ascending<'a>(
-    series: &'a MRangeSeriesResult,
-    options: &'a MRangeOptions,
-) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+/// One series' multi-aggregation rows, ascending as its shard bucketed them. Reverse and
+/// COUNT are applied downstream. `process_responses` refuses a series that arrived
+/// unbucketed, so there are no samples to aggregate here.
+fn series_rows(series: &MRangeSeriesResult) -> &[MultiSample] {
     match &series.data {
-        SeriesResultData::Rows(rows) => Box::new(rows.iter().cloned()),
-        SeriesResultData::Chunk(_) => {
-            Box::new(aggregate_rows_ascending(series.data.sample_iter(), options))
-        }
+        SeriesResultData::Rows(rows) => rows,
+        SeriesResultData::Chunk(_) => &[],
     }
 }
 
@@ -753,9 +699,7 @@ fn process_group(
 ) -> MRangeSeriesResult {
     let result_data = if is_multi_aggregation(options) {
         // Column-wise reduce: per-series bucket rows, merged by bucket
-        // timestamp, reduced independently per aggregation column. Under
-        // aggregation push-down each series arrives already bucketed (Rows);
-        // otherwise the coordinator aggregates the raw samples (Chunk) itself.
+        // timestamp, reduced independently per aggregation column.
         let columns = options
             .range
             .aggregation
@@ -765,7 +709,7 @@ fn process_group(
         let row_iters = data
             .series
             .iter()
-            .map(|s| series_rows_ascending(s, options))
+            .map(|s| series_rows(s).iter().cloned())
             .collect::<Vec<_>>();
         let merged = KWayMerge::new(row_iters);
         let reducer = RowReducer::new(
@@ -778,13 +722,6 @@ fn process_group(
             options.is_reverse,
             options.range.count,
         ))
-    } else if options.range.aggregation.is_some() {
-        // The shards sent raw samples (no aggregation push-down): bucket each series first,
-        // then reduce across series.
-        let samples = reduce_aggregated_group(&data.series, options, group_options);
-        SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(
-            samples,
-        )))
     } else {
         let samples = process_series_list(&data.series, options);
         SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(
@@ -815,46 +752,13 @@ fn process_group(
     }
 }
 
-/// GROUPBY … REDUCE over raw samples with AGGREGATION: aggregate each series on its own,
-/// k-way merge the per-series buckets, then reduce across series — as the single-node path
-/// (`get_grouped_samples`) does.
-///
-/// Routing this through `process_series_list` merged the raw samples of every series and
-/// bucketed the merged stream, so the reducer saw one value per bucket rather than one per
-/// series: `AGGREGATION max 10` + `REDUCE sum` over A={1,1} and B={2,2} gave 2, not 3.
-///
-/// Each series runs ascending with COUNT withheld; COUNT and the requested order apply to
-/// the reduced stream.
-fn reduce_aggregated_group(
-    series: &[MRangeSeriesResult],
-    options: &MRangeOptions,
-    group_options: &RangeGroupingOptions,
-) -> Vec<Sample> {
-    let mut range = options.range.clone();
-    let count = range.count.take();
-    let per_series = series
-        .iter()
-        .map(|s| {
-            create_sample_iterator_adapter(
-                s.data.sample_iter(),
-                &range,
-                false,
-                EmptyFillBounds::default(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let merged = KWayMerge::new(per_series);
-    let reducer = SampleReducer::new(merged, group_options.aggregation.create_aggregator());
-    collect_samples(reducer, options.is_reverse, count)
-}
-
 fn process_series_samples(
     mut series: MRangeSeriesResult,
     options: &MRangeOptions,
 ) -> MRangeSeriesResult {
     if is_multi_aggregation(options) {
         let rows = collect_rows(
-            series_rows_ascending(&series, options),
+            series_rows(&series).iter().cloned(),
             options.is_reverse,
             options.range.count,
         );
@@ -868,57 +772,43 @@ fn process_series_samples(
     series
 }
 
+/// A series' samples, or a group's merged, with the query's reverse and COUNT applied. They
+/// are already bucketed when the query aggregates: `process_responses` cleared the
+/// aggregation, so nothing here aggregates them again.
 fn process_series_list(series: &[MRangeSeriesResult], options: &MRangeOptions) -> Vec<Sample> {
-    let (reverse_iter, reverse_aggr) = validate_reverse(options);
-
-    if reverse_iter {
+    debug_assert!(options.range.aggregation.is_none());
+    if options.is_reverse {
         let mut samples: Vec<_> = series.iter().flat_map(|s| s.data.sample_iter()).collect();
         samples.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
-        finish_series_list(samples.into_iter(), options, reverse_aggr)
+        finish_series_list(samples.into_iter(), options)
     } else if series.len() == 1 {
-        finish_series_list(series[0].data.sample_iter(), options, reverse_aggr)
+        finish_series_list(series[0].data.sample_iter(), options)
     } else {
         let iters = series
             .iter()
             .map(|s| s.data.sample_iter())
             .collect::<Vec<_>>();
-        finish_series_list(KWayMerge::new(iters), options, reverse_aggr)
+        finish_series_list(KWayMerge::new(iters), options)
     }
 }
 
-/// Reduce a group's merged samples per timestamp if there is a group, then apply the query's
-/// remaining options. A group reaches here only without AGGREGATION, since a group of aggregated
-/// series has to bucket each one first (`reduce_aggregated_group`), and after `reply` cleared the
-/// filters the shards already applied, so nothing filters the reduced values.
+/// Reduce a group's merged samples per timestamp if there is a group, then apply COUNT. The
+/// samples come in the reply's order, and `reply` cleared the filters the shards already
+/// applied, so nothing filters the reduced values.
 fn finish_series_list(
     samples: impl Iterator<Item = Sample>,
     options: &MRangeOptions,
-    is_reverse: bool,
 ) -> Vec<Sample> {
     let empty_fill = EmptyFillBounds::default();
     match &options.grouping {
         Some(group) => {
-            debug_assert!(options.range.aggregation.is_none());
             let reducer = SampleReducer::new(samples, group.aggregation.create_aggregator());
-            create_sample_iterator_adapter(reducer, &options.range, is_reverse, empty_fill)
-                .collect()
+            create_sample_iterator_adapter(reducer, &options.range, false, empty_fill).collect()
         }
-        None => create_sample_iterator_adapter(samples, &options.range, is_reverse, empty_fill)
-            .collect(),
+        None => {
+            create_sample_iterator_adapter(samples, &options.range, false, empty_fill).collect()
+        }
     }
-}
-
-pub fn validate_reverse(options: &MRangeOptions) -> (bool, bool) {
-    let has_aggregation = options.range.aggregation.is_some();
-
-    // Aggregation requires ascending input order from base iterators
-    // Without aggregation, base iterators can directly provide the requested order
-    let should_reverse_iter = !has_aggregation && options.is_reverse;
-
-    // Apply reversal after aggregation if needed
-    let should_reverse_aggr = has_aggregation && options.is_reverse;
-
-    (should_reverse_iter, should_reverse_aggr)
 }
 
 #[cfg(test)]
@@ -1114,8 +1004,35 @@ mod tests {
         result.data.sample_iter().collect()
     }
 
-    /// Simulate what a push-down shard returns: the per-series aggregation
-    /// pipeline applied to the raw samples.
+    /// What a standalone server answers for one series of an aggregating query: the
+    /// per-series pipeline over its raw samples, reverse and COUNT included.
+    fn standalone(raw: Vec<Sample>, options: &MRangeOptions) -> Vec<Sample> {
+        assert!(options.range.aggregation.is_some());
+        create_sample_iterator_adapter(
+            raw.into_iter(),
+            &options.range,
+            options.is_reverse,
+            EmptyFillBounds::default(),
+        )
+        .collect()
+    }
+
+    /// A shard's multi-aggregation of one series' raw samples: ascending bucket rows,
+    /// before reverse and COUNT.
+    fn aggregate_rows_ascending<'a>(
+        samples: impl Iterator<Item = Sample> + 'a,
+        options: &MRangeOptions,
+    ) -> crate::aggregators::MultiAggregateIterator<impl Iterator<Item = Sample> + 'a> {
+        let aggregation = options.range.aggregation.as_ref().unwrap();
+        let (start_ts, end_ts) = options.range.get_timestamp_range();
+        let aligned_timestamp = aggregation
+            .alignment
+            .get_aligned_timestamp(start_ts, end_ts);
+        crate::aggregators::MultiAggregateIterator::new(samples, aggregation, aligned_timestamp)
+    }
+
+    /// Simulate what a shard returns: the per-series aggregation pipeline applied to the
+    /// raw samples.
     fn shard_aggregate(raw: Vec<Sample>, options: &MRangeOptions) -> Vec<Sample> {
         create_sample_iterator_adapter(
             raw.into_iter(),
@@ -1126,11 +1043,10 @@ mod tests {
         .collect()
     }
 
-    /// Push-down equivalence: shard-side bucketing + coordinator post-processing
-    /// with aggregation cleared must equal coordinator-side aggregation of the
-    /// raw samples.
+    /// The shards bucket each series ascending, without COUNT; the coordinator applies
+    /// reverse and COUNT to the buckets and must answer as a standalone server would.
     #[test]
-    fn test_pushdown_basic_equivalence() {
+    fn test_aggregated_series_match_standalone() {
         let raw = samples(&[(0, 1.0), (10, 3.0), (110, 5.0), (120, 7.0), (250, 9.0)]);
 
         for (is_reverse, count) in [
@@ -1139,38 +1055,28 @@ mod tests {
             (true, Some(2)),
             (false, Some(1)),
         ] {
-            let mut legacy_options = mrange_options(0, 1000);
-            legacy_options.range.aggregation = Some(avg_aggregation(100));
-            legacy_options.range.count = count;
-            legacy_options.is_reverse = is_reverse;
+            let mut options = mrange_options(0, 1000);
+            options.range.aggregation = Some(avg_aggregation(100));
+            options.range.count = count;
+            options.is_reverse = is_reverse;
 
-            let legacy = handle_basic(
-                vec![to_response(series_result("a", None, raw.clone()))],
-                &legacy_options,
-            )
-            .unwrap();
-
-            // Shard aggregates ascending with COUNT/reverse stripped, exactly
-            // as get_local_response does under push-down.
-            let mut shard_options = legacy_options.clone();
+            let mut shard_options = options.clone();
             shard_options.range.count = None;
             shard_options.is_reverse = false;
             let buckets = shard_aggregate(raw.clone(), &shard_options);
 
-            // Coordinator with aggregation cleared (reply() under push-down)
-            let mut coord_options = legacy_options.clone();
-            coord_options.range.aggregation = None;
-            let pushed = handle_basic(
-                vec![to_response(series_result("a", None, buckets))],
-                &coord_options,
-            )
-            .unwrap();
+            let mut command = MRangeFanoutCommand::new(options.clone());
+            let results = command
+                .process_responses(
+                    vec![to_response(series_result("a", None, buckets))],
+                    Vec::new(),
+                )
+                .unwrap();
 
-            assert_eq!(legacy.len(), 1);
-            assert_eq!(pushed.len(), 1);
+            assert_eq!(results.len(), 1);
             assert_eq!(
-                result_samples(&legacy[0]),
-                result_samples(&pushed[0]),
+                result_samples(&results[0]),
+                standalone(raw.clone(), &options),
                 "reverse={is_reverse} count={count:?}"
             );
         }
@@ -1286,93 +1192,8 @@ mod tests {
         );
     }
 
-    /// GROUPBY + REDUCE with AGGREGATION when the shards did not aggregate (push-down off):
-    /// the coordinator must bucket each series before reducing across series, and so agree
-    /// with the push-down result. It used to bucket the merged stream of the whole group.
-    #[test]
-    fn test_grouped_aggregation_without_pushdown_reduces_per_series_buckets() {
-        let raw_a = samples(&[(0, 1.0), (1, 1.0), (10, 4.0), (25, 1.0)]);
-        let raw_b = samples(&[(0, 2.0), (1, 2.0), (12, 3.0), (27, 6.0)]);
-        let responses = |a: Vec<Sample>, b: Vec<Sample>| {
-            vec![
-                to_response(series_result("a", Some("us"), a)),
-                to_response(series_result("b", Some("us"), b)),
-            ]
-        };
-
-        for (is_reverse, count) in [
-            (false, None),
-            (true, None),
-            (false, Some(2)),
-            (true, Some(2)),
-        ] {
-            let mut options = mrange_options(0, 1000);
-            let mut aggregation = avg_aggregation(10);
-            aggregation.aggregations =
-                smallvec::smallvec![AggregatorConfig::new(AggregationType::Max, None).unwrap()];
-            options.range.aggregation = Some(aggregation);
-            options.range.count = count;
-            options.is_reverse = is_reverse;
-            options.grouping = Some(RangeGroupingOptions {
-                aggregation: AggregatorConfig::new(AggregationType::Sum, None).unwrap(),
-                group_label: "region".into(),
-            });
-
-            let raw = handle_grouping(responses(raw_a.clone(), raw_b.clone()), &options).unwrap();
-
-            // Push-down: each shard buckets its series ascending with COUNT stripped, and the
-            // coordinator runs with aggregation cleared.
-            let mut shard_options = options.clone();
-            shard_options.range.count = None;
-            shard_options.is_reverse = false;
-            let mut coord_options = options.clone();
-            coord_options.range.aggregation = None;
-            let pushed = handle_grouping(
-                responses(
-                    shard_aggregate(raw_a.clone(), &shard_options),
-                    shard_aggregate(raw_b.clone(), &shard_options),
-                ),
-                &coord_options,
-            )
-            .unwrap();
-
-            assert_eq!(
-                result_samples(&raw[0]),
-                result_samples(&pushed[0]),
-                "reverse={is_reverse} count={count:?}"
-            );
-            if !is_reverse && count.is_none() {
-                // max per series per 10ms bucket, summed across the two series.
-                assert_eq!(
-                    result_samples(&raw[0]),
-                    samples(&[(0, 3.0), (10, 7.0), (20, 7.0)])
-                );
-            }
-        }
-    }
-
-    /// The request flag mirrors the latched push-down decision.
-    #[test]
-    fn test_generate_request_flag() {
-        let mut options = mrange_options(0, 1000);
-        options.range.aggregation = Some(avg_aggregation(100));
-
-        let mut command = MRangeFanoutCommand::new(options.clone());
-        command.pushdown = true;
-        assert!(command.generate_request().apply_aggregation);
-
-        command.pushdown = false;
-        assert!(!command.generate_request().apply_aggregation);
-
-        // No aggregation in the query => never pushed down, regardless of config
-        options.range.aggregation = None;
-        let command = MRangeFanoutCommand::new(options);
-        assert!(!command.pushdown);
-        assert!(!command.generate_request().apply_aggregation);
-    }
-
-    /// Fallback matrix: group-reduce push-down is latched only for
-    /// decomposable reducers; others fall back to legacy transport.
+    /// Group-reduce push-down is latched only for decomposable reducers; the
+    /// others get per-series buckets.
     #[test]
     fn test_group_reduce_latch_and_request_flag() {
         let grouping_with = |ty: AggregationType| {
@@ -1389,22 +1210,17 @@ mod tests {
         assert!(command.pushdown_group);
         assert!(command.generate_request().apply_group_reduce);
 
-        // Decomposable reducer + AGGREGATION: both flags set
+        // Decomposable reducer + AGGREGATION
         options.range.aggregation = Some(avg_aggregation(100));
         let command = MRangeFanoutCommand::new(options.clone());
         assert!(command.pushdown_group);
-        let request = command.generate_request();
-        assert!(request.apply_group_reduce);
-        assert!(request.apply_aggregation);
+        assert!(command.generate_request().apply_group_reduce);
 
-        // Non-decomposable reducer: falls back to per-series buckets (Phase 1)
+        // Non-decomposable reducer: per-series buckets
         options.grouping = grouping_with(AggregationType::Increase);
         let command = MRangeFanoutCommand::new(options.clone());
         assert!(!command.pushdown_group);
-        assert!(command.pushdown, "Phase 1 still applies");
-        let request = command.generate_request();
-        assert!(!request.apply_group_reduce);
-        assert!(request.apply_aggregation);
+        assert!(!command.generate_request().apply_group_reduce);
 
         // No grouping: never group-pushed
         options.grouping = None;
@@ -1668,23 +1484,6 @@ mod tests {
         assert!(results[1].data.is_empty());
     }
 
-    /// COUNT push-down latch: flag mirrors config && COUNT presence.
-    #[test]
-    fn test_count_pushdown_latch() {
-        let mut options = mrange_options(0, 1000);
-        assert!(!MRangeFanoutCommand::new(options.clone()).pushdown_count);
-        assert!(
-            !MRangeFanoutCommand::new(options.clone())
-                .generate_request()
-                .apply_count
-        );
-
-        options.range.count = Some(5);
-        let command = MRangeFanoutCommand::new(options);
-        assert!(command.pushdown_count);
-        assert!(command.generate_request().apply_count);
-    }
-
     fn multi_aggregation(bucket_duration: u64) -> AggregationOptions {
         AggregationOptions {
             aggregations: smallvec::smallvec![
@@ -1706,10 +1505,9 @@ mod tests {
         }
     }
 
-    /// Multi-aggregation enables all three push-downs: per-series buckets ship
-    /// as per-column chunks, group partials carry `column_count` states per
-    /// bucket, and COUNT rides on either. Non-decomposable reducers still fall
-    /// back to per-series bucket transport, exactly as for single-aggregation.
+    /// Multi-aggregation takes group partials, with `column_count` states per bucket,
+    /// for a decomposable reducer, and per-series buckets for any other, exactly as
+    /// single-aggregation does.
     #[test]
     fn test_multi_aggregation_pushdown_flags() {
         let mut options = mrange_options(0, 1000);
@@ -1721,16 +1519,11 @@ mod tests {
         });
 
         let command = MRangeFanoutCommand::new(options.clone());
-        assert!(command.pushdown, "per-series aggregation push-down applies");
         assert!(
             command.pushdown_group,
             "group partial-state push-down applies column-wise"
         );
-        assert!(command.pushdown_count, "COUNT push-down rides on pushdown");
-        let request = command.generate_request();
-        assert!(request.apply_aggregation);
-        assert!(request.apply_group_reduce);
-        assert!(request.apply_count);
+        assert!(command.generate_request().apply_group_reduce);
 
         // non-decomposable reducer: multi falls back to per-series buckets
         options.grouping = Some(RangeGroupingOptions {
@@ -1738,7 +1531,6 @@ mod tests {
             group_label: "region".into(),
         });
         let command = MRangeFanoutCommand::new(options.clone());
-        assert!(command.pushdown);
         assert!(!command.pushdown_group);
         assert!(!command.generate_request().apply_group_reduce);
 
@@ -1749,71 +1541,12 @@ mod tests {
             group_label: "region".into(),
         });
         let command = MRangeFanoutCommand::new(options);
-        assert!(command.pushdown);
         assert!(command.pushdown_group);
-        assert!(command.pushdown_count);
     }
 
-    /// Coordinator multi-aggregation of shard raw samples: column i of the
-    /// rows equals a single-aggregation run of that aggregator; reverse and
-    /// COUNT apply to rows.
-    #[test]
-    fn test_multi_aggregation_basic() {
-        let raw = samples(&[(0, 1.0), (10, 3.0), (110, 5.0), (120, 7.0), (250, 9.0)]);
-
-        for (is_reverse, count) in [(false, None), (true, None), (true, Some(2))] {
-            let mut options = mrange_options(0, 1000);
-            options.range.aggregation = Some(multi_aggregation(100));
-            options.range.count = count;
-            options.is_reverse = is_reverse;
-
-            let results = handle_basic(
-                vec![to_response(series_result("a", None, raw.clone()))],
-                &options,
-            )
-            .unwrap();
-            assert_eq!(results.len(), 1);
-            let rows = result_rows(&results[0]);
-
-            // compare each column against the single-aggregation flow
-            for (column, ty) in [
-                AggregationType::Avg,
-                AggregationType::Max,
-                AggregationType::Count,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let mut single_options = options.clone();
-                single_options.range.aggregation = Some(AggregationOptions {
-                    aggregations: smallvec::smallvec![ty.into()],
-                    ..multi_aggregation(100)
-                });
-                let single = handle_basic(
-                    vec![to_response(series_result("a", None, raw.clone()))],
-                    &single_options,
-                )
-                .unwrap();
-                let singles = result_samples(&single[0]);
-
-                assert_eq!(
-                    rows.len(),
-                    singles.len(),
-                    "reverse={is_reverse} count={count:?}"
-                );
-                for (row, sample) in rows.iter().zip(singles.iter()) {
-                    assert_eq!(row.timestamp, sample.timestamp);
-                    assert_eq!(
-                        row.values[column], sample.value,
-                        "column {column} ({ty:?}) reverse={is_reverse} count={count:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Grouped multi-aggregation: column-wise reduce across the group's
-    /// series. Hand-computed fixture: two series, avg,max buckets, REDUCE sum.
+    /// Grouped multi-aggregation over per-series bucket rows: column-wise reduce
+    /// across the group's series. Hand-computed fixture: two series, avg,max
+    /// buckets, REDUCE sum.
     #[test]
     fn test_multi_aggregation_grouped_column_reduce() {
         let mut options = mrange_options(0, 1000);
@@ -1836,16 +1569,18 @@ mod tests {
         // series a buckets: [0,100): avg 2, max 3; [100,200): avg 5, max 5
         // series b buckets: [0,100): avg 10, max 12; [200,300): avg 7, max 7
         let responses = vec![
-            to_response(series_result(
+            shard_multi_response(
                 "a",
                 Some("us"),
-                samples(&[(0, 1.0), (10, 3.0), (110, 5.0)]),
-            )),
-            to_response(series_result(
+                &samples(&[(0, 1.0), (10, 3.0), (110, 5.0)]),
+                &options,
+            ),
+            shard_multi_response(
                 "b",
                 Some("us"),
-                samples(&[(0, 8.0), (20, 12.0), (250, 7.0)]),
-            )),
+                &samples(&[(0, 8.0), (20, 12.0), (250, 7.0)]),
+                &options,
+            ),
         ];
 
         let results = handle_grouping(responses, &options).unwrap();
@@ -1877,16 +1612,18 @@ mod tests {
         options.is_reverse = true;
         options.range.count = Some(2);
         let responses = vec![
-            to_response(series_result(
+            shard_multi_response(
                 "a",
                 Some("us"),
-                samples(&[(0, 1.0), (10, 3.0), (110, 5.0)]),
-            )),
-            to_response(series_result(
+                &samples(&[(0, 1.0), (10, 3.0), (110, 5.0)]),
+                &options,
+            ),
+            shard_multi_response(
                 "b",
                 Some("us"),
-                samples(&[(0, 8.0), (20, 12.0), (250, 7.0)]),
-            )),
+                &samples(&[(0, 8.0), (20, 12.0), (250, 7.0)]),
+                &options,
+            ),
         ];
         let results = handle_grouping(responses, &options).unwrap();
         let rows = result_rows(&results[0]);
@@ -1918,12 +1655,12 @@ mod tests {
         })
     }
 
-    /// Multi-aggregation push-down round trip (non-grouped): shard-aggregated
-    /// bucket rows survive the per-column transport, and the coordinator
-    /// post-processes them (reverse + COUNT) without re-aggregating. Result
-    /// must equal coordinator-side aggregation of the raw samples.
+    /// Multi-aggregation round trip (non-grouped): shard-aggregated bucket rows
+    /// survive the per-column transport, and the coordinator applies reverse and
+    /// COUNT without aggregating again. Column i must be what a standalone server
+    /// answers for that aggregation alone.
     #[test]
-    fn test_multi_aggregation_pushdown_roundtrip() {
+    fn test_multi_aggregation_roundtrip_matches_standalone() {
         let raw = samples(&[(0, 1.0), (10, 3.0), (110, 5.0), (120, 7.0), (250, 9.0)]);
 
         for (is_reverse, count) in [
@@ -1937,23 +1674,42 @@ mod tests {
             options.range.count = count;
             options.is_reverse = is_reverse;
 
-            let reference = handle_basic(
-                vec![to_response(series_result("a", None, raw.clone()))],
-                &options,
-            )
-            .unwrap();
+            let mut command = MRangeFanoutCommand::new(options.clone());
+            let results = command
+                .process_responses(
+                    vec![shard_multi_response("a", None, &raw, &options)],
+                    Vec::new(),
+                )
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            let rows = result_rows(&results[0]);
 
-            let pushed = handle_basic(
-                vec![shard_multi_response("a", None, &raw, &options)],
-                &options,
-            )
-            .unwrap();
-
-            assert_eq!(
-                result_rows(&reference[0]),
-                result_rows(&pushed[0]),
-                "reverse={is_reverse} count={count:?}"
-            );
+            for (column, ty) in [
+                AggregationType::Avg,
+                AggregationType::Max,
+                AggregationType::Count,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut single = options.clone();
+                single.range.aggregation = Some(AggregationOptions {
+                    aggregations: smallvec::smallvec![ty.into()],
+                    ..multi_aggregation(100)
+                });
+                let expected = standalone(raw.clone(), &single);
+                let got: Vec<Sample> = rows
+                    .iter()
+                    .map(|row| Sample {
+                        timestamp: row.timestamp,
+                        value: row.values[column],
+                    })
+                    .collect();
+                assert_eq!(
+                    got, expected,
+                    "column {column} ({ty:?}) reverse={is_reverse} count={count:?}"
+                );
+            }
         }
     }
 
@@ -2006,8 +1762,7 @@ mod tests {
 
     /// Multi-aggregation group-reduce push-down: shard-side column-wise
     /// partial states, merged and finalized at the coordinator, must equal
-    /// the per-series bucket transport fallback (itself proven equal to the
-    /// raw flow above). REDUCE avg makes the cross-shard merge nontrivial
+    /// the per-series bucket transport. REDUCE avg makes the cross-shard merge nontrivial
     /// (count+sum accumulate across shards); one shard holds two series
     /// (pre-merged locally), the other holds one.
     #[test]
@@ -2286,58 +2041,32 @@ mod tests {
         let mut ungrouped = MRangeFanoutCommand::new(mrange_options(0, 1000));
         invalid(ungrouped.process_responses(Vec::new(), vec![partial.clone()]));
 
+        // A multi-aggregation series that arrives unbucketed, from a peer or this node.
+        let mut multi = mrange_options(0, 1000);
+        multi.range.aggregation = Some(multi_aggregation(100));
+        invalid(
+            MRangeFanoutCommand::new(multi.clone())
+                .process_responses(vec![to_response(series())], Vec::new()),
+        );
+        let mut command = MRangeFanoutCommand::new(multi.clone());
+        command.ingest_local(vec![series()]);
+        invalid(command.process_responses(Vec::new(), Vec::new()));
+
         // The right shapes go through.
         assert!(
             grouped()
                 .process_responses(Vec::new(), vec![partial])
                 .is_ok()
         );
-    }
-
-    /// Multi-aggregation push-down round trip (grouped): per-series bucket rows
-    /// arrive already aggregated; the coordinator merges and reduces
-    /// column-wise without re-aggregating. Must equal the raw-sample flow where
-    /// the coordinator aggregates each series itself.
-    #[test]
-    fn test_multi_aggregation_pushdown_roundtrip_grouped() {
-        let raw_a = samples(&[(0, 1.0), (10, 3.0), (110, 5.0)]);
-        let raw_b = samples(&[(0, 8.0), (20, 12.0), (250, 7.0)]);
-
-        for (is_reverse, count) in [(false, None), (true, Some(2))] {
-            let mut options = mrange_options(0, 1000);
-            options.range.aggregation = Some(multi_aggregation(100));
-            options.range.count = count;
-            options.is_reverse = is_reverse;
-            options.grouping = Some(RangeGroupingOptions {
-                aggregation: AggregatorConfig::new(AggregationType::Sum, None).unwrap(),
-                group_label: "region".into(),
-            });
-
-            let reference = handle_grouping(
-                vec![
-                    to_response(series_result("a", Some("us"), raw_a.clone())),
-                    to_response(series_result("b", Some("us"), raw_b.clone())),
-                ],
-                &options,
-            )
-            .unwrap();
-
-            let pushed = handle_grouping(
-                vec![
-                    shard_multi_response("a", Some("us"), &raw_a, &options),
-                    shard_multi_response("b", Some("us"), &raw_b, &options),
-                ],
-                &options,
-            )
-            .unwrap();
-
-            assert_eq!(reference.len(), pushed.len());
-            assert_eq!(
-                result_rows(&reference[0]),
-                result_rows(&pushed[0]),
-                "reverse={is_reverse} count={count:?}"
-            );
-        }
+        let raw = samples(&[(0, 1.0)]);
+        assert!(
+            MRangeFanoutCommand::new(multi.clone())
+                .process_responses(
+                    vec![shard_multi_response("a", None, &raw, &multi)],
+                    Vec::new()
+                )
+                .is_ok()
+        );
     }
 
     /// End-to-end through `ingest_response`: a shard that interned its labels
@@ -2520,82 +2249,76 @@ mod tests {
             Some(avg_aggregation(100)),
             Some(multi_aggregation(100)),
         ] {
-            for pushdown in [false, true] {
-                if pushdown && aggregation.is_none() {
-                    continue;
-                }
-                for grouped in [false, true] {
-                    for (is_reverse, count) in [(false, None), (true, None), (true, Some(2))] {
-                        for (with_labels, exclude_empty) in [(false, false), (true, !grouped)] {
-                            let mut options = mrange_options(0, 1000);
-                            options.range.aggregation = aggregation.clone();
-                            options.range.count = count;
-                            options.is_reverse = is_reverse;
-                            options.with_labels = with_labels;
-                            options.exclude_empty = exclude_empty;
-                            options.grouping = grouped.then(grouping);
-                            let is_multi = is_multi_aggregation(&options);
+            let aggregated = aggregation.is_some();
+            for grouped in [false, true] {
+                for (is_reverse, count) in [(false, None), (true, None), (true, Some(2))] {
+                    for (with_labels, exclude_empty) in [(false, false), (true, !grouped)] {
+                        let mut options = mrange_options(0, 1000);
+                        options.range.aggregation = aggregation.clone();
+                        options.range.count = count;
+                        options.is_reverse = is_reverse;
+                        options.with_labels = with_labels;
+                        options.exclude_empty = exclude_empty;
+                        options.grouping = grouped.then(grouping);
+                        let is_multi = is_multi_aggregation(&options);
 
-                            // What a shard answers with: ascending, COUNT withheld, and
-                            // bucketed when the aggregation was pushed down to it.
-                            let mut shard_options = options.clone();
-                            shard_options.range.count = None;
-                            shard_options.is_reverse = false;
-                            let shard_results: Vec<MRangeSeriesResult> = raw
-                                .iter()
-                                .map(|(key, group, data)| {
-                                    let mut result = series_result(key, *group, data.clone());
-                                    if pushdown && is_multi {
-                                        let rows = aggregate_rows_ascending(
-                                            data.iter().copied(),
-                                            &shard_options,
-                                        )
-                                        .collect();
-                                        result.data = SeriesResultData::Rows(rows);
-                                    } else if pushdown {
-                                        result = series_result(
-                                            key,
-                                            *group,
-                                            shard_aggregate(data.clone(), &shard_options),
-                                        );
-                                    }
-                                    if with_labels {
-                                        result.labels = vec![
-                                            crate::labels::Label::new(
-                                                "region",
-                                                group.unwrap_or(""),
-                                            ),
-                                            crate::labels::Label::new("id", key),
-                                        ];
-                                    }
-                                    result
-                                })
-                                .collect();
+                        // What a shard answers with: ascending, COUNT withheld, and
+                        // bucketed when the query aggregates.
+                        let mut shard_options = options.clone();
+                        shard_options.range.count = None;
+                        shard_options.is_reverse = false;
+                        let shard_results: Vec<MRangeSeriesResult> = raw
+                            .iter()
+                            .map(|(key, group, data)| {
+                                let mut result = series_result(key, *group, data.clone());
+                                if is_multi {
+                                    let rows = aggregate_rows_ascending(
+                                        data.iter().copied(),
+                                        &shard_options,
+                                    )
+                                    .collect();
+                                    result.data = SeriesResultData::Rows(rows);
+                                } else if aggregated {
+                                    result = series_result(
+                                        key,
+                                        *group,
+                                        shard_aggregate(data.clone(), &shard_options),
+                                    );
+                                }
+                                if with_labels {
+                                    result.labels = vec![
+                                        crate::labels::Label::new("region", group.unwrap_or("")),
+                                        crate::labels::Label::new("id", key),
+                                    ];
+                                }
+                                result
+                            })
+                            .collect();
 
-                            // How many of the series arrive as this node's own share.
-                            let run = |local_count: usize| {
-                                let mut command = MRangeFanoutCommand {
-                                    options: options.clone(),
-                                    pushdown,
-                                    ..Default::default()
-                                };
-                                let (local, wire) = shard_results.split_at(local_count);
-                                let wire = series_to_wire(wire.to_vec()).unwrap();
-                                command.ingest_response(wire).unwrap();
-                                command.ingest_local(local.to_vec());
-                                let series = std::mem::take(&mut command.series);
-                                describe(command.process_responses(series, Vec::new()).unwrap())
+                        // How many of the series arrive as this node's own share.
+                        let run = |local_count: usize| {
+                            // Per-series buckets, also for a reducer that
+                            // takes partials: the transport other reducers use.
+                            let mut command = MRangeFanoutCommand {
+                                options: options.clone(),
+                                ..Default::default()
                             };
-                            let case = format!(
-                                "aggregation={aggregation:?} pushdown={pushdown} grouped={grouped} \
+                            let (local, wire) = shard_results.split_at(local_count);
+                            let wire = series_to_wire(wire.to_vec()).unwrap();
+                            command.ingest_response(wire).unwrap();
+                            command.ingest_local(local.to_vec());
+                            let series = std::mem::take(&mut command.series);
+                            describe(command.process_responses(series, Vec::new()).unwrap())
+                        };
+                        let case = format!(
+                            "aggregation={aggregation:?} grouped={grouped} \
                                  reverse={is_reverse} count={count:?} labels={with_labels} \
                                  exclude_empty={exclude_empty}"
-                            );
-                            let all_wire = run(0);
-                            assert!(!all_wire.is_empty(), "{case}");
-                            assert_eq!(run(shard_results.len()), all_wire, "all local: {case}");
-                            assert_eq!(run(2), all_wire, "mixed: {case}");
-                        }
+                        );
+                        let all_wire = run(0);
+                        assert!(!all_wire.is_empty(), "{case}");
+                        assert_eq!(run(shard_results.len()), all_wire, "all local: {case}");
+                        assert_eq!(run(2), all_wire, "mixed: {case}");
                     }
                 }
             }

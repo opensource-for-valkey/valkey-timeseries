@@ -2,13 +2,13 @@
 
 ## Payload: push-down is binding
 
-A request can ask a shard to do part of the work. For example, `MultiRangeRequest` carries
-`apply_aggregation`, `apply_group_reduce` and `apply_count` (`proto/v1/request.proto`). A shard does
-exactly what it is asked, and nothing echoes it back: the coordinator expects buckets under
-`apply_aggregation` and group partials alone under `apply_group_reduce`, and rejects a share of any
-other shape.
+A shard does part of the work the coordinator would otherwise do. For `TS.MRANGE` it always
+aggregates each series and pre-applies `COUNT`; `MultiRangeRequest.apply_group_reduce`
+(`proto/v1/request.proto`) additionally asks it to answer a GROUPBY with group partials alone.
+Nothing echoes the work back: the coordinator expects buckets whenever the query aggregates and
+partials alone under `apply_group_reduce`, and rejects a share of any other shape.
 
-No released version predates these flags, so no shard can ignore them. A push-down added after a
+No released version predates this, so no shard can answer otherwise. A push-down added after a
 release will need a way to tell an older shard's answer apart, or a bit in `required_features`
 (below) so an older shard refuses the request instead of answering it wrongly.
 

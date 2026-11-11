@@ -598,19 +598,16 @@ pub struct MultiRangeRequest {
     pub selected_labels: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(bool, tag = "6")]
     pub is_reverse: bool,
-    /// Push-down: binding on the shard, which answers with exactly the work asked for
-    /// (buckets, group partials alone, a COUNT pre-filter). There is no echo; the
-    /// coordinator rejects a share of the wrong shape.
+    /// A shard always aggregates each series and pre-applies COUNT. GROUPBY/REDUCE
+    /// is the one choice the coordinator makes: with this set, the shard answers with
+    /// group partials alone; without it, with per-series buckets. There is no echo;
+    /// the coordinator rejects a share of the wrong shape.
     #[prost(bool, tag = "7")]
-    pub apply_aggregation: bool,
-    #[prost(bool, tag = "8")]
     pub apply_group_reduce: bool,
-    #[prost(bool, tag = "9")]
-    pub apply_count: bool,
     /// EXCLUDEEMPTY: shards drop series with no reported samples before shipping.
-    /// Purely a transfer optimization — the coordinator re-applies the filter, so a
-    /// peer that ignores this field still produces the same reply.
-    #[prost(bool, tag = "10")]
+    /// The coordinator re-applies the filter, which coordinator-side processing
+    /// could otherwise undo.
+    #[prost(bool, tag = "8")]
     pub exclude_empty: bool,
 }
 /// TS._DEBUG STRINGPOOLSTATS: each shard reports its own interning pool, which
