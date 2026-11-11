@@ -35,6 +35,10 @@
 #                   file and/or under another compose project (see the overrides
 #                   section below). Unset means docker-compose.compat.yml under the
 #                   default project — the build.sh / fuzz.sh behaviour.
+#   COMPAT_REFERENCE_NOTIFY_KEYSPACE_EVENTS
+#                   Binary mode only: the reference's notify-keyspace-events. Unset
+#                   means KEA, as the compat compose service runs it; set it empty for
+#                   a benchmark, which the docker overlay does for its own service.
 # ---------------------------------------------------------------------------
 
 # Resolved once, from this file's location, so the caller's cwd is irrelevant.
@@ -94,6 +98,11 @@ fi
 _compat_ref_log()  { printf '\033[1;34m==>\033[0m reference: %s\n' "$*" >&2; }
 _compat_ref_warn() { printf '\033[1;33mwarn:\033[0m reference: %s\n' "$*" >&2; }
 _compat_ref_err()  { printf '\033[1;31merror:\033[0m reference: %s\n' "$*" >&2; }
+
+# A URL fit for logs: any password in `scheme://user:password@host` masked.
+_compat_ref_redact_url() {
+    printf '%s' "$1" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)([^:@/]*):[^@/]*@#\1\2:***@#; s#^([A-Za-z][A-Za-z0-9+.-]*://)[^:@/]+@#\1***@#'
+}
 
 # ---------------------------------------------------------------------------
 # supported distro/arch matrix
@@ -516,7 +525,7 @@ _compat_ref_start_binary() {
         --logfile "$COMPAT_REFERENCE_WORKDIR/reference.log" \
         --loadmodule "$_COMPAT_REF_CACHE_DIR/redistimeseries.so" \
         --enable-debug-command yes \
-        --notify-keyspace-events KEA \
+        --notify-keyspace-events "${COMPAT_REFERENCE_NOTIFY_KEYSPACE_EVENTS-KEA}" \
         --maxmemory-policy noeviction \
         --save "" \
         --appendonly no &
@@ -604,9 +613,9 @@ compat_reference_start() {
     if [ -n "$COMPAT_REFERENCE_URL" ]; then
         COMPAT_REFERENCE_KIND="external"
         COMPAT_REFERENCE_OWNED=0
-        _compat_ref_log "using external reference $COMPAT_REFERENCE_URL"
+        _compat_ref_log "using external reference $(_compat_ref_redact_url "$COMPAT_REFERENCE_URL")"
         if ! _compat_ref_wait_ping "$COMPAT_REFERENCE_URL" 5; then
-            _compat_ref_err "COMPAT_REFERENCE_URL=$COMPAT_REFERENCE_URL is not reachable"
+            _compat_ref_err "COMPAT_REFERENCE_URL=$(_compat_ref_redact_url "$COMPAT_REFERENCE_URL") is not reachable"
             return 1
         fi
         _compat_ref_validate_pin "$COMPAT_REFERENCE_URL" || return 1

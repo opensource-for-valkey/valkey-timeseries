@@ -36,19 +36,25 @@ pub fn redact_url(url: &str) -> String {
     format!("{}{}@{}", &url[..scheme_end + 3], masked, &rest[at + 1..])
 }
 
-/// Append the protocol selector understood by the client library.
+/// The URL with the protocol selector the client library understands set to
+/// `protocol`. A selector already in the URL is replaced, never kept: a case's
+/// protocol is what the run records, so the connection must use it.
 pub fn url_with_protocol(url: &str, protocol: Protocol) -> String {
-    match protocol {
-        Protocol::Resp2 => url.to_string(),
-        Protocol::Resp3 => {
-            if url.contains("protocol=") {
-                url.to_string()
-            } else if url.contains('?') {
-                format!("{url}&protocol=resp3")
-            } else {
-                format!("{url}?protocol=resp3")
-            }
-        }
+    let (base, query) = match url.split_once('?') {
+        Some((base, query)) => (base, query),
+        None => (url, ""),
+    };
+    let mut params: Vec<&str> = query
+        .split('&')
+        .filter(|p| !p.is_empty() && !p.starts_with("protocol="))
+        .collect();
+    if protocol == Protocol::Resp3 {
+        params.push("protocol=resp3");
+    }
+    if params.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", params.join("&"))
     }
 }
 
@@ -277,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_selector_is_appended_once() {
+    fn protocol_selector_is_set_exactly_once() {
         assert_eq!(url_with_protocol("redis://h", Protocol::Resp2), "redis://h");
         assert_eq!(
             url_with_protocol("redis://h", Protocol::Resp3),
@@ -291,9 +297,18 @@ mod tests {
             url_with_protocol("redis://h?x=1", Protocol::Resp3),
             "redis://h?x=1&protocol=resp3"
         );
+        // A selector in the URL never overrides the case's protocol.
         assert_eq!(
             url_with_protocol("redis://h?protocol=resp2", Protocol::Resp3),
-            "redis://h?protocol=resp2"
+            "redis://h?protocol=resp3"
+        );
+        assert_eq!(
+            url_with_protocol("redis://h?protocol=resp3", Protocol::Resp2),
+            "redis://h"
+        );
+        assert_eq!(
+            url_with_protocol("redis://h/0?x=1&protocol=resp3&y=2", Protocol::Resp2),
+            "redis://h/0?x=1&y=2"
         );
     }
 

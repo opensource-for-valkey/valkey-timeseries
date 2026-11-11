@@ -138,8 +138,13 @@ SUBJECT_DOCKER_OWNED=false
 cleanup() {
     local status=$?
     set +e
-    if [ "$KEEP" = true ] && [ ${#OWNED_PIDS[@]} -gt 0 ]; then
-        log "--keep: leaving owned subject server(s) running (pids ${OWNED_PIDS[*]})"
+    if [ "$KEEP" = true ]; then
+        if [ ${#OWNED_PIDS[@]} -gt 0 ]; then
+            log "--keep: leaving owned server(s) running (pids ${OWNED_PIDS[*]})"
+        fi
+        if [ "$SUBJECT_DOCKER_OWNED" = true ]; then
+            log "--keep: leaving the subject container running"
+        fi
     else
         local pid
         for pid in "${OWNED_PIDS[@]+"${OWNED_PIDS[@]}"}"; do
@@ -210,7 +215,9 @@ DRIVER="$BENCH_DIR/target/release/server_bench"
 ensure_driver() {
     if [ "$SKIP_BUILD" = false ]; then
         log "building the driver (tools/server_bench, separate workspace)"
-        (cd "$BENCH_DIR" && cargo build --release --locked 2>/dev/null || cargo build --release)
+        # The committed lockfile pins the load generator; never re-resolve it here.
+        (cd "$BENCH_DIR" && cargo build --release --locked) \
+            || die "the driver does not build against tools/server_bench/Cargo.lock"
     fi
     [ -x "$DRIVER" ] || die "driver not found at $DRIVER"
 }
@@ -356,14 +363,18 @@ DEPLOYMENT="mixed"
 # --- subject -----------------------------------------------------------------
 SUBJECT_ARGS=()
 if [ -n "$SUBJECT_URL" ]; then
-    _compat_ref_wait_ping "$SUBJECT_URL" 5 || die "--subject-url $SUBJECT_URL is not reachable"
-    log "subject: $SUBJECT_URL (external)"
+    _compat_ref_wait_ping "$SUBJECT_URL" 5 \
+        || die "--subject-url $(_compat_ref_redact_url "$SUBJECT_URL") is not reachable"
+    log "subject: $(_compat_ref_redact_url "$SUBJECT_URL") (external)"
     NOTES+=(--note "deployment.subject=external")
 elif [ "$SUBJECT_DOCKER" = true ]; then
     start_subject_docker
     SUBJECT_URL="$STARTED_URL"
     SUBJECT_ARGS+=(--subject-owned)
+    # The image as requested, besides the digest that ended up running: only a request
+    # pinned by digest makes the run reproducible (and publishable).
     NOTES+=(--note "deployment.subject=docker" --note "deployment.subject_image=$(image_digest subject)")
+    NOTES+=(--note "deployment.subject_image_ref=${BENCH_VALKEY_IMAGE:-valkey/valkey:9.1}")
 else
     ensure_server
     start_subject_process subject
@@ -385,6 +396,9 @@ if [ "$SELF_CHECK" = true ]; then
     NOTES+=(--note "deployment.reference_module=$reference_module")
     DEPLOYMENT="self-check"
 else
+    # The baseline wants keyspace notifications off; the compat suite's binary reference
+    # turns them on (the docker overlay already overrides its own service).
+    COMPAT_REFERENCE_NOTIFY_KEYSPACE_EVENTS=""
     compat_reference_start || die "could not provide a reference server"
     REFERENCE_URL="$COMPAT_REFERENCE_URL"
     REFERENCE_ARGS+=(--reference-pin "$COMPAT_REFERENCE_VERSION:$COMPAT_REFERENCE_MODULE_VERSION")
@@ -403,6 +417,8 @@ fi
 NOTES+=(--note "deployment.kind=$DEPLOYMENT")
 if [ "$DEPLOYMENT" != "containers-equal-limits" ]; then
     warn "deployment '$DEPLOYMENT' is exploratory: results are not publishable (plan, 'Comparable environments')"
+elif [[ "${BENCH_VALKEY_IMAGE:-valkey/valkey:9.1}" != *@sha256:* ]]; then
+    warn "BENCH_VALKEY_IMAGE is not pinned by digest: results are exploratory, not publishable"
 fi
 
 # --- drive -------------------------------------------------------------------

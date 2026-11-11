@@ -133,8 +133,11 @@ dataset/shape variants `core-counter`, `core-noisy`, `core-jitter`, `core-shallo
 moves — ADD/MADD encode, scan-only and raw ranges, sum/max aggregation, memory — and GET as a
 placement control. Run several and put them side by side with
 `server_bench compare --run-dir A --run-dir B ...`, which groups runs by deployment,
-limits, fixture shape/dataset, protocol and trial budget — only runs in one group are
-comparable — and lists each run's ratios as a column labelled by its encoding pair.
+limits, fixture (shape, dataset and digest), protocol and trial budget — only runs in one
+group are comparable — and lists each run's ratios as a column labelled by its encoding pair.
+A case id lines up across runs only when they define it the same way; otherwise each
+definition gets its own row. A run is publishable only from `--subject-docker` with
+equal-limit containers and `BENCH_VALKEY_IMAGE` pinned by digest (`...@sha256:...`).
 
 ## Fixtures
 

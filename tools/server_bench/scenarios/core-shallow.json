@@ -77,7 +77,7 @@
       "connections": 8
     },
     {
-      "id": "range_recent100_c8",
+      "id": "range_recent10_c8",
       "kind": "range",
       "window": {
         "type": "recent",
@@ -94,7 +94,7 @@
       "connections": 8
     },
     {
-      "id": "revrange_recent100_c8",
+      "id": "revrange_recent10_c8",
       "kind": "range",
       "window": {
         "type": "recent",

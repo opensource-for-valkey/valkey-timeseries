@@ -327,12 +327,22 @@ fn json_str<'a>(v: &'a Json, path: &[&str]) -> &'a str {
     cur.as_str().unwrap_or("")
 }
 
+/// Whether a run can be published: both engines in equal-limit containers, a
+/// real reference (not a self-check), and a subject image requested by digest,
+/// since a tag can name a different image tomorrow. The digest recorded from the
+/// running container does not tell: an image pulled by tag has one too.
+fn is_publishable(manifest: &Json) -> bool {
+    json_str(manifest, &["notes", "deployment.kind"]) == "containers-equal-limits"
+        && json_str(manifest, &["preflight", "comparison"]) != "self_check"
+        && json_str(manifest, &["notes", "deployment.subject_image_ref"]).contains("@sha256:")
+}
+
 pub fn markdown(results: &RunResults, manifest: &Json) -> String {
     let mut md = String::new();
     let comparison = json_str(manifest, &["preflight", "comparison"]);
     let self_check = comparison == "self_check";
     let deployment = json_str(manifest, &["notes", "deployment.kind"]);
-    let publishable = deployment == "containers-equal-limits" && !self_check;
+    let publishable = is_publishable(manifest);
 
     let _ = writeln!(md, "# Server benchmark report — {}", results.run_id);
     let _ = writeln!(md);
@@ -348,7 +358,7 @@ pub fn markdown(results: &RunResults, manifest: &Json) -> String {
         let _ = writeln!(
             md,
             "> **Exploratory run** (deployment `{deployment}`): not a publishable comparison \
-             (plan, \"Comparable environments\")."
+             (plan, \"Comparable environments\": equal-limit containers, both images pinned by digest)."
         );
         let _ = writeln!(md);
     }
@@ -952,15 +962,17 @@ pub fn load_run(run_dir: &Path) -> Result<LoadedRun> {
 }
 
 /// Runs are only comparable side by side when they measured the same thing
-/// under the same budget: deployment kind and container limits, fixture
-/// shape and dataset, protocol, trial count and read duration. The encoding
-/// pair is what varies *within* a group (the encoding sweep); the dataset
-/// varies *across* groups (the dataset sweep).
+/// under the same budget: deployment kind and container limits, the very same
+/// fixture (shape, dataset, labels: its digest), protocol, trial count and read
+/// duration. The encoding pair is what varies *within* a group (the encoding
+/// sweep); the dataset varies *across* groups (the dataset sweep). Cases line up
+/// within a group only when their definitions match too (see [`case_rows`]).
 fn group_key(m: &Json) -> String {
     let fx = &m["fixture"]["manifest"];
     let sc = &m["scenario"]["body"];
+    let digest = json_str(m, &["fixture", "sha256"]);
     format!(
-        "{} · {} · {}×{} {} · {} · {} trial(s) × {} s",
+        "{} · {} · {}×{} {} (fixture {}) · {} · {} trial(s) × {} s",
         json_str(m, &["notes", "deployment.kind"]),
         if json_str(m, &["notes", "deployment.compose_limits"]).is_empty() {
             "no limits"
@@ -970,10 +982,53 @@ fn group_key(m: &Json) -> String {
         fx["shape"]["series"],
         fx["shape"]["samples_per_series"],
         json_str(fx, &["generator", "dataset_key"]),
+        &digest[..digest.len().min(12)],
         json_str(sc, &["protocol"]),
         sc["trials"],
         sc["read_duration_seconds"]
     )
+}
+
+/// A case's definition as the run's scenario states it, canonically serialized
+/// (object keys sorted), or empty for a run that does not record it.
+fn case_definition(m: &Json, id: &str) -> String {
+    m["scenario"]["body"]["cases"]
+        .as_array()
+        .and_then(|cases| cases.iter().find(|c| c["id"].as_str() == Some(id)))
+        .map(|c| c.to_string())
+        .unwrap_or_default()
+}
+
+/// The rows of a group's table, as `(label, case id, definition)`: one per case
+/// id and definition, so a case is only compared across runs that defined it the
+/// same way. An id defined differently by different runs gets one row per
+/// definition, labelled to tell them apart.
+fn case_rows(members: &[&LoadedRun]) -> Vec<(String, String, String)> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for r in members {
+        for c in r.results.cases.iter().filter(|c| c.family != "memory") {
+            let row = (c.case_id.clone(), case_definition(&r.manifest, &c.case_id));
+            if !rows.contains(&row) {
+                rows.push(row);
+            }
+        }
+    }
+    rows.iter()
+        .map(|(id, definition)| {
+            let variants: Vec<&String> = rows
+                .iter()
+                .filter(|(other, _)| other == id)
+                .map(|(_, d)| d)
+                .collect();
+            let label = match variants.iter().position(|d| *d == definition) {
+                Some(k) if variants.len() > 1 => {
+                    format!("{id} (definition {} of {})", k + 1, variants.len())
+                }
+                _ => id.clone(),
+            };
+            (label, id.clone(), definition.clone())
+        })
+        .collect()
 }
 
 fn encoding_label(m: &Json) -> String {
@@ -991,8 +1046,9 @@ pub fn compare(runs: &[LoadedRun]) -> String {
     let _ = writeln!(md);
     let _ = writeln!(
         md,
-        "Runs are grouped by deployment, container limits, fixture shape and dataset, protocol and trial budget; \
-         only runs inside one group are comparable with each other. Within a group each column is one run, \
+        "Runs are grouped by deployment, container limits, fixture (shape, dataset and digest), protocol and \
+         trial budget; only runs inside one group are comparable with each other, and a case only lines up \
+         across runs that define it the same way. Within a group each column is one run, \
          labelled by its subject/reference encoding pair. Cells are the run's own ratios: throughput subject/reference, \
          p50 and p99 latency reference/subject and server CPU per command reference/subject (all > 1 favour \
          the subject), computed over that run's valid pairs."
@@ -1011,10 +1067,7 @@ pub fn compare(runs: &[LoadedRun]) -> String {
     for (key, members) in &groups {
         let _ = writeln!(md, "## {key}");
         let _ = writeln!(md);
-        let exploratory = members.iter().any(|r| {
-            json_str(&r.manifest, &["notes", "deployment.kind"]) != "containers-equal-limits"
-                || json_str(&r.manifest, &["preflight", "comparison"]) == "self_check"
-        });
+        let exploratory = members.iter().any(|r| !is_publishable(&r.manifest));
         if exploratory {
             let _ = writeln!(md, "> Exploratory deployment: not publishable.");
             let _ = writeln!(md);
@@ -1032,14 +1085,7 @@ pub fn compare(runs: &[LoadedRun]) -> String {
         }
         let _ = writeln!(md);
 
-        let mut case_ids: Vec<&str> = Vec::new();
-        for r in members {
-            for c in &r.results.cases {
-                if c.family != "memory" && !case_ids.contains(&c.case_id.as_str()) {
-                    case_ids.push(&c.case_id);
-                }
-            }
-        }
+        let rows = case_rows(members);
         let mut head = String::from("| case |");
         let mut rule = String::from("| --- |");
         for r in members {
@@ -1052,10 +1098,14 @@ pub fn compare(runs: &[LoadedRun]) -> String {
         }
         let _ = writeln!(md, "{head}");
         let _ = writeln!(md, "{rule}");
-        for id in &case_ids {
-            let mut row = format!("| {id} |");
+        for (label, id, definition) in &rows {
+            let mut row = format!("| {label} |");
             for r in members {
-                match r.results.cases.iter().find(|c| c.case_id == *id) {
+                let same =
+                    r.results.cases.iter().find(|c| {
+                        c.case_id == *id && case_definition(&r.manifest, id) == *definition
+                    });
+                match same {
                     Some(c) => {
                         let s = summarize(c);
                         let _ = write!(
@@ -1258,5 +1308,85 @@ mod tests {
     fn bootstrap_is_deterministic() {
         let pairs = vec![(2.0, 1.0), (2.2, 1.1), (1.8, 0.9), (2.1, 1.0)];
         assert_eq!(bootstrap_ratio_ci(&pairs), bootstrap_ratio_ci(&pairs));
+    }
+
+    fn loaded(run_id: &str, fixture: &str, image_ref: &str, cases: Json) -> LoadedRun {
+        let ids: Vec<String> = cases
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect();
+        LoadedRun {
+            dir: run_id.into(),
+            results: RunResults {
+                results_version: 1,
+                run_id: run_id.into(),
+                cases: ids
+                    .into_iter()
+                    .map(|id| CaseResults {
+                        case_id: id,
+                        family: "range".into(),
+                        ..case(vec![(
+                            trial(Engine::Subject, 100, 1.0, 10.0),
+                            trial(Engine::Reference, 50, 1.0, 20.0),
+                        )])
+                    })
+                    .collect(),
+            },
+            manifest: serde_json::json!({
+                "notes": {
+                    "deployment.kind": "containers-equal-limits",
+                    "deployment.subject_image_ref": image_ref,
+                },
+                "preflight": {"comparison": "reference"},
+                "fixture": {"sha256": fixture, "manifest": {"shape": {}, "generator": {}}},
+                "scenario": {"name": run_id, "body": {"cases": cases}},
+            }),
+        }
+    }
+
+    /// Only a subject image requested by digest is publishable: a tag can name
+    /// another image tomorrow, and the running image's digest exists either way.
+    #[test]
+    fn publishable_needs_a_digest_pinned_subject_image() {
+        let cases = serde_json::json!([]);
+        let pinned = loaded("a", "f", "valkey/valkey:9.1@sha256:abc", cases.clone());
+        assert!(is_publishable(&pinned.manifest));
+        let tagged = loaded("b", "f", "valkey/valkey:9.1", cases);
+        assert!(!is_publishable(&tagged.manifest));
+        let report = markdown(&tagged.results, &tagged.manifest);
+        assert!(report.contains("Exploratory run"), "{report}");
+    }
+
+    /// Runs over different fixtures never share a group, and a case id lines up
+    /// across runs only where the runs defined it the same way.
+    #[test]
+    fn compare_lines_up_only_the_same_data_and_case_definitions() {
+        let window = |points: u64| {
+            serde_json::json!([{"id": "r", "kind": "range", "connections": 8,
+                                "window": {"type": "recent", "points": points}}])
+        };
+        let a = loaded("a", "fixture-1", "x@sha256:1", window(10));
+        let b = loaded("b", "fixture-1", "x@sha256:1", window(100));
+        let c = loaded("c", "fixture-2", "x@sha256:1", window(10));
+        assert_eq!(group_key(&a.manifest), group_key(&b.manifest));
+        assert_ne!(group_key(&a.manifest), group_key(&c.manifest));
+
+        let rows = case_rows(&[&a, &b]);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].0, "r (definition 1 of 2)");
+        assert_eq!(rows[1].0, "r (definition 2 of 2)");
+        let same = case_rows(&[&a, &loaded("d", "fixture-1", "x@sha256:1", window(10))]);
+        assert_eq!(same.len(), 1);
+        assert_eq!(same[0].0, "r");
+
+        let report = compare(&[a, b]);
+        // Each definition's row has a cell for one run and a dash for the other.
+        let row = report
+            .lines()
+            .find(|l| l.starts_with("| r (definition 1 of 2)"))
+            .unwrap();
+        assert!(row.contains("— | — | — | — | — |"), "{row}");
     }
 }
