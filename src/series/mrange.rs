@@ -717,8 +717,10 @@ fn handle_grouping<M: GroupMember>(
     // Aggregated single-column GROUPBY: decode and bucket every member series of every
     // group in parallel over *series* (not groups, so one big group still uses the pool),
     // then fold each group's rows into its bucket table in series order — the same order
-    // the k-way merge yields, so the reduce is bit-identical to it. Groups the grid
-    // cannot serve fall through to the merge below.
+    // this function's k-way merge yields, so the reduce is bit-identical to that fallback
+    // for the same member order. This does not promise bit-identical cluster replies:
+    // the fanout coordinator uses a separate reduction pipeline. Groups the grid cannot
+    // serve fall through to the merge below.
     let (dense, mut merged) =
         plan_dense_groups(grouped_series_map, &options, count, DENSE_STAGING_MAX_ROWS);
 
@@ -1000,7 +1002,8 @@ struct DenseGroupTable {
 impl DenseGroupTable {
     /// Folds one series' rows in. Rows arrive ascending per series and series are folded in
     /// group order, so each slot sees its contributions in exactly the order the k-way merge
-    /// would have yielded them (timestamp, then series) — the reduce is bit-identical.
+    /// in `get_grouped_samples` would have yielded them (timestamp, then series) — the reduce
+    /// is bit-identical for the same member order. This guarantee is local to this pipeline.
     /// Returns `false` for a row the grid cannot address; the caller then falls back.
     fn fold(&mut self, grid: &BucketGrid, rows: impl Iterator<Item = Sample>) -> bool {
         for row in rows {

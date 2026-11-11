@@ -224,6 +224,10 @@ shard), and the coordinator merges and finalizes them per bucket. The remaining 
 `none`) fall back to per-series bucket transport; `first`, `last`, `rate`, `irate` and `increase` are not accepted as
 reducers. `COUNT` and reversal (`TS.MREVRANGE`) are always applied at the coordinator.
 
+Grouped `TS.MRANGE`/`TS.MREVRANGE` results can differ in trailing floating-point digits between cluster and standalone
+deployments, for example with `REDUCE std.s`: the reduction pipelines can accumulate values and combine partial states
+in different orders. Bit-for-bit equality is not guaranteed; compare floating-point results with a numerical tolerance.
+
 Multi-aggregation queries (`AGGREGATION avg,max,count …`) participate in both push-downs: per-series buckets travel as
 one compressed chunk per aggregation column, and group partials carry one reducer state per column per bucket, reduced
 column-wise with the same `REDUCE` type.

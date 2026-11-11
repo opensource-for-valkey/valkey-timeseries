@@ -426,6 +426,8 @@ O(n×m×k) where:
   series is omitted regardless of which shard owns it
 - When using `GROUPBY`, series are grouped by the specified label value
 - Aggregation is applied before grouping when both are specified
+- Grouped floating-point results (for example, `REDUCE std.s`) can differ in trailing digits between cluster and
+  standalone deployments because reduction order can differ; compare with a numerical tolerance
 - `LATEST` is useful when you have compaction rules and want aggregated data without querying compacted series directly
 - On a server with cluster mode disabled, a large read (or any read while other clients' `TS.MRANGE`/`TS.MREVRANGE`
   reads are arriving) is decoded and answered off the main thread. The reply is unchanged, but the client is blocked
