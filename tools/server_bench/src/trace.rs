@@ -15,7 +15,7 @@
 //! refuses a pair whose workload digests differ. Every frame carries what
 //! the reply must look like, so the executor validates instead of discarding.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -56,9 +56,10 @@ pub enum Expect {
     Ints(Vec<i64>),
     /// `[timestamp, value]` with this timestamp; the value is compared as f64.
     Sample { timestamp: i64, value: f64 },
-    /// An array of exactly `count` `[timestamp, value]` pairs whose timestamps
-    /// fall within `[from, to]`.
-    Samples { count: usize, from: i64, to: i64 },
+    /// Exactly these `[timestamp, value]` pairs, in this order (raw
+    /// `TS.RANGE`/`TS.REVRANGE`). Raw values round-trip exactly on both
+    /// engines, so they must match bit for bit.
+    Samples(Vec<(i64, f64)>),
     /// Aggregated buckets: exactly these `(timestamp, value)` pairs in this
     /// order (or reversed). `exact` buckets must match bit for bit; otherwise
     /// values are compared with a relative tolerance and every deviation is
@@ -73,13 +74,25 @@ pub enum Expect {
     /// One `[key, labels, [timestamp, value]]` entry per key, in any order,
     /// each carrying exactly that key's last sample (`TS.MGET`).
     LastSamples(Vec<(String, i64, f64)>),
-    /// One entry per key, in any order, each with exactly `count` samples
-    /// inside `[from, to]` (raw `TS.MRANGE`).
-    MultiSeries(Vec<(String, usize, i64, i64)>),
-    /// One entry per group name, in any order, each with exactly this many
-    /// buckets (`TS.MRANGE ... GROUPBY ... REDUCE`). Values are not checked:
-    /// reducer results depend on summation order across series.
-    Groups(Vec<(String, usize)>),
+    /// One entry per series or group, in any order, sorted here by name
+    /// (`TS.MRANGE`, with or without `AGGREGATION` or `GROUPBY ... REDUCE`).
+    /// `exact` as for `Buckets`: sums and averages, over a series' buckets or
+    /// across a group's members, depend on summation order.
+    MultiSeries {
+        entries: Vec<SeriesExpect>,
+        exact: bool,
+    },
+}
+
+/// One series' (or group's) expected answer in a multi-series reply.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeriesExpect {
+    pub name: String,
+    /// The full label set, sorted, when the read asked for it (`WITHLABELS`):
+    /// the engines may list labels in any order. `None` leaves labels unchecked.
+    pub labels: Option<Vec<(String, String)>>,
+    /// The samples or buckets, in reply order.
+    pub samples: Vec<(i64, f64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -465,20 +478,13 @@ fn range_streams(
     let connections = case.connections as usize;
     let mut rng = Rng::for_case(&case.id);
     let mut streams = vec![Stream::default(); connections];
+    let mut cache = ExpectCache::default();
     let cmd: &[u8] = if reverse { b"TS.REVRANGE" } else { b"TS.RANGE" };
     let band_args = band.map(|b| (b.min.to_string(), b.max.to_string()));
     for n in 0..cycle {
         let i = rng.below(fixture.series.len());
         let s = &fixture.series[i];
-        let (from, to, count) = window_bounds(&s.samples, window);
-        let count = match band {
-            Some(b) => s
-                .samples
-                .iter()
-                .filter(|x| x.timestamp >= from && x.timestamp <= to && b.contains(x.value))
-                .count(),
-            None => count,
-        };
+        let (from, to, _) = window_bounds(&s.samples, window);
         let (from_arg, to_arg) = window_args(window, from, to);
         let mut args: Vec<&[u8]> = vec![
             cmd,
@@ -489,9 +495,20 @@ fn range_streams(
         if let Some((min, max)) = &band_args {
             args.extend([&b"FILTER_BY_VALUE"[..], min.as_bytes(), max.as_bytes()]);
         }
-        streams[n % connections]
-            .frames
-            .push(Frame::new(&args, Expect::Samples { count, from, to }));
+        let frame = cache.frame(&args, || {
+            let mut samples: Vec<(i64, f64)> = s
+                .samples
+                .iter()
+                .filter(|x| x.timestamp >= from && x.timestamp <= to)
+                .filter(|x| band.is_none_or(|b| b.contains(x.value)))
+                .map(|x| (x.timestamp, x.value))
+                .collect();
+            if reverse {
+                samples.reverse();
+            }
+            Expect::Samples(samples)
+        });
+        streams[n % connections].frames.push(frame);
     }
     streams
 }
@@ -626,6 +643,34 @@ fn aggregate_streams(
     streams
 }
 
+/// The oracle for `REDUCE <reducer>` over one bucket's member values.
+fn reduce(reducer: Reducer, values: &[f64]) -> f64 {
+    let sum = || values.iter().sum::<f64>();
+    match reducer {
+        Reducer::Sum => sum(),
+        Reducer::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
+        Reducer::Max => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        Reducer::Avg => sum() / values.len() as f64,
+        Reducer::Count => values.len() as f64,
+    }
+}
+
+/// Whether a reduced bucket is exact on both engines: a count always is, and a
+/// min or max is whenever the buckets it picks from are.
+fn reducer_is_exact(reducer: Reducer, aggregator: Aggregator) -> bool {
+    match reducer {
+        Reducer::Count => true,
+        Reducer::Min | Reducer::Max => aggregator.is_exact(),
+        Reducer::Sum | Reducer::Avg => false,
+    }
+}
+
+fn sorted_labels(labels: &[(String, String)]) -> Vec<(String, String)> {
+    let mut labels = labels.to_vec();
+    labels.sort();
+    labels
+}
+
 /// Series indices carrying each value of label `l<label>`, indexed by value.
 fn label_index(fixture: &Fixture, label: usize) -> Vec<(String, Vec<usize>)> {
     let name = &fixture.manifest.labels.definitions[label].name;
@@ -746,29 +791,37 @@ fn mrange_streams(
         }
         args.extend([b"FILTER".as_slice(), filter.as_bytes()]);
         let frame = cache.frame(&args, || {
-            let mut expected: Vec<(String, usize, i64, i64)> = matched
+            let mut entries: Vec<SeriesExpect> = matched
                 .iter()
                 .map(|&i| {
                     let s = &fixture.series[i];
+                    // `- +` reaches every sample of each series, whatever its
+                    // own timestamps; other windows are the first series'.
                     let (f, t) = match (window, aggregation) {
                         (RangeWindow::Full {}, None) => (i64::MIN, i64::MAX),
                         _ => (from, to),
                     };
-                    // Aggregated: one entry per non-empty bucket, stamped
-                    // with its start, which lies inside `[from, to]` too.
-                    let count = match (aggregation, bucket) {
-                        (Some(a), Some(b)) => aggregate(&s.samples, f, t, b, a.aggregator).len(),
+                    let samples = match (aggregation, bucket) {
+                        (Some(a), Some(b)) => aggregate(&s.samples, f, t, b, a.aggregator),
                         _ => s
                             .samples
                             .iter()
                             .filter(|x| x.timestamp >= f && x.timestamp <= t)
-                            .count(),
+                            .map(|x| (x.timestamp, x.value))
+                            .collect(),
                     };
-                    (s.key.clone(), count, f, t)
+                    SeriesExpect {
+                        name: s.key.clone(),
+                        labels: withlabels.then(|| sorted_labels(&s.labels)),
+                        samples,
+                    }
                 })
                 .collect();
-            expected.sort_by(|a, b| a.0.cmp(&b.0));
-            Expect::MultiSeries(expected)
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            Expect::MultiSeries {
+                entries,
+                exact: aggregation.is_none_or(|a| a.aggregator.is_exact()),
+            }
         });
         streams[n % connections].frames.push(frame);
     }
@@ -819,8 +872,8 @@ fn groupby_streams(
             reducer.as_arg().as_bytes(),
         ];
         let frame = cache.frame(&args, || {
-            // Group -> union of its members' non-empty buckets.
-            let mut groups: Vec<(String, Vec<i64>)> = Vec::new();
+            // Group -> bucket start -> its members' bucket values, in series order.
+            let mut groups: BTreeMap<String, BTreeMap<i64, Vec<f64>>> = BTreeMap::new();
             for &i in matched {
                 let s = &fixture.series[i];
                 let gv = s
@@ -829,26 +882,26 @@ fn groupby_streams(
                     .find(|(k, _)| k == group_name)
                     .map(|(_, v)| v.clone())
                     .expect("fixture series carries every label");
-                let starts: Vec<i64> = aggregate(&s.samples, from, to, bucket, aggregator)
-                    .into_iter()
-                    .map(|(ts, _)| ts)
-                    .collect();
-                let name = format!("{group_name}={gv}");
-                match groups.iter_mut().find(|(g, _)| *g == name) {
-                    Some((_, all)) => all.extend(starts),
-                    None => groups.push((name, starts)),
+                let buckets = groups.entry(format!("{group_name}={gv}")).or_default();
+                for (start, value) in aggregate(&s.samples, from, to, bucket, aggregator) {
+                    buckets.entry(start).or_default().push(value);
                 }
             }
-            let mut expected: Vec<(String, usize)> = groups
+            let entries = groups
                 .into_iter()
-                .map(|(name, mut starts)| {
-                    starts.sort_unstable();
-                    starts.dedup();
-                    (name, starts.len())
+                .map(|(name, buckets)| SeriesExpect {
+                    name,
+                    labels: None,
+                    samples: buckets
+                        .into_iter()
+                        .map(|(start, values)| (start, reduce(reducer, &values)))
+                        .collect(),
                 })
                 .collect();
-            expected.sort_by(|a, b| a.0.cmp(&b.0));
-            Expect::Groups(expected)
+            Expect::MultiSeries {
+                entries,
+                exact: reducer_is_exact(reducer, aggregator),
+            }
         });
         streams[n % connections].frames.push(frame);
     }
@@ -1303,10 +1356,15 @@ mod tests {
         assert_eq!(entries[0].1, 1_700_000_000_000 + 2000);
 
         let mr = build_case(&s, &f, &s.cases[2]);
-        let Expect::MultiSeries(entries) = &*mr.workload[0].frames[0].expect else {
+        let Expect::MultiSeries { entries, exact } = &*mr.workload[0].frames[0].expect else {
             panic!()
         };
-        assert!(entries.iter().all(|(_, count, _, _)| *count == 2));
+        assert!(*exact, "raw samples are exact");
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.samples.len() == 2 && e.labels.is_none())
+        );
 
         let gb = build_case(&s, &f, &s.cases[3]);
         let text = String::from_utf8(gb.workload[0].frames[0].bytes.clone()).unwrap();
@@ -1314,12 +1372,22 @@ mod tests {
             text.starts_with("*14\r\n$9\r\nTS.MRANGE\r\n$13\r\n1700000000000\r\n$13\r\n1700000002000\r\n$5\r\nALIGN\r\n$5\r\nstart\r\n"),
             "aggregated windows must carry explicit bounds: {text}"
         );
-        let Expect::Groups(groups) = &*gb.workload[0].frames[0].expect else {
+        let Expect::MultiSeries {
+            entries: groups,
+            exact,
+        } = &*gb.workload[0].frames[0].expect
+        else {
             panic!()
         };
+        assert!(!*exact, "a sum of averages depends on summation order");
         assert_eq!(groups.len(), 10, "one group per l1 value");
-        assert!(groups.iter().all(|(_, n)| *n == 2), "{groups:?}");
-        assert_eq!(groups[0].0, "l1=v0000000");
+        assert!(groups.iter().all(|g| g.samples.len() == 2), "{groups:?}");
+        assert_eq!(groups[0].name, "l1=v0000000");
+        // Series 0, 10 and 20 hold 100.i, 101.i, 102.i; the first 1,001 ms
+        // bucket averages the first two, and REDUCE sum adds the three averages.
+        let (start, value) = groups[0].samples[0];
+        assert_eq!(start, 1_700_000_000_000);
+        assert!((value - (100.5 + 100.6 + 100.7)).abs() < 1e-9, "{value}");
         let text = String::from_utf8(gb.workload[0].frames[0].bytes.clone()).unwrap();
         assert!(
             text.contains("GROUPBY\r\n$2\r\nl1\r\n$6\r\nREDUCE\r\n$3\r\nsum\r\n"),
@@ -1328,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregated_mrange_carries_bucket_counts() {
+    fn aggregated_mrange_carries_buckets_and_labels() {
         let f = fixture("mrange-agg", 25, 3);
         let s = scenario(
             serde_json::json!([
@@ -1350,16 +1418,35 @@ mod tests {
             ),
             "aggregated windows must carry explicit bounds: {text}"
         );
-        let Expect::MultiSeries(entries) = &*mra.workload[0].frames[0].expect else {
+        let Expect::MultiSeries { entries, exact } = &*mra.workload[0].frames[0].expect else {
             panic!()
         };
-        // 3 samples 1 s apart in 1,001 ms buckets: {0, 1} {2}.
-        assert!(
-            entries
-                .iter()
-                .all(|(_, n, f, t)| *n == 2 && *f == 1_700_000_000_000 && *t == 1_700_000_002_000),
-            "{entries:?}"
-        );
+        assert!(*exact, "max is exact");
+        // write_fixture: series i holds `100.i`, `101.i`, `102.i`, 1 s apart,
+        // so 1,001 ms buckets take the max of {0, 1} and of {2}.
+        let value = |name: &str, j: usize| -> f64 {
+            let i = name.strip_prefix("bench:").unwrap();
+            format!("{}.{i}", 100 + j).parse().unwrap()
+        };
+        for e in entries {
+            assert_eq!(
+                e.samples,
+                vec![
+                    (1_700_000_000_000, value(&e.name, 1)),
+                    (1_700_000_001_001, value(&e.name, 2))
+                ]
+            );
+            let i: usize = e.name.strip_prefix("bench:").unwrap().parse().unwrap();
+            assert_eq!(
+                e.labels.as_deref(),
+                Some(
+                    &[
+                        ("l0".to_string(), "v0000000".to_string()),
+                        ("l1".to_string(), format!("v{:07}", i % 10))
+                    ][..]
+                )
+            );
+        }
 
         let mrl = build_case(&s, &f, &s.cases[1]);
         let text = String::from_utf8(mrl.workload[0].frames[0].bytes.clone()).unwrap();
@@ -1369,10 +1456,20 @@ mod tests {
             ),
             "{text}"
         );
-        let Expect::MultiSeries(entries) = &*mrl.workload[0].frames[0].expect else {
+        let Expect::MultiSeries { entries, .. } = &*mrl.workload[0].frames[0].expect else {
             panic!()
         };
-        assert!(entries.iter().all(|(_, n, _, _)| *n == 3), "{entries:?}");
+        for e in entries {
+            assert_eq!(
+                e.samples,
+                vec![
+                    (1_700_000_000_000, value(&e.name, 0)),
+                    (1_700_000_001_000, value(&e.name, 1)),
+                    (1_700_000_002_000, value(&e.name, 2))
+                ]
+            );
+            assert!(e.labels.is_some());
+        }
     }
 
     #[test]
