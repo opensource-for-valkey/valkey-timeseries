@@ -15,17 +15,33 @@ use valkey_module::{Context, ValkeyError, ValkeyResult, raw};
 /// An entry lives from [`DisconnectWatch::new`] until [`DisconnectWatch::forget`], which runs
 /// before the client is unblocked, and the server frees a handle only after that, so a handle
 /// never names two clients here.
-static DISCONNECTED: LazyLock<Mutex<HashMap<usize, Arc<AtomicBool>>>> =
+static DISCONNECTED: LazyLock<Mutex<HashMap<usize, Watched>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// What runs when a watched client disconnects: on the main thread, with the GIL held, while
+/// the client is still blocked. It may unblock the client.
+pub(crate) type DisconnectHook = Box<dyn FnOnce(&Context) + Send>;
+
+struct Watched {
+    flag: Arc<AtomicBool>,
+    hook: Option<DisconnectHook>,
+}
 
 /// Runs on the main thread when a blocked client's connection closes (the peer went away, or
 /// `CLIENT KILL`), never for a client unblocked normally or timed out.
 unsafe extern "C" fn on_disconnect(
-    _ctx: *mut raw::RedisModuleCtx,
+    ctx: *mut raw::RedisModuleCtx,
     bc: *mut raw::RedisModuleBlockedClient,
 ) {
-    if let Some(flag) = lock(&DISCONNECTED).get(&(bc as usize)) {
-        flag.store(true, Ordering::Relaxed);
+    let hook = lock(&DISCONNECTED)
+        .get_mut(&(bc as usize))
+        .and_then(|watched| {
+            watched.flag.store(true, Ordering::Relaxed);
+            watched.hook.take()
+        });
+    // Outside the registry lock: a hook that unblocks the client forgets it, which takes it.
+    if let Some(hook) = hook {
+        hook(&Context::new(ctx));
     }
 }
 
@@ -48,7 +64,11 @@ impl DisconnectWatch {
         let flag = Arc::new(AtomicBool::new(false));
         let watching = !bc.is_null();
         if watching {
-            lock(&DISCONNECTED).insert(bc as usize, Arc::clone(&flag));
+            let watched = Watched {
+                flag: Arc::clone(&flag),
+                hook: None,
+            };
+            lock(&DISCONNECTED).insert(bc as usize, watched);
             unsafe { raw::RedisModule_SetDisconnectCallback.unwrap()(bc, Some(on_disconnect)) };
         }
         Self {
@@ -68,10 +88,23 @@ impl DisconnectWatch {
         self.flag.load(Ordering::Relaxed)
     }
 
+    /// Runs `hook` should the client disconnect, in place of any hook set before. Main thread
+    /// only, so it cannot race the callback; a watch already forgotten drops `hook` unrun.
+    pub(crate) fn on_disconnect(&self, hook: DisconnectHook) {
+        let stale = match lock(&DISCONNECTED).get_mut(&self.bc) {
+            Some(watched) if self.watching => watched.hook.replace(hook),
+            _ => Some(hook),
+        };
+        // Outside the registry lock: a hook's captures run arbitrary drops.
+        drop(stale);
+    }
+
     /// Stops watching. Must run before the client is unblocked; idempotent.
     pub(crate) fn forget(&mut self) {
         if std::mem::take(&mut self.watching) {
-            lock(&DISCONNECTED).remove(&self.bc);
+            let watched = lock(&DISCONNECTED).remove(&self.bc);
+            // Outside the registry lock, for the same reason.
+            drop(watched);
         }
     }
 }

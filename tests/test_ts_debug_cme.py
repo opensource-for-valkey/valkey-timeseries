@@ -594,43 +594,89 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         wait_for_true(lambda: debug_metrics(peer, 'fanout')['fanout_served_ok_total'] == 1)
         assert debug_metrics(peer, 'fanout')['fanout_cancels_received_total'] == 0
 
-    def test_a_client_that_disconnects_gets_no_reply_built(self):
-        """A client that hangs up while its fan-out waits on a sleeping peer is not answered:
-        once the peer answers, the reply lane skips the reply nobody would read."""
-        tags = self.populate()
-        # Enough samples that the coordinator builds the reply on the reply lane, not inline.
-        cluster_client = self.new_cluster_client()
-        for tag in tags:
-            for j in range(3):
-                key = f'fo:{{{tag}}}:{j}'
-                cluster_client.execute_command(
-                    'TS.MADD', *[a for t in range(30) for a in (key, 2000 + t, t)])
-        self.reset_all()
+    def hang_up_while_a_peer_sleeps(self, *command, sleep=2, while_asleep=None):
+        """Send `command` to primary 0 and disconnect while its fan-out waits on primary 1,
+        which is in DEBUG SLEEP. `while_asleep` runs once the server has dropped the client,
+        before the peer wakes."""
         coordinator = self.primaries()[0]
         server = self.get_primary(0)
         leaver = Valkey(host=server.bind_ip, port=server.port, single_connection_client=True)
         leaver.client_setname('leaver')
         sleeper = threading.Thread(
-            target=lambda: self.new_client_for_primary(1).execute_command('DEBUG', 'SLEEP', 1))
+            target=lambda: self.new_client_for_primary(1).execute_command('DEBUG', 'SLEEP', sleep))
         sleeper.start()
         try:
             time.sleep(0.2)
-            leaver.connection.send_command('TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
-            wait_for_true(lambda: coordinator.execute_command('TS._DEBUG', 'INFLIGHT') != [])
+            leaver.connection.send_command(*command)
+
+            def waiting_on_the_sleeper_only():
+                entries = coordinator.execute_command('TS._DEBUG', 'INFLIGHT')
+                if len(entries) != 1:
+                    return False
+                entry = entries[0]
+                fields = {entry[i].decode(): entry[i + 1] for i in range(0, len(entry), 2)}
+                return fields['outstanding'] == 1
+            wait_for_true(waiting_on_the_sleeper_only)
             leaver.connection.disconnect()
             wait_for_true(lambda: all(c['name'] != 'leaver' for c in coordinator.client_list()))
+            if while_asleep is not None:
+                while_asleep()
         finally:
             sleeper.join()
 
-        wait_for_true(
-            lambda: debug_metrics(coordinator, 'fanout')['fanout_reply_disconnected_total'] == 1)
+    def test_a_client_that_disconnects_ends_its_fanout(self):
+        """A client that hangs up while its fan-out waits on a sleeping peer ends the fan-out
+        at once: the peer is sent a cancel and nothing waits for its answer."""
+        self.populate()
+        self.reset_all()
+        coordinator, peer = self.primaries()[:2]
+
+        def ended_before_the_peer_answers():
+            stats = debug_metrics(coordinator, 'fanout')
+            assert stats['fanout_client_disconnects_total'] == 1
+            assert stats['fanout_cancels_sent_total'] == 1
+            assert stats['fanout_early_completions_total'] == 1
+            assert stats['fanout_inflight'] == 0
+            assert coordinator.execute_command('TS._DEBUG', 'INFLIGHT') == []
+
+        self.hang_up_while_a_peer_sleeps(
+            'TS.MRANGE', '-', '+', 'FILTER', 'env=prod', while_asleep=ended_before_the_peer_answers)
+
+        # Once awake, the peer reads the request, then the cancel behind it.
+        def share_ended():
+            peer_stats = debug_metrics(peer, 'fanout')
+            return peer_stats['fanout_cancels_received_total'] == 1 and (
+                peer_stats['fanout_served_ok_total']
+                + peer_stats['fanout_dropped_expired_total']
+                + peer_stats['fanout_abandoned_expired_total']
+                + peer_stats['fanout_answers_discarded_total']) == 1
+        wait_for_true(share_ended)
         stats = debug_metrics(coordinator, 'fanout')
-        assert stats['fanout_reply_expired_total'] == 0
+        assert stats['fanout_reply_disconnected_total'] == 0
         assert stats['fanout_client_timeouts_total'] == 0
-        wait_for_true(lambda: debug_metrics(coordinator, 'fanout')['fanout_inflight'] == 0)
+        assert stats['fanout_aborts_total'] == 0
         # The coordinator still answers the next client.
         reply = coordinator.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
         assert len(reply) == 3 * self.CLUSTER_SIZE
+
+    def test_a_write_whose_client_disconnects_runs_to_the_end(self):
+        """TS.MDEL is not ended by its client hanging up: the sleeping peer still deletes."""
+        self.populate()
+        self.reset_all()
+        coordinator, peer = self.primaries()[:2]
+
+        def still_waiting_on_the_peer():
+            assert debug_metrics(coordinator, 'fanout')['fanout_inflight'] == 1
+
+        self.hang_up_while_a_peer_sleeps(
+            'TS.MDEL', 'FILTER', 'env=prod', while_asleep=still_waiting_on_the_peer)
+
+        wait_for_true(lambda: debug_metrics(coordinator, 'fanout')['fanout_inflight'] == 0)
+        wait_for_true(lambda: debug_metrics(peer, 'fanout')['fanout_served_ok_total'] == 1)
+        stats = debug_metrics(coordinator, 'fanout')
+        assert stats['fanout_client_disconnects_total'] == 0
+        assert stats['fanout_cancels_sent_total'] == 0
+        assert coordinator.execute_command('TS.QUERYINDEX', 'env=prod') == []
 
     def test_inflight_lists_a_request_waiting_on_a_peer(self):
         self.populate()

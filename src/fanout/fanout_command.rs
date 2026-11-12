@@ -74,7 +74,7 @@ pub trait FanoutCommand: Default + Send + 'static {
         started: Instant,
         timeout: Duration,
         f: F,
-    ) -> FanoutResult
+    ) -> FanoutResult<Option<FanoutCancel>>
     where
         F: FnOnce(Self, FanoutCommandResult) + Send + 'static,
     {
@@ -121,6 +121,9 @@ fn describe_target(target: &NodeInfo) -> String {
 /// and any cluster-map refresh it triggers, building and serializing the
 /// request, the remote shares (whose RPC timer gets what is left) and the
 /// local share. `fanout_duration_seconds` is measured from `started` too.
+///
+/// Returns, for an operation that may be abandoned ([`FanoutCommand::cancellable`]), the
+/// [`FanoutCancel`] that ends it once nobody is waiting for its result.
 pub fn exec_command<OP: FanoutCommand, F>(
     ctx: &Context,
     command: OP,
@@ -128,7 +131,7 @@ pub fn exec_command<OP: FanoutCommand, F>(
     started: Instant,
     timeout: Duration,
     f: F,
-) -> FanoutResult
+) -> FanoutResult<Option<FanoutCancel>>
 where
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
@@ -162,13 +165,14 @@ where
     {
         metrics::FANOUT_LOCAL_ONLY.incr();
         let state = Arc::new(FanoutState::new(op, outstanding, f, started));
-        return spawn_local_request(state, req, local, fanout_user, db, deadline, None).map_err(
-            |_| {
+        let cancel = FanoutCancel::new(&state, None);
+        return spawn_local_request(state, req, local, fanout_user, db, deadline, None)
+            .map(|()| cancel)
+            .map_err(|_| {
                 metrics::FANOUT_LOCAL_SHARE_BUSY.incr();
                 metrics::FANOUT_DURATION.observe_duration(started.elapsed());
                 FanoutError::busy()
-            },
-        );
+            });
     }
 
     let state = Arc::new(FanoutState::new(op, outstanding, f, started));
@@ -243,7 +247,50 @@ where
         }
     }
 
-    Ok(())
+    Ok(FanoutCancel::new(&state, Some(request_id)))
+}
+
+/// What the result is completed with when its client has gone; nobody reads it.
+const CLIENT_GONE: &str = "the client disconnected";
+
+/// Ends a fan-out whose result nobody is waiting for any more (its client disconnected):
+/// the local share stops at its next batch, the remote shares are sent cancels, and the
+/// operation completes with an error that is never sent.
+///
+/// Only for an operation that may be abandoned ([`FanoutCommand::cancellable`]): a write
+/// runs to the end on every shard, as it does when it times out.
+pub struct FanoutCancel(Box<dyn FnOnce(&Context) + Send>);
+
+impl FanoutCancel {
+    fn new<OP, F>(state: &Arc<FanoutState<OP, F>>, rpc_id: Option<u64>) -> Option<Self>
+    where
+        OP: FanoutCommand + 'static,
+        F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
+    {
+        if !OP::cancellable() {
+            return None;
+        }
+        // Weak: whoever holds this (the blocked client's disconnect hook) is itself held by
+        // the completion callback, which the state owns until the fan-out completes.
+        let state = Arc::downgrade(state);
+        Some(Self(Box::new(move |ctx: &Context| {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            if state.client_gone()
+                && let Some(id) = rpc_id
+            {
+                abandon_inflight_request(ctx, id);
+            }
+        })))
+    }
+
+    /// The hook to run when the client disconnects: on the main thread, under the GIL (it may
+    /// tell the RPC layer to abandon the remote shares). A fan-out that has already completed
+    /// is left alone.
+    pub(crate) fn into_hook(self) -> Box<dyn FnOnce(&Context) + Send> {
+        self.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,6 +322,8 @@ where
     /// mismatch) and this exact error is returned to the client, bypassing the
     /// per-shard error aggregation.
     abort_error: Option<FanoutError>,
+    /// The client stopped waiting ([`FanoutCancel`]): nobody reads the result.
+    client_gone: bool,
     callback: Option<F>,
     /// The completion callback with its arguments, set by [`Self::on_completion`] and
     /// run by [`FanoutState`] once the state lock is released (see
@@ -390,6 +439,20 @@ where
         }
     }
 
+    /// Completes the fan-out for a client that has gone. True when it was still running, so
+    /// any remote shares are still outstanding.
+    fn client_gone(&mut self) -> bool {
+        if self.lifecycle == FanoutLifecycleState::Completed {
+            return false;
+        }
+        metrics::FANOUT_CLIENT_DISCONNECTS.incr();
+        self.activate();
+        self.client_gone = true;
+        self.outstanding = 0;
+        self.on_completion();
+        true
+    }
+
     fn on_completion(&mut self) {
         if self.lifecycle == FanoutLifecycleState::Completed {
             return;
@@ -403,7 +466,9 @@ where
         };
 
         metrics::FANOUT_DURATION.observe_duration(self.started.elapsed());
-        let result = if let Some(err) = self.abort_error.take() {
+        let result = if self.client_gone {
+            Err(FanoutError::custom(CLIENT_GONE))
+        } else if let Some(err) = self.abort_error.take() {
             metrics::FANOUT_ABORTS.incr();
             Err(err)
         } else if self.timed_out {
@@ -495,6 +560,7 @@ where
                 timed_out: false,
                 first_error: None,
                 abort_error: None,
+                client_gone: false,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 callback: Some(f),
                 ready: None,
@@ -534,6 +600,11 @@ where
 
     fn on_response(&self, resp: OP::Response, target: &NodeInfo) {
         self.with_inner(|inner| inner.on_response(resp, target));
+    }
+
+    /// See [`FanoutStateInner::client_gone`].
+    fn client_gone(&self) -> bool {
+        self.with_inner(FanoutStateInner::client_gone)
     }
 
     /// Deliver the local share's error. True when it completed the fanout while
@@ -843,6 +914,110 @@ mod tests {
         let err = rx.try_recv().unwrap().1.unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidDb);
         assert_eq!(err.to_string(), ErrorKind::InvalidDb.as_str());
+    }
+
+    /// Like [`Sum`], but a write: it runs to the end on every shard.
+    #[derive(Default)]
+    struct SumWrite(Sum);
+
+    impl FanoutCommand for SumWrite {
+        type Request = Count;
+        type Response = Count;
+
+        fn name() -> &'static str {
+            "sum_write"
+        }
+
+        fn get_local_response(ctx: &FanoutContext, req: Count) -> ValkeyResult<Count> {
+            Sum::get_local_response(ctx, req)
+        }
+
+        fn cancellable() -> bool {
+            false
+        }
+
+        fn generate_request(&self) -> Count {
+            self.0.generate_request()
+        }
+
+        fn on_response(&mut self, resp: Count, target: &NodeInfo) -> FanoutCommandResult {
+            self.0.on_response(resp, target)
+        }
+    }
+
+    /// Runs a cancel built with no RPC id, which never touches the context it is given.
+    fn run_cancel(cancel: FanoutCancel) {
+        cancel.into_hook()(&Context::new(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_client_gone_completes_and_ignores_later_answers() {
+        let (state, rx) = fanout(3);
+        let state = Arc::new(state);
+        state.on_response(answer(1), &node(1));
+        let cancel = FanoutCancel::new(&state, None).expect("a read can be cancelled");
+        let flag = state.cancel_flag();
+
+        run_cancel(cancel);
+        let (total, result) = rx.try_recv().unwrap();
+        assert_eq!(total, 1, "the operation is handed back with what it had");
+        assert!(result.unwrap_err().to_string().contains(CLIENT_GONE));
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "the local share is told to stop"
+        );
+
+        // Later answers neither complete again nor touch the placeholder.
+        state.on_response(answer(5), &node(2));
+        state.on_error(FanoutError::timeout(), &node(3));
+        drop(state);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_client_gone_before_any_answer_still_completes() {
+        let (state, rx) = fanout(2);
+        let state = Arc::new(state);
+        run_cancel(FanoutCancel::new(&state, None).unwrap());
+        assert!(rx.try_recv().unwrap().1.is_err());
+    }
+
+    #[test]
+    fn test_client_gone_after_completion_does_nothing() {
+        let (state, rx) = fanout(1);
+        let state = Arc::new(state);
+        let cancel = FanoutCancel::new(&state, None).unwrap();
+        state.on_response(answer(2), &node(1));
+        assert!(rx.try_recv().unwrap().1.is_ok());
+        assert!(!state.client_gone());
+        run_cancel(cancel);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// The cancel holds the state weakly: it neither keeps a finished fan-out alive nor
+    /// fails once the state is gone.
+    #[test]
+    fn test_client_gone_after_the_state_is_dropped_does_nothing() {
+        let (state, rx) = fanout(1);
+        let state = Arc::new(state);
+        let cancel = FanoutCancel::new(&state, None).unwrap();
+        drop(state);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        run_cancel(cancel);
+    }
+
+    #[test]
+    fn test_a_write_cannot_be_cancelled() {
+        let state = Arc::new(FanoutState::new(
+            SumWrite::default(),
+            2,
+            |_: SumWrite, _| {},
+            Instant::now(),
+        ));
+        assert!(FanoutCancel::new(&state, Some(1)).is_none());
     }
 
     #[test]

@@ -358,8 +358,9 @@ fn finish_inflight_request(ctx: &Context, request: &InFlightRequest) {
 /// unread. `timed_out` claims the request against a timer firing at the same moment, and makes
 /// a second call a no-op.
 ///
-/// Runs under the GIL, from a message callback or a local share, never from the timer's own
-/// callback, so stopping the timer here is safe (see [`InFlightRequest::cancel_timer`]).
+/// Runs under the GIL, from a message callback, a local share or a client's disconnect
+/// callback, never from the timer's own callback, so stopping the timer here is safe (see
+/// [`InFlightRequest::cancel_timer`]).
 fn abandon_remaining_shares(ctx: &Context, request: &InFlightRequest) {
     if request.timed_out.swap(true, Ordering::AcqRel) {
         return;
@@ -371,7 +372,7 @@ fn abandon_remaining_shares(ctx: &Context, request: &InFlightRequest) {
 }
 
 /// The fanout behind request `id` was completed by its local share (that share's error aborted
-/// it), so the remote shares are no longer wanted. Remote answers only reach the request through
+/// it) or by its client disconnecting, so the remote shares are no longer wanted. Remote answers only reach the request through
 /// [`InFlightRequest::handle_response`], so without this a stalled peer kept its share running
 /// until another answer or the timer arrived. A request that is already gone (every remote target
 /// answered, or the timer fired) is left alone.

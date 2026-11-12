@@ -41,6 +41,8 @@ pub static FANOUT_BLOCKING_DENIED: AtomicU64 = AtomicU64::new(0);
 pub static FANOUT_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Blocked clients answered with the timeout error.
 pub static FANOUT_CLIENT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+/// Operations ended early because their client disconnected while they ran.
+pub static FANOUT_CLIENT_DISCONNECTS: AtomicU64 = AtomicU64::new(0);
 /// RPCs whose timer fired with shares outstanding.
 pub static FANOUT_RPC_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 /// Cancel messages sent to shares still outstanding when an RPC's timer fired or the fanout
@@ -214,6 +216,11 @@ static COUNTERS: &[(&str, &AtomicU64, &str)] = &[
         "client_timeouts",
         &FANOUT_CLIENT_TIMEOUTS,
         "Blocked fanout clients answered with the timeout error",
+    ),
+    (
+        "client_disconnects",
+        &FANOUT_CLIENT_DISCONNECTS,
+        "Fanout operations ended early because their client disconnected while they ran",
     ),
     (
         "cancels_sent",
