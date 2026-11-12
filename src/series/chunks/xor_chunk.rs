@@ -237,6 +237,22 @@ impl<C: SampleCodec> XorChunk<C> {
     /// costs a decode plus an encode of the chunk, so `rdb_load_series` runs it only for a
     /// foreign payload. Call [`check_header`](Self::check_header) first; its count bound caps
     /// the loop at the payload size.
+    ///
+    /// # The encoder output is a format
+    ///
+    /// Byte equality means a stream is accepted only if the *current* encoder writes exactly
+    /// it. Any change to what an encoder writes, not only to the grammar a decoder reads, makes
+    /// every chunk written before the change fail `RESTORE`, `MIGRATE` and slot import, while
+    /// the same chunk still loads from an RDB, where this pass does not run. Golden streams pin
+    /// both encoders (`chimp/fixtures/`, `gorilla/fixtures/`), so such a change fails a test.
+    ///
+    /// Before the first release such a change can land in place, with regenerated fixtures.
+    /// After it, the change needs a new module encoding version, and this pass needs that
+    /// version: thread `enc_ver` from `rdb_load_series` into the call. A chunk written by an
+    /// older encoder then gets a decode-and-rebuild check instead of byte equality: it must
+    /// decode cleanly with the count it claims, have non-negative and strictly increasing
+    /// timestamps, and match its header's bounds and last sample. Its tail state is rebuilt from
+    /// the decode rather than compared, since the old encoder's choices no longer reproduce.
     pub(crate) fn verify_stream(&self) -> Result<(), String> {
         let mut rebuilt = C::with_soft_cap(self.max_size);
         let mut prev: Option<Timestamp> = None;

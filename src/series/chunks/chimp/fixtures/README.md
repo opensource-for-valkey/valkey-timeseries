@@ -21,4 +21,6 @@ The tests in `chimp_chunk_tests.rs` (`fixtures` module) re-encode the samples an
 compare the bytes, decode the bytes and compare every sample bit for bit, then
 append, serialize again and compare. A change to any of those outputs is a format
 change: it needs regenerated fixtures (`write_chimp_fixtures`, `#[ignore]`d) and,
-once the module has been released, a new module encoding version.
+once the module has been released, a new module encoding version. That is because a foreign
+load accepts a chunk only if the current encoder reproduces its stream exactly
+(`XorChunk::verify_stream`, whose doc says what the version bump must change there).
