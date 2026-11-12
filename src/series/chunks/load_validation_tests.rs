@@ -1,5 +1,5 @@
-//! Load-time validation of compressed chunks: `XorChunk::check_count`, `check_header` and
-//! `verify_stream`. Each forged case rewrites one header field the way a hostile payload can,
+//! Load-time validation of compressed chunks: `XorChunk::check_count`, `check_header`,
+//! `check_write_limits` and `verify_stream`. Each forged case rewrites one header field the way a hostile payload can,
 //! and must be rejected; every chunk the write path builds must be accepted.
 
 use crate::common::Sample;
@@ -21,13 +21,19 @@ fn chunk_of<C: SampleCodec>(samples: &[Sample]) -> XorChunk<C> {
     chunk
 }
 
+/// Everything a foreign load checks on a compressed chunk.
 fn accepted<C: SampleCodec>(chunk: &XorChunk<C>) -> bool {
-    chunk.check_header().is_ok() && chunk.verify_stream().is_ok()
+    chunk.check_header().is_ok()
+        && chunk.check_write_limits().is_ok()
+        && chunk.verify_stream().is_ok()
 }
 
 fn assert_accepted<C: SampleCodec>(chunk: &XorChunk<C>, what: &str) {
     if let Err(e) = chunk.check_header() {
         panic!("{} {what}: header rejected: {e}", C::ENCODING.name());
+    }
+    if let Err(e) = chunk.check_write_limits() {
+        panic!("{} {what}: write limits rejected: {e}", C::ENCODING.name());
     }
     if let Err(e) = chunk.verify_stream() {
         panic!("{} {what}: stream rejected: {e}", C::ENCODING.name());
@@ -126,9 +132,15 @@ fn forged_bounds_are_rejected<C: SampleCodec>(set_bounds: impl Fn(&mut C, i64, i
     set_bounds(&mut swapped.encoder, last, first, value);
     assert!(swapped.check_header().is_err(), "first > last");
 
+    // A write-path limit rather than a header rule: an encoder can write it, so only the
+    // series-level load decides what it costs (see `normalize_series`).
     let mut negative = honest.clone();
     set_bounds(&mut negative.encoder, -101, last, value);
-    assert!(negative.check_header().is_err(), "negative first timestamp");
+    assert!(negative.check_header().is_ok());
+    assert!(
+        negative.check_write_limits().is_err(),
+        "negative first timestamp"
+    );
 
     let mut fake_last = honest.clone();
     set_bounds(&mut fake_last.encoder, first, 99000, 12345.0);

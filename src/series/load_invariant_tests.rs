@@ -1,5 +1,6 @@
-//! The RDB loader's series checks (`check_series_invariants`, and the compressed chunks'
-//! `check_header` / `verify_stream`) must accept everything the write path can store: a load
+//! The RDB loader's series checks (`check_series_invariants`, the chunks' `check_write_limits`,
+//! and the compressed chunks' `check_header` / `verify_stream`) must accept everything the write
+//! path can store: a load
 //! error fails a whole RDB load, so a check tighter than the commands makes a server that saved
 //! fine unable to restart. Random command sequences pin that, and the forged cases pin what the
 //! checks are for.
@@ -34,6 +35,12 @@ fn assert_loadable(ts: &TimeSeries) {
     let mut total = 0usize;
     for (i, chunk) in ts.chunks.iter().enumerate() {
         total += chunk.len();
+        if let Err(e) = chunk.check_write_limits() {
+            panic!(
+                "chunk {i} of {} outside the write limits: {e}",
+                ts.chunks.len()
+            );
+        }
         let checked = match chunk {
             TimeSeriesChunk::Uncompressed(c) => {
                 assert!(
@@ -258,7 +265,9 @@ fn oversized_chunks_are_rejected() {
         gorilla.verify_stream().is_ok(),
         "the stream itself is honest"
     );
-    assert!(gorilla.check_header().is_err());
+    // The densest honest stream still fits the count bound: `MIN_SAMPLE_BITS` is not too high.
+    assert!(gorilla.check_header().is_ok());
+    assert!(gorilla.check_write_limits().is_err());
 
     let mut series = new_series(ChunkEncoding::Gorilla, MAX_CHUNK_SIZE);
     series.chunks.push(chunk);

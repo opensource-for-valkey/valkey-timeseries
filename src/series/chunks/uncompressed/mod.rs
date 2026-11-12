@@ -82,6 +82,25 @@ impl UncompressedChunk {
         }
     }
 
+    /// The compressed chunks' `check_write_limits`: at most `MAX_LOADED_CHUNK_BYTES` of samples
+    /// and a non-negative first timestamp. The loader already requires strictly increasing
+    /// timestamps, so the first one stands for all of them.
+    pub(crate) fn check_write_limits(&self) -> Result<(), String> {
+        let bytes = self.samples.len().saturating_mul(SAMPLE_SIZE);
+        if bytes > MAX_LOADED_CHUNK_BYTES {
+            return Err(format!(
+                "{} samples exceed the {MAX_LOADED_CHUNK_BYTES}-byte chunk limit",
+                self.samples.len()
+            ));
+        }
+        match self.samples.first() {
+            Some(first) if first.timestamp < 0 => {
+                Err(format!("negative first timestamp {}", first.timestamp))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn handle_insert(&mut self, sample: Sample, policy: DuplicatePolicy) -> TsdbResult<()> {
         let ts = sample.timestamp;
 
@@ -479,14 +498,9 @@ impl Chunk for UncompressedChunk {
         // check `is_full`, so nothing guarantees a saved chunk stayed within its capacity. The
         // generic guard rejects a corrupt count, and the allocation is capped up front — each
         // sample is a read that fails on a short payload.
+        // The chunk-size limit is a write-path rule, applied by `rdb_load_series` (see
+        // `check_write_limits`); the reads below are bounded by the payload regardless.
         let len = rdb_load_len(rdb, MAX_RDB_COLLECTION_LEN)?;
-        // The same per-chunk size limit as the compressed encodings, checked before the loop.
-        if len.saturating_mul(SAMPLE_SIZE) > MAX_LOADED_CHUNK_BYTES {
-            return Err(ValkeyError::String(format!(
-                "Invalid uncompressed chunk: {len} samples exceed the \
-                 {MAX_LOADED_CHUNK_BYTES}-byte chunk limit"
-            )));
-        }
         let mut samples = Vec::with_capacity(len.min(max_elements));
         for _ in 0..len {
             let ts = raw::load_signed(rdb)?;

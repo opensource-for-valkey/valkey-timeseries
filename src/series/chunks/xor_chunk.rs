@@ -177,18 +177,14 @@ impl<C: SampleCodec> XorChunk<C> {
         Ok(())
     }
 
-    /// [`check_count`](Self::check_count), plus the persisted first and last timestamps in the
-    /// domain the write path stores: non-negative and ordered. O(1); run on every RDB load.
-    /// Agreement with the stream itself is [`verify_stream`](Self::verify_stream).
+    /// [`check_count`](Self::check_count), plus persisted first and last timestamps that are
+    /// ordered. O(1); run on every load, trusted or not: no encoder can write a header that
+    /// fails it. What the write path keeps on top of that is
+    /// [`check_write_limits`](Self::check_write_limits); agreement with the stream itself is
+    /// [`verify_stream`](Self::verify_stream).
     ///
     /// Only for stored chunks: a fan-out chunk can carry samples a series never stores.
     pub(crate) fn check_header(&self) -> Result<(), String> {
-        let bytes = self.data_size();
-        if bytes > MAX_LOADED_CHUNK_BYTES {
-            return Err(format!(
-                "{bytes}-byte stream exceeds the {MAX_LOADED_CHUNK_BYTES}-byte chunk limit"
-            ));
-        }
         self.check_count()?;
         let len = self.len();
         if len == 0 {
@@ -196,13 +192,30 @@ impl<C: SampleCodec> XorChunk<C> {
         }
         let first = self.first_timestamp();
         let last = self.last_timestamp();
-        if first < 0 {
-            return Err(format!("negative first timestamp {first}"));
-        }
         if first > last || (len == 1 && first != last) {
             return Err(format!(
                 "timestamps {first}..{last} do not fit {len} samples"
             ));
+        }
+        Ok(())
+    }
+
+    /// What the write path keeps every stored chunk within: at most
+    /// [`MAX_LOADED_CHUNK_BYTES`] of stream, and a non-negative first timestamp. O(1).
+    ///
+    /// Unlike [`check_header`](Self::check_header), a writer bug can break these (a defrag
+    /// merge outgrew the size limit), so `rdb_load_series` applies them at the series level,
+    /// where a payload the server wrote itself is repaired rather than refused.
+    pub(crate) fn check_write_limits(&self) -> Result<(), String> {
+        let bytes = self.data_size();
+        if bytes > MAX_LOADED_CHUNK_BYTES {
+            return Err(format!(
+                "{bytes}-byte stream exceeds the {MAX_LOADED_CHUNK_BYTES}-byte chunk limit"
+            ));
+        }
+        let first = self.first_timestamp();
+        if !self.is_empty() && first < 0 {
+            return Err(format!("negative first timestamp {first}"));
         }
         Ok(())
     }
@@ -215,8 +228,9 @@ impl<C: SampleCodec> XorChunk<C> {
     /// The encoders are deterministic, so re-encoding is the one comparison that covers all of
     /// it, including tail state (Chimp's stored value, Gorilla's window) that only shapes the
     /// *next* append: a false `stored_val` made acknowledged appends read back as garbage. It
-    /// costs a decode plus an encode of the chunk, so `rdb_load_series` runs it only outside
-    /// RDB loading. Call [`check_header`](Self::check_header) first; it bounds the loop.
+    /// costs a decode plus an encode of the chunk, so `rdb_load_series` runs it only for a
+    /// foreign payload. Call [`check_header`](Self::check_header) first; its count bound caps
+    /// the loop at the payload size.
     pub(crate) fn verify_stream(&self) -> Result<(), String> {
         let mut rebuilt = C::with_soft_cap(self.max_size);
         let mut prev: Option<Timestamp> = None;

@@ -18,6 +18,31 @@ use valkey_module::{ValkeyError, ValkeyResult, raw};
 const MAX_PREALLOCATED_CHUNKS: usize = 1024;
 const MAX_PREALLOCATED_RULES: usize = 16;
 
+/// Where a series payload came from, which decides how much of it is checked and what a failed
+/// check does. Decided once per series, at the start of [`rdb_load_series`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoadTrust {
+    /// An RDB or AOF this server wrote, or a full sync from its primary: the write path made
+    /// it and a whole-file checksum covers it.
+    Own,
+    /// `RESTORE` (and so `MIGRATE`'s receiving end) and a slot import's `TS._RESTORE`. Any
+    /// client allowed to `RESTORE` can forge one: the DUMP footer is a checksum anyone can
+    /// recompute, not a validation step.
+    Foreign,
+}
+
+impl LoadTrust {
+    /// The trust of the payload being loaded now. A client command cannot reach the loader
+    /// while the server loads its own data, so the load window tells the two apart.
+    fn current() -> Self {
+        if is_loading_active() {
+            LoadTrust::Own
+        } else {
+            LoadTrust::Foreign
+        }
+    }
+}
+
 pub fn rdb_save_series(series: &TimeSeries, rdb: *mut raw::RedisModuleIO) {
     raw::save_unsigned(rdb, series.id);
     series.labels.to_rdb(rdb);
@@ -80,10 +105,9 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
     let chunks_len = rdb_load_len(rdb, MAX_RDB_COLLECTION_LEN)?;
     // A compressed chunk's header (count, bounds, last value, encoder tail state) is only
     // checked against its stream by decoding it, which costs a decode and an encode of every
-    // sample. That runs for `RESTORE` and a slot import's `TS._RESTORE`, which any client with
-    // `RESTORE` can reach with a forged DUMP footer, but not while the server loads an RDB or
-    // AOF it wrote itself: there the O(1) header checks in the chunk loaders stand alone.
-    let verify_streams = !is_loading_active();
+    // sample. That runs for a foreign payload, but not while the server loads an RDB or AOF it
+    // wrote itself: there the O(1) header checks in the chunk loaders stand alone.
+    let trust = LoadTrust::current();
     // Reserve from the declared counts only up to a cap: each element is a read that fails on a
     // short payload, but an uncapped reservation runs first, and a 165-byte payload declaring
     // 16M chunks asked for ~1.8 GB (an abort wherever the allocator refuses it).
@@ -99,13 +123,17 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
 
     for _ in 0..chunks_len {
         let chunk = TimeSeriesChunk::load_rdb(rdb, enc_ver)?;
-        if verify_streams {
-            chunk.verify_stream().map_err(|e| {
-                ValkeyError::String(format!(
-                    "Invalid {} chunk: {e}",
-                    chunk.get_encoding().name()
-                ))
-            })?;
+        if trust == LoadTrust::Foreign {
+            // The size limit first: it bounds what the decode below costs.
+            chunk
+                .check_write_limits()
+                .and_then(|_| chunk.verify_stream())
+                .map_err(|e| {
+                    ValkeyError::String(format!(
+                        "Invalid {} chunk: {e}",
+                        chunk.get_encoding().name()
+                    ))
+                })?;
         }
         total_samples = total_samples
             .checked_add(chunk.len())

@@ -211,6 +211,16 @@ impl TimeSeriesChunk {
             TimeSeriesChunk::Chimp(chunk) => chunk.verify_stream(),
         }
     }
+
+    /// The size limit and timestamp domain the write path keeps every stored chunk within; see
+    /// `XorChunk::check_write_limits`. O(1).
+    pub(crate) fn check_write_limits(&self) -> Result<(), String> {
+        match self {
+            TimeSeriesChunk::Uncompressed(chunk) => chunk.check_write_limits(),
+            TimeSeriesChunk::Gorilla(chunk) => chunk.check_write_limits(),
+            TimeSeriesChunk::Chimp(chunk) => chunk.check_write_limits(),
+        }
+    }
 }
 
 impl Default for TimeSeriesChunk {
