@@ -1,5 +1,6 @@
 import json
 import pytest
+from valkey import ResponseError
 
 from valkeytestframework.util.waiters import *
 from valkeytestframework.conftest import resource_port_tracker
@@ -84,6 +85,39 @@ class TestTimeSeriesIngest(ValkeyTimeSeriesTestCaseBase):
             self.client.execute_command("TS.ADDBULK", "series_addbulk_non_numeric", payload)
 
         assert "invalid value" in str(excinfo.value).lower() or "length mismatch" in str(excinfo.value).lower()
+
+    @pytest.mark.parametrize("encoding", ["COMPRESSED", "UNCOMPRESSED"])
+    def test_timestamps_past_i64_max_are_refused(self, encoding):
+        """A timestamp from 2^63 up was stored as a negative one: the batch was acknowledged,
+        reads skipped the sample, and the RDB loader then refused the series, so DUMP/RESTORE
+        failed and a reload stopped at that key. TS.ADD refuses the same values."""
+        client = self.client
+        key = f"bulk:i64:{encoding}"
+        client.execute_command("TS.CREATE", key, "ENCODING", encoding)
+        client.execute_command("TS.ADD", key, 1000, 1)
+        for ts in (2**63, 2**64 - 1):
+            for timestamps in ([ts], [2000, ts]):
+                payload = json.dumps({"timestamps": timestamps, "values": [2.0] * len(timestamps)})
+                with pytest.raises(ResponseError, match="^TSDB: invalid timestamp$"):
+                    client.execute_command("TS.ADDBULK", key, payload)
+            with pytest.raises(ResponseError, match="^TSDB: invalid timestamp$"):
+                client.execute_command("TS.ADD", key, ts, 2)
+        # Refused before anything was stored, and before an absent key would be created.
+        assert client.execute_command("TS.RANGE", key, "-", "+") == [[1000, b"1"]]
+        with pytest.raises(ResponseError, match="^TSDB: invalid timestamp$"):
+            client.execute_command("TS.ADDBULK", "bulk:i64:absent", json.dumps(
+                {"timestamps": [2**63], "values": [1.0]}))
+        assert client.exists("bulk:i64:absent") == 0
+
+        # The top of the domain is accepted, and the series still reloads.
+        payload = json.dumps({"timestamps": [2**63 - 1], "values": [3.0]})
+        assert client.execute_command("TS.ADDBULK", key, payload) == [1, 1]
+        expected = [[1000, b"1"], [2**63 - 1, b"3"]]
+        assert client.execute_command("TS.RANGE", key, "-", "+") == expected
+        assert client.restore(f"{key}:copy", 0, client.dump(key)) == b"OK"
+        assert client.execute_command("TS.RANGE", f"{key}:copy", "-", "+") == expected
+        client.execute_command("DEBUG", "RELOAD")
+        assert client.execute_command("TS.RANGE", key, "-", "+") == expected
 
     def test_runs_compactions_and_writes_destination_series(self):
         src = "series_addbulk_compact_src"
