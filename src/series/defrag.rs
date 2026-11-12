@@ -60,8 +60,10 @@ pub fn defrag_series(series: &mut TimeSeries) -> TsdbResult {
     // `MAX_LOADED_CHUNK_BYTES` from a foreign payload, and every writer keeping chunks within
     // 1.25x their budget is what keeps the server's own snapshots under it. Almost always a
     // scan that finds nothing. Defrag runs on the main thread holding the GIL, and waiting on
-    // the shared pool there is allowed (rule R2, `common::threads`).
-    series.split_chunks_if_needed()?;
+    // the shared pool there is allowed (rule R2, `common::threads`). A failed split is
+    // reported only after the recount below: the merges above have already changed the
+    // chunks, and the counts must describe them either way.
+    let split = series.split_chunks_if_needed();
 
     // Every survivor just absorbed samples from its successors, growing its bit stream by
     // doubling; and defrag is exactly the point at which the caller is asking for memory back.
@@ -82,7 +84,7 @@ pub fn defrag_series(series: &mut TimeSeries) -> TsdbResult {
     series.recalculate_total_samples();
     series.update_first_last_timestamps();
 
-    Ok(())
+    split
 }
 
 #[cfg(test)]

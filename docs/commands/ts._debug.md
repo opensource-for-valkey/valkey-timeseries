@@ -361,7 +361,7 @@ these counters with the server, so its saves are counted on the node that forked
 | `rdb_saves_total` | counter | Saves with an aux field to write, failed ones included |
 | `rdb_save_failures_total` | counter | Saves that left the aux field out because the index was locked at fork time, or whose write failed |
 | `rdb_load_repairs_total` | counter | Rules a loaded series broke and was repaired for, one per rule per series: empty chunks dropped, an oversized chunk split, a chunk budget, `CHUNK_SIZE` or retention clamped, a stray chunk encoding re-encoded or the series' encoding taken from its chunks |
-| `rdb_load_tolerated_total` | counter | Rules a series loaded from the server's own RDB, AOF or full sync still breaks, one per rule per series: negative timestamps, chunks out of order. `RESTORE` and slot imports refuse these instead |
+| `rdb_load_tolerated_total` | counter | Rules a series loaded from the server's own RDB, AOF or full sync still breaks, one per rule per series: negative timestamps, chunks out of order, a chunk of another encoding kept because its stream does not decode fully. `RESTORE` and slot imports refuse these instead |
 
 The two series counters move per series, on any load including `RESTORE`; a rate-limited warning
 names the key and the rules. On the server's own data a repair means some writer stored state it

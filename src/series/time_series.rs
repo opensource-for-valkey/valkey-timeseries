@@ -499,14 +499,17 @@ impl TimeSeries {
     /// chunk — halving it later would re-encode every sample it holds only to leave two
     /// half-empty chunks, once per chunk-full of appends. Only a chunk that a merge has grown
     /// past `max_size + max_size / SPLIT_SLACK_DIVISOR` is split; bulk ingest plans its
-    /// overfill below that line (see `bulk_add`).
+    /// overfill below that line (see `bulk_add`). Bytes alone decide: an uncompressed chunk's
+    /// `is_full` counts samples against a capacity the RDB loader raises to the loaded count,
+    /// so testing it left the halves of an oversized loaded chunk unsplit and still over
+    /// `MAX_LOADED_CHUNK_BYTES`.
     ///
     /// This is the merge-path split rule; the upsert path uses `TimeSeriesChunk::should_split`.
     /// See the `# Capacity` section on [`ChunkOps`](crate::series::chunks::ChunkOps).
     pub(crate) fn needs_split(chunk: &TimeSeriesChunk) -> bool {
         let max = chunk.max_size();
         // A single sample cannot be split, however small the budget.
-        chunk.len() > 1 && chunk.is_full() && chunk.size() > max + max / SPLIT_SLACK_DIVISOR
+        chunk.len() > 1 && chunk.size() > max + max / SPLIT_SLACK_DIVISOR
     }
 
     /// Splits until no chunk [`needs_split`](Self::needs_split). One merge can grow a chunk to

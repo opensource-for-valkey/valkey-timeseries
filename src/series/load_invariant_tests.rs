@@ -13,7 +13,7 @@ use crate::series::chunks::{
 use crate::series::serialization::{
     BUDGET_CLAMPED, CHUNK_SIZE_CLAMPED, CHUNKS_OUT_OF_ORDER, ENCODING_ADOPTED, LoadTrust,
     NEGATIVE_TIMESTAMPS, OVERSIZED_SPLIT, RETENTION_CLAMPED, STRAYS_REENCODED,
-    check_series_invariants, drop_empty_chunks, normalize_series,
+    UNDECODABLE_STRAYS_KEPT, check_series_invariants, drop_empty_chunks, normalize_series,
 };
 use crate::series::{
     DuplicatePolicy, SPLIT_SLACK_DIVISOR, TimeSeries, bulk_insert_samples, defrag_series,
@@ -420,6 +420,11 @@ fn oversized_chunk(encoding: ChunkEncoding, after: i64) -> TimeSeriesChunk {
         .collect();
     let mut chunk = TimeSeriesChunk::new(encoding, MAX_CHUNK_SIZE);
     chunk.set_data(&samples).unwrap();
+    // As `UncompressedChunk::load_rdb` leaves it: an overfull chunk loads with its capacity
+    // raised to its sample count, so it reads as exactly full.
+    if let TimeSeriesChunk::Uncompressed(c) = &mut chunk {
+        c.max_elements = c.max_elements.max(samples.len());
+    }
     assert!(
         chunk.size() > MAX_LOADED_CHUNK_BYTES,
         "{encoding}: only {} bytes",
@@ -620,6 +625,58 @@ fn empty_chunks_are_dropped_on_load() {
         assert!(drop_empty_chunks(&mut several));
         assert!(several.chunks.is_empty());
         assert_loadable(&several);
+    }
+}
+
+/// A stray chunk's iterator ends at a decode error, so re-encoding what it yields would
+/// store only the readable prefix. An own load keeps such a stray as it is, and tolerates it;
+/// a decodable stray beside it is still re-encoded.
+#[test]
+fn an_undecodable_stray_is_kept_not_truncated() {
+    // A stream that claims more samples than it holds.
+    fn damage(chunk: &mut TimeSeriesChunk) {
+        match chunk {
+            TimeSeriesChunk::Gorilla(c) => {
+                let half = c.encoder.bytes().len() / 2;
+                c.encoder.truncate_stream_for_test(half);
+            }
+            TimeSeriesChunk::Chimp(c) => *c.encoder.header_mut_for_test().0 *= 2,
+            TimeSeriesChunk::Uncompressed(_) => unreachable!("no stream to damage"),
+        }
+    }
+    for encoding in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
+        let mut ts = loaded_base(ChunkEncoding::Uncompressed);
+        let mut t = ts.chunks.last().unwrap().last_timestamp();
+        let mut stray = |n: i64| {
+            let mut chunk = TimeSeriesChunk::new(encoding, 4096);
+            for _ in 0..n {
+                t += 1000;
+                chunk.add_sample(&Sample::new(t, t as f64 * 0.37)).unwrap();
+            }
+            chunk
+        };
+        let good = stray(20);
+        let mut bad = stray(100);
+        damage(&mut bad);
+        assert!(bad.iter().count() < bad.len(), "{encoding}: still decodes");
+        ts.chunks.push(good);
+        ts.chunks.push(bad.clone());
+        ts.recalculate_total_samples();
+        ts.update_first_last_timestamps();
+        let total = ts.total_samples;
+
+        assert!(normalize_series(&mut ts.clone(), LoadTrust::Foreign).is_err());
+        let repairs = normalize_series(&mut ts, LoadTrust::Own).unwrap();
+        assert_eq!(repairs.repaired, [STRAYS_REENCODED], "{encoding}");
+        assert_eq!(repairs.tolerated, [UNDECODABLE_STRAYS_KEPT], "{encoding}");
+        let n = ts.chunks.len();
+        assert_eq!(
+            ts.chunks[n - 2].get_encoding(),
+            ChunkEncoding::Uncompressed,
+            "{encoding}: the decodable stray"
+        );
+        assert_eq!(ts.chunks[n - 1], bad, "{encoding}: the damaged stray");
+        assert_eq!(ts.total_samples, total, "{encoding}: samples dropped");
     }
 }
 

@@ -81,7 +81,11 @@ class TestRdbLoadRepair(ValkeyTimeSeriesTestCaseBase):
     @pytest.mark.parametrize("encoding", ["UNCOMPRESSED", "CHIMP"])
     def test_negative_timestamp_is_loaded_as_it_is(self, encoding):
         """The state an unchecked TS.ADDBULK timestamp left: refusing it made the server refuse
-        its own RDB. Reads never see a negative sample, as before these checks existed."""
+        its own RDB. Reads never see a negative sample, as before these checks existed.
+
+        The Chimp case forges only the header's first timestamp; its stream still starts at
+        1000, since Python has no Chimp encoder. A negative sample inside a compressed stream
+        is covered by the trust table in `load_invariant_tests`."""
         payload = self.dump("neg", encoding)
         s = Series(payload)
         first_ts = s.chunks[0][0] + (5 if encoding == "UNCOMPRESSED" else
@@ -91,9 +95,10 @@ class TestRdbLoadRepair(ValkeyTimeSeriesTestCaseBase):
         repairs, tolerated = self.counters()
         self.reload_with("neg", edited)
         assert self.counters() == (repairs, tolerated + 1)
-        if encoding == "UNCOMPRESSED":
-            assert self.client.execute_command("TS.RANGE", "neg", "-", "+") == \
-                [[i * 1000, str(i * 1.5).encode().replace(b".0", b"")] for i in range(2, 21)]
+        # The uncompressed edit replaced the first sample; the Chimp one left the stream whole.
+        first = 2 if encoding == "UNCOMPRESSED" else 1
+        assert self.client.execute_command("TS.RANGE", "neg", "-", "+") == \
+            [[i * 1000, str(i * 1.5).encode().replace(b".0", b"")] for i in range(first, 21)]
         assert self.client.execute_command("TS.GET", "neg") == [20000, b"30"]
         self.assert_restore_refuses("neg")
 
@@ -125,6 +130,36 @@ class TestRdbLoadRepair(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command("DEBUG", "RELOAD")
         assert self.counters() == (repairs + 1, tolerated)
         assert self.client.restore("big:copy", 0, self.client.dump("big")) == b"OK"
+
+    def test_oversized_uncompressed_chunk_is_split(self):
+        """An uncompressed chunk loads with its capacity raised to its sample count. Its split
+        must still go by bytes: a chunk over twice the load limit used to stop at two halves
+        each still over it, and the halves kept the raised capacity, so appends could grow the
+        last one past its budget again."""
+        s = Series(self.dump("wide", "UNCOMPRESSED"))
+        span = s.span(0)
+        head = [list(x) for x in span[:5]]  # type, flag, max_size, max_elements, len
+        ts_op, value_op = span[5][0], span[6][0]
+        count = 2 * MAX_LOADED_CHUNK_BYTES // 16 + 1024
+        head[4][1] = count
+        samples = [[op, v] for i in range(1, count + 1)
+                   for op, v in ((ts_op, i), (value_op, float(i % 7)))]
+        edited = s.with_chunks([head + samples])
+
+        repairs, tolerated = self.counters()
+        self.reload_with("wide", edited)
+        assert self.counters() == (repairs + 1, tolerated)
+        assert self.ts_info("wide")["totalSamples"] == count
+        assert max(self.chunk_sizes("wide")) <= 4096 + 4096 // 4
+
+        # More than a chunk's worth of appends after the last sample stays within the budget.
+        for i in range(1, 600):
+            self.client.execute_command("TS.ADD", "wide", count + i, 1)
+        assert max(self.chunk_sizes("wide")) <= 4096 + 4096 // 4
+
+        self.client.execute_command("DEBUG", "RELOAD")
+        assert self.counters() == (repairs + 1, tolerated)
+        assert self.client.restore("wide:copy", 0, self.client.dump("wide")) == b"OK"
 
     def test_chunk_of_another_encoding_is_re_encoded(self):
         """A Chimp series whose last chunk is uncompressed: the layout a forged count turned into

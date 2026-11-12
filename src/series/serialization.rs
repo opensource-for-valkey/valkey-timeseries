@@ -284,6 +284,7 @@ pub(crate) const CHUNK_SIZE_CLAMPED: &str = "chunk size clamped";
 pub(crate) const RETENTION_CLAMPED: &str = "retention clamped";
 pub(crate) const NEGATIVE_TIMESTAMPS: &str = "negative timestamps";
 pub(crate) const CHUNKS_OUT_OF_ORDER: &str = "chunks out of order";
+pub(crate) const UNDECODABLE_STRAYS_KEPT: &str = "undecodable chunks of another encoding kept";
 
 /// Brings an assembled series within what the write path maintains, or refuses it.
 ///
@@ -299,7 +300,7 @@ pub(crate) const CHUNKS_OUT_OF_ORDER: &str = "chunks out of order";
 /// | A chunk budget over `MAX_CHUNK_SIZE` | refused | clamped |
 /// | Empty chunks beside others | dropped | dropped |
 /// | The series' encoding differs from its chunks', which agree | adopted | adopted |
-/// | Chunks of more than one encoding | refused | strays re-encoded to the series' |
+/// | Chunks of more than one encoding | refused | strays re-encoded to the series'; one that does not decode fully is kept as it is |
 /// | Chunk data over `MAX_LOADED_CHUNK_BYTES` | refused | split, as the merge path splits |
 /// | `chunk_size_bytes` outside `validate_chunk_size` | refused | clamped into range |
 /// | Retention past `i64::MAX` ms | refused | clamped to `i64::MAX` ms |
@@ -352,8 +353,13 @@ pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<
                 "chunks of more than one encoding in a {} series",
                 ts.chunk_encoding
             ))?;
-            reencode_strays(ts)?;
-            repairs.repair(STRAYS_REENCODED);
+            let (reencoded, kept) = reencode_strays(ts)?;
+            if reencoded > 0 {
+                repairs.repair(STRAYS_REENCODED);
+            }
+            if kept > 0 {
+                repairs.tolerate(UNDECODABLE_STRAYS_KEPT);
+            }
         }
     }
 
@@ -428,21 +434,34 @@ pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<
 }
 
 /// Re-encodes every chunk whose encoding is not the series' own, keeping its budget.
-fn reencode_strays(ts: &mut TimeSeries) -> Result<(), String> {
+/// Re-encodes every chunk not in the series' encoding, returning how many were re-encoded and
+/// how many were kept as they are.
+///
+/// A stray whose stream stops decoding before its count is kept: `iter` ends at a decode
+/// error, so re-encoding what it yields would store the readable prefix and lose the rest for
+/// good. Kept, it reads as any own-load chunk with a damaged stream does (the decode error is
+/// counted), and its bytes survive for recovery.
+fn reencode_strays(ts: &mut TimeSeries) -> Result<(usize, usize), String> {
     let encoding = ts.chunk_encoding;
+    let (mut reencoded, mut kept) = (0, 0);
     for (i, chunk) in ts.chunks.iter_mut().enumerate() {
         if chunk.get_encoding() == encoding {
             continue;
         }
         let samples: Vec<Sample> = chunk.iter().collect();
+        if samples.len() != chunk.len() {
+            kept += 1;
+            continue;
+        }
         let mut rebuilt = TimeSeriesChunk::new(encoding, chunk.max_size());
         rebuilt
             .set_data(&samples)
             .map_err(|e| format!("cannot re-encode chunk {i} as {encoding}: {e}"))?;
         seal_chunk(&mut rebuilt);
         *chunk = rebuilt;
+        reencoded += 1;
     }
-    Ok(())
+    Ok((reencoded, kept))
 }
 
 /// Whether a series is in the form a foreign load accepts unchanged: what the write path

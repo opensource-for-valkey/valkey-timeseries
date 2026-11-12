@@ -466,6 +466,9 @@ impl Chunk for UncompressedChunk {
         let samples = std::mem::take(&mut self.samples);
         let (left, right) = samples.split_at(half);
         self.samples = left.to_vec();
+        // Back to the budget's capacity: a loaded overfull chunk carries its sample count
+        // here, and halves keeping it would take appends up to that count again.
+        self.max_elements = self.max_size / SAMPLE_SIZE;
 
         Ok(Self {
             max_size: self.max_size,

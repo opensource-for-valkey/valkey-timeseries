@@ -47,8 +47,10 @@ pub fn ts_alter_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         //
         // `ENCODING` (and the bare `COMPRESSED` / `UNCOMPRESSED` keywords) are parsed and
         // validated as on `TS.CREATE`, then ignored, as RTS does: a series keeps the encoding
-        // it was created with. `update_series` never reads `chunk_encoding`, and the RDB
-        // loader rejects a series whose chunks disagree with it.
+        // it was created with. `update_series` never reads `chunk_encoding`. Were it changed,
+        // the chunks would no longer match it: the RDB loader would take the encoding back
+        // from them on reload, and a series holding both would be refused by `RESTORE`
+        // (`normalize_series`).
         let options = parse_series_options_onto(
             TimeSeriesOptions::empty(),
             args,
