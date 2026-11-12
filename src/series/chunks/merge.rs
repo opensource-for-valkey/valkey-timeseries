@@ -88,9 +88,18 @@ pub(crate) fn merge_by_capacity(
         return Ok(None);
     }
 
-    // check if the previous block has capacity, and if so, merge into it
+    // Room in `dest`, in samples of `src`. `estimate_remaining_sample_capacity` divides the
+    // free bytes by `dest`'s own bytes per sample, which overstates the room for a sparser
+    // source by the ratio of their densities: a dense constant chunk (about a byte a sample)
+    // took a chunk of 17-byte samples whole and outgrew its budget, at 1 MiB budgets past the
+    // RDB loader's chunk-size limit. Merged sizes are close to additive, so `src`'s own
+    // density bounds what fits. `defrag_series` splits whatever still overshoots.
     let count = src.len();
-    let remaining_capacity = dest.estimate_remaining_sample_capacity();
+    let room = dest.max_size().saturating_sub(dest.size());
+    let src_bytes_per_sample = src.size().div_ceil(count).max(1);
+    let remaining_capacity = dest
+        .estimate_remaining_sample_capacity()
+        .min(room / src_bytes_per_sample);
     let first_ts = src.first_timestamp().max(min_timestamp);
     // if there is enough capacity in the previous block, merge the last block into it
     if remaining_capacity >= count {

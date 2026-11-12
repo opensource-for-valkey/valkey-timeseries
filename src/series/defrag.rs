@@ -55,6 +55,14 @@ pub fn defrag_series(series: &mut TimeSeries) -> TsdbResult {
         series.chunks.shrink_to_fit();
     }
 
+    // `merge_by_capacity` budgets each merge from estimates, so a merged chunk can still end
+    // past its budget. Split it as the merge path does: the RDB loader refuses a chunk past
+    // `MAX_LOADED_CHUNK_BYTES` from a foreign payload, and every writer keeping chunks within
+    // 1.25x their budget is what keeps the server's own snapshots under it. Almost always a
+    // scan that finds nothing. Defrag runs on the main thread holding the GIL, and waiting on
+    // the shared pool there is allowed (rule R2, `common::threads`).
+    series.split_chunks_if_needed()?;
+
     // Every survivor just absorbed samples from its successors, growing its bit stream by
     // doubling; and defrag is exactly the point at which the caller is asking for memory back.
     // The last chunk is still the append target, so it is left alone to avoid a regrow on the
@@ -187,6 +195,69 @@ mod tests {
         defrag_series(&mut series).unwrap();
         assert_eq!(series.chunks.len(), 1);
         assert_eq!(series.total_samples, 3);
+    }
+
+    /// A dense chunk's room was estimated at its own bytes per sample, so it took a sparse
+    /// chunk whole at many times the bytes it had left. The merged chunk outgrew its budget,
+    /// and at 1 MiB budgets the RDB loader's chunk-size limit: the server could not reload
+    /// what it had saved. Defrag must keep every chunk within the merge path's split threshold.
+    #[test]
+    fn test_defrag_keeps_chunks_within_their_budget() {
+        use crate::series::DuplicatePolicy;
+        use crate::series::SPLIT_SLACK_DIVISOR;
+        use crate::series::chunks::ChunkEncoding;
+        use crate::series::serialization::check_series_invariants;
+
+        const BUDGET: usize = 4096;
+        for encoding in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
+            let mut series = TimeSeries::new();
+            series.chunk_encoding = encoding;
+            series.chunk_size_bytes = BUDGET;
+            series.retention = Duration::ZERO;
+
+            // A constant value at step 1 until the first chunk is full: a few bits a sample.
+            let mut timestamp = 0;
+            while series.chunks.len() < 2 {
+                series.add(timestamp, 1.0, None);
+                timestamp += 1;
+            }
+            let dense_end = series.chunks[0].last_timestamp();
+
+            // Then expensive samples: timestamp deltas alternating 2^42 and 1, random values.
+            let mut seed = 42u64;
+            let sparse: Vec<Sample> = (0..600)
+                .map(|i| {
+                    timestamp += if i % 2 == 0 { 1 << 42 } else { 1 };
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    Sample {
+                        timestamp,
+                        value: f64::from_bits(seed >> 2),
+                    }
+                })
+                .collect();
+            series
+                .merge_samples(&sparse, Some(DuplicatePolicy::KeepLast))
+                .unwrap();
+
+            // Room in the dense chunk, at the same density.
+            series.remove_range(0, dense_end * 9 / 10).unwrap();
+            let before = all_samples(&series);
+
+            defrag_series(&mut series).unwrap();
+
+            assert_eq!(all_samples(&series), before, "{encoding}: samples changed");
+            for (i, chunk) in series.chunks.iter().enumerate() {
+                let max = chunk.max_size();
+                assert!(
+                    chunk.size() <= max + max / SPLIT_SLACK_DIVISOR,
+                    "{encoding}: chunk {i} holds {} bytes on a {max}-byte budget",
+                    chunk.size()
+                );
+            }
+            if let Err(e) = check_series_invariants(&series) {
+                panic!("{encoding}: {e}");
+            }
+        }
     }
 
     /// A `max_size`-byte chunk holding up to `count` samples from `start` (fewer if it fills).
