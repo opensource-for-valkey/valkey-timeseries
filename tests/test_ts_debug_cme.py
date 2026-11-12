@@ -652,7 +652,7 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
                 + peer_stats['fanout_answers_discarded_total']) == 1
         wait_for_true(share_ended)
         stats = debug_metrics(coordinator, 'fanout')
-        assert stats['fanout_reply_disconnected_total'] == 0
+        assert stats['fanout_reply_disconnected_total'] == 1
         assert stats['fanout_client_timeouts_total'] == 0
         assert stats['fanout_aborts_total'] == 0
         # The coordinator still answers the next client.
@@ -673,6 +673,9 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
         wait_for_true(lambda: debug_metrics(coordinator, 'fanout')['fanout_inflight'] == 0)
         wait_for_true(lambda: debug_metrics(peer, 'fanout')['fanout_served_ok_total'] == 1)
+        # Its reply is not built, though.
+        wait_for_true(
+            lambda: debug_metrics(coordinator, 'fanout')['fanout_reply_disconnected_total'] == 1)
         stats = debug_metrics(coordinator, 'fanout')
         assert stats['fanout_client_disconnects_total'] == 0
         assert stats['fanout_cancels_sent_total'] == 0
