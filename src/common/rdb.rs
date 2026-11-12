@@ -98,6 +98,9 @@ pub fn rdb_load_usize(rdb: *mut RedisModuleIO) -> ValkeyResult<usize> {
 
 /// Narrows a loaded integer to the type it was saved from, failing the load on a value that
 /// type cannot hold. An `as` cast would wrap instead: a chunk type of 258 loaded as Gorilla.
+///
+/// For `usize` this depends on the build: a value a 64-bit node saved past `u32::MAX` (a
+/// chunk budget, a count) fails to load on a 32-bit build rather than wrapping there.
 fn narrow<T: TryFrom<V>, V: Copy + std::fmt::Display>(value: V, ty: &str) -> ValkeyResult<T> {
     T::try_from(value)
         .map_err(|_| ValkeyError::String(format!("RDB: {value} out of range for {ty}")))
@@ -182,6 +185,9 @@ pub fn rdb_save_bool(rdb: *mut RedisModuleIO, val: bool) {
     rdb_save_u8(rdb, bool_val)
 }
 
+/// Reads what [`rdb_save_bool`] wrote: `0` or `1`, anything else failing the load. Never pair it
+/// with [`rdb_save_optional_bool`], which writes `2` for `None`; that one reads back with
+/// [`rdb_load_optional_bool`].
 pub fn rdb_load_bool(rdb: *mut RedisModuleIO) -> ValkeyResult<bool> {
     match rdb_load_u8(rdb)? {
         0 => Ok(false),
@@ -190,6 +196,8 @@ pub fn rdb_load_bool(rdb: *mut RedisModuleIO) -> ValkeyResult<bool> {
     }
 }
 
+/// Writes `0`, `1`, or `2` for `None`; read it back with [`rdb_load_optional_bool`] only, since
+/// [`rdb_load_bool`] refuses `2`.
 pub fn rdb_save_optional_bool(rdb: *mut RedisModuleIO, value: Option<bool>) {
     if let Some(value) = value {
         rdb_save_bool(rdb, value);
