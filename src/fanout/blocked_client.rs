@@ -1,6 +1,6 @@
 use crate::common::logging::log_error;
 use crate::common::metrics::fanout as metrics;
-use crate::common::replies::ReplyContext;
+use crate::common::replies::{DisconnectWatch, ReplyContext};
 use crate::fanout::fanout_error::TIMEOUT_ERROR;
 use crate::fanout::{FanoutClientCommand, FanoutResult};
 use metered::Counter;
@@ -62,6 +62,8 @@ pub(super) struct FanoutBlockedClient<T: FanoutClientCommand> {
     is_blocked: bool,
     /// When the server times the client out ([`timeout_callback`]).
     deadline: Instant,
+    /// Reports the client's disconnect, after which no reply is read.
+    disconnect: DisconnectWatch,
 }
 
 // SAFETY: `inner` is a raw pointer to a `ValkeyModuleBlockedClient`, which is safe to hand off
@@ -86,7 +88,11 @@ where
     /// The server owns the private data from `UnblockClient` on: [`reply_callback`] only borrows
     /// it and [`free_callback`] drops it. A client that timed out is detached before the
     /// operation finishes, so its reply callback never runs; with the reply callback doing the
-    /// freeing, as it used to, that result (an MRANGE's samples, say) leaked.
+    /// freeing, as it used to, that result (an MRANGE's samples, say) leaked. The same holds
+    /// for a client that disconnects: the server runs only [`free_callback`] for it, and
+    /// [`Self::reply_off_main_thread`] skips building its reply.
+    ///
+    /// Main thread only (the disconnect callback is installed here).
     pub fn new(ctx: &Context, timeout: Duration) -> Self {
         // 0 means "never" to the server.
         let timeout_ms = i64::try_from(timeout.as_millis())
@@ -108,6 +114,7 @@ where
             data: None,
             is_blocked: true,
             deadline: Instant::now() + Duration::from_millis(timeout_ms as u64),
+            disconnect: DisconnectWatch::new(bc_ptr.cast()),
         };
 
         res.measure_time_start();
@@ -129,10 +136,18 @@ where
     ///
     /// Past the client's deadline this builds nothing and leaves the reply to
     /// [`reply_callback`], which the server runs only if it has not timed the client out yet:
-    /// a client that has had the timeout error costs no reply. Returns `op` once its reply is
-    /// written, for the caller to drop off the main thread, and `None` when `op` went to the
+    /// a client that has had the timeout error costs no reply. A client that disconnected
+    /// gets none either: nobody would read it. Returns `op` once its reply is written or
+    /// skipped, for the caller to drop off the main thread, and `None` when `op` went to the
     /// main thread instead.
     pub(super) fn reply_off_main_thread(&mut self, mut op: T) -> Option<T> {
+        if self.disconnect.is_disconnected() {
+            metrics::FANOUT_REPLY_DISCONNECTED.incr();
+            // The server runs no reply callback for a client that has gone; marking it
+            // answered keeps that callback from writing anything should it run regardless.
+            self.mark_answered();
+            return Some(op);
+        }
         if Instant::now() >= self.deadline {
             metrics::FANOUT_REPLY_EXPIRED.incr();
             self.set_private_data(op, Ok(()));
@@ -156,10 +171,15 @@ where
             }
             raw::RedisModule_FreeThreadSafeContext.unwrap()(ctx);
         }
+        self.mark_answered();
+        Some(op)
+    }
+
+    /// Leaves [`reply_callback`] nothing to write.
+    fn mark_answered(&mut self) {
         let mut answered = BlockedClientPrivateData::new(T::default(), Ok(()));
         answered.answered = true;
         self.data = Some(Box::new(answered));
-        Some(op)
     }
 
     fn unblock(&mut self) {
@@ -167,6 +187,8 @@ where
             return;
         }
         self.is_blocked = false;
+        // Before the unblock, after which the server may free the handle and reuse its address.
+        self.disconnect.forget();
 
         // Ensure any ongoing measurement is ended.
         self.measure_time_end();

@@ -594,6 +594,44 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         wait_for_true(lambda: debug_metrics(peer, 'fanout')['fanout_served_ok_total'] == 1)
         assert debug_metrics(peer, 'fanout')['fanout_cancels_received_total'] == 0
 
+    def test_a_client_that_disconnects_gets_no_reply_built(self):
+        """A client that hangs up while its fan-out waits on a sleeping peer is not answered:
+        once the peer answers, the reply lane skips the reply nobody would read."""
+        tags = self.populate()
+        # Enough samples that the coordinator builds the reply on the reply lane, not inline.
+        cluster_client = self.new_cluster_client()
+        for tag in tags:
+            for j in range(3):
+                key = f'fo:{{{tag}}}:{j}'
+                cluster_client.execute_command(
+                    'TS.MADD', *[a for t in range(30) for a in (key, 2000 + t, t)])
+        self.reset_all()
+        coordinator = self.primaries()[0]
+        server = self.get_primary(0)
+        leaver = Valkey(host=server.bind_ip, port=server.port, single_connection_client=True)
+        leaver.client_setname('leaver')
+        sleeper = threading.Thread(
+            target=lambda: self.new_client_for_primary(1).execute_command('DEBUG', 'SLEEP', 1))
+        sleeper.start()
+        try:
+            time.sleep(0.2)
+            leaver.connection.send_command('TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
+            wait_for_true(lambda: coordinator.execute_command('TS._DEBUG', 'INFLIGHT') != [])
+            leaver.connection.disconnect()
+            wait_for_true(lambda: all(c['name'] != 'leaver' for c in coordinator.client_list()))
+        finally:
+            sleeper.join()
+
+        wait_for_true(
+            lambda: debug_metrics(coordinator, 'fanout')['fanout_reply_disconnected_total'] == 1)
+        stats = debug_metrics(coordinator, 'fanout')
+        assert stats['fanout_reply_expired_total'] == 0
+        assert stats['fanout_client_timeouts_total'] == 0
+        wait_for_true(lambda: debug_metrics(coordinator, 'fanout')['fanout_inflight'] == 0)
+        # The coordinator still answers the next client.
+        reply = coordinator.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
+        assert len(reply) == 3 * self.CLUSTER_SIZE
+
     def test_inflight_lists_a_request_waiting_on_a_peer(self):
         self.populate()
         coordinator = self.primaries()[0]

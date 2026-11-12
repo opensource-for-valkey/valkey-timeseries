@@ -7,24 +7,78 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use valkey_module::{Context, ValkeyError, ValkeyResult, raw};
 
-/// The disconnect flag of every client blocked through [`block_client`], by its handle. The
-/// server reports a disconnect with the handle alone, so this is how the callback finds the
-/// flag; the handle's private data would do too, but the server writes that from the thread
-/// that unblocks the client, which can race the callback reading it.
+/// The disconnect flag of every watched blocked client ([`DisconnectWatch`]), by its handle.
+/// The server reports a disconnect with the handle alone, so this is how the callback finds
+/// the flag; the handle's private data would do too, but the server writes that from the
+/// thread that unblocks the client, which can race the callback reading it.
 ///
-/// An entry lives from [`block_client`] until its [`BlockedClient`] unblocks the client, and
-/// the server frees a handle only after that, so a handle never names two clients here.
+/// An entry lives from [`DisconnectWatch::new`] until [`DisconnectWatch::forget`], which runs
+/// before the client is unblocked, and the server frees a handle only after that, so a handle
+/// never names two clients here.
 static DISCONNECTED: LazyLock<Mutex<HashMap<usize, Arc<AtomicBool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Runs on the main thread when a blocked client's connection closes (the peer went away, or
-/// `CLIENT KILL`), never for a client unblocked normally.
+/// `CLIENT KILL`), never for a client unblocked normally or timed out.
 unsafe extern "C" fn on_disconnect(
     _ctx: *mut raw::RedisModuleCtx,
     bc: *mut raw::RedisModuleBlockedClient,
 ) {
     if let Some(flag) = lock(&DISCONNECTED).get(&(bc as usize)) {
         flag.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Learns that a blocked client disconnected: nobody will read its reply, so the work
+/// answering it can stop, and the reply need not be built.
+///
+/// The server still has to be told the client is done: the handle must be unblocked as usual,
+/// and [`Self::forget`] called first, since the server may reuse the handle's address for
+/// another blocked client once this one is unblocked.
+pub(crate) struct DisconnectWatch {
+    bc: usize,
+    flag: Arc<AtomicBool>,
+    watching: bool,
+}
+
+impl DisconnectWatch {
+    /// Installs the disconnect callback on `bc`. Main thread only: the server calls that
+    /// callback from the main thread, and the handle must be registered before it can run.
+    pub(crate) fn new(bc: *mut raw::RedisModuleBlockedClient) -> Self {
+        let flag = Arc::new(AtomicBool::new(false));
+        let watching = !bc.is_null();
+        if watching {
+            lock(&DISCONNECTED).insert(bc as usize, Arc::clone(&flag));
+            unsafe { raw::RedisModule_SetDisconnectCallback.unwrap()(bc, Some(on_disconnect)) };
+        }
+        Self {
+            bc: bc as usize,
+            flag,
+            watching,
+        }
+    }
+
+    /// The flag the callback sets; it stays readable after [`Self::forget`].
+    pub(crate) fn flag(&self) -> &AtomicBool {
+        &self.flag
+    }
+
+    /// Whether the client has disconnected.
+    pub(crate) fn is_disconnected(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    /// Stops watching. Must run before the client is unblocked; idempotent.
+    pub(crate) fn forget(&mut self) {
+        if std::mem::take(&mut self.watching) {
+            lock(&DISCONNECTED).remove(&self.bc);
+        }
+    }
+}
+
+impl Drop for DisconnectWatch {
+    fn drop(&mut self) {
+        self.forget();
     }
 }
 
@@ -41,9 +95,9 @@ pub struct BlockedClient {
     pub(crate) inner: *mut raw::RedisModuleBlockedClient,
     /// Whether a reply has been written or handed to a writer.
     answered: bool,
-    /// Set once the client's connection closes: nobody will read the reply, so the work
-    /// answering it can stop.
-    disconnected: Arc<AtomicBool>,
+    /// Reports the client's disconnect: nobody will read the reply, so the work answering it
+    /// can stop.
+    disconnect: DisconnectWatch,
 }
 
 // We need to be able to send the inner pointer to another thread
@@ -55,7 +109,7 @@ impl Drop for BlockedClient {
             return;
         }
         // Before the unblock, after which the server may free the handle and reuse its address.
-        lock(&DISCONNECTED).remove(&(self.inner as usize));
+        self.disconnect.forget();
         unsafe {
             if !self.answered {
                 let ctx = raw::RedisModule_GetThreadSafeContext.unwrap()(self.inner);
@@ -84,13 +138,10 @@ pub(crate) fn block_client(ctx: &Context) -> BlockedClient {
             None, 0,
         )
     };
-    let flag = Arc::new(AtomicBool::new(false));
-    lock(&DISCONNECTED).insert(inner as usize, Arc::clone(&flag));
-    unsafe { raw::RedisModule_SetDisconnectCallback.unwrap()(inner, Some(on_disconnect)) };
     BlockedClient {
         inner,
         answered: false,
-        disconnected: flag,
+        disconnect: DisconnectWatch::new(inner),
     }
 }
 
@@ -133,7 +184,7 @@ impl ThreadSafeReplyContext {
     /// Set once the client has disconnected: the reply will not be read, so the work can
     /// stop.
     pub(crate) fn disconnected(&self) -> &AtomicBool {
-        &self.blocked_client.disconnected
+        self.blocked_client.disconnect.flag()
     }
 
     /// The Valkey modules API does not require locking for `Reply` functions,
