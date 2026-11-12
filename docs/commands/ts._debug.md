@@ -259,6 +259,7 @@ As coordinator:
 | `fanout_aborts_total` | counter | Operations ended early by an error returned as it is: a cluster-map mismatch, a permission denial, a busy shard |
 | `fanout_generic_error_replies_total` | counter | Operations answered with the generic "Internal error in fanout operation" reply after a shard failed with another kind |
 | `fanout_client_timeouts_total` | counter | Blocked clients answered with the timeout error |
+| `fanout_client_disconnects_total` | counter | Operations ended early because their client disconnected: the local share stops, the remote shares are sent cancels (reads only; a write runs to the end) |
 | `fanout_rpc_timeouts_total` | counter | RPCs whose timer fired with remote shares outstanding |
 | `fanout_cancels_sent_total` | counter | Cancel messages sent to shares still outstanding when an RPC's timer fired or its fanout completed early |
 | `fanout_early_completions_total` | counter | Fanout RPCs abandoned with remote shares outstanding because a share's error had already completed the fanout |

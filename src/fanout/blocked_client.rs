@@ -1,6 +1,6 @@
 use crate::common::logging::log_error;
 use crate::common::metrics::fanout as metrics;
-use crate::common::replies::{DisconnectWatch, ReplyContext};
+use crate::common::replies::{DisconnectHook, DisconnectWatch, ReplyContext};
 use crate::fanout::fanout_error::TIMEOUT_ERROR;
 use crate::fanout::{FanoutClientCommand, FanoutResult};
 use metered::Counter;
@@ -121,6 +121,17 @@ where
         res
     }
 
+    /// Runs `hook` on the main thread should the client disconnect while blocked. Main thread
+    /// only.
+    pub(super) fn on_disconnect(&self, hook: DisconnectHook) {
+        self.disconnect.on_disconnect(hook);
+    }
+
+    /// Whether the client has disconnected: nobody will read a reply.
+    pub(super) fn is_disconnected(&self) -> bool {
+        self.disconnect.is_disconnected()
+    }
+
     pub(super) fn set_private_data(&mut self, op: T, result: FanoutResult) {
         let private_data = Box::new(BlockedClientPrivateData::new(op, result));
         self.data = Some(private_data);
@@ -141,7 +152,7 @@ where
     /// skipped, for the caller to drop off the main thread, and `None` when `op` went to the
     /// main thread instead.
     pub(super) fn reply_off_main_thread(&mut self, mut op: T) -> Option<T> {
-        if self.disconnect.is_disconnected() {
+        if self.is_disconnected() {
             metrics::FANOUT_REPLY_DISCONNECTED.incr();
             // The server runs no reply callback for a client that has gone; marking it
             // answered keeps that callback from writing anything should it run regardless.
@@ -173,6 +184,12 @@ where
         }
         self.mark_answered();
         Some(op)
+    }
+
+    /// For a client that has disconnected: no reply is written, and [`reply_callback`], which
+    /// the server skips for such a client anyway, would write nothing either.
+    pub(super) fn discard_reply(&mut self) {
+        self.mark_answered();
     }
 
     /// Leaves [`reply_callback`] nothing to write.

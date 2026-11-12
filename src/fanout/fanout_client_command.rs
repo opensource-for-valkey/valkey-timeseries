@@ -90,6 +90,28 @@ pub trait FanoutClientCommand: Default + Send + 'static {
             // that peer requests and other local shares are queued for: measured, that
             // saved ~20 µs of CPU per reply and no throughput, and cost peer requests
             // 5–9 % latency under contention.
+            //
+            // A client that disconnected reads no reply (the fan-out may have ended early
+            // for that reason, see `FanoutCancel`). What the shards sent is freed on the
+            // reply lane, as after a reply built there, rather than on the main thread,
+            // which runs this when the disconnect ended the fan-out.
+            let gone = {
+                let mut bc = lock(&bc_for_closure);
+                let gone = bc.is_disconnected();
+                if gone {
+                    bc.discard_reply();
+                }
+                gone
+            };
+            if gone {
+                if let Ok(slot) = REPLY_EXECUTOR.try_reserve() {
+                    slot.spawn(move || {
+                        drop(op);
+                        drop(bc_for_closure);
+                    });
+                }
+                return;
+            }
             if result.is_ok()
                 && op.should_reply_off_main_thread()
                 && let Ok(slot) = REPLY_EXECUTOR.try_reserve()
@@ -108,7 +130,14 @@ pub trait FanoutClientCommand: Default + Send + 'static {
 
         let exec_result = Self::exec_command(self, ctx, started, timeout, handle_response);
         match exec_result {
-            Ok(()) => Ok(ValkeyValue::NoReply),
+            Ok(cancel) => {
+                // Still on the main thread, inside the command, so the client cannot have
+                // disconnected yet: the hook is in place before the server could run it.
+                if let Some(cancel) = cancel {
+                    lock(&blocked_client).on_disconnect(cancel.into_hook());
+                }
+                Ok(ValkeyValue::NoReply)
+            }
             Err(err) => {
                 // Set an error payload so the reply_callback sends back the
                 // proper error message instead of "No reply data".
