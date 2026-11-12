@@ -350,7 +350,7 @@ prefixed `ts_`, without the `debug-mode` gate.
 #### `rdb`
 
 The RDB aux field that carries the postings index, counted once per RDB that has one (not per
-series). A save is counted wherever the server writes the RDB: `SAVE`, `BGSAVE`, a replica's full
+series), and what the series loader repaired or tolerated. A save is counted wherever the server writes the RDB: `SAVE`, `BGSAVE`, a replica's full
 sync, an AOF rewrite's RDB preamble, `DEBUG RELOAD`. The fork child of a background save shares
 these counters with the server, so its saves are counted on the node that forked it.
 
@@ -360,6 +360,12 @@ these counters with the server, so its saves are counted on the node that forked
 | `rdb_load_failures_total` | counter | Loads whose aux field was unreadable, of a foreign encoding version, or rejected by the parser; the index is rebuilt from the keys instead |
 | `rdb_saves_total` | counter | Saves with an aux field to write, failed ones included |
 | `rdb_save_failures_total` | counter | Saves that left the aux field out because the index was locked at fork time, or whose write failed |
+| `rdb_load_repairs_total` | counter | Rules a loaded series broke and was repaired for, one per rule per series: empty chunks dropped, an oversized chunk split, a chunk budget, `CHUNK_SIZE` or retention clamped, a stray chunk encoding re-encoded or the series' encoding taken from its chunks |
+| `rdb_load_tolerated_total` | counter | Rules a series loaded from the server's own RDB, AOF or full sync still breaks, one per rule per series: negative timestamps, chunks out of order. `RESTORE` and slot imports refuse these instead |
+
+The two series counters move per series, on any load including `RESTORE`; a rate-limited warning
+names the key and the rules. On the server's own data a repair means some writer stored state it
+should not have, and a tolerated rule means the series still holds it.
 
 Successful loads are `rdb_loads_total - rdb_load_failures_total`, and likewise for saves. Neither
 load counter moves when `ts-index-persist` is off and the payload is discarded, and neither

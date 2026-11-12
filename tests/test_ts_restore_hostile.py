@@ -320,7 +320,9 @@ class TestRestoreHostilePayloads(ValkeyTimeSeriesTestCaseBase):
         client = self.client
         key = "hostile:empties"
         client.delete(key)
+        repairs = int(client.info("ts_rdb")["ts_rdb_load_repairs_total"])
         assert client.restore(key, 0, edited) == b"OK"
+        assert int(client.info("ts_rdb")["ts_rdb_load_repairs_total"]) == repairs + 1
         assert client.execute_command("TS.RANGE", key, "-", "+") == \
             client.execute_command("TS.RANGE", "empties", "-", "+")
         client.execute_command("COPY", key, f"{key}:reads")

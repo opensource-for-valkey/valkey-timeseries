@@ -50,8 +50,41 @@ use metered::{
     MetricType, MetricValues, Registry, Scalar, Unit,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// At most one warning per [`WarningLimit::INTERVAL_SECS`], for an event whose counter carries
+/// the rest: a corrupt chunk on a hot key, or a load repairing many series, would otherwise
+/// write the same line over and over.
+pub(crate) struct WarningLimit {
+    /// Unix second of the last warning let through; 0 before the first.
+    last_secs: AtomicU64,
+}
+
+impl WarningLimit {
+    pub(crate) const INTERVAL_SECS: u64 = 60;
+
+    pub(crate) const fn new() -> Self {
+        Self {
+            last_secs: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether a warning may be written now. Concurrent callers race for the slot and only one
+    /// wins it.
+    pub(crate) fn due(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let last = self.last_secs.load(Ordering::Relaxed);
+        (last == 0 || now >= last + Self::INTERVAL_SECS)
+            && self
+                .last_secs
+                .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+    }
+}
 
 /// Finite buckets of a duration histogram: powers of two from 1 µs to 2^23 µs (about 8.4 s).
 /// Slower observations land in the implicit `+Inf` bucket.

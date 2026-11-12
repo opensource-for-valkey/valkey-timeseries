@@ -200,6 +200,12 @@ impl<C: SampleCodec> XorChunk<C> {
         Ok(())
     }
 
+    /// Sets the budget, and the stream's allocation cap with it (see `BitStream::set_soft_cap`).
+    pub(crate) fn clamp_max_size(&mut self, max: usize) {
+        self.max_size = max;
+        self.encoder.set_soft_cap(max);
+    }
+
     /// What the write path keeps every stored chunk within: at most
     /// [`MAX_LOADED_CHUNK_BYTES`] of stream, and a non-negative first timestamp. O(1).
     ///

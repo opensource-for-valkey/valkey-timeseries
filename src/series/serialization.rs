@@ -2,16 +2,18 @@ use crate::common::rdb::*;
 use crate::common::{Sample, Timestamp};
 use crate::labels::MetricName;
 use crate::series::chunks::{
-    Chunk, ChunkEncoding, ChunkOps, MAX_CHUNK_SIZE, MAX_LOADED_CHUNK_BYTES, TimeSeriesChunk,
-    validate_chunk_size,
+    Chunk, ChunkEncoding, ChunkOps, MAX_CHUNK_SIZE, MAX_LOADED_CHUNK_BYTES, MIN_CHUNK_SIZE,
+    TimeSeriesChunk, validate_chunk_size,
 };
 use crate::series::compaction::CompactionRule;
 use crate::series::index::persistence::is_loading_active;
+use crate::series::seal_chunk;
 use crate::series::series_data_type::{
     MIN_TIMESERIES_TYPE_ENCODING_VERSION, TIMESERIES_TYPE_ENCODING_VERSION,
     is_supported_encoding_version,
 };
 use crate::series::{SampleDuplicatePolicy, SeriesLink, TimeSeries, TimeseriesId};
+use std::time::Duration;
 use valkey_module::{ValkeyError, ValkeyResult, raw};
 
 /// Initial reservation caps for the chunk and rule vectors; past them they grow as elements load.
@@ -32,6 +34,13 @@ pub(crate) enum LoadTrust {
 }
 
 impl LoadTrust {
+    fn name(self) -> &'static str {
+        match self {
+            LoadTrust::Own => "own",
+            LoadTrust::Foreign => "foreign",
+        }
+    }
+
     /// The trust of the payload being loaded now. A client command cannot reach the loader
     /// while the server loads its own data, so the load window tells the two apart.
     fn current() -> Self {
@@ -179,13 +188,21 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
         rules,
     };
 
-    drop_empty_chunks(&mut ts);
-    check_series_invariants(&ts)
+    let repairs = normalize_series(&mut ts, trust)
         .map_err(|e| ValkeyError::String(format!("Invalid series: {e}")))?;
 
     // Assign `_db` from the IO context and count the series toward the current load window
     // (no-op for db-less payloads like RESTORE / TS._RESTORE strings).
     crate::series::index::persistence::observe_series_rdb_load(rdb, &mut ts);
+
+    if !repairs.is_empty() {
+        crate::common::metrics::rdb::note_series_repairs(
+            &ts.key,
+            trust.name(),
+            &repairs.repaired,
+            &repairs.tolerated,
+        );
+    }
 
     Ok(ts)
 }
@@ -206,72 +223,215 @@ pub(crate) fn drop_empty_chunks(ts: &mut TimeSeries) -> bool {
     true
 }
 
-/// What the write path maintains for every series it stores, checked once a payload has been
-/// assembled. Each chunk loader checks its own encoding; this covers what only the series sees.
-///
-/// Every rule is something no command can violate, never a tighter limit: a series load error
-/// fails the whole RDB load (or `RESTORE`), so a rule stricter than the write path makes a
-/// server that saved fine unable to restart.
-///
-/// - `chunk_size_bytes` passes `validate_chunk_size`, as `TS.CREATE`, `TS.ALTER` and the config do.
-/// - Retention fits the `i64` milliseconds the commands parse.
-/// - Every chunk has the series' encoding: every chunk is created from it, and `TS.ALTER`
-///   cannot change it (it rejects `ENCODING`; RTS accepts the option and ignores it). A stray
-///   encoding was what let an uncompressed chunk follow a compressed one, which a forged count
-///   turned into an abort in the `FILTER_BY_TS` reverse path. A command that ever converts a
-///   series in place must re-encode every chunk, or relax this rule.
-/// - Every chunk's own budget is at most `MAX_CHUNK_SIZE` and its data at most
-///   `MAX_LOADED_CHUNK_BYTES`. A chunk's `max_size` may still differ from the series' after
-///   `TS.ALTER CHUNK_SIZE`, so it is not compared with `chunk_size_bytes`.
-/// - Non-empty chunks hold non-negative timestamps, ascending with no overlap from one chunk to
-///   the next. An empty chunk only stands alone; [`drop_empty_chunks`] runs first.
-pub(crate) fn check_series_invariants(ts: &TimeSeries) -> Result<(), String> {
-    if validate_chunk_size(ts.chunk_size_bytes).is_err() {
-        return Err(format!("chunk size {} out of range", ts.chunk_size_bytes));
+/// What [`normalize_series`] changed in a payload, or loaded although it breaks a rule. Each
+/// entry names one rule, once per series.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Repairs {
+    /// Rules the series broke and was brought back within.
+    pub repaired: Vec<&'static str>,
+    /// Rules the series still breaks, because no local repair exists. Only an own load
+    /// tolerates one; a foreign load fails instead.
+    pub tolerated: Vec<&'static str>,
+}
+
+impl Repairs {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.repaired.is_empty() && self.tolerated.is_empty()
     }
-    if ts.retention.as_millis() > i64::MAX as u128 {
-        return Err(format!(
-            "retention {} ms out of range",
-            ts.retention.as_millis()
-        ));
-    }
-    let mut prev_last: Option<Timestamp> = None;
-    for (i, chunk) in ts.chunks.iter().enumerate() {
-        let encoding = chunk.get_encoding();
-        if encoding != ts.chunk_encoding {
-            return Err(format!(
-                "chunk {i} is {encoding} in a {} series",
-                ts.chunk_encoding
-            ));
+
+    fn repair(&mut self, rule: &'static str) {
+        if !self.repaired.contains(&rule) {
+            self.repaired.push(rule);
         }
+    }
+
+    fn tolerate(&mut self, rule: &'static str) {
+        if !self.tolerated.contains(&rule) {
+            self.tolerated.push(rule);
+        }
+    }
+}
+
+pub(crate) const BUDGET_CLAMPED: &str = "chunk budget clamped";
+pub(crate) const EMPTY_CHUNKS_DROPPED: &str = "empty chunks dropped";
+pub(crate) const ENCODING_ADOPTED: &str = "series encoding taken from its chunks";
+pub(crate) const STRAYS_REENCODED: &str = "chunks of another encoding re-encoded";
+pub(crate) const OVERSIZED_SPLIT: &str = "oversized chunks split";
+pub(crate) const CHUNK_SIZE_CLAMPED: &str = "chunk size clamped";
+pub(crate) const RETENTION_CLAMPED: &str = "retention clamped";
+pub(crate) const NEGATIVE_TIMESTAMPS: &str = "negative timestamps";
+pub(crate) const CHUNKS_OUT_OF_ORDER: &str = "chunks out of order";
+
+/// Brings an assembled series within what the write path maintains, or refuses it.
+///
+/// Each chunk loader has already applied the rules no writer can break (the count bound, the
+/// free-bit count, codec state, ordered bounds, the uncompressed order), and those fail any
+/// load. The rules here mirror the write path instead, so a writer bug can break them: one did,
+/// when a `TS.ADDBULK` timestamp past `i64::MAX` was stored negative and the server then
+/// refused its own RDB. What a broken rule costs therefore depends on where the payload came
+/// from ([`LoadTrust`]):
+///
+/// | Rule | Foreign | Own |
+/// | --- | --- | --- |
+/// | A chunk budget over `MAX_CHUNK_SIZE` | refused | clamped |
+/// | Empty chunks beside others | dropped | dropped |
+/// | The series' encoding differs from its chunks', which agree | adopted | adopted |
+/// | Chunks of more than one encoding | refused | strays re-encoded to the series' |
+/// | Chunk data over `MAX_LOADED_CHUNK_BYTES` | refused | split, as the merge path splits |
+/// | `chunk_size_bytes` outside `validate_chunk_size` | refused | clamped into range |
+/// | Retention past `i64::MAX` ms | refused | clamped to `i64::MAX` ms |
+/// | Negative timestamps | refused | loaded as they are |
+/// | Chunks out of order or overlapping | refused | loaded as they are |
+///
+/// Repairs are local and keep every sample. A rule with no such repair is tolerated rather
+/// than enforced on an own load: refusing it would fail the whole RDB load, a worse outcome
+/// than what the rule protects against. Before this branch those series loaded unchecked.
+/// Every repair and tolerance is counted and logged (`note_series_repairs`).
+///
+/// Budgets come first because the split works from them: `needs_split` adds a quarter of a
+/// budget to itself, which overflows for a forged `usize::MAX`.
+pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<Repairs, String> {
+    let own = trust == LoadTrust::Own;
+    // Fails a foreign load; lets an own load go on to repair or tolerate.
+    let refuse = |err: String| if own { Ok(()) } else { Err(err) };
+    let mut repairs = Repairs::default();
+
+    for (i, chunk) in ts.chunks.iter_mut().enumerate() {
         if chunk.max_size() > MAX_CHUNK_SIZE {
-            return Err(format!(
+            refuse(format!(
                 "chunk {i} budget {} out of range",
                 chunk.max_size()
-            ));
+            ))?;
+            chunk.clamp_max_size(MAX_CHUNK_SIZE);
+            repairs.repair(BUDGET_CLAMPED);
         }
-        if chunk.size() > MAX_LOADED_CHUNK_BYTES {
-            return Err(format!("chunk {i} holds {} bytes", chunk.size()));
-        }
-        if chunk.is_empty() {
-            if ts.chunks.len() > 1 {
-                return Err(format!("chunk {i} of {} is empty", ts.chunks.len()));
+    }
+
+    if drop_empty_chunks(ts) {
+        repairs.repair(EMPTY_CHUNKS_DROPPED);
+    }
+
+    if let Some(encoding) = ts.chunks.first().map(TimeSeriesChunk::get_encoding) {
+        if ts
+            .chunks
+            .iter()
+            .all(|chunk| chunk.get_encoding() == encoding)
+        {
+            // Only the hint new chunks are created from; nothing reads it otherwise.
+            if encoding != ts.chunk_encoding {
+                ts.chunk_encoding = encoding;
+                repairs.repair(ENCODING_ADOPTED);
             }
+        } else {
+            // A stray encoding was what let an uncompressed chunk follow a compressed one,
+            // which a forged count turned into an abort in the reverse `FILTER_BY_TS` path.
+            refuse(format!(
+                "chunks of more than one encoding in a {} series",
+                ts.chunk_encoding
+            ))?;
+            reencode_strays(ts)?;
+            repairs.repair(STRAYS_REENCODED);
+        }
+    }
+
+    let oversized = ts
+        .chunks
+        .iter()
+        .enumerate()
+        .find(|(_, chunk)| chunk.size() > MAX_LOADED_CHUNK_BYTES)
+        .map(|(i, chunk)| (i, chunk.size()));
+    if let Some((i, bytes)) = oversized {
+        refuse(format!("chunk {i} holds {bytes} bytes"))?;
+        // Halves until no chunk is past 1.25x its budget (at most `MAX_CHUNK_SIZE`, clamped
+        // above), so every chunk ends under the limit.
+        ts.split_chunks_if_needed()
+            .map_err(|e| format!("cannot split chunk {i}: {e}"))?;
+        repairs.repair(OVERSIZED_SPLIT);
+    }
+
+    if validate_chunk_size(ts.chunk_size_bytes).is_err() {
+        refuse(format!("chunk size {} out of range", ts.chunk_size_bytes))?;
+        // Both ends of the range are multiples of 8, so rounding down stays inside it.
+        ts.chunk_size_bytes = ts.chunk_size_bytes.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE) / 8 * 8;
+        repairs.repair(CHUNK_SIZE_CLAMPED);
+    }
+
+    if ts.retention.as_millis() > i64::MAX as u128 {
+        refuse(format!(
+            "retention {} ms out of range",
+            ts.retention.as_millis()
+        ))?;
+        // The read floor subtracts retention from the last timestamp as an `i64`
+        // (`get_min_timestamp`), so this keeps every sample. Clamping to the config's
+        // ten-year maximum instead would expire older data on reload.
+        ts.retention = Duration::from_millis(i64::MAX as u64);
+        repairs.repair(RETENTION_CLAMPED);
+    }
+
+    let mut prev_last: Option<Timestamp> = None;
+    for (i, chunk) in ts.chunks.iter().enumerate() {
+        // Only a sole empty chunk is left.
+        if chunk.is_empty() {
             continue;
         }
         let first = chunk.first_timestamp();
         let last = chunk.last_timestamp();
-        if first < 0 || first > last {
+        if first > last {
+            // The chunk loaders refuse these bounds; this keeps the order checks below sound.
             return Err(format!("chunk {i} spans {first}..{last}"));
+        }
+        if first < 0 {
+            refuse(format!("chunk {i} starts at negative timestamp {first}"))?;
+            repairs.tolerate(NEGATIVE_TIMESTAMPS);
         }
         if let Some(prev) = prev_last
             && first <= prev
         {
-            return Err(format!(
+            refuse(format!(
                 "chunk {i} starts at {first}, not after the previous chunk's {prev}"
-            ));
+            ))?;
+            repairs.tolerate(CHUNKS_OUT_OF_ORDER);
         }
-        prev_last = Some(last);
+        prev_last = Some(prev_last.map_or(last, |prev| prev.max(last)));
+    }
+
+    if !repairs.repaired.is_empty() {
+        // Splits and re-encodes keep every sample, but the bookkeeping is cheap to redo and
+        // then cannot disagree with the chunks.
+        ts.update_first_last_timestamps();
+        ts.recalculate_total_samples();
+    }
+    Ok(repairs)
+}
+
+/// Re-encodes every chunk whose encoding is not the series' own, keeping its budget.
+fn reencode_strays(ts: &mut TimeSeries) -> Result<(), String> {
+    let encoding = ts.chunk_encoding;
+    for (i, chunk) in ts.chunks.iter_mut().enumerate() {
+        if chunk.get_encoding() == encoding {
+            continue;
+        }
+        let samples: Vec<Sample> = chunk.iter().collect();
+        let mut rebuilt = TimeSeriesChunk::new(encoding, chunk.max_size());
+        rebuilt
+            .set_data(&samples)
+            .map_err(|e| format!("cannot re-encode chunk {i} as {encoding}: {e}"))?;
+        seal_chunk(&mut rebuilt);
+        *chunk = rebuilt;
     }
     Ok(())
+}
+
+/// Whether a series is in the form a foreign load accepts unchanged: what the write path
+/// stores, after [`normalize_series`]. For tests: every series a command sequence builds must
+/// pass, or a reload would refuse or rewrite it.
+#[cfg(test)]
+pub(crate) fn check_series_invariants(ts: &TimeSeries) -> Result<(), String> {
+    let mut loaded = ts.clone();
+    let repairs = normalize_series(&mut loaded, LoadTrust::Foreign)?;
+    if repairs.repaired.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("loads only after: {}", repairs.repaired.join(", ")))
+    }
 }

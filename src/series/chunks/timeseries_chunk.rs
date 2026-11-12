@@ -221,6 +221,20 @@ impl TimeSeriesChunk {
             TimeSeriesChunk::Chimp(chunk) => chunk.check_write_limits(),
         }
     }
+
+    /// Lowers the chunk's budget to `max` if it is larger, and reports whether it was. The data
+    /// is untouched: a budget only decides when a chunk counts as full or needs a split.
+    pub(crate) fn clamp_max_size(&mut self, max: usize) -> bool {
+        if self.max_size() <= max {
+            return false;
+        }
+        match self {
+            TimeSeriesChunk::Uncompressed(chunk) => chunk.max_size = max,
+            TimeSeriesChunk::Gorilla(chunk) => chunk.clamp_max_size(max),
+            TimeSeriesChunk::Chimp(chunk) => chunk.clamp_max_size(max),
+        }
+        true
+    }
 }
 
 impl Default for TimeSeriesChunk {

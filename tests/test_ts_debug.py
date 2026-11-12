@@ -1059,7 +1059,8 @@ class TestDebugMetrics(ValkeyTimeSeriesTestCaseDebugMode):
     SECTIONS = ['asm', 'chunk', 'clustermap', 'exec', 'fanout', 'index_reconciliation', 'rdb',
                 'blocked_read', 'string_interning', 'task']
     # Within a section, metrics are sorted by family name (a counter's name before `_total`).
-    RDB_METRICS = ['rdb_load_failures_total', 'rdb_loads_total',
+    RDB_METRICS = ['rdb_load_failures_total', 'rdb_load_repairs_total',
+                   'rdb_load_tolerated_total', 'rdb_loads_total',
                    'rdb_save_failures_total', 'rdb_saves_total']
     EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
                     'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_reply_queued',

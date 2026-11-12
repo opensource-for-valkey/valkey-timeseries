@@ -9,7 +9,11 @@ use crate::common::Sample;
 use crate::series::chunks::{
     ChunkEncoding, ChunkOps, MAX_CHUNK_SIZE, MAX_LOADED_CHUNK_BYTES, TimeSeriesChunk,
 };
-use crate::series::serialization::{check_series_invariants, drop_empty_chunks};
+use crate::series::serialization::{
+    BUDGET_CLAMPED, CHUNK_SIZE_CLAMPED, CHUNKS_OUT_OF_ORDER, ENCODING_ADOPTED, LoadTrust,
+    NEGATIVE_TIMESTAMPS, OVERSIZED_SPLIT, RETENTION_CLAMPED, STRAYS_REENCODED,
+    check_series_invariants, drop_empty_chunks, normalize_series,
+};
 use crate::series::{DuplicatePolicy, TimeSeries};
 use proptest::prelude::*;
 use std::time::Duration;
@@ -180,57 +184,179 @@ fn loaded_base(encoding: ChunkEncoding) -> TimeSeries {
     ts
 }
 
+fn other_encoding(encoding: ChunkEncoding) -> ChunkEncoding {
+    if encoding == ChunkEncoding::Uncompressed {
+        ChunkEncoding::Chimp
+    } else {
+        ChunkEncoding::Uncompressed
+    }
+}
+
+fn set_budget(chunk: &mut TimeSeriesChunk, max_size: usize) {
+    match chunk {
+        TimeSeriesChunk::Uncompressed(c) => c.max_size = max_size,
+        TimeSeriesChunk::Gorilla(c) => c.max_size = max_size,
+        TimeSeriesChunk::Chimp(c) => c.max_size = max_size,
+    }
+}
+
+/// A chunk past `MAX_LOADED_CHUNK_BYTES`, after `after`: incompressible values at step 1, so
+/// a few hundred thousand samples are enough in every encoding.
+fn oversized_chunk(encoding: ChunkEncoding, after: i64) -> TimeSeriesChunk {
+    let mut seed = 42u64;
+    let samples: Vec<Sample> = (1..=300_000)
+        .map(|i| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            // The top two bits clear keep the value finite, so samples compare equal.
+            Sample::new(after + i, f64::from_bits(seed >> 2))
+        })
+        .collect();
+    let mut chunk = TimeSeriesChunk::new(encoding, MAX_CHUNK_SIZE);
+    chunk.set_data(&samples).unwrap();
+    assert!(
+        chunk.size() > MAX_LOADED_CHUNK_BYTES,
+        "{encoding}: only {} bytes",
+        chunk.size()
+    );
+    chunk
+}
+
+fn stored_samples(ts: &TimeSeries) -> Vec<Sample> {
+    ts.chunks.iter().flat_map(|chunk| chunk.iter()).collect()
+}
+
+/// What an own load does with a series a foreign load refuses.
+enum OwnLoad {
+    /// Brought back within these rules, keeping every sample.
+    Repaired(&'static [&'static str]),
+    /// Loaded unchanged although it breaks this rule.
+    AsIs(&'static str),
+}
+
+/// Every write-path rule refuses a foreign payload. A payload the server wrote itself is
+/// repaired where a local repair exists, and otherwise loaded as it is: a refusal there fails
+/// the whole RDB load, which is what a `TS.ADDBULK` timestamp past `i64::MAX` once did.
 #[test]
-fn forged_series_are_rejected() {
+fn forged_series_are_refused_when_foreign_and_kept_when_own() {
+    use OwnLoad::*;
     for encoding in ENCODINGS {
         let base = loaded_base(encoding);
-        let rejected = |what: &str, ts: TimeSeries| {
-            assert!(
-                check_series_invariants(&ts).is_err(),
-                "{encoding}: accepted {what}"
-            );
-        };
+        let last = base.last_timestamp();
+        let mut cases: Vec<(&str, TimeSeries, OwnLoad)> = Vec::new();
 
         let mut ts = base.clone();
         ts.chunks.reverse();
-        rejected("descending chunks", ts);
+        cases.push(("descending chunks", ts, AsIs(CHUNKS_OUT_OF_ORDER)));
 
         let mut ts = base.clone();
         let copy = ts.chunks.clone();
         ts.chunks.extend(copy);
-        rejected("every chunk twice", ts);
+        cases.push(("every chunk twice", ts, AsIs(CHUNKS_OUT_OF_ORDER)));
 
         let mut ts = base.clone();
         let dup = ts.chunks[1].clone();
         ts.chunks.insert(1, dup);
-        rejected("one chunk twice", ts);
-
-        for size in [0, 7, 40, MAX_CHUNK_SIZE + 8, usize::MAX] {
-            let mut ts = base.clone();
-            ts.chunk_size_bytes = size;
-            rejected("chunk size out of range", ts);
-        }
-
-        let mut ts = base.clone();
-        ts.retention = Duration::from_millis(u64::MAX);
-        rejected("retention past i64", ts);
-
-        let other = if encoding == ChunkEncoding::Uncompressed {
-            ChunkEncoding::Chimp
-        } else {
-            ChunkEncoding::Uncompressed
-        };
-        let mut ts = base.clone();
-        let mut stray = TimeSeriesChunk::new(other, 128);
-        stray.add_sample(&Sample::new(1_000_000, 1.0)).unwrap();
-        ts.chunks.push(stray);
-        rejected("a chunk of another encoding", ts);
+        cases.push(("one chunk twice", ts, AsIs(CHUNKS_OUT_OF_ORDER)));
 
         let mut ts = base.clone();
         let mut negative = TimeSeriesChunk::new(encoding, 128);
         negative.add_sample(&Sample::new(-101, 1.0)).unwrap();
         ts.chunks.insert(0, negative);
-        rejected("a negative timestamp", ts);
+        cases.push(("a negative timestamp", ts, AsIs(NEGATIVE_TIMESTAMPS)));
+
+        for size in [0, 7, 40, MAX_CHUNK_SIZE + 8, usize::MAX] {
+            let mut ts = base.clone();
+            ts.chunk_size_bytes = size;
+            cases.push((
+                "chunk size out of range",
+                ts,
+                Repaired(&[CHUNK_SIZE_CLAMPED]),
+            ));
+        }
+
+        let mut ts = base.clone();
+        ts.retention = Duration::from_millis(u64::MAX);
+        cases.push(("retention past i64", ts, Repaired(&[RETENTION_CLAMPED])));
+
+        let mut ts = base.clone();
+        let mut stray = TimeSeriesChunk::new(other_encoding(encoding), 128);
+        stray.add_sample(&Sample::new(last + 1000, 1.0)).unwrap();
+        ts.chunks.push(stray);
+        cases.push((
+            "a chunk of another encoding",
+            ts,
+            Repaired(&[STRAYS_REENCODED]),
+        ));
+
+        let mut ts = base.clone();
+        set_budget(&mut ts.chunks[0], MAX_CHUNK_SIZE + 8);
+        cases.push((
+            "a chunk budget past the limit",
+            ts,
+            Repaired(&[BUDGET_CLAMPED]),
+        ));
+
+        // The budget is clamped before the split: `needs_split` adds a quarter of it to itself.
+        let mut ts = base.clone();
+        let mut big = oversized_chunk(encoding, last);
+        set_budget(&mut big, usize::MAX);
+        ts.chunks.push(big);
+        ts.recalculate_total_samples();
+        ts.update_first_last_timestamps();
+        cases.push((
+            "an oversized chunk with a usize::MAX budget",
+            ts,
+            Repaired(&[BUDGET_CLAMPED, OVERSIZED_SPLIT]),
+        ));
+
+        for (what, ts, own) in cases {
+            assert!(
+                normalize_series(&mut ts.clone(), LoadTrust::Foreign).is_err(),
+                "{encoding}: a foreign load accepted {what}"
+            );
+            let mut loaded = ts.clone();
+            let repairs = normalize_series(&mut loaded, LoadTrust::Own)
+                .unwrap_or_else(|e| panic!("{encoding}: an own load refused {what}: {e}"));
+            assert_eq!(
+                stored_samples(&loaded),
+                stored_samples(&ts),
+                "{encoding}: {what} lost samples"
+            );
+            match own {
+                Repaired(rules) => {
+                    assert_eq!(repairs.repaired, rules, "{encoding}: {what}");
+                    assert!(repairs.tolerated.is_empty(), "{encoding}: {what}");
+                    assert_loadable(&loaded);
+                    // Visible, too: a clamp that hid samples would pass the checks above.
+                    assert_eq!(
+                        loaded.get_range(0, i64::MAX),
+                        stored_samples(&ts),
+                        "{encoding}: {what}"
+                    );
+                }
+                AsIs(rule) => {
+                    assert_eq!(repairs.tolerated, [rule], "{encoding}: {what}");
+                    assert!(repairs.repaired.is_empty(), "{encoding}: {what}");
+                    assert!(loaded == ts, "{encoding}: {what} was changed");
+                }
+            }
+        }
+    }
+}
+
+/// A series' encoding is only the hint new chunks are created from, so one that disagrees with
+/// chunks that all agree is taken from them, on any load.
+#[test]
+fn a_series_encoding_its_chunks_disagree_with_is_taken_from_them() {
+    for encoding in ENCODINGS {
+        for trust in [LoadTrust::Foreign, LoadTrust::Own] {
+            let mut ts = loaded_base(encoding);
+            ts.chunk_encoding = other_encoding(encoding);
+            let repairs = normalize_series(&mut ts, trust).unwrap();
+            assert_eq!(repairs.repaired, [ENCODING_ADOPTED], "{encoding} {trust:?}");
+            assert_eq!(ts.chunk_encoding, encoding);
+            assert_loadable(&ts);
+        }
     }
 }
 

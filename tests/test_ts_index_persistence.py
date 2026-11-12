@@ -367,6 +367,7 @@ class TestIndexPersistenceMetrics(ValkeyTimeSeriesTestCaseBase):
         client = self.server.get_new_client()
         assert set(self.rdb_info(client)) == {
             "rdb_loads_total", "rdb_load_failures_total",
+            "rdb_load_repairs_total", "rdb_load_tolerated_total",
             "rdb_saves_total", "rdb_save_failures_total",
         }
 
