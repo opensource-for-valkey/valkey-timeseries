@@ -268,6 +268,7 @@ As coordinator:
 | `fanout_local_share_busy_total` | counter | Local shares refused because the fan-out lane's queue was full |
 | `fanout_local_share_expired_total` | counter | Local shares that waited in the queue past the deadline |
 | `fanout_reply_expired_total` | counter | Replies the `ts-fanout-reply` lane did not build because the client's deadline had passed (left to the main thread, which skips a client already timed out) |
+| `fanout_reply_disconnected_total` | counter | Replies the `ts-fanout-reply` lane did not build because the client had disconnected |
 | `fanout_error_decode_failures_total` | counter | Error responses from peers that could not be decoded |
 | `fanout_ignored_unknown_request_total` | counter | Peer answers dropped because their request is no longer in flight (it timed out, say) |
 | `fanout_ignored_unknown_sender_total` | counter | Peer answers dropped because their sender is not a remote target of the request |
