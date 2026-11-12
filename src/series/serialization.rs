@@ -41,8 +41,19 @@ impl LoadTrust {
         }
     }
 
-    /// The trust of the payload being loaded now. A client command cannot reach the loader
-    /// while the server loads its own data, so the load window tells the two apart.
+    /// The trust of the payload being loaded now: own inside the load window
+    /// (`RdbStarted` / `AofStarted` / `ReplStarted` to `Ended` / `Failed`), foreign outside it.
+    ///
+    /// The window is enough because every load the module sees is synchronous, and a
+    /// synchronous load refuses client commands with `-LOADING`. The one asynchronous load, a
+    /// `repl-diskless-load swapdb` full sync, needs the module to declare
+    /// `HANDLE_REPL_ASYNC_LOAD`, which it never does (`common::module_options`), so the server
+    /// loads such a sync synchronously instead.
+    ///
+    /// Inside the window, a `TS._RESTORE` replayed from the AOF is own data. Outside it, so is
+    /// nothing: a `RESTORE`, a slot import's `TS._RESTORE`, and the same commands replicated
+    /// from a primary all count as foreign, the last because the primary checked them the same
+    /// way.
     fn current() -> Self {
         if is_loading_active() {
             LoadTrust::Own
@@ -116,6 +127,18 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
     // checked against its stream by decoding it, which costs a decode and an encode of every
     // sample. That runs for a foreign payload, but not while the server loads an RDB or AOF it
     // wrote itself: there the O(1) header checks in the chunk loaders stand alone.
+    //
+    // Measured `RESTORE` cost with the pass (release build, server-side, honest series with
+    // 1 MiB chunks; macOS, 2026-11-12):
+    //
+    //   Gorilla, constant (2 bits/sample, the densest)  7.5 ns/sample  31.6 ms per MiB
+    //   Chimp, constant (4 bits/sample)                 8.5 ns/sample  17.9 ms per MiB
+    //   Chimp, random values                           34.9 ns/sample   4.6 ms per MiB
+    //   Uncompressed, random (no pass)                 40.6 ns/sample   2.9 ms per MiB
+    //
+    // So at worst about one full read of the restored key, linear in the bytes the sender had
+    // to transmit. There is deliberately no budget: one that fell back to the header checks
+    // past some size would be the bypass. A budget, if ever added, must refuse past it.
     let trust = LoadTrust::current();
     // Reserve from the declared counts only up to a cap: each element is a read that fails on a
     // short payload, but an uncapped reservation runs first, and a 165-byte payload declaring

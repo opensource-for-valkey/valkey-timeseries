@@ -21,10 +21,30 @@ pub const HANDLE_IO_ERRORS: c_int = 1 << 0;
 /// `VALKEYMODULE_OPTIONS_HANDLE_ATOMIC_SLOT_MIGRATION`.
 pub const HANDLE_ATOMIC_SLOT_MIGRATION: c_int = 1 << 5;
 
+/// `VALKEYMODULE_OPTIONS_HANDLE_REPL_ASYNC_LOAD`, deliberately never declared.
+///
+/// Without it, a replica configured for `repl-diskless-load swapdb` loads a full sync
+/// synchronously instead ("Skipping diskless-load because there are modules that are not aware
+/// of async replication"), and a synchronous load refuses every client command with `-LOADING`.
+/// So no client `RESTORE` can reach the series loader while the server loads its own data, which
+/// is what lets `LoadTrust::current` (`series::serialization`) tell an own payload from a foreign
+/// one by the load window alone. Declaring it would let a forged `RESTORE` on a writable replica
+/// load as the server's own data; the loader would first need to tell the two apart per call.
+pub const HANDLE_REPL_ASYNC_LOAD: c_int = 1 << 2;
+
 static DECLARED_OPTIONS: AtomicI32 = AtomicI32::new(0);
 
 /// Adds `flags` to the module's declared options and re-applies the accumulated mask.
+///
+/// # Panics
+///
+/// On [`HANDLE_REPL_ASYNC_LOAD`]; see there. Every module load runs this, so any test catches it.
 pub fn declare_module_options(ctx: &Context, flags: c_int) {
+    assert_eq!(
+        flags & HANDLE_REPL_ASYNC_LOAD,
+        0,
+        "HANDLE_REPL_ASYNC_LOAD would let client commands reach the series loader during a load"
+    );
     let previous = DECLARED_OPTIONS.fetch_or(flags, Ordering::SeqCst);
     let combined = previous | flags;
 

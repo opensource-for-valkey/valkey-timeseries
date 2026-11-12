@@ -17,6 +17,7 @@ except ImportError:
 
 from common import SERVER_PATH, get_module_path, parse_info_response
 from valkeytestframework.conftest import resource_port_tracker
+from valkeytestframework.util.waiters import wait_for_true
 from valkeytestframework.valkey_test_case import ReplicationTestCase
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,29 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         for i, (ts, val) in enumerate(result):
             assert ts == timestamps[i]
             assert float(val) == values[i]
+
+    def test_swapdb_full_sync_loads_synchronously(self):
+        """The series loader tells the server's own data from a client's RESTORE by the load
+        window, which only works if no client command runs during a load. A
+        `repl-diskless-load swapdb` sync would allow that, so the module never declares
+        HANDLE_REPL_ASYNC_LOAD, and the server falls back to a synchronous load. A forced full
+        sync on a replica asking for swapdb shows the fallback, and the data still arrives."""
+        self.client.execute_command("TS.ADD", "ts:swapdb", 1000, 1.5)
+        self.wait_for_replication()
+
+        replica = self.replicas[0]
+        replica_client = replica.client
+        replica_client.config_set("repl-diskless-load", "swapdb")
+        # A fresh replication id makes the next sync a full one.
+        replica_client.execute_command("REPLICAOF", "NO", "ONE")
+        replica_client.execute_command("DEBUG", "CHANGE-REPL-ID")
+        replica_client.execute_command("REPLICAOF", self.server.bind_ip, self.server.port)
+
+        wait_for_true(lambda: replica.verify_string_in_logfile(
+            "Skipping diskless-load because there are modules that are not aware of async "
+            "replication"), timeout=30)
+        self.wait_for_replication()
+        assert replica_client.execute_command("TS.GET", "ts:swapdb") == [1000, b"1.5"]
 
     def test_replication_ts_create_with_labels(self):
         """Test that time series with labels replicate correctly"""
