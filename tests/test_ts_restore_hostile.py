@@ -295,6 +295,22 @@ class TestRestoreHostilePayloads(ValkeyTimeSeriesTestCaseBase):
         self.assert_rejected(chimp.with_chunks([chimp.span(0), span]),
                              "an uncompressed chunk in a chimp series")
 
+    @pytest.mark.parametrize("encoding", ["GORILLA", "CHIMP"])
+    def test_forged_count_before_an_uncompressed_chunk(self, encoding):
+        """The payload that aborted the server: a compressed chunk claiming 2^60 samples, then
+        an uncompressed chunk at 30000 and 31000. `TS.REVRANGE ... FILTER_BY_TS 31000 5000`
+        buffered the uncompressed chunk, then reserved 2^60 samples for the compressed one."""
+        head = Series(self.dump("abort:head", encoding))
+        plain = Series(self.dump("abort:tail", "UNCOMPRESSED", samples=2))
+        tail = [list(x) for x in plain.span(0)]
+        tail[5][1], tail[7][1] = 30000, 31000  # timestamps 1000, 2000 -> 30000, 31000
+        forged = [list(x) for x in head.span(0)]
+        forged[1 + CHUNK_FIELDS[forged[0][1]].index("count")][1] = 1 << 60
+
+        self.assert_restores(head.with_chunks([head.span(0)]), "abort:head")
+        self.assert_rejected(head.with_chunks([forged, tail]), f"{encoding}: the abort payload")
+        assert self.server.is_alive()
+
     def test_negative_uncompressed_timestamp(self):
         payload = self.dump("neg", "UNCOMPRESSED")
         s = Series(payload)

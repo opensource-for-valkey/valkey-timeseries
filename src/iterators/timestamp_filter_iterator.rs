@@ -474,6 +474,35 @@ mod tests {
         }
     }
 
+    /// A reverse lookup that buffers an uncompressed chunk and then a compressed one sized the
+    /// second buffer from the compressed chunk's persisted count: a count of 2^60 aborted the
+    /// process. The loader now refuses such a count, so this builds it in memory; the buffer
+    /// must come from what the stream decodes, not from what the header claims.
+    #[test]
+    fn a_forged_sample_count_does_not_size_the_reverse_buffer() {
+        let compressed: Vec<Sample> = (1..=20).map(|i| s(i * 1000, i as f64 * 1.5)).collect();
+        for encoding in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
+            let mut forged = empty_chunk(encoding);
+            forged.set_data(&compressed).unwrap();
+            match &mut forged {
+                TimeSeriesChunk::Gorilla(c) => c.encoder.num_samples = 1 << 60,
+                TimeSeriesChunk::Chimp(c) => *c.encoder.header_mut_for_test().0 = 1 << 60,
+                TimeSeriesChunk::Uncompressed(_) => unreachable!(),
+            }
+            let tail = TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(vec![
+                s(30_000, 2.0),
+                s(31_000, 2.0),
+            ]));
+            let series = TimeSeries::from_chunks(vec![forged, tail]).unwrap();
+
+            assert_eq!(
+                lookup(&series, &[31_000, 5_000], true),
+                vec![31_000, 5_000],
+                "{encoding:?}"
+            );
+        }
+    }
+
     /// Hits and misses interleaved across a chunk large enough for decoder state to matter, in
     /// both directions, against what the arithmetic says must match.
     #[test]
