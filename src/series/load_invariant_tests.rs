@@ -1,28 +1,37 @@
 //! The RDB loader's series checks (`check_series_invariants`, the chunks' `check_write_limits`,
 //! and the compressed chunks' `check_header` / `verify_stream`) must accept everything the write
-//! path can store: a load
-//! error fails a whole RDB load, so a check tighter than the commands makes a server that saved
-//! fine unable to restart. Random command sequences pin that, and the forged cases pin what the
-//! checks are for.
+//! path can store. A foreign payload is refused on any of them, and an own one repaired, so a
+//! check tighter than the commands turns a series the server saved into one it cannot hand to
+//! another node, or rewrites it on every restart. Random command sequences pin that; the forged
+//! cases pin what the checks are for.
 
-use crate::common::Sample;
+use crate::common::{Sample, Timestamp};
 use crate::series::chunks::{
-    ChunkEncoding, ChunkOps, MAX_CHUNK_SIZE, MAX_LOADED_CHUNK_BYTES, TimeSeriesChunk,
+    Chunk, ChunkEncoding, ChunkOps, MAX_CHUNK_SIZE, MAX_LOADED_CHUNK_BYTES, SampleCodec,
+    TimeSeriesChunk, XorChunk,
 };
 use crate::series::serialization::{
     BUDGET_CLAMPED, CHUNK_SIZE_CLAMPED, CHUNKS_OUT_OF_ORDER, ENCODING_ADOPTED, LoadTrust,
     NEGATIVE_TIMESTAMPS, OVERSIZED_SPLIT, RETENTION_CLAMPED, STRAYS_REENCODED,
     check_series_invariants, drop_empty_chunks, normalize_series,
 };
-use crate::series::{DuplicatePolicy, TimeSeries};
+use crate::series::{
+    DuplicatePolicy, SPLIT_SLACK_DIVISOR, TimeSeries, bulk_insert_samples, defrag_series,
+};
 use proptest::prelude::*;
 use std::time::Duration;
+use valkey_module::Context;
 
 const ENCODINGS: [ChunkEncoding; 3] = [
     ChunkEncoding::Uncompressed,
     ChunkEncoding::Gorilla,
     ChunkEncoding::Chimp,
 ];
+
+/// What a chunk may hold past `max + max / SPLIT_SLACK_DIVISOR`: the sample whose append
+/// crossed its budget. The loader's `MAX_LOADED_CHUNK_BYTES` is twice the largest budget on the
+/// strength of this bound, so every writer is held to it, not just to the load limit.
+const ONE_SAMPLE_SLACK: usize = 64;
 
 fn new_series(encoding: ChunkEncoding, chunk_size: usize) -> TimeSeries {
     let mut ts = TimeSeries::new();
@@ -31,7 +40,9 @@ fn new_series(encoding: ChunkEncoding, chunk_size: usize) -> TimeSeries {
     ts
 }
 
-/// Everything the loader checks, as it would see this series after a save.
+/// Everything the loader checks, as it would see this series after a save; that every chunk
+/// stays within its budget; and that each chunk still verifies after a save, a load and more
+/// appends.
 fn assert_loadable(ts: &TimeSeries) {
     if let Err(e) = check_series_invariants(ts) {
         panic!("series rejected: {e}");
@@ -45,6 +56,13 @@ fn assert_loadable(ts: &TimeSeries) {
                 ts.chunks.len()
             );
         }
+        let max = chunk.max_size();
+        assert!(
+            chunk.size() <= max + max / SPLIT_SLACK_DIVISOR + ONE_SAMPLE_SLACK,
+            "chunk {i} of {} holds {} bytes on a {max}-byte budget",
+            ts.chunks.len(),
+            chunk.size()
+        );
         let checked = match chunk {
             TimeSeriesChunk::Uncompressed(c) => {
                 assert!(
@@ -60,90 +78,279 @@ fn assert_loadable(ts: &TimeSeries) {
         if let Err(e) = checked {
             panic!("chunk {i} of {} rejected: {e}", ts.chunks.len());
         }
+        assert_reload_then_append_verifies(i, chunk);
     }
     assert_eq!(total, ts.total_samples);
+}
+
+/// `verify_stream` compares a chunk with a from-scratch re-encode of its samples, so a chunk
+/// that was saved, loaded and then appended to must encode exactly as one that never stopped.
+/// Chimp carries `stored_val`, `last_alpha` and a hint-recheck counter across the hop; if the
+/// hop changed any of them, `RESTORE` of a live series would start failing after its next
+/// append. Both persisted formats hold the same codec state, so the wire format stands in for
+/// the RDB one.
+fn assert_reload_then_append_verifies(i: usize, chunk: &TimeSeriesChunk) {
+    let mut buf = Vec::new();
+    chunk.serialize(&mut buf);
+    let mut loaded = TimeSeriesChunk::deserialize(&buf)
+        .unwrap_or_else(|e| panic!("chunk {i}: does not load back: {e}"));
+    assert!(loaded == *chunk, "chunk {i}: changed by a save and load");
+    match &mut loaded {
+        TimeSeriesChunk::Uncompressed(_) => {}
+        TimeSeriesChunk::Gorilla(c) => append_and_verify(i, c),
+        TimeSeriesChunk::Chimp(c) => append_and_verify(i, c),
+    }
+}
+
+fn append_and_verify<C: SampleCodec>(i: usize, chunk: &mut XorChunk<C>) {
+    let (start, last_value) = if chunk.is_empty() {
+        (0, 0.0)
+    } else {
+        (chunk.last_timestamp(), chunk.encoder.last_value())
+    };
+    for k in 1..=50i64 {
+        let Some(timestamp) = start.checked_add(k * 7) else {
+            break;
+        };
+        // A repeat, a short decimal, a long one and an integer: each takes a different path
+        // through the value encoders' state.
+        let value = match k % 4 {
+            0 => last_value,
+            1 => k as f64 * 0.25,
+            2 => (k as f64).sqrt(),
+            _ => (k * 1000) as f64,
+        };
+        // Past the budget is fine: the encoder state is what is under test.
+        chunk.encoder.push(&Sample::new(timestamp, value)).unwrap();
+    }
+    if let Err(e) = chunk.check_header().and_then(|_| chunk.verify_stream()) {
+        panic!("chunk {i}: rejected after a reload and 50 appends: {e}");
+    }
 }
 
 #[derive(Debug, Clone)]
 enum Op {
     /// `TS.ADD` at `last + gap` (or at `gap` on an empty series).
     Append { gap: i64, value: f64 },
+    /// `count` appends at a fixed step, constant or noisy: a run of one density.
+    Run {
+        count: usize,
+        step: i64,
+        noisy: bool,
+    },
     /// `TS.ADD` into the past, `KEEP_LAST` on a collision.
     Backfill { back: i64, value: f64 },
     /// `TS.MADD` of a sorted batch spread over `[start, start + span]`.
-    Merge { start: i64, span: i64, count: usize },
-    /// `TS.DEL` over `[start, start + span]`.
-    Delete { start: i64, span: i64 },
+    Merge {
+        start: i64,
+        span: i64,
+        count: usize,
+        noisy: bool,
+    },
+    /// `TS.ADDBULK` of the same: the bulk path groups by chunk and plans new chunks itself.
+    Bulk {
+        start: i64,
+        span: i64,
+        count: usize,
+        noisy: bool,
+    },
+    /// `TS.DEL` from `at` per mille of the way through the series' span, `width` per mille of
+    /// it wide: always where the data is, which absolute offsets often missed.
+    Delete { at: u16, width: u16 },
     /// `TS.ALTER CHUNK_SIZE`.
     Alter { chunk_size: usize },
     /// A retention trim, as the cron or a delete runs it.
     Trim { retention: u64 },
+    /// Defragmentation, as the module type's `defrag` callback runs it.
+    Defrag,
+    /// Every chunk saved and loaded; later operations continue on the loaded state.
+    Reload,
 }
 
-fn op() -> impl Strategy<Value = Op> {
+/// Operations whose timestamps are offsets below `max_offset`, with batches of up to
+/// `max_count` samples, appended at steps of up to `max_step`, onto chunk budgets drawn from
+/// `budgets`.
+fn op_with(
+    max_offset: i64,
+    max_count: usize,
+    max_step: i64,
+    budgets: Vec<usize>,
+) -> impl Strategy<Value = Op> {
     let value = prop_oneof![
         Just(1.5),
         -1e6..1e6f64,
         (0u32..200).prop_map(|n| n as f64),
         Just(f64::NAN),
     ];
+    let span = 0..max_offset;
     prop_oneof![
-        6 => (1i64..2_000, value.clone()).prop_map(|(gap, value)| Op::Append { gap, value }),
+        5 => (1..max_step.min(2_000), value.clone()).prop_map(|(gap, value)| Op::Append { gap, value }),
+        2 => (1..3_000usize, prop_oneof![Just(1i64), 1..max_step], any::<bool>())
+            .prop_map(|(count, step, noisy)| Op::Run { count, step, noisy }),
         2 => (0i64..50_000, value).prop_map(|(back, value)| Op::Backfill { back, value }),
-        2 => (0i64..60_000, 0i64..60_000, 1usize..1_500)
-            .prop_map(|(start, span, count)| Op::Merge { start, span, count }),
-        1 => (0i64..60_000, 0i64..10_000).prop_map(|(start, span)| Op::Delete { start, span }),
-        1 => (6usize..=64).prop_map(|n| Op::Alter { chunk_size: n * 8 }),
-        1 => (1_000u64..50_000).prop_map(|retention| Op::Trim { retention }),
+        2 => (span.clone(), span.clone(), 1..max_count, any::<bool>())
+            .prop_map(|(start, span, count, noisy)| Op::Merge { start, span, count, noisy }),
+        2 => (span.clone(), span.clone(), 1..max_count, any::<bool>())
+            .prop_map(|(start, span, count, noisy)| Op::Bulk { start, span, count, noisy }),
+        2 => (0..1000u16, 0..500u16).prop_map(|(at, width)| Op::Delete { at, width }),
+        1 => prop::sample::select(budgets).prop_map(|chunk_size| Op::Alter { chunk_size }),
+        // Up to the offsets' scale, so a trim keeps part of the data rather than all but the
+        // last few samples.
+        1 => (1_000u64..(max_offset as u64).max(50_000)).prop_map(|retention| Op::Trim { retention }),
+        2 => Just(Op::Defrag),
+        1 => Just(Op::Reload),
     ]
 }
 
-fn apply(ts: &mut TimeSeries, op: &Op) {
+/// A value for sample `i` of a batch: a cheap ramp, or incompressible bits (finite, so samples
+/// compare equal).
+fn batch_value(noisy: bool, i: i64) -> f64 {
+    if noisy {
+        let bits = (i as u64 ^ 0x9e37_79b9_7f4a_7c15).wrapping_mul(6364136223846793005);
+        f64::from_bits(bits >> 2)
+    } else {
+        i as f64 * 0.25
+    }
+}
+
+/// `count` sorted samples over `[base + start, base + start + span]`, or none if that range
+/// leaves `i64`.
+fn batch(base: Timestamp, start: i64, span: i64, count: usize, noisy: bool) -> Vec<Sample> {
+    let step = (span / count as i64).max(1);
+    (0..count as i64)
+        .map_while(|i| {
+            base.checked_add(start)?
+                .checked_add(i * step)
+                .map(|t| Sample::new(t, batch_value(noisy, i)))
+        })
+        .collect()
+}
+
+/// Applies `op` with every timestamp offset by `base`.
+fn apply(ts: &mut TimeSeries, base: Timestamp, op: &Op) {
+    let last = if ts.is_empty() {
+        base
+    } else {
+        ts.last_timestamp()
+    };
     match *op {
         Op::Append { gap, value } => {
-            let at = if ts.is_empty() {
-                gap
-            } else {
-                ts.last_timestamp() + gap
-            };
-            ts.add(at, value, None);
+            if let Some(at) = last.checked_add(gap) {
+                ts.add(at, value, None);
+            }
+        }
+        Op::Run { count, step, noisy } => {
+            for i in 1..=count as i64 {
+                let Some(at) = i.checked_mul(step).and_then(|d| last.checked_add(d)) else {
+                    break;
+                };
+                ts.add(at, if noisy { batch_value(true, i) } else { 1.0 }, None);
+            }
         }
         Op::Backfill { back, value } => {
-            let at = (ts.last_timestamp() - back).max(0);
+            let at = (last - back).max(base);
             if !ts.is_older_than_retention(at) {
                 ts.add(at, value, Some(DuplicatePolicy::KeepLast));
             }
         }
-        Op::Merge { start, span, count } => {
-            let step = (span / count as i64).max(1);
-            let samples: Vec<Sample> = (0..count as i64)
-                .map(|i| Sample::new(start + i * step, i as f64 * 0.25))
-                .collect();
+        Op::Merge {
+            start,
+            span,
+            count,
+            noisy,
+        } => {
+            let samples = batch(base, start, span, count, noisy);
             let _ = ts.merge_samples(&samples, Some(DuplicatePolicy::KeepLast));
         }
-        Op::Delete { start, span } => {
-            let _ = ts.remove_range(start, start + span);
+        Op::Bulk {
+            start,
+            span,
+            count,
+            noisy,
+        } => {
+            let samples = batch(base, start, span, count, noisy);
+            if !samples.is_empty() {
+                bulk_insert_samples(
+                    &Context::dummy(),
+                    ts,
+                    &samples,
+                    Some(DuplicatePolicy::KeepLast),
+                );
+            }
+        }
+        Op::Delete { at, width } => {
+            if !ts.is_empty() {
+                // In `i128`: a span near `i64::MAX` times a per-mille factor overflows `i64`.
+                let first = ts.first_timestamp as i128;
+                let span = last as i128 - first;
+                let from = first + span * at as i128 / 1000;
+                let to = from + span * width as i128 / 1000;
+                let _ = ts.remove_range(from as Timestamp, to as Timestamp);
+            }
         }
         Op::Alter { chunk_size } => ts.chunk_size_bytes = chunk_size,
         Op::Trim { retention } => {
             ts.retention = Duration::from_millis(retention);
             let _ = ts.trim();
         }
+        Op::Defrag => {
+            let _ = defrag_series(ts);
+        }
+        Op::Reload => {
+            for chunk in ts.chunks.iter_mut() {
+                let mut buf = Vec::new();
+                chunk.serialize(&mut buf);
+                *chunk = TimeSeriesChunk::deserialize(&buf).unwrap();
+            }
+        }
     }
 }
 
+/// Small budgets, so a short sequence fills, splits, merges and defragments many chunks.
+fn small_budgets() -> Vec<usize> {
+    (6usize..=64).map(|n| n * 8).collect()
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(96))]
+    #![proptest_config(ProptestConfig::with_cases(192))]
 
     #[test]
     fn command_sequences_stay_loadable(
         encoding in 0usize..3,
-        chunk_size in (6usize..=64).prop_map(|n| n * 8),
-        ops in prop::collection::vec(op(), 1..120),
+        chunk_size in prop::sample::select(small_budgets()),
+        ops in prop::collection::vec(op_with(60_000, 1_500, 100_000, small_budgets()), 1..120),
     ) {
         let mut ts = new_series(ENCODINGS[encoding], chunk_size);
         for op in &ops {
-            apply(&mut ts, op);
+            apply(&mut ts, 0, op);
+        }
+        assert_loadable(&ts);
+    }
+}
+
+/// Budgets up to `MAX_CHUNK_SIZE`, the chunk sizes the load limit is twice of.
+fn large_budgets() -> Vec<usize> {
+    vec![48, 4096, 65536, MAX_CHUNK_SIZE]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    /// The same property at the scale where the load limit matters: budgets up to 1 MiB,
+    /// batches of up to 100k samples, density switching between operations, and timestamps
+    /// either near zero or within 2^40 of `i64::MAX`, where every delta and offset must stay
+    /// in range.
+    #[test]
+    fn large_budgets_stay_loadable(
+        encoding in 0usize..3,
+        chunk_size in prop::sample::select(large_budgets()),
+        near_max in any::<bool>(),
+        ops in prop::collection::vec(op_with(1 << 39, 100_000, 1 << 20, large_budgets()), 1..24),
+    ) {
+        let base = if near_max { i64::MAX - (1 << 40) } else { 0 };
+        let mut ts = new_series(ENCODINGS[encoding], chunk_size);
+        for op in &ops {
+            apply(&mut ts, base, op);
         }
         assert_loadable(&ts);
     }
