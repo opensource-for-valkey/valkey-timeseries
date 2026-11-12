@@ -262,14 +262,14 @@ As coordinator:
 | `fanout_client_disconnects_total` | counter | Operations ended early because their client disconnected: the local share stops, the remote shares are sent cancels (reads only; a write runs to the end) |
 | `fanout_rpc_timeouts_total` | counter | RPCs whose timer fired with remote shares outstanding |
 | `fanout_cancels_sent_total` | counter | Cancel messages sent to shares still outstanding when an RPC's timer fired or its fanout completed early |
-| `fanout_early_completions_total` | counter | Fanout RPCs abandoned with remote shares outstanding because a share's error had already completed the fanout |
+| `fanout_early_completions_total` | counter | Fanout RPCs abandoned with remote shares outstanding because the fanout had already completed: a share's error, or the client disconnected |
 | `fanout_setup_failures_total` | counter | Operations that failed before any remote request was sent |
 | `fanout_blocking_denied_total` | counter | Commands refused because the client could not be blocked (MULTI, a script, a module call) |
 | `fanout_send_failures_total` | counter | Requests the cluster bus refused to send |
 | `fanout_local_share_busy_total` | counter | Local shares refused because the fan-out lane's queue was full |
 | `fanout_local_share_expired_total` | counter | Local shares that waited in the queue past the deadline |
 | `fanout_reply_expired_total` | counter | Replies the `ts-fanout-reply` lane did not build because the client's deadline had passed (left to the main thread, which skips a client already timed out) |
-| `fanout_reply_disconnected_total` | counter | Replies the `ts-fanout-reply` lane did not build because the client had disconnected |
+| `fanout_reply_disconnected_total` | counter | Replies not built because the client had disconnected: when the operation completed (whether or not the disconnect ended it), or while the reply waited on the `ts-fanout-reply` lane |
 | `fanout_error_decode_failures_total` | counter | Error responses from peers that could not be decoded |
 | `fanout_ignored_unknown_request_total` | counter | Peer answers dropped because their request is no longer in flight (it timed out, say) |
 | `fanout_ignored_unknown_sender_total` | counter | Peer answers dropped because their sender is not a remote target of the request |

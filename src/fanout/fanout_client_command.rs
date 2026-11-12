@@ -94,7 +94,10 @@ pub trait FanoutClientCommand: Default + Send + 'static {
             // A client that disconnected reads no reply (the fan-out may have ended early
             // for that reason, see `FanoutCancel`). What the shards sent is freed on the
             // reply lane, as after a reply built there, rather than on the main thread,
-            // which runs this when the disconnect ended the fan-out.
+            // which runs this when the disconnect ended the fan-out. With the lane full they
+            // are freed here instead: no worse than a live client's fallback, which builds
+            // and frees its reply on the main thread, and a thread per call (the only other
+            // place to send them) is what an overloaded server can least afford.
             let gone = {
                 let mut bc = lock(&bc_for_closure);
                 let gone = bc.is_disconnected();

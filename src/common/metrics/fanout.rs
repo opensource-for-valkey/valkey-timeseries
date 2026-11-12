@@ -33,7 +33,7 @@ pub static FANOUT_LOCAL_SHARE_BUSY: AtomicU64 = AtomicU64::new(0);
 pub static FANOUT_LOCAL_SHARE_EXPIRED: AtomicU64 = AtomicU64::new(0);
 /// Replies the reply lane left to the main thread because the client's deadline had passed.
 pub static FANOUT_REPLY_EXPIRED: AtomicU64 = AtomicU64::new(0);
-/// Replies the reply lane did not build because the client had disconnected.
+/// Replies not built because the client had disconnected: at completion, or on the reply lane.
 pub static FANOUT_REPLY_DISCONNECTED: AtomicU64 = AtomicU64::new(0);
 /// Commands refused because the client could not be blocked (MULTI, a script, a module call).
 pub static FANOUT_BLOCKING_DENIED: AtomicU64 = AtomicU64::new(0);
@@ -49,7 +49,7 @@ pub static FANOUT_RPC_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 /// completed early.
 pub static FANOUT_CANCELS_SENT: AtomicU64 = AtomicU64::new(0);
 /// RPCs abandoned with remote shares outstanding because the fanout had already completed (a
-/// share's error aborted it).
+/// share's error aborted it, or its client disconnected).
 pub static FANOUT_EARLY_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 /// Operations ended early by an error returned to the client as it is (a cluster-map mismatch,
 /// a permission denial, a busy shard).
@@ -200,7 +200,7 @@ static COUNTERS: &[(&str, &AtomicU64, &str)] = &[
     (
         "reply_disconnected",
         &FANOUT_REPLY_DISCONNECTED,
-        "Fanout replies not built on the reply lane because the client had disconnected",
+        "Fanout replies not built because the client had disconnected",
     ),
     (
         "blocking_denied",
@@ -230,7 +230,7 @@ static COUNTERS: &[(&str, &AtomicU64, &str)] = &[
     (
         "early_completions",
         &FANOUT_EARLY_COMPLETIONS,
-        "Fanout RPCs abandoned with remote shares outstanding because a share's error had already completed the fanout",
+        "Fanout RPCs abandoned with remote shares outstanding because the fanout had already completed (a share's error, or the client disconnected)",
     ),
     (
         "rpc_timeouts",

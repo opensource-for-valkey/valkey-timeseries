@@ -189,6 +189,7 @@ where
     /// For a client that has disconnected: no reply is written, and [`reply_callback`], which
     /// the server skips for such a client anyway, would write nothing either.
     pub(super) fn discard_reply(&mut self) {
+        metrics::FANOUT_REPLY_DISCONNECTED.incr();
         self.mark_answered();
     }
 
