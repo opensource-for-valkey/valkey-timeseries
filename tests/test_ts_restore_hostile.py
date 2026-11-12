@@ -180,6 +180,26 @@ class Series:
         return self.payload.tokens[start:end]
 
 
+def empty_chunk(span):
+    """The tokens of an empty chunk of the same type as `span`, as the encoders start one."""
+    tokens = [list(x) for x in span]
+    kind = tokens[0][1]
+    if kind == 1:  # type, flag, max_size, max_elements, len
+        tokens = tokens[:5]
+        tokens[4][1] = 0
+        return tokens
+    empty = {
+        2: {"count": 0, "first_ts": 0, "last_ts": 0, "last_value": 0.0, "ts_delta": 0,
+            "leading": 0, "trailing": 0, "stream": b"", "free_bits": 0},
+        3: {"count": 0, "first_ts": 0, "last_ts": 0, "last_value": 0.0, "last_delta": 0,
+            "last_alpha": -1, "stored_lz": 64, "stored_tz": 0, "stored_val": 0, "first": 1,
+            "stream": b"", "free_bits": 0},
+    }[kind]
+    for name, value in empty.items():
+        tokens[1 + CHUNK_FIELDS[kind].index(name)][1] = value
+    return tokens
+
+
 def set_token(payload: Payload, edits) -> bytes:
     tokens = [list(x) for x in payload.tokens]
     for index, value in edits.items():
@@ -283,6 +303,33 @@ class TestRestoreHostilePayloads(ValkeyTimeSeriesTestCaseBase):
         # Rebuilding the payload from its own spans is a no-op, so the edits above are the
         # only thing the server rejected.
         self.assert_restores(s.with_chunks(spans), "multi")
+
+    @pytest.mark.parametrize("encoding", ["UNCOMPRESSED", "GORILLA", "CHIMP"])
+    def test_empty_chunks_are_dropped(self, encoding):
+        """An empty chunk's bounds read as zero. Interior or trailing ones broke the ordering the
+        chunk search assumes past 16 chunks, so deletes and bounded reads of existing samples
+        found nothing while a full scan still returned them. They load, without the empties."""
+        payload = self.dump("empties", encoding, chunk_size=64, samples=1500)
+        s = Series(payload)
+        assert len(s.chunks) > 16, "needs the binary-search path"
+        spans = [s.span(i) for i in range(len(s.chunks))]
+        empty = empty_chunk(spans[0])
+        middle = len(spans) // 2
+        edited = s.with_chunks([empty] + spans[:middle] + [empty] + spans[middle:] + [empty])
+
+        client = self.client
+        key = "hostile:empties"
+        client.delete(key)
+        assert client.restore(key, 0, edited) == b"OK"
+        assert client.execute_command("TS.RANGE", key, "-", "+") == \
+            client.execute_command("TS.RANGE", "empties", "-", "+")
+        client.execute_command("COPY", key, f"{key}:reads")
+        for timestamp, _ in client.execute_command("TS.RANGE", "empties", "-", "+"):
+            assert len(client.execute_command("TS.RANGE", f"{key}:reads", timestamp,
+                                              timestamp)) == 1, f"read at {timestamp}"
+            assert client.execute_command("TS.DEL", key, timestamp, timestamp) == 1, \
+                f"delete at {timestamp}"
+        assert self.ts_info(f"{key}:reads")["chunkCount"] == len(spans)
 
     def test_mixed_encodings_are_rejected(self):
         chimp = Series(self.dump("mix:chimp", "CHIMP"))

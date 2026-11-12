@@ -179,6 +179,7 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
         rules,
     };
 
+    drop_empty_chunks(&mut ts);
     check_series_invariants(&ts)
         .map_err(|e| ValkeyError::String(format!("Invalid series: {e}")))?;
 
@@ -187,6 +188,22 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
     crate::series::index::persistence::observe_series_rdb_load(rdb, &mut ts);
 
     Ok(ts)
+}
+
+/// Drops every empty chunk unless it is the series' only chunk, and reports whether any went.
+///
+/// An empty chunk's bounds read as zero, which breaks the ordering the chunk searches assume
+/// once a series has more than 16 chunks (`binary_search_chunks_by_timestamp`): deletes and
+/// bounded reads of existing samples found nothing. Commands never leave one anywhere but
+/// alone: deletes, defrag and the retention trim all drop the chunks they empty, and
+/// `get_last_chunk` creates a chunk on demand. So this changes no series the server wrote, and
+/// the digest hashes samples, not chunks. Applied to every load, foreign or not.
+pub(crate) fn drop_empty_chunks(ts: &mut TimeSeries) -> bool {
+    if ts.chunks.len() < 2 || !ts.chunks.iter().any(|chunk| chunk.is_empty()) {
+        return false;
+    }
+    ts.chunks.retain(|chunk| !chunk.is_empty());
+    true
 }
 
 /// What the write path maintains for every series it stores, checked once a payload has been
@@ -207,8 +224,7 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
 ///   `MAX_LOADED_CHUNK_BYTES`. A chunk's `max_size` may still differ from the series' after
 ///   `TS.ALTER CHUNK_SIZE`, so it is not compared with `chunk_size_bytes`.
 /// - Non-empty chunks hold non-negative timestamps, ascending with no overlap from one chunk to
-///   the next. Empty chunks are allowed anywhere: a series keeps an empty tail chunk, and they
-///   are harmless elsewhere.
+///   the next. An empty chunk only stands alone; [`drop_empty_chunks`] runs first.
 pub(crate) fn check_series_invariants(ts: &TimeSeries) -> Result<(), String> {
     if validate_chunk_size(ts.chunk_size_bytes).is_err() {
         return Err(format!("chunk size {} out of range", ts.chunk_size_bytes));
@@ -238,6 +254,9 @@ pub(crate) fn check_series_invariants(ts: &TimeSeries) -> Result<(), String> {
             return Err(format!("chunk {i} holds {} bytes", chunk.size()));
         }
         if chunk.is_empty() {
+            if ts.chunks.len() > 1 {
+                return Err(format!("chunk {i} of {} is empty", ts.chunks.len()));
+            }
             continue;
         }
         let first = chunk.first_timestamp();

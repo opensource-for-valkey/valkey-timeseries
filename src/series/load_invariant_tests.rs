@@ -9,7 +9,7 @@ use crate::common::Sample;
 use crate::series::chunks::{
     ChunkEncoding, ChunkOps, MAX_CHUNK_SIZE, MAX_LOADED_CHUNK_BYTES, TimeSeriesChunk,
 };
-use crate::series::serialization::check_series_invariants;
+use crate::series::serialization::{check_series_invariants, drop_empty_chunks};
 use crate::series::{DuplicatePolicy, TimeSeries};
 use proptest::prelude::*;
 use std::time::Duration;
@@ -234,16 +234,59 @@ fn forged_series_are_rejected() {
     }
 }
 
+/// An empty chunk reports bounds of zero, which breaks the ordering the chunk searches assume
+/// once a series has more than 16 chunks: deletes and bounded reads of existing samples found
+/// nothing. Commands only ever leave a sole empty chunk, so the loader drops every other one.
 #[test]
-fn empty_chunks_and_zero_chunks_are_accepted() {
+fn empty_chunks_are_dropped_on_load() {
     for encoding in ENCODINGS {
         assert_loadable(&new_series(encoding, 128));
 
-        let mut ts = loaded_base(encoding);
-        ts.chunks.insert(1, TimeSeriesChunk::new(encoding, 128));
+        let mut base = new_series(encoding, 128);
+        let mut t = 0;
+        // More than `LINEAR_SCAN_MAX` chunks, so the lookups below binary-search.
+        while base.chunks.len() <= 24 {
+            t += 1000;
+            base.add(t, t as f64 * 0.37, None);
+        }
+        let mut ts = base.clone();
+        let middle = ts.chunks.len() / 2;
+        ts.chunks
+            .insert(middle, TimeSeriesChunk::new(encoding, 128));
         ts.chunks.insert(0, TimeSeriesChunk::new(encoding, 128));
         ts.chunks.push(TimeSeriesChunk::new(encoding, 128));
-        assert!(check_series_invariants(&ts).is_ok(), "{encoding}");
+        assert!(
+            check_series_invariants(&ts).is_err(),
+            "{encoding}: not the loaded form"
+        );
+
+        assert!(drop_empty_chunks(&mut ts), "{encoding}");
+        assert_eq!(ts.chunks.len(), base.chunks.len(), "{encoding}");
+        assert_loadable(&ts);
+        for sample in base.iter() {
+            let t = sample.timestamp;
+            assert_eq!(ts.get_range(t, t), vec![sample], "{encoding}: read at {t}");
+            assert_eq!(
+                ts.clone().remove_range(t, t).unwrap(),
+                1,
+                "{encoding}: delete at {t}"
+            );
+        }
+
+        // A sole empty chunk is what a series that never kept a sample looks like: kept.
+        let mut sole = new_series(encoding, 128);
+        sole.chunks.push(TimeSeriesChunk::new(encoding, 128));
+        assert!(!drop_empty_chunks(&mut sole));
+        assert_eq!(sole.chunks.len(), 1);
+        assert_loadable(&sole);
+
+        // Several, and nothing else: none, which `get_last_chunk` already handles.
+        let mut several = new_series(encoding, 128);
+        several.chunks.push(TimeSeriesChunk::new(encoding, 128));
+        several.chunks.push(TimeSeriesChunk::new(encoding, 128));
+        assert!(drop_empty_chunks(&mut several));
+        assert!(several.chunks.is_empty());
+        assert_loadable(&several);
     }
 }
 
