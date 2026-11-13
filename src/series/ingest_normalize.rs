@@ -20,20 +20,16 @@ pub(super) struct NormalizedBatch {
     pub(super) results: Vec<SampleAddResult>,
 }
 
-/// Per-input-index mask of in-batch duplicates: every occurrence of a timestamp after the first
-/// in input order. A stable index sort makes equal timestamps adjacent in input order.
-fn in_batch_duplicates(samples: &[Sample]) -> Vec<bool> {
+/// Per-input-index mask of in-batch duplicates in an *unsorted* batch: every occurrence of a
+/// timestamp after the first in input order. A stable index sort makes equal timestamps adjacent
+/// in input order. (In a sorted batch a repeat is just equal to its predecessor; see
+/// [`normalize_batch`], which skips this allocation then.)
+fn unsorted_in_batch_duplicates(samples: &[Sample]) -> Vec<bool> {
     let mut duplicate = vec![false; samples.len()];
-    if samples.is_sorted_by_key(|s| s.timestamp) {
-        for i in 1..samples.len() {
-            duplicate[i] = samples[i].timestamp == samples[i - 1].timestamp;
-        }
-    } else {
-        let mut order: Vec<usize> = (0..samples.len()).collect();
-        order.sort_by_key(|&i| samples[i].timestamp);
-        for pair in order.windows(2) {
-            duplicate[pair[1]] = samples[pair[1]].timestamp == samples[pair[0]].timestamp;
-        }
+    let mut order: Vec<usize> = (0..samples.len()).collect();
+    order.sort_by_key(|&i| samples[i].timestamp);
+    for pair in order.windows(2) {
+        duplicate[pair[1]] = samples[pair[1]].timestamp == samples[pair[0]].timestamp;
     }
     duplicate
 }
@@ -63,19 +59,27 @@ pub(super) fn normalize_batch(
     samples: &[Sample],
     policy_override: Option<DuplicatePolicy>,
 ) -> NormalizedBatch {
-    let duplicate = in_batch_duplicates(samples);
+    // Sorted input is the hot case (TS.ADDBULK sorts its payload; in-order TS.MADD), and costs
+    // no allocations beyond the three returned vectors.
+    let sorted = samples.is_sorted_by_key(|s| s.timestamp);
+    let repeats = (!sorted).then(|| unsorted_in_batch_duplicates(samples));
+    let is_repeat = |i: usize| match &repeats {
+        Some(mask) => mask[i],
+        None => i > 0 && samples[i].timestamp == samples[i - 1].timestamp,
+    };
     let dup_policy = series.sample_duplicates;
     let retention_ms = (!series.retention.is_zero()).then_some(series.retention.as_millis() as i64);
 
     let mut results = vec![SampleAddResult::Error("Unknown error"); samples.len()];
-    let mut accepted: Vec<(usize, Sample)> = Vec::with_capacity(samples.len());
+    let mut to_insert: Vec<Sample> = Vec::with_capacity(samples.len());
+    let mut insert_index: Vec<usize> = Vec::with_capacity(samples.len());
 
     // The last stored sample as sequential adds would leave it: the retention floor and the
     // IGNORE comparison both read it.
     let mut running_last = series.last_sample;
 
     for (index, sample) in samples.iter().enumerate() {
-        if duplicate[index] {
+        if is_repeat(index) {
             results[index] = SampleAddResult::Duplicate;
             continue;
         }
@@ -105,15 +109,19 @@ pub(super) fn normalize_batch(
         if running_last.is_none_or(|last| adjusted.timestamp >= last.timestamp) {
             running_last = Some(adjusted);
         }
-        accepted.push((index, adjusted));
+        to_insert.push(adjusted);
+        insert_index.push(index);
     }
 
-    // Chunk merging needs ascending timestamps. They are unique by now, so the sort need not
+    // Chunk merging needs ascending timestamps. A subsequence of a sorted batch is sorted, so
+    // only unsorted input can need this; the timestamps are unique by now, so the sort need not
     // be stable.
-    if !accepted.is_sorted_by_key(|(_, s)| s.timestamp) {
-        accepted.sort_unstable_by_key(|(_, s)| s.timestamp);
+    if !sorted && !to_insert.is_sorted_by_key(|s| s.timestamp) {
+        let mut order: Vec<usize> = (0..to_insert.len()).collect();
+        order.sort_unstable_by_key(|&k| to_insert[k].timestamp);
+        to_insert = order.iter().map(|&k| to_insert[k]).collect();
+        insert_index = order.iter().map(|&k| insert_index[k]).collect();
     }
-    let (insert_index, to_insert) = accepted.into_iter().unzip();
 
     NormalizedBatch {
         to_insert,
