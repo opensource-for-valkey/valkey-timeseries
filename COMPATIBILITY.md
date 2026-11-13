@@ -90,6 +90,7 @@ This section describes areas where Valkey TimeSeries intentionally diverges from
 - Valkey TimeSeries fans out over Valkey's native cluster bus. There is no separate coordinator component, no additional network port, and no module-level shared password — RedisTimeSeries required `OSS_GLOBAL_PASSWORD` on every cluster node prior to its 8.0 release, which replaced it with an internal shared-secret mechanism.
 - Valkey TimeSeries bounds each fan-out with the `ts-fanout-command-timeout` configurable and returns an error when a consistent cluster-wide view cannot be established within it. This is a reply an equivalent RedisTimeSeries deployment need not produce.
 - ACL keyspace restrictions are enforced on the fanned-out result (see _Security Architecture_ under Non-Goals).
+- Valkey TimeSeries assumes that a user's ACL rules for time-series commands, keys and databases are the same on every node of a cluster. Rules that differ between nodes are a misconfiguration: a multi-series command would see different data depending on which shard holds it. As a safeguard, on Valkey 9.1 and later each shard also checks the caller's access to the request's database (`db=`, `alldbs`, `resetdbs`) against its own rules, so an obvious mismatch (a database granted on the coordinator but on no selector of some shard) fails the command instead of returning that shard's data. The safeguard does not tie the database to the selector that grants the command or keys, so it does not catch every mismatch, and it is no substitute for identical rules. Redis has no database-level ACL rule, so this has no RedisTimeSeries counterpart.
 
 Valkey TimeSeries reads each shard's `TS.QUERYINDEX` and `TS.QUERYLABELS` matches in batches,
 releasing the module lock between batches. This is not a point-in-time snapshot of a shard:
@@ -325,6 +326,8 @@ When a multi-series command returns labels (via `WITHLABELS` or `SELECTED_LABELS
 ### 9. Review ACL keyspace restrictions
 
 If ACL keyspace restrictions are used, these should be reviewed, as Valkey TimeSeries is more restrictive in some cases: label-based multi-series queries only return series whose keys the calling user is permitted to access. A query that appeared to return a complete result set under RedisTimeSeries may return a filtered subset under Valkey TimeSeries when the user's key permissions are narrower than the set of matching series.
+
+In a cluster, give each user the same ACL rules on every node, including database rules (`db=`, Valkey 9.1 and later). Valkey TimeSeries assumes they match; a multi-series command fails if a shard plainly denies the caller the selected database, but other mismatches are not detected.
 
 ### 10. Re-baseline anything that consumes `std.p` / `std.s` / `var.p` / `var.s`
 

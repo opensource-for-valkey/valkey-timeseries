@@ -166,4 +166,20 @@ mod tests {
             );
         }
     }
+
+    /// `check_db_access` asks whether the user may run its probe command in a database. The
+    /// server only applies database rules to commands with keys or a `@read`/`@write`/
+    /// `@keyspace` category, so a probe without one would pass every user.
+    #[test]
+    fn the_database_probe_command_is_restricted_by_database() {
+        use crate::common::acl::DB_PROBE_COMMAND;
+        let (_, categories) = COMMAND_ACL_CATEGORIES
+            .iter()
+            .find(|(name, _)| *name == DB_PROBE_COMMAND)
+            .expect("the database probe names a registered command");
+        assert!(
+            categories.split_whitespace().any(|c| c == "read"),
+            "{DB_PROBE_COMMAND} must stay @read: {categories}"
+        );
+    }
 }

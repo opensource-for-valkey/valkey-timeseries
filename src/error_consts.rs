@@ -100,6 +100,8 @@ pub const KEY_UPDATE_PERMISSION_ERROR: &str = "TSDB: key update permission error
 pub const KEY_DELETE_PERMISSION_ERROR: &str = "TSDB: key delete permission error";
 pub const ALL_KEYS_READ_PERMISSION_ERROR: &str = "TSDB: current user doesn't have read permission to one or more keys that match the specified filter";
 pub const ALL_KEYS_WRITE_PERMISSION_ERROR: &str = "TSDB: current user doesn't have write permission to one or more keys that match the specified filter";
+pub const DB_PERMISSION_ERROR: &str =
+    "TSDB: current user doesn't have permission to access the selected database";
 /// A thread tried to enter a second ACL scope while one was live: it would have replaced the
 /// first scope's identity, and dropping it would have cleared that identity under the first.
 pub const ACL_SCOPE_ALREADY_ENTERED: &str =
