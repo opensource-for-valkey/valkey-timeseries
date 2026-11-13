@@ -113,6 +113,42 @@ impl CompactionRule {
             self.has_samples = true;
         }
     }
+
+    /// Brings a loaded rule's open-bucket state back within what the engine maintains, and
+    /// says what it changed.
+    ///
+    /// The engine never leaves aggregator state behind without an open bucket: `clear` empties
+    /// both, and `reset` is always followed by the next bucket's start. A payload that has
+    /// such state anyway, `has_samples` included, would have it folded into the next bucket
+    /// the rule opens, because starting a bucket does not reset the aggregator. That gives the
+    /// destination a wrong value with no error. Clearing it again makes this a new rule, which is
+    /// a no-op on any state the engine wrote. An open bucket that is not on the rule's grid
+    /// cannot be fixed locally, so the rule is marked `dirty` and the next write rebuilds that
+    /// bucket from the source.
+    pub(crate) fn repair_open_bucket(&mut self) -> Option<OpenBucketRepair> {
+        match self.bucket_start {
+            None => {
+                let stale = self.aggregator.clone();
+                let had_samples = self.has_samples;
+                self.clear();
+                (had_samples || stale != self.aggregator).then_some(OpenBucketRepair::Cleared)
+            }
+            Some(start) if self.calc_bucket_start(start) != start => {
+                self.dirty = true;
+                Some(OpenBucketRepair::Rebuild)
+            }
+            Some(_) => None,
+        }
+    }
+}
+
+/// What [`CompactionRule::repair_open_bucket`] changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenBucketRepair {
+    /// Aggregator state with no open bucket was dropped.
+    Cleared,
+    /// An open bucket off the rule's grid was marked for a rebuild from the source.
+    Rebuild,
 }
 
 impl RdbSerializable for CompactionRule {

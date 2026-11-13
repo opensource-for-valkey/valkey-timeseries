@@ -324,7 +324,7 @@ fn handle_sample_compaction(ctx: &mut CompactionContext, sample: Sample) -> Tsdb
         }
         Ordering::Greater => {
             // Sample starts a new bucket - finalize the current bucket first
-            finalize_current_bucket(ctx, sample, sample_bucket_start)?;
+            finalize_current_bucket(ctx, current_bucket_start, sample, sample_bucket_start)?;
         }
         Ordering::Less => {
             let bucket_last = ctx.rule.bucket_last(sample_bucket_start);
@@ -344,19 +344,17 @@ fn handle_sample_compaction(ctx: &mut CompactionContext, sample: Sample) -> Tsdb
     Ok(())
 }
 
-/// Finalize the current aggregation bucket and start a new one
+/// Finalize the current aggregation bucket, which starts at `current_bucket_start`, and start a
+/// new one
 fn finalize_current_bucket(
     ctx: &mut CompactionContext<'_>,
+    current_bucket_start: Timestamp,
     new_sample: Sample,
     new_bucket_start: Timestamp,
 ) -> TsdbResult<()> {
     if ctx.has_samples() {
         // Finalize the current bucket
         let aggregated_value = AggregationHandler::finalize(&mut ctx.rule.aggregator);
-        let current_bucket_start = ctx.rule.bucket_start.expect(
-            "finalize_current_bucket should be called when current bucket start is already set",
-        );
-
         let stored_before = ctx.written.len();
         add_dest_bucket(ctx, current_bucket_start, aggregated_value)?;
         // A bucket the destination refused (a duplicate it ignored, or one below its retention
@@ -833,6 +831,82 @@ mod tests {
             input_order: &order,
         };
         apply_op(&mut cctx, op).unwrap();
+    }
+
+    /// A loaded rule whose aggregator holds state with no open bucket must not fold that state
+    /// into the next bucket it opens. Unrepaired, bucket 1000 published 103 (the stale 100 plus
+    /// the bucket's own 1 and 2).
+    #[test]
+    fn stale_state_without_an_open_bucket_is_cleared_before_it_reaches_a_bucket() {
+        for has_samples in [true, false] {
+            let mut rule = fresh_rule(AggregationType::Sum, 1000);
+            rule.update(5, 100.0);
+            rule.bucket_start = None;
+            rule.has_samples = has_samples;
+            assert_eq!(
+                rule.repair_open_bucket(),
+                Some(crate::series::OpenBucketRepair::Cleared)
+            );
+            assert_eq!(rule, fresh_rule(AggregationType::Sum, 1000));
+
+            let mut parent = TimeSeries::new();
+            let mut dest = TimeSeries::new();
+            let mut prev = None;
+            for (ts, v) in [(1000, 1.0), (1500, 2.0), (2000, 3.0), (3000, 4.0)] {
+                assert!(matches!(parent.add(ts, v, None), SampleAddResult::Ok(_)));
+                ingest_batch_of_one(&parent, &mut dest, &mut rule, Sample::new(ts, v), prev);
+                prev = Some(ts);
+            }
+            let published: Vec<_> = dest.iter().map(|s| (s.timestamp, s.value)).collect();
+            assert_eq!(
+                published,
+                [(1000, 3.0), (2000, 3.0)],
+                "has_samples={has_samples}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_open_bucket_off_the_grid_marks_the_rule_for_a_rebuild() {
+        let mut rule = fresh_rule(AggregationType::Sum, 1000);
+        rule.update(1234, 1.0);
+        rule.bucket_start = Some(1234);
+        assert_eq!(
+            rule.repair_open_bucket(),
+            Some(crate::series::OpenBucketRepair::Rebuild)
+        );
+        assert!(rule.dirty);
+        assert_eq!(
+            rule.bucket_start,
+            Some(1234),
+            "the rebuild replaces it, not the load"
+        );
+    }
+
+    /// The repair runs on every load, so it must leave anything the engine writes alone: a new
+    /// rule, one mid-bucket, one past a closed bucket (a counter carrying its last sample) and a
+    /// cleared one.
+    #[test]
+    fn open_bucket_repair_leaves_engine_written_state_alone() {
+        for &agg in RULE_TYPES {
+            let mut parent = TimeSeries::new();
+            let mut dest = TimeSeries::new();
+            let mut rule = fresh_rule(agg, 1000);
+            assert_eq!(rule.repair_open_bucket(), None, "{agg:?}: new rule");
+
+            let mut prev = None;
+            for (ts, v) in [(100, 1.0), (700, 5.0), (1200, 2.0), (2500, f64::NAN)] {
+                assert!(matches!(parent.add(ts, v, None), SampleAddResult::Ok(_)));
+                ingest_batch_of_one(&parent, &mut dest, &mut rule, Sample::new(ts, v), prev);
+                prev = Some(ts);
+                let before = rule.clone();
+                assert_eq!(rule.repair_open_bucket(), None, "{agg:?}: after {ts}");
+                assert_eq!(rule, before, "{agg:?}: after {ts}");
+            }
+
+            rule.clear();
+            assert_eq!(rule.repair_open_bucket(), None, "{agg:?}: cleared");
+        }
     }
 
     /// The all-appends fast path must leave exactly what the general path leaves. A trailing

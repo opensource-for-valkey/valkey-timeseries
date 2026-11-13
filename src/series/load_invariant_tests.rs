@@ -12,8 +12,9 @@ use crate::series::chunks::{
 };
 use crate::series::serialization::{
     BUDGET_CLAMPED, CHUNK_SIZE_CLAMPED, CHUNKS_OUT_OF_ORDER, ENCODING_ADOPTED, LoadTrust,
-    NEGATIVE_TIMESTAMPS, OVERSIZED_SPLIT, RETENTION_CLAMPED, STRAYS_REENCODED,
-    UNDECODABLE_STRAYS_KEPT, check_series_invariants, drop_empty_chunks, normalize_series,
+    NEGATIVE_TIMESTAMPS, OFF_GRID_BUCKET_REBUILT, OVERSIZED_SPLIT, RETENTION_CLAMPED,
+    STALE_RULE_STATE_CLEARED, STRAYS_REENCODED, UNDECODABLE_STRAYS_KEPT, check_series_invariants,
+    drop_empty_chunks, normalize_series,
 };
 use crate::series::{
     DuplicatePolicy, SPLIT_SLACK_DIVISOR, TimeSeries, bulk_insert_samples, defrag_series,
@@ -568,6 +569,59 @@ fn a_series_encoding_its_chunks_disagree_with_is_taken_from_them() {
             assert_eq!(repairs.repaired, [ENCODING_ADOPTED], "{encoding} {trust:?}");
             assert_eq!(ts.chunk_encoding, encoding);
             assert_loadable(&ts);
+        }
+    }
+}
+
+/// A rule's open-bucket state is repaired on any load: aggregator state with no open bucket
+/// would be folded into the next bucket the rule opens, and an open bucket off the rule's grid is
+/// rebuilt from the source by the next write. A rule the engine wrote is left alone.
+#[test]
+fn inconsistent_compaction_state_is_repaired_on_any_load() {
+    use crate::aggregators::{AggregationType, Aggregator};
+    use crate::series::{CompactionRule, SeriesLink};
+
+    let rule = |bucket_start, has_samples| {
+        let mut aggregator = Aggregator::try_from(AggregationType::Sum).unwrap();
+        crate::aggregators::AggregationHandler::update(&mut aggregator, 5, 100.0);
+        CompactionRule {
+            dest: SeriesLink::from("dst"),
+            aggregator,
+            bucket_duration: 1000,
+            align_timestamp: 0,
+            bucket_start,
+            has_samples,
+            dirty: false,
+        }
+    };
+    for trust in [LoadTrust::Foreign, LoadTrust::Own] {
+        let mut ts = loaded_base(ChunkEncoding::Chimp);
+        ts.rules = vec![rule(Some(1000), true)];
+        assert!(
+            normalize_series(&mut ts, trust).unwrap().is_empty(),
+            "{trust:?}"
+        );
+
+        for (bucket_start, has_samples, expected) in [
+            (None, true, STALE_RULE_STATE_CLEARED),
+            (None, false, STALE_RULE_STATE_CLEARED),
+            (Some(1234), true, OFF_GRID_BUCKET_REBUILT),
+        ] {
+            let mut ts = loaded_base(ChunkEncoding::Chimp);
+            ts.rules = vec![rule(bucket_start, has_samples)];
+            let repairs = normalize_series(&mut ts, trust).unwrap();
+            assert_eq!(repairs.repaired, [expected], "{trust:?} {bucket_start:?}");
+            assert!(repairs.tolerated.is_empty());
+            let fixed = &ts.rules[0];
+            if bucket_start.is_none() {
+                assert!(!fixed.has_samples && !fixed.dirty);
+                assert_eq!(
+                    crate::aggregators::AggregationHandler::current(&fixed.aggregator),
+                    None
+                );
+            } else {
+                assert!(fixed.dirty);
+            }
         }
     }
 }

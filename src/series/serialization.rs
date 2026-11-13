@@ -5,7 +5,7 @@ use crate::series::chunks::{
     Chunk, ChunkEncoding, ChunkOps, MAX_CHUNK_SIZE, MAX_LOADED_CHUNK_BYTES, MIN_CHUNK_SIZE,
     TimeSeriesChunk, validate_chunk_size,
 };
-use crate::series::compaction::CompactionRule;
+use crate::series::compaction::{CompactionRule, OpenBucketRepair};
 use crate::series::index::persistence::is_loading_active;
 use crate::series::seal_chunk;
 use crate::series::series_data_type::{
@@ -285,6 +285,9 @@ pub(crate) const RETENTION_CLAMPED: &str = "retention clamped";
 pub(crate) const NEGATIVE_TIMESTAMPS: &str = "negative timestamps";
 pub(crate) const CHUNKS_OUT_OF_ORDER: &str = "chunks out of order";
 pub(crate) const UNDECODABLE_STRAYS_KEPT: &str = "undecodable chunks of another encoding kept";
+pub(crate) const STALE_RULE_STATE_CLEARED: &str = "compaction state without an open bucket cleared";
+pub(crate) const OFF_GRID_BUCKET_REBUILT: &str =
+    "compaction bucket off its grid marked for rebuild";
 
 /// Brings an assembled series within what the write path maintains, or refuses it.
 ///
@@ -306,6 +309,8 @@ pub(crate) const UNDECODABLE_STRAYS_KEPT: &str = "undecodable chunks of another 
 /// | Retention past `i64::MAX` ms | refused | clamped to `i64::MAX` ms |
 /// | Negative timestamps | refused | loaded as they are |
 /// | Chunks out of order or overlapping | refused | loaded as they are |
+/// | A rule's aggregator state with no open bucket | cleared | cleared |
+/// | A rule's open bucket off its grid | marked `dirty`, rebuilt by the next write | marked `dirty`, rebuilt by the next write |
 ///
 /// Repairs are local and keep every sample. A rule with no such repair is tolerated rather
 /// than enforced on an own load: refusing it would fail the whole RDB load, a worse outcome
@@ -422,6 +427,16 @@ pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<
             repairs.tolerate(CHUNKS_OUT_OF_ORDER);
         }
         prev_last = Some(prev_last.map_or(last, |prev| prev.max(last)));
+    }
+
+    // Rule state is repaired on every load: the repair is a no-op on anything the engine wrote,
+    // and a refusal would protect nothing the repair does not.
+    for rule in &mut ts.rules {
+        match rule.repair_open_bucket() {
+            Some(OpenBucketRepair::Cleared) => repairs.repair(STALE_RULE_STATE_CLEARED),
+            Some(OpenBucketRepair::Rebuild) => repairs.repair(OFF_GRID_BUCKET_REBUILT),
+            None => {}
+        }
     }
 
     if !repairs.repaired.is_empty() {
