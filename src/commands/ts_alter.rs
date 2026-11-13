@@ -58,7 +58,7 @@ pub fn ts_alter_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             &[CommandArgToken::OnDuplicate],
         )?;
 
-        let changed = update_series(ctx, series, options, &key);
+        let changed = update_series(ctx, series, options, &key)?;
 
         ctx.replicate_verbatim();
         if changed {
@@ -73,8 +73,20 @@ fn update_series(
     series: &mut TimeSeries,
     options: TimeSeriesOptions,
     key: &ValkeyString,
-) -> bool {
+) -> ValkeyResult<bool> {
     let mut has_changed = false;
+
+    // Retention goes first: changing it trims under the old window, and that can fail on a
+    // chunk that no longer decodes. Failing before any other option is applied keeps the
+    // ALTER all-or-nothing, which matters because a failed command is not replicated.
+    if let Some(retention) = options.retention
+        && retention != series.retention
+    {
+        series
+            .set_retention(retention)
+            .map_err(|_e| ValkeyError::Str("TSDB: error trimming expired samples"))?;
+        has_changed = true;
+    }
 
     if let Some(chunk_size) = options.chunk_size
         && chunk_size != series.chunk_size_bytes
@@ -99,13 +111,6 @@ fn update_series(
         };
 
         ts_index.index_timeseries(series, key.as_slice());
-    }
-
-    if let Some(retention) = options.retention
-        && retention != series.retention
-    {
-        has_changed = true;
-        series.set_retention(retention);
     }
 
     if let Some(policy) = options.duplicate_policy
@@ -139,5 +144,5 @@ fn update_series(
         has_changed = true;
     }
 
-    has_changed
+    Ok(has_changed)
 }

@@ -2286,8 +2286,8 @@ mod tests {
                 let visible = lazy.get_range(0, Timestamp::MAX);
                 assert_eq!(visible.len(), 101, "{encoding:?}");
 
-                lazy.set_retention(widened);
-                trimmed.set_retention(widened);
+                lazy.set_retention(widened).unwrap();
+                trimmed.set_retention(widened).unwrap();
 
                 let context = format!("{encoding:?}, retention -> {widened:?}");
                 assert_eq!(lazy.get_range(0, Timestamp::MAX), visible, "{context}");
@@ -2301,10 +2301,54 @@ mod tests {
     #[test]
     fn narrowing_retention_hides_samples_outside_the_new_window() {
         let (mut lazy, _) = lazily_and_fully_trimmed(ChunkEncoding::Chimp);
-        lazy.set_retention(Duration::from_millis(10));
+        lazy.set_retention(Duration::from_millis(10)).unwrap();
         let range = lazy.get_range(0, Timestamp::MAX);
         assert_eq!(range.len(), 11);
         assert_eq!(range[0].timestamp, 190);
         assert_eq!(lazy.visible_total_samples(), 11);
+    }
+
+    /// A wholly expired Gorilla chunk (1..=50) and a boundary chunk (51..=150) whose stream
+    /// no longer decodes, under a retention window whose floor (100) falls inside it.
+    fn series_with_undecodable_boundary_chunk() -> TimeSeries {
+        let chunk = |range: std::ops::RangeInclusive<i64>| {
+            let mut chunk = TimeSeriesChunk::new(ChunkEncoding::Gorilla, 4096);
+            for ts in range {
+                chunk
+                    .add_sample(&Sample::new(ts, ts as f64 * 0.37))
+                    .unwrap();
+            }
+            chunk
+        };
+        let mut boundary = chunk(51..=150);
+        let TimeSeriesChunk::Gorilla(gorilla) = &mut boundary else {
+            unreachable!()
+        };
+        let half = gorilla.encoder.buf().len() / 2;
+        gorilla.encoder.truncate_stream_for_test(half);
+
+        let mut series = TimeSeries::new();
+        series.chunk_encoding = ChunkEncoding::Gorilla;
+        series.chunks = vec![chunk(1..=50), boundary];
+        series.update_state_from_chunks();
+        series.retention = Duration::from_millis(50);
+        series
+    }
+
+    #[test]
+    fn failed_boundary_trim_still_accounts_for_the_dropped_chunks() {
+        let mut series = series_with_undecodable_boundary_chunk();
+        assert!(series.trim().is_err());
+
+        assert_eq!(series.chunks.len(), 1);
+        assert_eq!(series.total_samples, 100);
+        assert_eq!(series.first_timestamp, 51);
+    }
+
+    #[test]
+    fn set_retention_fails_and_keeps_the_window_when_the_trim_fails() {
+        let mut series = series_with_undecodable_boundary_chunk();
+        assert!(series.set_retention(Duration::ZERO).is_err());
+        assert_eq!(series.retention, Duration::from_millis(50));
     }
 }

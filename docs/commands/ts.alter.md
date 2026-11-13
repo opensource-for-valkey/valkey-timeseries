@@ -57,6 +57,7 @@ Returns `OK` on success.
 - A chunk-size or rounding error — An option value is outside its valid range.
 - `TSDB: invalid duplicate policy` — The duplicate policy is unknown.
 - A label parsing error — Labels or a metric name are malformed.
+- `TSDB: error trimming expired samples` — `RETENTION` changed, but the expired samples stored under the old window could not be removed because a chunk no longer decodes. Nothing is altered.
 
 ## Complexity
 

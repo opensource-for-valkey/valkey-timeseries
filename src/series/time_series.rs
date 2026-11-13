@@ -320,14 +320,18 @@ impl TimeSeries {
     /// otherwise they would reappear, and how many would depend on when this node last
     /// trimmed — a primary and a replica would disagree. The floor follows the series' own
     /// last sample, so every node applying the change trims to the same point.
-    pub(crate) fn set_retention(&mut self, retention: Duration) {
-        if !self.retention.is_zero()
-            && let Err(e) = self.trim()
-        {
-            logging::log_warning(format!("TSDB: Error trimming time series: {e:?}"));
+    ///
+    /// If that trim fails (a boundary chunk that no longer decodes), the retention is left
+    /// as it was and the error returned: applying the new window would show again the
+    /// expired samples the failed trim left stored. What the trim did drop before failing
+    /// was expired, so the series still reads the same.
+    pub(crate) fn set_retention(&mut self, retention: Duration) -> TsdbResult {
+        if !self.retention.is_zero() {
+            self.trim()?;
         }
         self.retention = retention;
         self.apply_retention();
+        Ok(())
     }
 
     pub(crate) fn validate_sample(
@@ -980,17 +984,20 @@ impl TimeSeries {
         // Handle the boundary chunk: drop only samples strictly older than the
         // retention window. `remove_range` is inclusive, so the upper bound is
         // `min_timestamp - 1` — the sample at `min_timestamp` itself is retained.
+        // A failed `remove_range` leaves the chunk as it was.
+        let mut result = Ok(());
         if let Some(chunk) = self.chunks.first_mut()
             && chunk.first_timestamp() < min_timestamp
             && (force || head_trim_due(chunk, min_timestamp))
         {
-            if let Ok(count) = chunk.remove_range(0, min_timestamp - 1) {
-                deleted_count += count;
-            } else {
-                return Err(TsdbError::RemoveRangeError);
+            match chunk.remove_range(0, min_timestamp - 1) {
+                Ok(count) => deleted_count += count,
+                Err(_) => result = Err(TsdbError::RemoveRangeError),
             }
         }
 
+        // The whole chunks dropped above are gone even when the boundary trim failed, so
+        // the bookkeeping has to follow either way.
         self.total_samples -= deleted_count;
 
         if deleted_count > 0 {
@@ -998,7 +1005,7 @@ impl TimeSeries {
             self.update_first_last_timestamps();
         }
 
-        Ok(deleted_count)
+        result.map(|()| deleted_count)
     }
 
     pub fn remove_range(&mut self, start_ts: Timestamp, end_ts: Timestamp) -> TsdbResult<usize> {
