@@ -1,5 +1,5 @@
 use super::fanout_error::INVALID_DB_ERROR;
-use crate::common::acl::AclContextGuard;
+use crate::common::acl::{AclContextGuard, check_db_access};
 use crate::common::context::set_current_db;
 use crate::common::threads::{GilSource, LockGil};
 use crate::error_consts;
@@ -133,9 +133,10 @@ impl FanoutContext {
     /// before locking and encode the response after releasing, so the server
     /// stays responsive while the shard-local reply is materialized.
     ///
-    /// Fails when the request's database cannot be selected or its ACL user no
-    /// longer exists, so a request cannot silently run against the wrong
-    /// database or without enforcement.
+    /// Fails when the request's database cannot be selected, its ACL user no
+    /// longer exists, or that user may not access the database on this node,
+    /// so a request cannot silently run against the wrong database or without
+    /// enforcement.
     pub fn lock(&self) -> ValkeyResult<AclContextGuard> {
         let ctx = self.ctx.lock_gil();
 
@@ -145,7 +146,11 @@ impl FanoutContext {
         }
         // Resolved afresh on every lock: a user deleted or disabled mid-request fails the
         // next step rather than finishing with rights it no longer has.
-        AclContextGuard::for_user(self.user.as_deref(), ctx)
+        let guard = AclContextGuard::for_user(self.user.as_deref(), ctx)?;
+        // The coordinator's server checked the database against its own rules only; this
+        // node's may differ, and a rule change mid-request applies from the next step.
+        check_db_access(&guard, self.db)?;
+        Ok(guard)
     }
 }
 

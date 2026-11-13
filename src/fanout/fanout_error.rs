@@ -385,7 +385,7 @@ fn convert_from_string(err: &str) -> FanoutError {
         // message so the client sees *why* the multi-shard command failed closed
         // instead of a generic aggregate error.
         error_consts::PERMISSION_DENIED => FanoutError::key_permissions(err.to_string()),
-        error_consts::ACL_USER_UNAVAILABLE => FanoutError {
+        error_consts::ACL_USER_UNAVAILABLE | error_consts::DB_PERMISSION_ERROR => FanoutError {
             kind: ErrorKind::Permissions,
             message: err.to_string(),
         },
@@ -452,6 +452,9 @@ mod tests {
         assert!(user.to_string().contains("does not exist or is disabled"));
         let db = FanoutError::from(ValkeyError::Str(INVALID_DB_ERROR));
         assert_eq!(db.kind, ErrorKind::InvalidDb);
+        let denied = FanoutError::from(ValkeyError::Str(error_consts::DB_PERMISSION_ERROR));
+        assert_eq!(denied.kind, ErrorKind::Permissions);
+        assert_eq!(denied.to_string(), error_consts::DB_PERMISSION_ERROR);
         let nodes = FanoutError::from(ValkeyError::Str(error_consts::NO_CLUSTER_NODES_AVAILABLE));
         assert_eq!(nodes.kind, ErrorKind::NodeUnreachable);
     }

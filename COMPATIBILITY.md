@@ -90,6 +90,7 @@ This section describes areas where Valkey TimeSeries intentionally diverges from
 - Valkey TimeSeries fans out over Valkey's native cluster bus. There is no separate coordinator component, no additional network port, and no module-level shared password — RedisTimeSeries required `OSS_GLOBAL_PASSWORD` on every cluster node prior to its 8.0 release, which replaced it with an internal shared-secret mechanism.
 - Valkey TimeSeries bounds each fan-out with the `ts-fanout-command-timeout` configurable and returns an error when a consistent cluster-wide view cannot be established within it. This is a reply an equivalent RedisTimeSeries deployment need not produce.
 - ACL keyspace restrictions are enforced on the fanned-out result (see _Security Architecture_ under Non-Goals).
+- On Valkey 9.1 and later, database ACL rules (`db=`, `alldbs`, `resetdbs`) are enforced on every shard as well as on the coordinator. Each shard checks the caller's access to the request's database against its own ACL rules, as it does for keys, so a user whose rules grant the database on the coordinator but not on some shard gets an error rather than that shard's data. Redis has no database-level ACL rule, so this has no RedisTimeSeries counterpart; it only matters where ACL rules differ between nodes.
 
 Valkey TimeSeries reads each shard's `TS.QUERYINDEX` and `TS.QUERYLABELS` matches in batches,
 releasing the module lock between batches. This is not a point-in-time snapshot of a shard:
@@ -325,6 +326,8 @@ When a multi-series command returns labels (via `WITHLABELS` or `SELECTED_LABELS
 ### 9. Review ACL keyspace restrictions
 
 If ACL keyspace restrictions are used, these should be reviewed, as Valkey TimeSeries is more restrictive in some cases: label-based multi-series queries only return series whose keys the calling user is permitted to access. A query that appeared to return a complete result set under RedisTimeSeries may return a filtered subset under Valkey TimeSeries when the user's key permissions are narrower than the set of matching series.
+
+On Valkey 9.1 and later, keep any database ACL rules (`db=`) identical on every node of a cluster: each shard enforces its own, so a multi-series command fails if any shard denies the caller the selected database.
 
 ### 10. Re-baseline anything that consumes `std.p` / `std.s` / `var.p` / `var.s`
 

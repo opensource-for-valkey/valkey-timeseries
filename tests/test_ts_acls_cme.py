@@ -3,7 +3,7 @@ from valkey import ResponseError, Valkey, ValkeyCluster
 
 from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCase
 from valkeytestframework.conftest import resource_port_tracker
-from common import LabelSearchResponse, parse_stats_response
+from common import SERVER_VERSION, LabelSearchResponse, parse_stats_response
 
 
 # Keys placed deterministically on distinct shards of a 3-primary cluster.
@@ -397,3 +397,81 @@ class TestTimeSeriesAclCluster(ValkeyTimeSeriesClusterTestCase):
         names = {lv.value for lv in LabelSearchResponse.parse(raw).results}
         # Per-shard unique label names must all be present for the full-access user.
         assert {b"only0", b"only1", b"only2"}.issubset(names)
+
+
+def _server_major_version():
+    """`unstable` is ahead of every release."""
+    head = SERVER_VERSION.split(".")[0]
+    return int(head) if head.isdigit() else 1 << 30
+
+
+@pytest.mark.skipif(_server_major_version() < 9, reason="cluster-databases needs Valkey >= 9.0")
+class TestTimeSeriesDbAclCluster(ValkeyTimeSeriesClusterTestCase):
+    """Database ACL rules (`db=`, Valkey 9.1+) are enforced on every shard.
+
+    The coordinator's server checks the caller's database against its own rules
+    only. ACLs are per node, so each shard must check the propagated identity's
+    access to the request's database itself, as it does for keys.
+    """
+
+    DB = 1
+
+    def get_config_file_lines(self, test_dir, port):
+        return super().get_config_file_lines(test_dir, port) + ["cluster-databases 16"]
+
+    def _setup_db_data(self):
+        for shard, key in enumerate(ALL_KEYS):
+            primary = self.new_client_for_primary(shard)
+            primary.select(self.DB)
+            primary.execute_command("TS.CREATE", key, "LABELS", "name", "cpu")
+            primary.execute_command("TS.ADD", key, 1000, 10)
+
+    def _set_user(self, shard: int, username: str, dbs: str):
+        primary = self.client_for_primary(shard)
+        try:
+            primary.execute_command(
+                "ACL", "SETUSER", username, "RESET", "ON", ">pw",
+                "+@timeseries", "+@read", "+select", "~*", "resetdbs", f"db={dbs}",
+            )
+        except ResponseError as e:
+            pytest.skip(f"server has no database ACL rules: {e}")
+
+    def _user_client(self, coordinator: int, username: str) -> Valkey:
+        client = self.new_client_for_primary(coordinator)
+        client.execute_command("AUTH", username, "pw")
+        client.select(self.DB)
+        return client
+
+    def test_user_granted_the_db_everywhere_reads_every_shard(self):
+        self._setup_db_data()
+        for shard in range(self.CLUSTER_SIZE):
+            self._set_user(shard, "erin", f"0,{self.DB}")
+
+        for coordinator in range(self.CLUSTER_SIZE):
+            erin = self._user_client(coordinator, "erin")
+            rows = erin.execute_command("TS.MGET", "FILTER", "name=cpu")
+            assert sorted(row[0] for row in rows) == sorted(ALL_KEYS), coordinator
+
+    def test_shard_refuses_a_db_its_rules_do_not_grant(self):
+        """Shard 1 does not grant the database the coordinator does: fail closed."""
+        self._setup_db_data()
+        for shard in range(self.CLUSTER_SIZE):
+            self._set_user(shard, "frank", f"0,{self.DB}" if shard != 1 else "0")
+
+        for coordinator in (0, 2):
+            frank = self._user_client(coordinator, "frank")
+            for command in (
+                ("TS.MGET", "FILTER", "name=cpu"),
+                ("TS.MRANGE", "-", "+", "FILTER", "name=cpu"),
+                ("TS.QUERYINDEX", "name=cpu"),
+            ):
+                with pytest.raises(ResponseError) as exc:
+                    frank.execute_command(*command)
+                assert "access the selected database" in str(exc.value), (
+                    coordinator, command, exc.value,
+                )
+
+        # The coordinator's own server refuses the database before the module runs.
+        with pytest.raises(ResponseError) as exc:
+            self._user_client(1, "frank")
+        assert "database" in str(exc.value).lower()

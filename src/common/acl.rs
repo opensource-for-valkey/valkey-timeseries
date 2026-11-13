@@ -17,7 +17,7 @@ use std::ops::Deref;
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use valkey_module::{
     AclPermissions, CallOptionsBuilder, CallReply, CallResult, Context, ValkeyError, ValkeyResult,
     ValkeyString, raw,
@@ -661,6 +661,133 @@ pub fn check_metadata_permissions(ctx: &Context) -> ValkeyResult<()> {
         Err(ValkeyError::Str(
             error_consts::ALL_KEYS_READ_PERMISSION_ERROR,
         ))
+    }
+}
+
+/// The command [`check_db_access`] asks the server about. It must stay keyless, carry
+/// a category the server restricts by database (`@read`), take no database argument,
+/// and have no subcommands, so that the server's answer turns on the database alone
+/// (a test in `commands` pins its categories).
+pub(crate) const DB_PROBE_COMMAND: &str = "ts.queryindex";
+
+/// `VALKEYMODULE_ACL_LOG_DB`: the denial reason `RM_ACLCheckPermissions` reports when the
+/// user may not access the database. The bindings the crate ships predate it.
+const ACL_LOG_DB: raw::RedisModuleACLLogEntryReason = 4;
+
+type AclCheckPermissionsFn = unsafe extern "C" fn(
+    user: *mut raw::RedisModuleUser,
+    argv: *mut *mut raw::RedisModuleString,
+    argc: std::os::raw::c_int,
+    dbid: std::os::raw::c_int,
+    denial_reason: *mut raw::RedisModuleACLLogEntryReason,
+) -> std::os::raw::c_int;
+
+/// `RM_ACLCheckPermissions` and the one-argument command line it is asked about.
+struct DbProbe {
+    check: AclCheckPermissionsFn,
+    /// [`DB_PROBE_COMMAND`], created with no context and never freed. The server only
+    /// reads it, and only under the module lock.
+    argv0: NonNull<raw::RedisModuleString>,
+}
+
+// SAFETY: `argv0` is created once and then only read, under the module lock.
+unsafe impl Send for DbProbe {}
+unsafe impl Sync for DbProbe {}
+
+/// The probe, or `None` on a server without `RM_ACLCheckPermissions`. Database ACL rules
+/// (`db=`, `alldbs`, `resetdbs`) arrived with it, in Valkey 9.1, so a server without it has
+/// no rule to check.
+fn db_probe() -> Option<&'static DbProbe> {
+    static PROBE: OnceLock<Option<DbProbe>> = OnceLock::new();
+    PROBE
+        .get_or_init(|| {
+            let check = resolve_api::<AclCheckPermissionsFn>(c"ACLCheckPermissions")?;
+            let argv0 =
+                ValkeyString::create_from_slice(ptr::null_mut(), DB_PROBE_COMMAND.as_bytes());
+            let raw_argv0 = NonNull::new(argv0.inner)?;
+            // Kept for the life of the process.
+            std::mem::forget(argv0);
+            Some(DbProbe {
+                check,
+                argv0: raw_argv0,
+            })
+        })
+        .as_ref()
+}
+
+/// Looks up a module API function the crate's bindings do not carry, under either of the
+/// names the server registers it as. `F` must be that function's pointer type.
+fn resolve_api<F: Copy>(name: &std::ffi::CStr) -> Option<F> {
+    const { assert!(size_of::<F>() == size_of::<*mut std::ffi::c_void>()) };
+    let name = name.to_bytes();
+    // SAFETY: the getters are written once, at module load, before any command runs.
+    let getters = unsafe { [raw::ValkeyModule_GetApi, raw::RedisModule_GetApi] };
+    for (getter, prefix) in getters
+        .into_iter()
+        .zip([&b"ValkeyModule_"[..], b"RedisModule_"])
+    {
+        let Some(get) = getter else { continue };
+        let full = std::ffi::CString::new([prefix, name].concat()).ok()?;
+        let mut target: *mut std::ffi::c_void = ptr::null_mut();
+        // SAFETY: `GetApi` writes the function's address to `target` or returns an error,
+        // leaving it untouched.
+        let status = unsafe { get(full.as_ptr(), (&raw mut target).cast()) };
+        if status as isize == raw::REDISMODULE_OK && !target.is_null() {
+            // SAFETY: `target` is the address of the function `F` names (see above).
+            return Some(unsafe { std::mem::transmute_copy::<*mut std::ffi::c_void, F>(&target) });
+        }
+    }
+    None
+}
+
+/// Whether the user [`checked_as`] names may access database `db` on this node.
+///
+/// The server checks a command's database against the client's selected one before it
+/// dispatches, so a command on the main thread needs no help. This is for work that
+/// selects a database on the caller's behalf: a fan-out share on another node, whose ACL
+/// rules need not match the coordinator's, and a background job that re-takes the lock.
+///
+/// It asks the server whether the user may run [`DB_PROBE_COMMAND`] in `db`, and refuses
+/// only a database denial. That isolates the database rule: each selector checks the
+/// database before anything else, and the server reports a database denial only when every
+/// selector refused on it (it is the lowest-ranked reason), so any other answer means some
+/// selector grants `db`. Like the per-key checks, this is not tied to one selector: a user
+/// granted `db` by one selector and a key by another passes both.
+pub(crate) fn check_db_access(ctx: &Context, db: i32) -> ValkeyResult<()> {
+    // Before the probe: its first use creates a server string.
+    check_holds_gil();
+    let Some(probe) = db_probe() else {
+        return Ok(());
+    };
+    match checked_as(ctx) {
+        None => Ok(()),
+        Some(CheckedAs::Scope(_, user)) => probe_db(probe, &user, db),
+        Some(CheckedAs::Client(name)) => {
+            let user = ModuleUser::from_name(&name)
+                .ok_or(ValkeyError::Str(error_consts::ACL_USER_UNAVAILABLE))?;
+            probe_db(probe, &user, db)
+        }
+    }
+}
+
+fn probe_db(probe: &DbProbe, user: &ModuleUser, db: i32) -> ValkeyResult<()> {
+    // Not a reason the server reports: tells an invalid call from a denial.
+    const UNSET: raw::RedisModuleACLLogEntryReason = raw::RedisModuleACLLogEntryReason::MAX;
+    let mut argv = [probe.argv0.as_ptr()];
+    let mut reason = UNSET;
+    // SAFETY: the user handle and `argv` are live under the module lock, which the caller
+    // holds; the server only reads them and writes `reason`.
+    let status =
+        unsafe { (probe.check)(user.0.as_ptr(), argv.as_mut_ptr(), 1, db, &raw mut reason) };
+    if raw::Status::from(status) == raw::Status::Ok {
+        return Ok(());
+    }
+    match reason {
+        // `UNSET`: `db` out of range, or the probe command missing. Neither should happen
+        // once the database was selected and the module loaded, so fail closed.
+        ACL_LOG_DB | UNSET => Err(ValkeyError::Str(error_consts::DB_PERMISSION_ERROR)),
+        // Some selector granted `db` and refused on something later (see above).
+        _ => Ok(()),
     }
 }
 
