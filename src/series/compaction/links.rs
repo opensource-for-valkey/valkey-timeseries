@@ -1,3 +1,4 @@
+use super::rebuild_open_bucket_as_of;
 use crate::aggregators::AggregationHandler;
 use crate::common::Sample;
 use crate::common::context::create_key_string;
@@ -36,9 +37,20 @@ pub(crate) fn get_latest_compaction_sample(ctx: &Context, series: &TimeSeries) -
         .rules
         .iter()
         .find(|rule| rule.dest.points_to(&series.key))?;
-    let start = rule.bucket_start?;
-
-    let mut agg = rule.aggregator.clone();
+    let (start, mut agg) = if rule.dirty {
+        // Failed applications and load repairs leave the saved aggregator untrustworthy.
+        // Rebuild a copy so LATEST is correct before the next write, without mutating state
+        // from a read command or clearing the dirty flag the write path still needs.
+        let mut rebuilt = rule.clone();
+        rebuild_open_bucket_as_of(
+            &parent,
+            &mut rebuilt,
+            parent.last_sample.map(|s| s.timestamp),
+        );
+        (rebuilt.bucket_start?, rebuilt.aggregator)
+    } else {
+        (rule.bucket_start?, rule.aggregator.clone())
+    };
     let value = AggregationHandler::finalize(&mut agg);
 
     let sample = Sample::new(start, value);

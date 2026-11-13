@@ -49,8 +49,9 @@ pub struct CompactionRule {
     pub has_samples: bool,
     /// Set when the rule's last application returned an error, so its open-bucket state may not
     /// reflect every sample the source stored. The next `Ingest` rebuilds the open bucket from the
-    /// source first (`rebuild_open_bucket_as_of`); a `RemoveRange` rebuilds it anyway. The rebuild
-    /// covers the open bucket only: destination buckets the failed application lost or left stale
+    /// source first (`rebuild_open_bucket_as_of`); a `RemoveRange` rebuilds it anyway. `LATEST`
+    /// reads rebuild a temporary copy without clearing the saved dirty flag. Recovery covers the
+    /// open bucket only: destination buckets the failed application lost or left stale
     /// (a bucket it should have closed, or one a failed removal should have recalculated) are not
     /// repaired — `ts_compaction_failures_total` is how an operator learns of them. Node-local:
     /// persisted, so a restart does not forget it, but not hashed into the digest, because a
@@ -129,7 +130,7 @@ impl CompactionRule {
     /// destination a wrong value with no error. Clearing it again makes this a new rule, which is
     /// a no-op on any state the engine wrote. An open bucket that is not on the rule's grid
     /// cannot be fixed locally, so the rule is marked `dirty` and the next write rebuilds that
-    /// bucket from the source.
+    /// bucket from the source. `LATEST` reads rebuild a temporary copy before finalizing it.
     pub(crate) fn repair_open_bucket(&mut self) -> Option<OpenBucketRepair> {
         match self.bucket_start {
             None => {

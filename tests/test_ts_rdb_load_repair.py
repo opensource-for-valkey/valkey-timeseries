@@ -78,6 +78,46 @@ class TestRdbLoadRepair(ValkeyTimeSeriesTestCaseBase):
         info = dict(zip(raw[::2], raw[1::2]))
         return [dict(zip(c[::2], c[1::2]))[b"size"] for c in info[b"Chunks"]]
 
+    @pytest.mark.parametrize("aggregation,value", [
+        ("sum", b"6"), ("avg", b"3"), ("increase", b"3"), ("rate", b"3")])
+    def test_latest_rebuilds_an_off_grid_loaded_rule_before_any_write(self, aggregation, value):
+        client = self.client
+        client.config_set("rdbcompression", "no")
+        client.execute_command("TS.CREATE", "src")
+        client.execute_command("TS.CREATE", "dst", "LABELS", "role", "repaired")
+        client.execute_command("TS.CREATERULE", "src", "dst", "AGGREGATION", aggregation, 1000)
+        for ts, sample in ((1000, 1), (1500, 2), (1700, 4)):
+            client.execute_command("TS.ADD", "src", ts, sample)
+
+        payload = Payload(client.dump("src"))
+        # The last five rule fields are duration, alignment, open start, has_samples, dirty.
+        assert [token[1] for token in payload.tokens[-5:]] == [1000, 0, 1000, 1, 0]
+        # Shift the grid without updating the saved bucket or aggregator. The load marks it
+        # dirty; the real open bucket is now [1500, 2500), with 1000 as the counter baseline.
+        edited = set_token(payload, {len(payload.tokens) - 4: 500})
+        repairs, tolerated = self.counters()
+        self.reload_with("src", edited)
+        assert self.counters() == (repairs + 1, tolerated)
+
+        loaded = client.dump("src")
+        assert Payload(loaded).tokens[-1][1] == 1
+        expected = [1500, value]
+        for _ in range(2):
+            assert client.execute_command("TS.GET", "dst", "LATEST") == expected
+            for command in ("TS.RANGE", "TS.REVRANGE"):
+                assert client.execute_command(command, "dst", "-", "+", "LATEST") == [expected]
+            assert client.execute_command("TS.MGET", "LATEST", "FILTER", "role=repaired") == \
+                [[b"dst", [], expected]]
+            for command in ("TS.MRANGE", "TS.MREVRANGE"):
+                assert client.execute_command(command, "-", "+", "LATEST", "FILTER", "role=repaired") == \
+                    [[b"dst", [], [expected]]]
+        # Reads leave the saved rule dirty so the next write still performs its own recovery.
+        assert client.dump("src") == loaded
+        assert client.execute_command("TS.RANGE", "dst", "-", "+") == []
+        client.execute_command("TS.ADD", "src", 2500, 8)
+        assert client.execute_command("TS.RANGE", "dst", "-", "+") == [expected]
+        assert Payload(client.dump("src")).tokens[-1][1] == 0
+
     @pytest.mark.parametrize("encoding", ["UNCOMPRESSED", "CHIMP"])
     def test_negative_timestamp_is_loaded_as_it_is(self, encoding):
         """The state an unchecked TS.ADDBULK timestamp left: refusing it made the server refuse
