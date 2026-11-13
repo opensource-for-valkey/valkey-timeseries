@@ -419,22 +419,32 @@ class TestTimeSeriesDbAclCluster(ValkeyTimeSeriesClusterTestCase):
     def get_config_file_lines(self, test_dir, port):
         return super().get_config_file_lines(test_dir, port) + ["cluster-databases 16"]
 
+    def _require_db_acl_rules(self):
+        """Skip on a server without database ACL rules (before Valkey 9.1). Only this probe
+        may skip: a rule a test sets later that the server refuses fails the test."""
+        primary = self.client_for_primary(0)
+        try:
+            primary.execute_command("ACL", "SETUSER", "db-acl-probe", "resetdbs")
+        except ResponseError as e:
+            pytest.skip(f"server has no database ACL rules: {e}")
+        primary.execute_command("ACL", "DELUSER", "db-acl-probe")
+
     def _setup_db_data(self):
+        self._require_db_acl_rules()
         for shard, key in enumerate(ALL_KEYS):
             primary = self.new_client_for_primary(shard)
             primary.select(self.DB)
             primary.execute_command("TS.CREATE", key, "LABELS", "name", "cpu")
             primary.execute_command("TS.ADD", key, 1000, 10)
 
-    def _set_user(self, shard: int, username: str, dbs: str):
+    def _set_rules(self, shard: int, username: str, *rules: str):
         primary = self.client_for_primary(shard)
-        try:
-            primary.execute_command(
-                "ACL", "SETUSER", username, "RESET", "ON", ">pw",
-                "+@timeseries", "+@read", "+select", "~*", "resetdbs", f"db={dbs}",
-            )
-        except ResponseError as e:
-            pytest.skip(f"server has no database ACL rules: {e}")
+        primary.execute_command("ACL", "SETUSER", username, "RESET", "ON", ">pw", *rules)
+
+    def _set_user(self, shard: int, username: str, dbs: str):
+        self._set_rules(
+            shard, username, "+@timeseries", "+@read", "+select", "~*", "resetdbs", f"db={dbs}"
+        )
 
     def _user_client(self, coordinator: int, username: str) -> Valkey:
         client = self.new_client_for_primary(coordinator)
@@ -475,3 +485,50 @@ class TestTimeSeriesDbAclCluster(ValkeyTimeSeriesClusterTestCase):
         with pytest.raises(ResponseError) as exc:
             self._user_client(1, "frank")
         assert "database" in str(exc.value).lower()
+
+    # The shard asks whether the user may run its probe command (TS.QUERYINDEX) in the
+    # database, and refuses only a database denial. These users lack the probe command, so
+    # the server's answer is a command denial wherever the database itself is granted.
+
+    def test_user_without_the_probe_command_reads_a_granted_db(self):
+        self._setup_db_data()
+        for shard in range(self.CLUSTER_SIZE):
+            self._set_rules(shard, "gina", "+ts.card", "+select", "~*", "resetdbs", f"db=0,{self.DB}")
+
+        for coordinator in range(self.CLUSTER_SIZE):
+            gina = self._user_client(coordinator, "gina")
+            assert gina.execute_command("TS.CARD", "FILTER", "name=cpu") == len(ALL_KEYS)
+            with pytest.raises(ResponseError):
+                gina.execute_command("TS.QUERYINDEX", "name=cpu")
+
+    def test_db_granted_by_one_selector_and_probe_by_another(self):
+        """The root selector grants TS.CARD in the database; a second grants the probe
+        command only in DB 0. The database is granted, so the read succeeds."""
+        self._setup_db_data()
+        probe_elsewhere = "(+ts.queryindex ~* resetdbs db=0)"
+        for shard in range(self.CLUSTER_SIZE):
+            self._set_rules(
+                shard, "hank", "+ts.card", "+select", "~*", "resetdbs", f"db={self.DB}",
+                probe_elsewhere,
+            )
+
+        for coordinator in range(self.CLUSTER_SIZE):
+            hank = self._user_client(coordinator, "hank")
+            assert hank.execute_command("TS.CARD", "FILTER", "name=cpu") == len(ALL_KEYS)
+
+    def test_shard_whose_every_selector_denies_the_db_refuses(self):
+        """As above, but on shard 1 neither selector grants the database."""
+        self._setup_db_data()
+        probe_elsewhere = "(+ts.queryindex ~* resetdbs db=0)"
+        for shard in range(self.CLUSTER_SIZE):
+            dbs = f"0,{self.DB}" if shard != 1 else "0"
+            self._set_rules(
+                shard, "ivy", "+ts.card", "+select", "~*", "resetdbs", f"db={dbs}",
+                probe_elsewhere,
+            )
+
+        for coordinator in (0, 2):
+            ivy = self._user_client(coordinator, "ivy")
+            with pytest.raises(ResponseError) as exc:
+                ivy.execute_command("TS.CARD", "FILTER", "name=cpu")
+            assert "access the selected database" in str(exc.value), (coordinator, exc.value)
