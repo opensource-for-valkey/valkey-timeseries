@@ -45,6 +45,9 @@ valkey-timeseries achieves high performance by storing series data in-memory and
 
 Command names and option names are case-insensitive.
 
+`LATEST` reads rebuild a dirty compaction rule's open bucket from retained source samples,
+including immediately after loading a repaired rule. See [failure recovery](docs/overview.md).
+
 #### A note about keys
 Since the general use-case for this module is querying across timeseries, it is a best practice to group related timeseries
 using "hash tags" in the key. This allows for more efficient querying across related timeseries. For example, if your

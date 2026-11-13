@@ -110,6 +110,12 @@ closed bucket lost to the failure is not repaired. `INFO ts_compaction` reports 
 each entry is the `dirty` flag). A non-zero failure counter is the signal that a destination may
 be missing a bucket.
 
+`LATEST` reads also rebuild a dirty rule's open bucket from retained source samples on a
+temporary copy. This applies immediately after load when an off-grid bucket was marked dirty,
+before any source write. Reads leave the persisted rule and rebuild counter unchanged; the next
+source write still rebuilds the rule normally. Samples already lost to retention cannot be
+recovered.
+
 `ts-compaction-policy` (`agg:bucket:retention[:align][|regex];…`) takes the filtered aggregations
 `all`, `any`, `countif`, `sumif`, `share` and `none` with the same inline condition as
 `TS.CREATERULE` (e.g. `countif>5:1M:1h`); one without its condition is rejected at `CONFIG SET`
