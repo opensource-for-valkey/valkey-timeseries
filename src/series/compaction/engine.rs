@@ -993,6 +993,82 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
+        /// A batch merged through the TS.MADD/TS.ADDBULK merge path compacts to the same rule
+        /// state whatever value its `Ok` results carry for an upsert. The merge path reports the
+        /// stored (policy-merged) value, single adds and the in-batch-duplicate fallback report
+        /// the input value, and a read-back reports the stored one. All three must agree with a
+        /// recomputation from the source: an upsert is always a back-fill, whose bucket is
+        /// re-read from the source, and an append's stored value is its input value.
+        #[test]
+        fn ingest_ignores_the_value_reported_for_an_upsert(
+            agg in prop::sample::select(RULE_TYPES),
+            bucket in prop::sample::select(&[500u64, 1000][..]),
+            policy in prop::sample::select(&[
+                DuplicatePolicy::Block,
+                DuplicatePolicy::KeepFirst,
+                DuplicatePolicy::KeepLast,
+                DuplicatePolicy::Min,
+                DuplicatePolicy::Max,
+                DuplicatePolicy::Sum,
+            ][..]),
+            history in prop::collection::vec((0i64..4000, -100i32..100), 0..20),
+            batch in prop::collection::btree_map(0i64..5000, -100i32..100, 2..12)
+                .prop_flat_map(|m| Just(m.into_iter().collect::<Vec<_>>()).prop_shuffle()),
+        ) {
+            let mut parent = TimeSeries::new();
+            parent.sample_duplicates.policy = Some(policy);
+            let mut dest = TimeSeries::new();
+            let mut rule = fresh_rule(agg, bucket);
+            for (ts, value) in history {
+                let prev_last = parent.last_sample.map(|s| s.timestamp);
+                if let SampleAddResult::Ok(stored) = parent.add(ts, value as f64, None) {
+                    let stored = parent.get_sample(stored.timestamp).unwrap().unwrap();
+                    ingest_batch_of_one(&parent, &mut dest, &mut rule, stored, prev_last);
+                }
+            }
+
+            let prev_last = parent.last_sample.map(|s| s.timestamp);
+            let input: Vec<Sample> =
+                batch.iter().map(|&(ts, v)| Sample::new(ts, v as f64)).collect();
+            let results = parent.merge_samples_deferring_retention(&input, None);
+            let accepted: Vec<(Sample, Sample)> = results
+                .iter()
+                .zip(&input)
+                .filter_map(|(res, inp)| match res {
+                    SampleAddResult::Ok(reported) => Some((*reported, *inp)),
+                    _ => None,
+                })
+                .collect();
+            prop_assume!(!accepted.is_empty());
+            let order: Vec<Timestamp> = accepted.iter().map(|(r, _)| r.timestamp).collect();
+
+            let variants: [fn(&TimeSeries, Sample, Sample) -> Sample; 3] = [
+                |_, reported, _| reported,
+                |_, _, input| input,
+                |series, reported, _| series.get_sample(reported.timestamp).unwrap().unwrap(),
+            ];
+            let mut views = Vec::new();
+            for payload in variants {
+                let mut samples: Vec<Sample> =
+                    accepted.iter().map(|&(r, i)| payload(&parent, r, i)).collect();
+                samples.sort_by_key(|s| s.timestamp);
+                let mut dest = dest.clone();
+                let mut rule = rule.clone();
+                let mut cctx = CompactionContext::new(&parent, &mut dest, &mut rule);
+                let op = CompactionOp::Ingest {
+                    samples: &samples,
+                    prev_last,
+                    input_order: &order,
+                };
+                apply_op(&mut cctx, op).unwrap();
+                views.push(rule_view(&dest, &rule));
+            }
+            let expected = recompute(&parent, agg, bucket);
+            prop_assert_eq!(&views[0], &expected, "merge-path payload");
+            prop_assert_eq!(&views[1], &expected, "input payload");
+            prop_assert_eq!(&views[2], &expected, "stored payload");
+        }
+
         /// Without retention, the destination holds exactly the buckets strictly older
         /// than the one containing the source's last sample that received at least one counted
         /// sample, each the aggregate of the source's samples in timestamp order, and the rule's
