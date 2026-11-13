@@ -319,14 +319,17 @@ impl TimeSeries {
     /// lowers the floor. So the samples expired under the old window are dropped first:
     /// otherwise they would reappear, and how many would depend on when this node last
     /// trimmed — a primary and a replica would disagree. The floor follows the series' own
-    /// last sample, so every node applying the change trims to the same point.
+    /// last sample, so every node applying the change trims to the same point. Narrowing
+    /// only raises the floor, so it skips that trim; the new window's own trim follows.
     ///
     /// If that trim fails (a boundary chunk that no longer decodes), the retention is left
     /// as it was and the error returned: applying the new window would show again the
     /// expired samples the failed trim left stored. What the trim did drop before failing
     /// was expired, so the series still reads the same.
     pub(crate) fn set_retention(&mut self, retention: Duration) -> TsdbResult {
-        if !self.retention.is_zero() {
+        let lowers_floor =
+            !self.retention.is_zero() && (retention.is_zero() || retention > self.retention);
+        if lowers_floor {
             self.trim()?;
         }
         self.retention = retention;

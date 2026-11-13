@@ -2308,31 +2308,43 @@ mod tests {
         assert_eq!(lazy.visible_total_samples(), 11);
     }
 
-    /// A wholly expired Gorilla chunk (1..=50) and a boundary chunk (51..=150) whose stream
-    /// no longer decodes, under a retention window whose floor (100) falls inside it.
-    fn series_with_undecodable_boundary_chunk() -> TimeSeries {
-        let chunk = |range: std::ops::RangeInclusive<i64>| {
-            let mut chunk = TimeSeriesChunk::new(ChunkEncoding::Gorilla, 4096);
-            for ts in range {
-                chunk
-                    .add_sample(&Sample::new(ts, ts as f64 * 0.37))
-                    .unwrap();
-            }
+    fn gorilla_chunk(range: std::ops::RangeInclusive<i64>) -> TimeSeriesChunk {
+        let mut chunk = TimeSeriesChunk::new(ChunkEncoding::Gorilla, 4096);
+        for ts in range {
             chunk
-        };
-        let mut boundary = chunk(51..=150);
-        let TimeSeriesChunk::Gorilla(gorilla) = &mut boundary else {
+                .add_sample(&Sample::new(ts, ts as f64 * 0.37))
+                .unwrap();
+        }
+        chunk
+    }
+
+    /// A chunk whose stream no longer decodes: it claims more samples than it holds.
+    fn undecodable_gorilla_chunk(range: std::ops::RangeInclusive<i64>) -> TimeSeriesChunk {
+        let mut chunk = gorilla_chunk(range);
+        let TimeSeriesChunk::Gorilla(gorilla) = &mut chunk else {
             unreachable!()
         };
         let half = gorilla.encoder.buf().len() / 2;
         gorilla.encoder.truncate_stream_for_test(half);
+        chunk
+    }
 
+    fn gorilla_series(chunks: Vec<TimeSeriesChunk>, retention_ms: u64) -> TimeSeries {
         let mut series = TimeSeries::new();
         series.chunk_encoding = ChunkEncoding::Gorilla;
-        series.chunks = vec![chunk(1..=50), boundary];
+        series.chunks = chunks;
         series.update_state_from_chunks();
-        series.retention = Duration::from_millis(50);
+        series.retention = Duration::from_millis(retention_ms);
         series
+    }
+
+    /// A wholly expired chunk (1..=50) and an undecodable boundary chunk (51..=150), under a
+    /// retention window whose floor (100) falls inside it.
+    fn series_with_undecodable_boundary_chunk() -> TimeSeries {
+        gorilla_series(
+            vec![gorilla_chunk(1..=50), undecodable_gorilla_chunk(51..=150)],
+            50,
+        )
     }
 
     #[test]
@@ -2350,5 +2362,25 @@ mod tests {
         let mut series = series_with_undecodable_boundary_chunk();
         assert!(series.set_retention(Duration::ZERO).is_err());
         assert_eq!(series.retention, Duration::from_millis(50));
+    }
+
+    /// Narrowing only raises the floor, so nothing expired can reappear and the old window
+    /// need not be trimmed first. Here that trim would fail on the undecodable chunk
+    /// (1..=100, partly expired under the old floor of 50) that the new floor of 150 drops
+    /// whole, without decoding it.
+    #[test]
+    fn narrowing_retention_drops_an_undecodable_chunk_it_wholly_expires() {
+        let mut series = gorilla_series(
+            vec![undecodable_gorilla_chunk(1..=100), gorilla_chunk(101..=200)],
+            150,
+        );
+        series.set_retention(Duration::from_millis(50)).unwrap();
+
+        assert_eq!(series.retention, Duration::from_millis(50));
+        assert_eq!(series.chunks.len(), 1);
+        let range = series.get_range(0, Timestamp::MAX);
+        assert_eq!(range.len(), 51);
+        assert_eq!(range[0].timestamp, 150);
+        assert_eq!(series.visible_total_samples(), 51);
     }
 }

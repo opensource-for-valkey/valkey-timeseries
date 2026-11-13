@@ -76,7 +76,7 @@ fn update_series(
 ) -> ValkeyResult<bool> {
     let mut has_changed = false;
 
-    // Retention goes first: changing it trims under the old window, and that can fail on a
+    // Retention goes first: widening it trims under the old window, and that can fail on a
     // chunk that no longer decodes. Failing before any other option is applied keeps the
     // ALTER all-or-nothing, which matters because a failed command is not replicated.
     if let Some(retention) = options.retention
