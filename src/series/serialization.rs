@@ -303,6 +303,7 @@ pub(crate) const NEGATIVE_TIMESTAMPS: &str = "negative timestamps";
 pub(crate) const CHUNKS_REORDERED: &str = "chunks out of order sorted";
 pub(crate) const CHUNKS_OVERLAPPING: &str = "overlapping chunks";
 pub(crate) const UNDECODABLE_STRAYS_KEPT: &str = "undecodable chunks of another encoding kept";
+pub(crate) const UNSPLITTABLE_CHUNKS_KEPT: &str = "oversized chunks that do not decode kept whole";
 pub(crate) const LABEL_NUL_KEPT: &str = "label with a NUL byte kept";
 pub(crate) const STALE_RULE_STATE_CLEARED: &str = "compaction state without an open bucket cleared";
 pub(crate) const OFF_GRID_BUCKET_REBUILT: &str =
@@ -323,7 +324,7 @@ pub(crate) const OFF_GRID_BUCKET_REBUILT: &str =
 /// | Empty chunks beside others | dropped | dropped |
 /// | The series' encoding differs from its chunks', which agree | adopted | adopted |
 /// | Chunks of more than one encoding | refused | strays re-encoded to the series'; one that does not decode fully is kept as it is |
-/// | Chunk data over `MAX_LOADED_CHUNK_BYTES` | refused | split, as the merge path splits |
+/// | Chunk data over `MAX_LOADED_CHUNK_BYTES` | refused | split, as the merge path splits; one that does not decode fully is kept whole |
 /// | `chunk_size_bytes` outside `validate_chunk_size` | refused | clamped into range |
 /// | Retention past `i64::MAX` ms | refused | clamped to `i64::MAX` ms |
 /// | Rounding digits outside what `DECIMAL_DIGITS`/`SIGNIFICANT_DIGITS` accept | refused | clamped to 16; zero significant digits dropped |
@@ -362,6 +363,9 @@ pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<
         repairs.repair(EMPTY_CHUNKS_DROPPED);
     }
 
+    // Indexes of the strays kept because they do not decode: nothing below may decode them.
+    // `ts.chunks` is not reordered or resized between here and the split that reads them.
+    let mut undecodable: Vec<usize> = Vec::new();
     if let Some(encoding) = ts.chunks.first().map(TimeSeriesChunk::get_encoding) {
         if ts
             .chunks
@@ -380,11 +384,12 @@ pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<
                 "chunks of more than one encoding in a {} series",
                 ts.chunk_encoding
             ))?;
-            let (reencoded, kept) = reencode_strays(ts)?;
+            let reencoded;
+            (reencoded, undecodable) = reencode_strays(ts)?;
             if reencoded > 0 {
                 repairs.repair(STRAYS_REENCODED);
             }
-            if kept > 0 {
+            if !undecodable.is_empty() {
                 repairs.tolerate(UNDECODABLE_STRAYS_KEPT);
             }
         }
@@ -398,11 +403,13 @@ pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<
         .map(|(i, chunk)| (i, chunk.size()));
     if let Some((i, bytes)) = oversized {
         refuse(format!("chunk {i} holds {bytes} bytes"))?;
-        // Halves until no chunk is past 1.25x its budget (at most `MAX_CHUNK_SIZE`, clamped
-        // above), so every chunk ends under the limit.
-        ts.split_chunks_if_needed()
-            .map_err(|e| format!("cannot split chunk {i}: {e}"))?;
-        repairs.repair(OVERSIZED_SPLIT);
+        let (split, kept) = split_oversized_on_load(ts, &undecodable);
+        if split > 0 {
+            repairs.repair(OVERSIZED_SPLIT);
+        }
+        if kept > 0 {
+            repairs.tolerate(UNSPLITTABLE_CHUNKS_KEPT);
+        }
     }
 
     if validate_chunk_size(ts.chunk_size_bytes).is_err() {
@@ -546,23 +553,23 @@ pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<
     Ok(repairs)
 }
 
-/// Re-encodes every chunk not in the series' encoding, keeping its budget, and returns how many
-/// were re-encoded and how many were kept as they are.
+/// Re-encodes every chunk not in the series' encoding, keeping its budget. Returns how many
+/// were re-encoded and the indexes of those kept as they are.
 ///
 /// A stray whose stream stops decoding before its count is kept: `iter` ends at a decode
 /// error, so re-encoding what it yields would store the readable prefix and lose the rest for
 /// good. Kept, it reads as any own-load chunk with a damaged stream does (the decode error is
 /// counted), and its bytes survive for recovery.
-fn reencode_strays(ts: &mut TimeSeries) -> Result<(usize, usize), String> {
+fn reencode_strays(ts: &mut TimeSeries) -> Result<(usize, Vec<usize>), String> {
     let encoding = ts.chunk_encoding;
-    let (mut reencoded, mut kept) = (0, 0);
+    let (mut reencoded, mut kept) = (0, Vec::new());
     for (i, chunk) in ts.chunks.iter_mut().enumerate() {
         if chunk.get_encoding() == encoding {
             continue;
         }
         let samples: Vec<Sample> = chunk.iter().collect();
         if samples.len() != chunk.len() {
-            kept += 1;
+            kept.push(i);
             continue;
         }
         let mut rebuilt = TimeSeriesChunk::new(encoding, chunk.max_size());
@@ -574,6 +581,58 @@ fn reencode_strays(ts: &mut TimeSeries) -> Result<(usize, usize), String> {
         reencoded += 1;
     }
     Ok((reencoded, kept))
+}
+
+/// Halves every chunk until none [`should_split`](TimeSeriesChunk::should_split) (past 1.25x a budget of
+/// at most `MAX_CHUNK_SIZE`, clamped before this runs), so every chunk it splits ends under
+/// `MAX_LOADED_CHUNK_BYTES`. Returns how many chunks were split and how many were kept whole.
+///
+/// Unlike the merge path's `split_chunks_if_needed`, one chunk that does not split cannot fail
+/// the rest: a split decodes the chunk, and an own load keeps chunks whose streams stop short
+/// (`undecodable`, or any other found here). Splitting one would fail, or keep the readable
+/// prefix and lose the rest, as re-encoding it would; kept whole, it reads as any damaged
+/// own-load chunk does. Each piece is split in place, so the chunks stay in order.
+fn split_oversized_on_load(ts: &mut TimeSeries, undecodable: &[usize]) -> (usize, usize) {
+    fn push_halves(mut chunk: TimeSeriesChunk, out: &mut Vec<TimeSeriesChunk>, kept: &mut usize) {
+        if !chunk.should_split() {
+            out.push(chunk);
+            return;
+        }
+        match chunk.split() {
+            Ok(mut upper) => {
+                // Both halves are re-encoded from scratch into doubling-grown buffers.
+                seal_chunk(&mut chunk);
+                seal_chunk(&mut upper);
+                push_halves(chunk, out, kept);
+                push_halves(upper, out, kept);
+            }
+            // A failed split leaves the chunk as it was.
+            Err(_) => {
+                *kept += 1;
+                out.push(chunk);
+            }
+        }
+    }
+
+    let (mut split, mut kept) = (0, 0);
+    let chunks = std::mem::take(&mut ts.chunks);
+    let mut out = Vec::with_capacity(chunks.len() + 1);
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        if !chunk.should_split() {
+            out.push(chunk);
+        } else if undecodable.contains(&i) || chunk.iter().count() != chunk.len() {
+            kept += 1;
+            out.push(chunk);
+        } else {
+            let before = out.len();
+            push_halves(chunk, &mut out, &mut kept);
+            if out.len() - before > 1 {
+                split += 1;
+            }
+        }
+    }
+    ts.chunks = out;
+    (split, kept)
 }
 
 /// Whether a series is in the form a foreign load accepts unchanged: what the write path
