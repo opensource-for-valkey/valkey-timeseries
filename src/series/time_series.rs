@@ -312,6 +312,24 @@ impl TimeSeries {
         }
     }
 
+    /// Changes the retention window of a series that may already hold samples.
+    ///
+    /// The write path and the trim cron leave expired samples stored (see
+    /// [`Self::trim_lazily`]) and rely on the floor to hide them, but widening the window
+    /// lowers the floor. So the samples expired under the old window are dropped first:
+    /// otherwise they would reappear, and how many would depend on when this node last
+    /// trimmed — a primary and a replica would disagree. The floor follows the series' own
+    /// last sample, so every node applying the change trims to the same point.
+    pub(crate) fn set_retention(&mut self, retention: Duration) {
+        if !self.retention.is_zero()
+            && let Err(e) = self.trim()
+        {
+            logging::log_warning(format!("TSDB: Error trimming time series: {e:?}"));
+        }
+        self.retention = retention;
+        self.apply_retention();
+    }
+
     pub(crate) fn validate_sample(
         &self,
         sample: &Sample,

@@ -104,12 +104,8 @@ fn update_series(
     if let Some(retention) = options.retention
         && retention != series.retention
     {
-        series.retention = retention;
         has_changed = true;
-        // Retention is applied eagerly on the write path so that TS.INFO agrees
-        // with TS.RANGE; tightening the window here has to trim what is already
-        // stored for the same reason.
-        series.apply_retention();
+        series.set_retention(retention);
     }
 
     if let Some(policy) = options.duplicate_policy

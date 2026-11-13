@@ -151,6 +151,50 @@ class TestLabelReplacement:
         diff("TS.INFO", "a:lbl:dupname")
 
 
+class TestAlterRetentionWidening:
+    """DIV-0064: widening the retention window of a series that already holds expired
+    samples."""
+
+    @staticmethod
+    def _expired(client, key, encoding):
+        """RETENTION 100 over ts 1..200: samples 1..99 are outside the window."""
+        client.execute_command("TS.CREATE", key, "RETENTION", 100, "ENCODING", encoding)
+        pipe = client.pipeline(transaction=False)
+        for ts in range(1, 201):
+            pipe.execute_command("TS.ADD", key, ts, ts)
+        pipe.execute()
+
+    @pytest.mark.parametrize("encoding", ["COMPRESSED", "UNCOMPRESSED"])
+    def test_reads_agree_before_the_window_widens(self, diff, encoding):
+        key = f"a:ret:wide:{encoding}"
+        self._expired(diff.reference, key, encoding)
+        self._expired(diff.subject, key, encoding)
+        diff("TS.RANGE", key, "-", "+")
+        diff("TS.INFO", key)
+
+    @pytest.mark.parametrize("encoding", ["COMPRESSED", "UNCOMPRESSED"])
+    @pytest.mark.parametrize("widened", [0, 100000])
+    def test_widening_brings_back_expired_samples_only_on_the_reference(
+        self, diff, encoding, widened
+    ):
+        """RTS still stores the expired samples of a chunk that is not wholly expired, and
+        widening the window shows them again; we drop everything expired under the old
+        window first. Pins DIV-0064."""
+        key = f"a:ret:wide:{encoding}:{widened}"
+        self._expired(diff.reference, key, encoding)
+        self._expired(diff.subject, key, encoding)
+        visible = diff.subject.execute_command("TS.RANGE", key, "-", "+")
+        assert len(visible) == 101
+
+        for client in (diff.reference, diff.subject):
+            assert client.execute_command("TS.ALTER", key, "RETENTION", widened) == b"OK"
+
+        reference = diff.reference.execute_command("TS.RANGE", key, "-", "+")
+        assert len(reference) > len(visible)
+        assert reference[-len(visible):] == visible
+        assert diff.subject.execute_command("TS.RANGE", key, "-", "+") == visible
+
+
 class TestAlterWithRules:
     def test_alter_source_of_a_rule(self, diff):
         mk_series(diff, "a:rule:src")

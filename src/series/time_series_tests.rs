@@ -2255,4 +2255,56 @@ mod tests {
         assert!(ts.chunks[0].first_timestamp() >= floor);
         assert_eq!(ts.iter().count(), ts.visible_total_samples());
     }
+
+    /// A series with retention, filled at 1 ms so the write path leaves an expired prefix
+    /// in the head chunk, next to a copy of it whose expired samples were all trimmed — the
+    /// same data as a node whose trim cron has run and one whose cron has not.
+    fn lazily_and_fully_trimmed(encoding: ChunkEncoding) -> (TimeSeries, TimeSeries) {
+        let options = TimeSeriesOptions {
+            chunk_encoding: encoding,
+            retention: Some(Duration::from_millis(100)),
+            ..Default::default()
+        };
+        let mut lazy = TimeSeries::with_options(options).unwrap();
+        for ts in 1..=200 {
+            assert!(lazy.add(ts, ts as f64, None).is_ok());
+        }
+        let mut trimmed = lazy.clone();
+        trimmed.trim().unwrap();
+        (lazy, trimmed)
+    }
+
+    #[test]
+    fn widening_retention_does_not_resurrect_expired_samples() {
+        for encoding in [
+            ChunkEncoding::Chimp,
+            ChunkEncoding::Gorilla,
+            ChunkEncoding::Uncompressed,
+        ] {
+            for widened in [Duration::ZERO, Duration::from_millis(10_000)] {
+                let (mut lazy, mut trimmed) = lazily_and_fully_trimmed(encoding);
+                let visible = lazy.get_range(0, Timestamp::MAX);
+                assert_eq!(visible.len(), 101, "{encoding:?}");
+
+                lazy.set_retention(widened);
+                trimmed.set_retention(widened);
+
+                let context = format!("{encoding:?}, retention -> {widened:?}");
+                assert_eq!(lazy.get_range(0, Timestamp::MAX), visible, "{context}");
+                assert_eq!(trimmed.get_range(0, Timestamp::MAX), visible, "{context}");
+                assert_eq!(lazy.visible_total_samples(), 101, "{context}");
+                assert_eq!(lazy.visible_first_timestamp(), 100, "{context}");
+            }
+        }
+    }
+
+    #[test]
+    fn narrowing_retention_hides_samples_outside_the_new_window() {
+        let (mut lazy, _) = lazily_and_fully_trimmed(ChunkEncoding::Chimp);
+        lazy.set_retention(Duration::from_millis(10));
+        let range = lazy.get_range(0, Timestamp::MAX);
+        assert_eq!(range.len(), 11);
+        assert_eq!(range[0].timestamp, 190);
+        assert_eq!(lazy.visible_total_samples(), 11);
+    }
 }
