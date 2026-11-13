@@ -38,8 +38,11 @@ checked as for [`TS.CREATE`](ts.create.md), but it has no effect: a series
 keeps the encoding it was created with. RedisTimeSeries behaves the same way.
 
 Changing `RETENTION` applies the new retention window immediately to existing
-samples. Changing labels updates the label index. Existing samples are not
-otherwise modified.
+samples. Widening the window, or setting it to `0`, does not bring back samples
+that had already expired: the series keeps exactly the samples it reported
+before the change, and only samples added afterwards fill the wider window.
+Changing labels updates the label index. Existing samples are not otherwise
+modified.
 
 ## Return value
 
@@ -54,11 +57,12 @@ Returns `OK` on success.
 - A chunk-size or rounding error — An option value is outside its valid range.
 - `TSDB: invalid duplicate policy` — The duplicate policy is unknown.
 - A label parsing error — Labels or a metric name are malformed.
+- `TSDB: error trimming expired samples` — `RETENTION` was widened or set to `0`, but the expired samples stored under the old window could not be removed because a chunk no longer decodes. Nothing is altered.
 
 ## Complexity
 
 O(1), excluding label-index maintenance when labels are changed and the
-retention trim that runs when `RETENTION` is tightened. That trim drops whole
+retention trim that runs when `RETENTION` changes. That trim drops whole
 expired chunks and then rewrites the boundary chunk, so it is O(C + S), where
 C is the number of expired chunks and S is the number of samples in the first
 surviving chunk.

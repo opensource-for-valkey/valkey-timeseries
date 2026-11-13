@@ -1388,3 +1388,29 @@
     `ts-compatibility-mode strict` does not relax it. RDB load and RESTORE reject such names too. Pinned by
     TestParserDivergences::test_label_name_with_separator_is_rejected.
   since: 0.1.0
+
+# DIV-0064 came with the fix for issue #151 (widening retention resurrected expired samples).
+# Reference behavior was observed black-box against the pinned redis:8.10 image.
+#
+# `behavior`-kind: signed off by the owner (ccollie), 2026-11-13.
+
+- id: DIV-0064
+  command: TS.ALTER
+  kind: behavior
+  documentation_only: true
+  description: >
+    Widening the retention window (a larger RETENTION, or 0) of a series that already holds
+    samples older than its window does not bring them back: TS.RANGE and TS.INFO report the
+    same samples as before the TS.ALTER. RTS 8.10 shows again every expired sample still
+    stored in a chunk that was not wholly expired — with RETENTION 100 over samples at
+    1..200 ms, 101 samples before `TS.ALTER key RETENTION 0` and all 200 after. Narrowing the
+    window agrees on both engines.
+  rationale: >
+    Accepted (owner sign-off 2026-11-13, §5.3), in both compatibility modes, strict included.
+    How many samples RTS brings back depends on where its chunk boundaries fall, and ours
+    would depend on when the write path or the per-node trim cron last trimmed, so primary
+    and replica could disagree after a replicated TS.ALTER. Trimming to the old window before
+    changing it makes the result the same on every node and independent of chunk layout;
+    samples a client could no longer read stay unreadable.
+    Pinned by TestAlterRetentionWidening::test_widening_brings_back_expired_samples_only_on_the_reference.
+  since: 0.1.0

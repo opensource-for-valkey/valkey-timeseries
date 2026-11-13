@@ -2255,4 +2255,132 @@ mod tests {
         assert!(ts.chunks[0].first_timestamp() >= floor);
         assert_eq!(ts.iter().count(), ts.visible_total_samples());
     }
+
+    /// A series with retention, filled at 1 ms so the write path leaves an expired prefix
+    /// in the head chunk, next to a copy of it whose expired samples were all trimmed — the
+    /// same data as a node whose trim cron has run and one whose cron has not.
+    fn lazily_and_fully_trimmed(encoding: ChunkEncoding) -> (TimeSeries, TimeSeries) {
+        let options = TimeSeriesOptions {
+            chunk_encoding: encoding,
+            retention: Some(Duration::from_millis(100)),
+            ..Default::default()
+        };
+        let mut lazy = TimeSeries::with_options(options).unwrap();
+        for ts in 1..=200 {
+            assert!(lazy.add(ts, ts as f64, None).is_ok());
+        }
+        let mut trimmed = lazy.clone();
+        trimmed.trim().unwrap();
+        (lazy, trimmed)
+    }
+
+    #[test]
+    fn widening_retention_does_not_resurrect_expired_samples() {
+        for encoding in [
+            ChunkEncoding::Chimp,
+            ChunkEncoding::Gorilla,
+            ChunkEncoding::Uncompressed,
+        ] {
+            for widened in [Duration::ZERO, Duration::from_millis(10_000)] {
+                let (mut lazy, mut trimmed) = lazily_and_fully_trimmed(encoding);
+                let visible = lazy.get_range(0, Timestamp::MAX);
+                assert_eq!(visible.len(), 101, "{encoding:?}");
+
+                lazy.set_retention(widened).unwrap();
+                trimmed.set_retention(widened).unwrap();
+
+                let context = format!("{encoding:?}, retention -> {widened:?}");
+                assert_eq!(lazy.get_range(0, Timestamp::MAX), visible, "{context}");
+                assert_eq!(trimmed.get_range(0, Timestamp::MAX), visible, "{context}");
+                assert_eq!(lazy.visible_total_samples(), 101, "{context}");
+                assert_eq!(lazy.visible_first_timestamp(), 100, "{context}");
+            }
+        }
+    }
+
+    #[test]
+    fn narrowing_retention_hides_samples_outside_the_new_window() {
+        let (mut lazy, _) = lazily_and_fully_trimmed(ChunkEncoding::Chimp);
+        lazy.set_retention(Duration::from_millis(10)).unwrap();
+        let range = lazy.get_range(0, Timestamp::MAX);
+        assert_eq!(range.len(), 11);
+        assert_eq!(range[0].timestamp, 190);
+        assert_eq!(lazy.visible_total_samples(), 11);
+    }
+
+    fn gorilla_chunk(range: std::ops::RangeInclusive<i64>) -> TimeSeriesChunk {
+        let mut chunk = TimeSeriesChunk::new(ChunkEncoding::Gorilla, 4096);
+        for ts in range {
+            chunk
+                .add_sample(&Sample::new(ts, ts as f64 * 0.37))
+                .unwrap();
+        }
+        chunk
+    }
+
+    /// A chunk whose stream no longer decodes: it claims more samples than it holds.
+    fn undecodable_gorilla_chunk(range: std::ops::RangeInclusive<i64>) -> TimeSeriesChunk {
+        let mut chunk = gorilla_chunk(range);
+        let TimeSeriesChunk::Gorilla(gorilla) = &mut chunk else {
+            unreachable!()
+        };
+        let half = gorilla.encoder.buf().len() / 2;
+        gorilla.encoder.truncate_stream_for_test(half);
+        chunk
+    }
+
+    fn gorilla_series(chunks: Vec<TimeSeriesChunk>, retention_ms: u64) -> TimeSeries {
+        let mut series = TimeSeries::new();
+        series.chunk_encoding = ChunkEncoding::Gorilla;
+        series.chunks = chunks;
+        series.update_state_from_chunks();
+        series.retention = Duration::from_millis(retention_ms);
+        series
+    }
+
+    /// A wholly expired chunk (1..=50) and an undecodable boundary chunk (51..=150), under a
+    /// retention window whose floor (100) falls inside it.
+    fn series_with_undecodable_boundary_chunk() -> TimeSeries {
+        gorilla_series(
+            vec![gorilla_chunk(1..=50), undecodable_gorilla_chunk(51..=150)],
+            50,
+        )
+    }
+
+    #[test]
+    fn failed_boundary_trim_still_accounts_for_the_dropped_chunks() {
+        let mut series = series_with_undecodable_boundary_chunk();
+        assert!(series.trim().is_err());
+
+        assert_eq!(series.chunks.len(), 1);
+        assert_eq!(series.total_samples, 100);
+        assert_eq!(series.first_timestamp, 51);
+    }
+
+    #[test]
+    fn set_retention_fails_and_keeps_the_window_when_the_trim_fails() {
+        let mut series = series_with_undecodable_boundary_chunk();
+        assert!(series.set_retention(Duration::ZERO).is_err());
+        assert_eq!(series.retention, Duration::from_millis(50));
+    }
+
+    /// Narrowing only raises the floor, so nothing expired can reappear and the old window
+    /// need not be trimmed first. Here that trim would fail on the undecodable chunk
+    /// (1..=100, partly expired under the old floor of 50) that the new floor of 150 drops
+    /// whole, without decoding it.
+    #[test]
+    fn narrowing_retention_drops_an_undecodable_chunk_it_wholly_expires() {
+        let mut series = gorilla_series(
+            vec![undecodable_gorilla_chunk(1..=100), gorilla_chunk(101..=200)],
+            150,
+        );
+        series.set_retention(Duration::from_millis(50)).unwrap();
+
+        assert_eq!(series.retention, Duration::from_millis(50));
+        assert_eq!(series.chunks.len(), 1);
+        let range = series.get_range(0, Timestamp::MAX);
+        assert_eq!(range.len(), 51);
+        assert_eq!(range[0].timestamp, 150);
+        assert_eq!(series.visible_total_samples(), 51);
+    }
 }

@@ -42,6 +42,39 @@ class TestTimeSeriesAlter(ValkeyTimeSeriesTestCaseBase):
         assert labels['sensor'] == 'temp'
         assert labels['area'] == 'A1'
 
+    @pytest.mark.parametrize('encoding', ['COMPRESSED', 'UNCOMPRESSED'])
+    @pytest.mark.parametrize('widened', [0, 100000])
+    def test_widening_retention_does_not_resurrect_expired_samples(self, encoding, widened):
+        """Expired samples may still be stored until something trims them physically, and
+        when that happens differs between nodes (the trim cron is per node). Widening the
+        window must not bring them back, or the answer would depend on trim history.
+
+        `lazy` keeps what the write path left behind; `trimmed` holds the same data with
+        every expired sample dropped (TS.DEL trims before it deletes, and nothing at
+        timestamp 0 is inside the window)."""
+        pipe = self.client.pipeline(transaction=False)
+        for key in ('lazy', 'trimmed'):
+            pipe.execute_command('TS.CREATE', key, 'RETENTION', 100, 'ENCODING', encoding)
+            for ts in range(1, 201):
+                pipe.execute_command('TS.ADD', key, ts, ts)
+        pipe.execute()
+        assert self.client.execute_command('TS.DEL', 'trimmed', 0, 0) == 0
+
+        visible = self.client.execute_command('TS.RANGE', 'lazy', '-', '+')
+        assert len(visible) == 101
+        assert self.client.execute_command('TS.RANGE', 'trimmed', '-', '+') == visible
+
+        for key in ('lazy', 'trimmed'):
+            assert self.client.execute_command('TS.ALTER', key, 'RETENTION', widened) == b'OK'
+
+        for key in ('lazy', 'trimmed'):
+            assert self.client.execute_command('TS.RANGE', key, '-', '+') == visible, key
+            info = self.ts_info(key)
+            assert info['totalSamples'] == 101, key
+            assert info['firstTimestamp'] == 100, key
+        assert self.client.execute_command('DEBUG', 'DIGEST-VALUE', 'lazy') == \
+            self.client.execute_command('DEBUG', 'DIGEST-VALUE', 'trimmed')
+
     def test_alter_chunk_size(self):
         """Test altering the chunk size"""
         self.setup_data()
