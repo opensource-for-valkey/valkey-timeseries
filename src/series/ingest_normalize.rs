@@ -44,10 +44,11 @@ fn unsorted_in_batch_duplicates(samples: &[Sample]) -> Vec<bool> {
 ///   ignored samples as `Ignored`.
 ///
 /// Retention and IGNORE are decided in **input order**, against the series' last sample as
-/// sequential adds would leave it: it advances only on an accepted sample at or past it, never
-/// on one that is `TooOld`, `Ignored` or a repeat. That is what RedisTimeSeries does for
-/// `TS.MADD`, item by item: whether an item is in order (and so subject to IGNORE) and where the
-/// retention floor sits both depend on the items before it, not on timestamp order. A *later*
+/// sequential adds would leave it: it advances only on an accepted sample at or past it (to the
+/// policy-resolved value for one at it), never on one that is `TooOld`, `Ignored` or a repeat.
+/// That is what RedisTimeSeries does for `TS.MADD`, item by item: whether an item is in order
+/// (and so subject to IGNORE) and where the retention floor sits both depend on the items before
+/// it, not on timestamp order. A *later*
 /// item that raises the floor does not retroactively reject an earlier accepted item — that
 /// earlier sample is inserted and then removed by the post-merge retention trim, so it is still
 /// reported as accepted.
@@ -106,8 +107,23 @@ pub(super) fn normalize_batch(
             continue;
         }
 
-        if running_last.is_none_or(|last| adjusted.timestamp >= last.timestamp) {
-            running_last = Some(adjusted);
+        match running_last {
+            None => running_last = Some(adjusted),
+            Some(last) if adjusted.timestamp > last.timestamp => running_last = Some(adjusted),
+            // An upsert onto the last sample leaves what the duplicate policy stores there,
+            // which need not be the input (a NaN under LAST keeps the old value; SUM adds).
+            // Repeats were refused above, so `last` is the stored sample. A refused upsert
+            // (BLOCK, NaN under MIN/MAX/SUM) leaves it unchanged.
+            Some(last) if adjusted.timestamp == last.timestamp => {
+                if let Ok(value) = dup_policy.resolve_policy(policy_override).duplicate_value(
+                    last.timestamp,
+                    last.value,
+                    adjusted.value,
+                ) {
+                    running_last = Some(Sample { value, ..last });
+                }
+            }
+            Some(_) => {}
         }
         to_insert.push(adjusted);
         insert_index.push(index);

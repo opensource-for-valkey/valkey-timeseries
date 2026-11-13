@@ -414,6 +414,23 @@ mod tests {
         assert_eq!(merged, sequential);
     }
 
+    /// An upsert onto the last sample leaves the policy-resolved value as the IGNORE baseline:
+    /// a NaN under LAST keeps the stored 1, so 1001 is within the IGNORE bounds of it.
+    /// Tracking the NaN input instead accepted 1001.
+    #[test]
+    fn madd_nan_upsert_keeps_the_stored_value_as_the_ignore_baseline() {
+        let mut series = ignoring_series(0);
+        series.add(1000, 1.0, None);
+        let batch = [s(1000, f64::NAN), s(1001, 1.0)];
+
+        let (merged, sequential) = madd_vs_sequential(&series, &batch);
+
+        assert_eq!(sequential.0[1], SampleAddResult::Ignored(1000));
+        assert_eq!(sequential.1, vec![s(1000, 1.0)]);
+        assert_eq!(merged.0[1], sequential.0[1]);
+        assert_eq!(merged.1, sequential.1);
+    }
+
     /// Seeded batches over every duplicate policy, with and without IGNORE and retention, in
     /// arbitrary argument order: the merge path must answer and store exactly what sequential
     /// adds do.
@@ -451,6 +468,12 @@ mod tests {
 
             // Distinct timestamps: a batch with repeats takes the sequential path anyway.
             let mut timestamps: Vec<i64> = Vec::new();
+            // Often upsert onto the last sample first: it moves the IGNORE baseline to whatever
+            // the policy stores there, which later in-order items are compared against.
+            let lead_upsert = series.last_sample.is_some() && next(3) == 0;
+            if let Some(last) = series.last_sample.filter(|_| lead_upsert) {
+                timestamps.push(last.timestamp);
+            }
             for _ in 0..2 + next(10) {
                 let ts = 800 + 10 * next(40) as i64;
                 if !timestamps.contains(&ts) {
@@ -460,10 +483,21 @@ mod tests {
             if timestamps.len() < 2 {
                 continue;
             }
-            let batch: Vec<Sample> = timestamps
+            let mut batch: Vec<Sample> = timestamps
                 .iter()
-                .map(|&ts| s(ts, next(4) as f64 * 0.75))
+                .map(|&ts| {
+                    let value = match next(8) {
+                        0 => f64::NAN,
+                        v => v as f64 * 0.375,
+                    };
+                    s(ts, value)
+                })
                 .collect();
+            // The generator's consecutive draws are correlated; pick the leading upsert's value
+            // on its own so it is a NaN often enough (NaN under LAST keeps the stored value).
+            if lead_upsert && next(2) == 0 {
+                batch[0].value = f64::NAN;
+            }
 
             let (merged, sequential) = madd_vs_sequential(&series, &batch);
             // `Ok` carries the stored (merged) value on the merge path and the input value on
@@ -477,9 +511,16 @@ mod tests {
                     })
                     .collect()
             };
+            // NaN is stored as-is under some policies; compare it by bit pattern.
+            let stored = |samples: &[Sample]| -> Vec<(i64, u64)> {
+                samples
+                    .iter()
+                    .map(|smp| (smp.timestamp, smp.value.to_bits()))
+                    .collect()
+            };
             assert_eq!(
-                (decided(&merged.0), &merged.1),
-                (decided(&sequential.0), &sequential.1),
+                (decided(&merged.0), stored(&merged.1)),
+                (decided(&sequential.0), stored(&sequential.1)),
                 "case {case}: policy {:?}, ignore ({}, {}), retention {:?}, stored {:?}, batch {batch:?}",
                 series.sample_duplicates.policy,
                 series.sample_duplicates.max_time_delta,
