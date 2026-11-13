@@ -204,8 +204,9 @@ fn estimate_bps(series: &TimeSeries, batch: &[Sample]) -> usize {
     // Probe contiguous windows spread across the batch (a prefix alone misjudges data whose
     // shape changes along the batch), each measured without its first sample: that one is
     // stored raw, and over a short window of very compressible data it would dominate.
-    // At most half the batch is probed, so a batch just past the no-estimate fast path is
-    // not encoded twice over.
+    // A batch with room for two windows or more is probed at most half, so a batch just past
+    // the no-estimate fast path is not encoded twice over. Below that one window is probed:
+    // all of a batch under `BPS_PROBE_WINDOW` samples, the first `BPS_PROBE_WINDOW` otherwise.
     let window = BPS_PROBE_WINDOW.min(batch.len());
     let windows = BPS_PROBE_WINDOWS.min(batch.len() / (2 * window)).max(1);
     let stride = batch.len() / windows;
@@ -386,8 +387,9 @@ fn group_samples_by_chunk<'a>(
         "grouping needs a series without empty chunks"
     );
 
-    // Pre-allocate based on chunk count + potential new chunks
-    let estimated_groups = series.chunks.len().saturating_add(2);
+    // At most one group per sample, so a small batch into a long series reserves little;
+    // new-chunk groups reserve their own count (see `push_new_groups`).
+    let estimated_groups = series.chunks.len().min(samples.len()).saturating_add(2);
     let mut out: Vec<ChunkSampleGroup<'a>> = Vec::with_capacity(estimated_groups);
 
     let chunk_size = series.chunk_size_bytes;
@@ -418,7 +420,15 @@ fn group_samples_by_chunk<'a>(
 
     let last_index = series.chunks.len() - 1;
 
-    for (chunk_idx, chunk) in series.chunks.iter().enumerate() {
+    // Visit only the chunks the batch reaches: chunks are sorted and disjoint, so the next one
+    // to take samples is the first ending at or after the next sample, found by binary search.
+    // Samples past every chunk land on the last one, the append target.
+    while i < samples.len() {
+        let chunk_idx = series
+            .chunks
+            .partition_point(|c| c.last_timestamp() < samples[i].timestamp)
+            .min(last_index);
+        let chunk = &series.chunks[chunk_idx];
         let start = i;
 
         let chunk_last = chunk.last_timestamp();
@@ -436,6 +446,9 @@ fn group_samples_by_chunk<'a>(
                 target: GroupTarget::Existing(chunk_idx),
                 samples: &samples[start..i],
             });
+        }
+        if chunk_idx == last_index {
+            break;
         }
     }
 
