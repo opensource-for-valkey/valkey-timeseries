@@ -39,15 +39,21 @@ pub fn ts_addbulk_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let key = args[1].clone();
     // simd_json parses in place, so the payload needs a buffer of its own.
-    let samples = parse_bulk_payload(&mut args[2].as_slice().to_vec())?;
+    let mut payload = args[2].as_slice().to_vec();
 
     // `TS.ADDBULK key data [options]`: options start at index 3.
     let options = parse_series_options(args, 3, &[])?;
     let on_duplicate = options.on_duplicate;
 
+    // The key is checked (type, ACL) before the payload is parsed, so a caller who may not
+    // write the key learns that rather than whether its payload parses.
     if let Some(mut guard) = try_get_timeseries_mut(ctx, &key, Some(AclPermissions::UPDATE))? {
+        let samples = parse_bulk_payload(&mut payload)?;
         return process_series(ctx, &mut guard, samples, on_duplicate);
     }
+
+    // Parsed before the series is created, so a bad payload leaves no empty series behind.
+    let samples = parse_bulk_payload(&mut payload)?;
 
     // Auto-create: no ts.create event. The create helper replicates the new series as a resolved
     // `TS.CREATE`, as for the TS.ADD family; this command then replicates itself.
