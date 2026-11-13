@@ -576,7 +576,8 @@ pub fn bulk_insert_samples(
         return Vec::new();
     }
 
-    let _saved_sample_count = series.total_samples;
+    #[cfg_attr(test, allow(unused_variables))]
+    let count_before = series.total_samples;
     // Last timestamp before the merge: batch compaction uses it to tell guaranteed-fresh
     // appends apart from samples that may have replaced existing values.
     let prev_last = series.last_sample.map(|s| s.timestamp);
@@ -590,12 +591,13 @@ pub fn bulk_insert_samples(
         ))
     });
 
-    // Always `ts.add`, even when the target is a compaction destination: `ts.add:dest` marks
-    // rule output only (emitted by the compaction path), matching TS.ADD/TS.MADD on RTS.
     #[cfg(not(test))]
-    if series.total_samples > _saved_sample_count {
-        notify_added(ctx, &series.key);
-    }
+    notify_added(
+        ctx,
+        &series.key,
+        results.iter().any(SampleAddResult::is_ok),
+        series.total_samples > count_before,
+    );
 
     // Propagate the accepted samples to compaction destinations in one batch.
     if !series.rules.is_empty() {
@@ -634,13 +636,21 @@ pub fn bulk_insert_samples(
     results
 }
 
+/// Emits the write's events. `ts.add` fires whenever a sample was accepted, upserts of
+/// existing timestamps included, as for TS.ADD and TS.MADD. It is `ts.add` even when the
+/// target is a compaction destination: `ts.add:dest` marks rule output only (emitted by the
+/// compaction path), matching TS.ADD/TS.MADD on RTS. A blocked `TS.READ` waits for new
+/// samples, so it is signalled only when the series grew.
 #[cfg(not(test))]
-fn notify_added(ctx: &Context, key: &[u8]) {
+fn notify_added(ctx: &Context, key: &[u8], accepted: bool, grew: bool) {
+    if !accepted {
+        return;
+    }
     let key = create_key_string(ctx, key);
     notify_keyspace_event(ctx, c"ts.add", &key);
-    // The sole caller already gated on the series' sample count having grown, which is
-    // exactly the condition that can satisfy a blocked `TS.READ`.
-    signal_timeseries_ready(ctx, &key);
+    if grew {
+        signal_timeseries_ready(ctx, &key);
+    }
 }
 
 #[cfg(test)]

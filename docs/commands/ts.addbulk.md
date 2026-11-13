@@ -161,6 +161,8 @@ The `data` argument expects a JSON object with the following structure:
 - **Series creation:** If the key doesn't exist, a new series is created with the provided options
 - **Ingestion count:** Only successfully inserted samples are counted; dropped or blocked samples are excluded from the
   success count
+- **Keyspace events:** `ts.add` is emitted once when at least one sample was ingested, including a sample that only
+  replaced the value at an existing timestamp. A payload with no sample ingested emits nothing
 
 ### Examples
 
