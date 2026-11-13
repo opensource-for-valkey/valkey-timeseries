@@ -162,6 +162,14 @@ pub const COMPACTION_RULE_NOT_FOUND: &str = "TSDB: compaction rule does not exis
 pub const INVALID_COMPARISON_OPERATOR: &str = "TSDB: invalid comparison operator";
 pub const TOO_MANY_SAMPLES: &str = "TSDB: too many samples";
 
+// TS.ADDBULK payload. The command has no reference counterpart, so these texts are ours.
+pub const BULK_MISSING_VALUES: &str = "TSDB: missing values";
+pub const BULK_MISSING_TIMESTAMPS: &str = "TSDB: missing timestamps";
+pub const BULK_EMPTY_PAYLOAD: &str = "TSDB: no timestamps or values";
+pub const BULK_LENGTH_MISMATCH: &str = "TSDB: timestamps and values length mismatch";
+pub const BULK_INVALID_VALUE: &str = "TSDB: invalid value (expected number)";
+pub const BULK_INVALID_TIMESTAMP: &str = "TSDB: invalid timestamp (expected u64)";
+
 // TS.READ. All four texts are verbatim from the 8.10 reference (probed 2026-08-01, see
 // docs/plans/ts-read-implementation-plan.md §6). Note the failure *class* split the reference uses:
 // duplicated/malformed options resolve to plain wrong-arity, only the value-range failures
