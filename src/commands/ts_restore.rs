@@ -31,10 +31,12 @@ use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValu
 /// was written with, or refuses a version it does not support instead of misreading it.
 ///
 /// Internal-only: fed by `aof_rewrite`/AOF replay, never meant to be invoked by a regular
-/// client. The payload bypasses `RESTORE`'s DUMP footer (version/CRC) checks entirely, so a
-/// direct client call can be used to inject a crafted `TimeSeries` straight past that
-/// validation. `is_real_user_client` rejects any caller that isn't the AOF-replay sentinel or a
-/// replicated (master-link) command, mirroring the same guard used for `is_acl_enforced`.
+/// client. `is_real_user_client` rejects any caller that isn't the AOF-replay sentinel or a
+/// replicated (master-link) command, mirroring the same guard used for `is_acl_enforced`. The
+/// payload carries no DUMP footer, but that footer is only a version and a checksum anyone can
+/// recompute, not a validation step: `RESTORE` reaches the same loader with a forged payload,
+/// and the loader's own checks are all that stand between either command and a crafted
+/// `TimeSeries`. The guard keeps an internal command internal; `RESTORE` has its own ACL.
 ///
 /// The direct-client guard is waived when `ts.debug-mode` is enabled, the same escape hatch
 /// `TS._DEBUG` uses to expose module internals to integration tests. This lets tests drive

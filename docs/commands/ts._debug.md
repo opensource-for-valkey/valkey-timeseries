@@ -205,6 +205,21 @@ The exporting node has no task of its own: the server deletes the exported keys,
 The same metrics are in `INFO ts_asm`, each prefixed `ts_`, without the `debug-mode` gate, except
 the duration histograms. `INFO` counts since module start: `METRICS RESET` doesn't move it.
 
+#### `chunk`
+
+Stored chunks that could not be read back. A compressed chunk is decoded on every read, and a
+decode error ends that read with the samples decoded so far, under an OK reply. Loading rejects a
+chunk whose stream disagrees with its header, so on a healthy node this stays at zero; a non-zero
+value means in-memory corruption or a codec bug. The first error, and at most one per minute after
+it, is also logged at `warning` level.
+
+| Name | Kind | Description |
+|------|------|-------------|
+| `chunk_decode_errors_total` | counter | Reads that stopped at an undecodable sample; the reply was truncated |
+
+The same metric is in `INFO ts_chunk` as `ts_chunk_decode_errors_total`, without the
+`debug-mode` gate. `INFO` counts since module start: `METRICS RESET` doesn't move it.
+
 #### `clustermap`
 
 The cluster map fan-outs choose their targets from. Empty-handed on a standalone server: the
@@ -335,7 +350,7 @@ prefixed `ts_`, without the `debug-mode` gate.
 #### `rdb`
 
 The RDB aux field that carries the postings index, counted once per RDB that has one (not per
-series). A save is counted wherever the server writes the RDB: `SAVE`, `BGSAVE`, a replica's full
+series), and what the series loader repaired or tolerated. A save is counted wherever the server writes the RDB: `SAVE`, `BGSAVE`, a replica's full
 sync, an AOF rewrite's RDB preamble, `DEBUG RELOAD`. The fork child of a background save shares
 these counters with the server, so its saves are counted on the node that forked it.
 
@@ -345,6 +360,12 @@ these counters with the server, so its saves are counted on the node that forked
 | `rdb_load_failures_total` | counter | Loads whose aux field was unreadable, of a foreign encoding version, or rejected by the parser; the index is rebuilt from the keys instead |
 | `rdb_saves_total` | counter | Saves with an aux field to write, failed ones included |
 | `rdb_save_failures_total` | counter | Saves that left the aux field out because the index was locked at fork time, or whose write failed |
+| `rdb_load_repairs_total` | counter | Rules a loaded series broke and was repaired for, one per rule per series: empty chunks dropped, an oversized chunk split, a chunk budget, `CHUNK_SIZE` or retention clamped, a stray chunk encoding re-encoded or the series' encoding taken from its chunks |
+| `rdb_load_tolerated_total` | counter | Rules a series loaded from the server's own RDB, AOF or full sync still breaks, one per rule per series: negative timestamps, chunks out of order, a chunk of another encoding kept because its stream does not decode fully. `RESTORE` and slot imports refuse these instead |
+
+The two series counters move per series, on any load including `RESTORE`; a rate-limited warning
+names the key and the rules. On the server's own data a repair means some writer stored state it
+should not have, and a tolerated rule means the series still holds it.
 
 Successful loads are `rdb_loads_total - rdb_load_failures_total`, and likewise for saves. Neither
 load counter moves when `ts-index-persist` is off and the payload is discarded, and neither

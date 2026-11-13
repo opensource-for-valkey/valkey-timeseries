@@ -49,7 +49,7 @@ impl Hash for GorillaEncoder {
         self.trailing_bits.hash(state);
         self.timestamp_delta.hash(state);
         self.last_ts.hash(state);
-        hash_f64(self.num_samples as f64, state);
+        hash_f64(self.last_value, state);
     }
 }
 
@@ -100,11 +100,14 @@ impl GorillaEncoder {
     }
 
     pub fn add_sample(&mut self, sample: &Sample) -> std::io::Result<()> {
+        let count = bump_count(self.num_samples)?;
         match self.num_samples {
             0 => self.write_first_sample(sample),
             1 => self.write_second_sample(sample),
             _ => self.write_nth_sample(sample),
-        }
+        }?;
+        self.num_samples = count;
+        Ok(())
     }
 
     fn write_first_sample(&mut self, sample: &Sample) -> std::io::Result<()> {
@@ -114,7 +117,6 @@ impl GorillaEncoder {
         self.first_ts = sample.timestamp;
         self.last_ts = sample.timestamp;
         self.last_value = sample.value;
-        self.num_samples += 1;
         Ok(())
     }
 
@@ -122,13 +124,7 @@ impl GorillaEncoder {
         let timestamp = sample.timestamp;
         let value = sample.value;
 
-        let timestamp_delta = timestamp - self.last_ts;
-        if timestamp_delta < 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "samples aren't sorted by timestamp ascending",
-            ));
-        }
+        let timestamp_delta = timestamp_delta(timestamp, self.last_ts)?;
 
         self.writer.write_uvarint(timestamp_delta as u64)?;
 
@@ -141,8 +137,6 @@ impl GorillaEncoder {
         self.trailing_bits = trailing;
         self.timestamp_delta = timestamp_delta;
 
-        self.num_samples += 1;
-
         Ok(())
     }
 
@@ -150,14 +144,12 @@ impl GorillaEncoder {
         let timestamp = sample.timestamp;
         let value = sample.value;
 
-        let timestamp_delta = timestamp - self.last_ts;
-        if timestamp_delta < 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "samples aren't sorted by timestamp ascending",
-            ));
-        }
-        let delta_of_delta = timestamp_delta - self.timestamp_delta;
+        let timestamp_delta = timestamp_delta(timestamp, self.last_ts)?;
+        let delta_of_delta = timestamp_delta
+            .checked_sub(self.timestamp_delta)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "delta-of-delta overflows")
+            })?;
 
         write_varbit(&mut self.writer, delta_of_delta)?;
 
@@ -175,8 +167,6 @@ impl GorillaEncoder {
         self.trailing_bits = trailing_bits;
         self.timestamp_delta = timestamp_delta;
 
-        self.num_samples += 1;
-
         Ok(())
     }
 
@@ -189,7 +179,6 @@ impl GorillaEncoder {
     }
 
     /// Bits written so far, counting the partial trailing byte exactly.
-    #[cfg(test)]
     pub(crate) fn stream_bit_len(&self) -> usize {
         self.writer.len() * 8 - self.writer.count as usize
     }
@@ -203,6 +192,20 @@ impl GorillaEncoder {
 
     pub(crate) fn shrink_to_fit(&mut self) {
         self.writer.shrink_to_fit()
+    }
+
+    /// Overwrites the rolling window, as a forged payload could.
+    #[cfg(test)]
+    pub(crate) fn set_window_for_test(&mut self, leading: u8, trailing: u8, delta: i64) {
+        self.leading_bits = leading;
+        self.trailing_bits = trailing;
+        self.timestamp_delta = delta;
+    }
+
+    /// The bit stream, for tests that forge one.
+    #[cfg(test)]
+    pub(crate) fn stream_mut_for_test(&mut self) -> &mut BitStream {
+        &mut self.writer
     }
 
     /// Keeps only the first `len` bytes of the stream while leaving `num_samples` and the
@@ -309,27 +312,38 @@ impl GorillaEncoder {
 }
 
 impl PartialEq<Self> for GorillaEncoder {
+    /// Field for field, with `last_value` compared by bit pattern: a NaN last sample must
+    /// equal itself, or a chunk could never match its own re-encoding (see
+    /// `XorChunk::verify_stream`).
     fn eq(&self, other: &Self) -> bool {
-        if self.num_samples != other.num_samples {
-            return false;
-        }
-        if self.last_ts != other.last_ts {
-            return false;
-        }
-        if self.last_value != other.last_value {
-            return false;
-        }
-        if self.leading_bits != other.leading_bits {
-            return false;
-        }
-        if self.trailing_bits != other.trailing_bits {
-            return false;
-        }
-        if self.timestamp_delta != other.timestamp_delta {
-            return false;
-        }
-        self.writer == other.writer
+        self.num_samples == other.num_samples
+            && self.first_ts == other.first_ts
+            && self.last_ts == other.last_ts
+            && self.last_value.to_bits() == other.last_value.to_bits()
+            && self.leading_bits == other.leading_bits
+            && self.trailing_bits == other.trailing_bits
+            && self.timestamp_delta == other.timestamp_delta
+            && self.writer == other.writer
     }
+}
+
+/// `timestamp - last`, which must be non-negative. Checked: the tail state can come from a
+/// payload, and release builds wrap on overflow.
+fn timestamp_delta(timestamp: i64, last: i64) -> std::io::Result<i64> {
+    match timestamp.checked_sub(last) {
+        Some(delta) if delta >= 0 => Ok(delta),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "samples aren't sorted by timestamp ascending",
+        )),
+    }
+}
+
+/// The sample count after one more append; a count at `usize::MAX` fails the append.
+fn bump_count(count: usize) -> std::io::Result<usize> {
+    count
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("sample count overflows"))
 }
 
 fn read_unsigned_varint(buf: &mut &[u8]) -> TsdbResult<u64> {

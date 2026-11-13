@@ -929,7 +929,8 @@
     `uncompressed`; RTS rejects both with "unknown ENCODING parameter". `chimp` is
     what `compressed` selects here, so the extra names expose the underlying
     compressor rather than adding a new storage mode. Applies to every command
-    that takes creation options (TS.CREATE, TS.ADD, TS.INCRBY/TS.DECRBY).
+    that takes creation options (TS.CREATE, TS.ADD, TS.INCRBY/TS.DECRBY), and to
+    TS.ALTER, where both engines validate ENCODING and then ignore it.
   rationale: >
     Accepted (owner sign-off 2026-07-29, §5.3): additional chunk encodings are a
     deliberate extension and, per the `CompatibilityMode` criterion in

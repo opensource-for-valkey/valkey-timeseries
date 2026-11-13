@@ -14,6 +14,18 @@ pub const MIN_CHUNK_SIZE: usize = 48;
 /// Largest allowed chunk size in bytes for `CHUNK_SIZE`.
 pub const MAX_CHUNK_SIZE: usize = 1048576;
 
+/// Largest encoded chunk, in bytes, a `RESTORE` or slot-import payload may carry. One past it in
+/// an RDB or AOF the server wrote is split on load instead (`normalize_series`).
+///
+/// Every read of a compressed chunk decodes it from the start and every mutation re-encodes all
+/// of it, on the main thread, so a stored chunk's size is a per-command latency bound: a forged
+/// 64 MiB chunk made one upsert take 3.3 s. The write path keeps a chunk within
+/// `max_size + max_size / 4` of a budget of at most [`MAX_CHUNK_SIZE`], plus one sample: the
+/// merge path and defragmentation split until it is, the upsert path splits at 1.2x, and
+/// appends seal at `max_size`. Twice `MAX_CHUNK_SIZE` leaves room for that without admitting
+/// much more.
+pub const MAX_LOADED_CHUNK_BYTES: usize = 2 * MAX_CHUNK_SIZE;
+
 /// The minimum number of samples before `bytes_per_sample()` can produce a
 /// reliable amortized estimate for compressed encodings. Below this
 /// threshold, header overhead dominates, and the ratio is inflated;
@@ -117,7 +129,7 @@ fn parse_encoding(encoding: &str) -> Option<ChunkEncoding> {
 #[enum_dispatch]
 pub trait ChunkOps {
     /// The chunk's samples with timestamps in `[start, end]`, ascending. A decode error ends
-    /// the iteration early (logged in debug builds).
+    /// the iteration early (counted in `chunk_decode_errors_total`).
     fn range_iter(&self, start: Timestamp, end: Timestamp) -> SampleIter<'_>;
     /// Every sample in the chunk, ascending.
     fn iter(&self) -> SampleIter<'_> {

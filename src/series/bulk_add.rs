@@ -91,11 +91,12 @@ impl IngestedSamples {
             let timestamp_u64 = ts
                 .as_u64()
                 .ok_or(ValkeyError::Str("TSDB: invalid timestamp (expected u64)"))?;
+            // `TS.ADD`'s domain, `0..=i64::MAX`. An `as` cast stored 2^63 and up as negative
+            // timestamps, which reads skip and the RDB loader refuses.
+            let timestamp = Timestamp::try_from(timestamp_u64)
+                .map_err(|_| ValkeyError::Str(error_consts::INVALID_TIMESTAMP))?;
 
-            samples.push(Sample {
-                timestamp: timestamp_u64 as i64,
-                value,
-            });
+            samples.push(Sample { timestamp, value });
         }
 
         samples.sort_by_key(|s| s.timestamp);
@@ -681,6 +682,26 @@ mod tests {
         assert_eq!(parsed.samples[0].value, 1.0);
         assert_eq!(parsed.samples[0].timestamp, 1549891472010);
         assert_eq!(parsed.samples[2].timestamp, 1549891503438);
+    }
+
+    /// Timestamps share `TS.ADD`'s domain, `0..=i64::MAX`. A JSON integer from 2^63 up used to
+    /// be cast to a negative timestamp, stored, and then refused by the RDB loader.
+    #[test]
+    fn test_parse_timestamps_past_i64_max_are_refused() {
+        for ts in [i64::MAX as u64 + 1, u64::MAX] {
+            let mut data =
+                format!(r#"{{"values": [1, 2], "timestamps": [1000, {ts}]}}"#).into_bytes();
+            match IngestedSamples::from_json_lines(&mut data) {
+                Err(ValkeyError::Str(msg)) => {
+                    assert_eq!(msg, error_consts::INVALID_TIMESTAMP, "{ts}")
+                }
+                other => panic!("{ts}: expected the timestamp to be refused, got {other:?}"),
+            }
+        }
+
+        let mut data = format!(r#"{{"values": [1], "timestamps": [{}]}}"#, i64::MAX).into_bytes();
+        let parsed = IngestedSamples::from_json_lines(&mut data).unwrap();
+        assert_eq!(parsed.samples[0].timestamp, i64::MAX);
     }
 
     #[test]

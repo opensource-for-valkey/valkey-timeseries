@@ -147,9 +147,9 @@ impl<'a> TimestampFilterIterator<'a> {
             buf.clear();
             buf.extend(it);
         } else {
-            let mut buf = Vec::with_capacity(chunk.len());
-            buf.extend(it);
-            self.buffer = Cow::Owned(buf);
+            // No reservation from `chunk.len()`: that is the persisted count, and a hostile one
+            // (2^60) aborted the process here. Growth from the decode is a handful of regrowths.
+            self.buffer = Cow::Owned(it.collect());
         }
     }
 
@@ -469,6 +469,35 @@ mod tests {
             assert_eq!(
                 lookup(&series, &[9, 10], false),
                 Vec::<i64>::new(),
+                "{encoding:?}"
+            );
+        }
+    }
+
+    /// A reverse lookup that buffers an uncompressed chunk and then a compressed one sized the
+    /// second buffer from the compressed chunk's persisted count: a count of 2^60 aborted the
+    /// process. The loader now refuses such a count, so this builds it in memory; the buffer
+    /// must come from what the stream decodes, not from what the header claims.
+    #[test]
+    fn a_forged_sample_count_does_not_size_the_reverse_buffer() {
+        let compressed: Vec<Sample> = (1..=20).map(|i| s(i * 1000, i as f64 * 1.5)).collect();
+        for encoding in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
+            let mut forged = empty_chunk(encoding);
+            forged.set_data(&compressed).unwrap();
+            match &mut forged {
+                TimeSeriesChunk::Gorilla(c) => c.encoder.num_samples = 1 << 60,
+                TimeSeriesChunk::Chimp(c) => *c.encoder.header_mut_for_test().0 = 1 << 60,
+                TimeSeriesChunk::Uncompressed(_) => unreachable!(),
+            }
+            let tail = TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(vec![
+                s(30_000, 2.0),
+                s(31_000, 2.0),
+            ]));
+            let series = TimeSeries::from_chunks(vec![forged, tail]).unwrap();
+
+            assert_eq!(
+                lookup(&series, &[31_000, 5_000], true),
+                vec![31_000, 5_000],
                 "{encoding:?}"
             );
         }

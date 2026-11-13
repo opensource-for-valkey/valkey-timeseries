@@ -1,5 +1,6 @@
 //! The module's `INFO` sections: `ts_index`, `ts_compaction`, `ts_rdb`, `ts_blocked_read`,
-//! `ts_string_interning`, `ts_task`, `ts_asm`, `ts_index_reconciliation` and `ts_fanout`.
+//! `ts_string_interning`, `ts_task`, `ts_asm`, `ts_index_reconciliation`, `ts_fanout` and
+//! `ts_chunk`.
 //!
 //! Module sections are emitted only for an explicit `INFO modules`, `INFO everything`, or
 //! `INFO <section>`; bare `INFO` and `INFO all` omit them. Section selection is checked before
@@ -16,8 +17,8 @@ use valkey_module::{
 use valkey_module_macros::info_command_handler;
 
 /// `INFO ts_index`, `INFO ts_compaction`, `INFO ts_rdb`, `INFO ts_blocked_read`,
-/// `INFO ts_string_interning`, `INFO ts_task`, `INFO ts_asm`, `INFO ts_index_reconciliation` and
-/// `INFO ts_fanout`.
+/// `INFO ts_string_interning`, `INFO ts_task`, `INFO ts_asm`, `INFO ts_index_reconciliation`,
+/// `INFO ts_fanout` and `INFO ts_chunk`.
 ///
 /// The sections are declared without the module name; the server prefixes each with it, so they
 /// land as `# ts_index`, `# ts_compaction`, `# ts_rdb` and so on, with every field prefixed
@@ -105,6 +106,7 @@ const MIRRORED: &[Section] = &[
     Section::Asm,
     Section::IndexReconciliation,
     Section::Fanout,
+    Section::Chunk,
 ];
 
 /// A metrics section's `INFO` fields: each counter and gauge under its

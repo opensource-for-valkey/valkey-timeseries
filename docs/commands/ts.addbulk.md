@@ -136,12 +136,14 @@ The `data` argument expects a JSON object with the following structure:
 **Required fields:**
 
 - `values` - Array of numeric values (parsed as floats)
-- `timestamps` - Array of timestamps in milliseconds (parsed as 64-bit integers)
+- `timestamps` - Array of timestamps in milliseconds: non-negative integers up to
+  `9223372036854775807` (`i64::MAX`), the same range `TS.ADD` accepts
 
 **Constraints:**
 
 - `values` and `timestamps` arrays must have equal length
 - At least one sample must be present
+- A batch with any timestamp outside that range is refused as a whole; nothing is stored
 
 ### Return value
 
@@ -191,6 +193,8 @@ TS.ADDBULK sensor:pressure:tank2 '{"values":[101.3,101.5],"timestamps":[16200000
 - **TSDB: missing timestamps:** JSON payload lacks `timestamps` array
 - **TSDB: values and timestamps length mismatch:** Arrays have different lengths
 - **TSDB: no timestamps or values:** Arrays are empty
+- **TSDB: invalid timestamp (expected u64):** A timestamp is not a non-negative JSON integer
+- **TSDB: invalid timestamp:** A timestamp is larger than `9223372036854775807`
 - **missing key or metric_name:** `metric` provided without `key` or `metric_name`
 
 #### Notes

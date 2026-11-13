@@ -499,23 +499,40 @@ impl TimeSeries {
     /// chunk — halving it later would re-encode every sample it holds only to leave two
     /// half-empty chunks, once per chunk-full of appends. Only a chunk that a merge has grown
     /// past `max_size + max_size / SPLIT_SLACK_DIVISOR` is split; bulk ingest plans its
-    /// overfill below that line (see `bulk_add`).
+    /// overfill below that line (see `bulk_add`). Bytes alone decide: an uncompressed chunk's
+    /// `is_full` counts samples against a capacity the RDB loader raises to the loaded count,
+    /// so testing it left the halves of an oversized loaded chunk unsplit and still over
+    /// `MAX_LOADED_CHUNK_BYTES`.
     ///
     /// This is the merge-path split rule; the upsert path uses `TimeSeriesChunk::should_split`.
     /// See the `# Capacity` section on [`ChunkOps`](crate::series::chunks::ChunkOps).
     pub(crate) fn needs_split(chunk: &TimeSeriesChunk) -> bool {
         let max = chunk.max_size();
-        chunk.is_full() && chunk.size() > max + max / SPLIT_SLACK_DIVISOR
+        // A single sample cannot be split, however small the budget.
+        chunk.len() > 1 && chunk.size() > max + max / SPLIT_SLACK_DIVISOR
     }
 
+    /// Splits until no chunk [`needs_split`](Self::needs_split). One merge can grow a chunk to
+    /// many times its budget (a `TS.MADD` backfilling a whole batch into one chunk's span), and a
+    /// single halving left it that way, so a stored chunk had no size bound at all. Each pass
+    /// halves every oversized chunk's sample count, so the loop ends within `log2(len)` passes;
+    /// the RDB loader's chunk-size limit relies on it.
     pub(crate) fn split_chunks_if_needed(&mut self) -> TsdbResult<()> {
         // Almost every merge ends here with nothing to split: decide that with a scan
         // before entering a parallel section.
-        let to_split = self.chunks.iter().filter(|c| Self::needs_split(c)).count();
-        if to_split == 0 {
-            return Ok(());
+        loop {
+            let to_split = self.chunks.iter().filter(|c| Self::needs_split(c)).count();
+            if to_split == 0 {
+                break;
+            }
+            self.split_oversized_chunks(to_split)?;
         }
+        Ok(())
+    }
 
+    /// Halves every chunk that [`needs_split`](Self::needs_split), once. `to_split` is how many
+    /// there are, which sizes the parallel section.
+    fn split_oversized_chunks(&mut self, to_split: usize) -> TsdbResult<()> {
         let errored: AtomicBool = AtomicBool::new(false);
 
         // todo: track error, but allow partials

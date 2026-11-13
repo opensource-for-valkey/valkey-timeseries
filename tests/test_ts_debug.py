@@ -1056,10 +1056,11 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
 class TestDebugMetrics(ValkeyTimeSeriesTestCaseDebugMode):
     """TS._DEBUG METRICS: the module metrics registries."""
 
-    SECTIONS = ['asm', 'clustermap', 'exec', 'fanout', 'index_reconciliation', 'rdb', 'blocked_read',
-                'string_interning', 'task']
+    SECTIONS = ['asm', 'chunk', 'clustermap', 'exec', 'fanout', 'index_reconciliation', 'rdb',
+                'blocked_read', 'string_interning', 'task']
     # Within a section, metrics are sorted by family name (a counter's name before `_total`).
-    RDB_METRICS = ['rdb_load_failures_total', 'rdb_loads_total',
+    RDB_METRICS = ['rdb_load_failures_total', 'rdb_load_repairs_total',
+                   'rdb_load_tolerated_total', 'rdb_loads_total',
                    'rdb_save_failures_total', 'rdb_saves_total']
     EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
                     'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_reply_queued',
@@ -1119,7 +1120,7 @@ class TestDebugMetrics(ValkeyTimeSeriesTestCaseDebugMode):
 
     def test_unknown_section_lists_valid_ones(self):
         with pytest.raises(ResponseError,
-                           match="unknown METRICS section 'bogus'.*asm, clustermap, exec, fanout, index_reconciliation, rdb, blocked_read, string_interning, task"):
+                           match="unknown METRICS section 'bogus'.*asm, chunk, clustermap, exec, fanout, index_reconciliation, rdb, blocked_read, string_interning, task"):
             self.client.execute_command('TS._DEBUG', 'METRICS', 'rdb', 'bogus')
 
     def test_string_interning(self):
@@ -1133,7 +1134,7 @@ class TestDebugMetrics(ValkeyTimeSeriesTestCaseDebugMode):
         assert after['string_interning_bytes'] > before['string_interning_bytes']
 
     @pytest.mark.parametrize('section', ['rdb', 'blocked_read', 'string_interning', 'task', 'asm',
-                                         'index_reconciliation'])
+                                         'index_reconciliation', 'chunk'])
     def test_info_mirrors_the_section(self, section):
         """`INFO ts_<section>` carries the section's counters and gauges (and `_human` twins)
         under the same names with a `ts_` prefix; INFO has no shape for a histogram."""

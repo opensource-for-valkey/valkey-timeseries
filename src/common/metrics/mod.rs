@@ -34,6 +34,7 @@
 //!   or in memory shared with the child, as the `rdb` save counters are (see [`rdb`]).
 
 pub mod asm;
+pub mod chunk;
 pub mod clustermap;
 pub mod exec;
 pub mod fanout;
@@ -49,8 +50,42 @@ use metered::{
     MetricType, MetricValues, Registry, Scalar, Unit,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// At most one warning per [`WarningLimit::INTERVAL_SECS`], for an event whose counter carries
+/// the rest: a corrupt chunk on a hot key, or a load repairing many series, would otherwise
+/// write the same line over and over.
+pub(crate) struct WarningLimit {
+    /// Second of the last warning let through, counted from 1 on a monotonic clock; 0 before
+    /// the first. Not the wall clock: stepping it back would hold every warning until it
+    /// caught up again.
+    last_secs: AtomicU64,
+}
+
+impl WarningLimit {
+    pub(crate) const INTERVAL_SECS: u64 = 60;
+
+    pub(crate) const fn new() -> Self {
+        Self {
+            last_secs: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether a warning may be written now. Concurrent callers race for the slot and only one
+    /// wins it.
+    pub(crate) fn due(&self) -> bool {
+        static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+        let now = ORIGIN.elapsed().as_secs() + 1;
+        let last = self.last_secs.load(Ordering::Relaxed);
+        (last == 0 || now >= last + Self::INTERVAL_SECS)
+            && self
+                .last_secs
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+    }
+}
 
 /// Finite buckets of a duration histogram: powers of two from 1 µs to 2^23 µs (about 8.4 s).
 /// Slower observations land in the implicit `+Inf` bucket.
@@ -77,6 +112,8 @@ pub enum Section {
     /// Atomic slot migration: draining the keys deferred during an import, and cleaning up the
     /// index on the exporting node.
     Asm,
+    /// Stored chunks that could not be read back.
+    Chunk,
     /// The cluster map fanouts pick their targets from: refreshes, staleness, age.
     Clustermap,
     /// Bounded executors: the lanes that run blocking, GIL-taking work off the main thread.
@@ -101,6 +138,7 @@ impl Section {
     /// Every section, in reporting order.
     pub const ALL: &'static [Section] = &[
         Section::Asm,
+        Section::Chunk,
         Section::Clustermap,
         Section::Exec,
         Section::Fanout,
@@ -114,6 +152,7 @@ impl Section {
     pub const fn as_str(self) -> &'static str {
         match self {
             Section::Asm => "asm",
+            Section::Chunk => "chunk",
             Section::Clustermap => "clustermap",
             Section::Exec => "exec",
             Section::Fanout => "fanout",
@@ -153,6 +192,7 @@ fn build_registry(section: Section) -> Registry<'static> {
     let mut registry = Registry::with_prefix(section.as_str());
     match section {
         Section::Asm => asm::register(&mut registry),
+        Section::Chunk => chunk::register(&mut registry),
         Section::Clustermap => clustermap::register(&mut registry),
         Section::Exec => exec::register(&mut registry),
         Section::Fanout => fanout::register(&mut registry),

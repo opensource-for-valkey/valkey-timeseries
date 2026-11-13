@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod encoder_tests;
+#[cfg(test)]
+mod golden_tests;
 mod gorilla_chunk;
 mod gorilla_encoder;
 mod gorilla_iterator;

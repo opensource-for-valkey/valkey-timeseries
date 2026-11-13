@@ -7,7 +7,7 @@ use crate::common::{SAMPLE_SIZE, Sample, Timestamp};
 use crate::error::{TsdbError, TsdbResult};
 use crate::iterators::SampleIter;
 use crate::series::chunks::merge::merge_chunk_samples;
-use crate::series::chunks::{Chunk, ChunkOps, MAX_CHUNK_SIZE};
+use crate::series::chunks::{Chunk, ChunkOps, MAX_CHUNK_SIZE, MAX_LOADED_CHUNK_BYTES};
 use crate::series::{DuplicatePolicy, SampleAddResult};
 use core::mem::size_of;
 use get_size2::{GetSize, GetSizeTracker};
@@ -79,6 +79,25 @@ impl UncompressedChunk {
             max_size: size,
             max_elements: size / SAMPLE_SIZE,
             ..Default::default()
+        }
+    }
+
+    /// The compressed chunks' `check_write_limits`: at most `MAX_LOADED_CHUNK_BYTES` of samples
+    /// and a non-negative first timestamp. The loader already requires strictly increasing
+    /// timestamps, so the first one stands for all of them.
+    pub(crate) fn check_write_limits(&self) -> Result<(), String> {
+        let bytes = self.samples.len().saturating_mul(SAMPLE_SIZE);
+        if bytes > MAX_LOADED_CHUNK_BYTES {
+            return Err(format!(
+                "{} samples exceed the {MAX_LOADED_CHUNK_BYTES}-byte chunk limit",
+                self.samples.len()
+            ));
+        }
+        match self.samples.first() {
+            Some(first) if first.timestamp < 0 => {
+                Err(format!("negative first timestamp {}", first.timestamp))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -447,6 +466,9 @@ impl Chunk for UncompressedChunk {
         let samples = std::mem::take(&mut self.samples);
         let (left, right) = samples.split_at(half);
         self.samples = left.to_vec();
+        // Back to the budget's capacity: a loaded overfull chunk carries its sample count
+        // here, and halves keeping it would take appends up to that count again.
+        self.max_elements = self.max_size / SAMPLE_SIZE;
 
         Ok(Self {
             max_size: self.max_size,
@@ -479,6 +501,8 @@ impl Chunk for UncompressedChunk {
         // check `is_full`, so nothing guarantees a saved chunk stayed within its capacity. The
         // generic guard rejects a corrupt count, and the allocation is capped up front — each
         // sample is a read that fails on a short payload.
+        // The chunk-size limit is a write-path rule, applied by `rdb_load_series` (see
+        // `check_write_limits`); the reads below are bounded by the payload regardless.
         let len = rdb_load_len(rdb, MAX_RDB_COLLECTION_LEN)?;
         let mut samples = Vec::with_capacity(len.min(max_elements));
         for _ in 0..len {

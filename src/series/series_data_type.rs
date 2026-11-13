@@ -96,8 +96,41 @@ unsafe extern "C" fn rdb_save(rdb: *mut RedisModuleIO, value: *mut c_void) {
     rdb_save_series(series, rdb);
 }
 
+// The barrier in `rdb_load` only exists when panics unwind: with `panic = "abort"` a loader bug
+// on a hostile payload aborts the server again, and nothing else would say so.
+#[cfg(panic = "abort")]
+compile_error!(
+    "the rdb_load panic barrier needs panic = \"unwind\"; see series_data_type::rdb_load"
+);
+
 unsafe extern "C" fn rdb_load(rdb: *mut RedisModuleIO, enc_ver: c_int) -> *mut c_void {
-    match rdb_load_series(rdb, enc_ver) {
+    // A panic must not unwind across this `extern "C"` boundary, where it aborts the server:
+    // a loader bug on a hostile payload becomes a failed load instead. What the loader holds
+    // when it panics (interned labels, loaded chunks) is released by its destructors; nothing
+    // is published before `rdb_load_series` returns.
+    //
+    // What the barrier does not do:
+    // - It needs `panic = "unwind"`, which the `compile_error!` above pins.
+    // - `AssertUnwindSafe` covers lock state as well, and that is not actually safe: a panic
+    //   while the loader holds a lock (inside `InternedString::new_pair`, say) leaves that lock
+    //   poisoned, and its next user fails. The barrier turns a panic into a failed load, nothing
+    //   more.
+    // - The default panic hook still prints the panic and its backtrace to stderr, before the
+    //   load error below is logged. An operator sees both; that is intended.
+    let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rdb_load_series(rdb, enc_ver)
+    }))
+    .unwrap_or_else(|panic| {
+        let what = panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        Err(valkey_module::ValkeyError::String(format!(
+            "series loader panicked: {what}"
+        )))
+    });
+    match loaded {
         Ok(series) => Box::into_raw(Box::new(series)) as *mut std::ffi::c_void,
         Err(e) => {
             // Warning level: this aborts the RESTORE / RDB load, and the

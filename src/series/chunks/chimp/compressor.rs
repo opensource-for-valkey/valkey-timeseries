@@ -219,6 +219,43 @@ impl ChimpCompressor {
         self.writer.shrink_to_fit();
     }
 
+    /// The persisted header, writable, as a forged payload could set it:
+    /// `(count, first_timestamp, last_timestamp, last_value, last_delta, last_alpha)`.
+    #[cfg(test)]
+    pub(crate) fn header_mut_for_test(
+        &mut self,
+    ) -> (
+        &mut u64,
+        &mut Timestamp,
+        &mut Timestamp,
+        &mut f64,
+        &mut i64,
+        &mut i32,
+    ) {
+        (
+            &mut self.count,
+            &mut self.first_timestamp,
+            &mut self.last_timestamp,
+            &mut self.last_value,
+            &mut self.last_delta,
+            &mut self.last_alpha,
+        )
+    }
+
+    /// Overwrites Chimp's stored value, keeping the rest of its window.
+    #[cfg(test)]
+    pub(crate) fn set_stored_val_for_test(&mut self, stored_val: u64) {
+        let mut state = self.chimp.state();
+        state.stored_val = stored_val;
+        self.chimp = ChimpEnc::from_state(state).expect("window unchanged");
+    }
+
+    /// The bit stream, for tests that forge one.
+    #[cfg(test)]
+    pub(crate) fn stream_mut_for_test(&mut self) -> &mut BitStream {
+        &mut self.writer
+    }
+
     /// Iterate the samples written so far.
     pub fn iter(&'_ self) -> ChimpIterator<'_> {
         ChimpIterator::new(self)
@@ -238,10 +275,14 @@ impl ChimpCompressor {
     /// are stored as raw bit patterns, so payload bits (a Prometheus stale
     /// marker, say) survive the round trip unchanged.
     pub fn add_sample(&mut self, timestamp: Timestamp, value: f64) -> io::Result<()> {
+        let count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("sample count overflows"))?;
         self.write_timestamp(timestamp)?;
         self.write_value(value)?;
         self.last_value = value;
-        self.count += 1;
+        self.count = count;
         #[cfg(test)]
         {
             self.stats.window_reuse = self.chimp.window_reuse.0;

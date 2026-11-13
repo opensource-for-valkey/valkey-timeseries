@@ -1,6 +1,8 @@
 mod chimp;
 mod chunk;
 mod gorilla;
+#[cfg(test)]
+mod load_validation_tests;
 mod merge;
 #[cfg(test)]
 mod proptest_roundtrip;

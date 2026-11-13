@@ -416,8 +416,11 @@ pub(crate) fn observe_series_rdb_load(rdb: *mut RedisModuleIO, series: &mut Time
     // Presence is a load-time invariant (`check_required_module_apis`).
     let get_db_id =
         unsafe { raw::RedisModule_GetDbIdFromIO }.expect("RedisModule_GetDbIdFromIO unavailable");
-    // A negative db means there is no IO context to read it from: a `RESTORE`/`TS._RESTORE`
-    // payload rather than an RDB stream. Not an error — those callers assign `_db` themselves.
+    // A negative db means the payload came from `RM_LoadDataTypeFromStringEncver`, which gives
+    // the IO context no key or db: a `TS._RESTORE` string, whose caller assigns `_db` itself.
+    // A plain `RESTORE` is not one of these: the server loads it through `rdbLoadObject` with the
+    // client's db and the key, as it loads an RDB file. So the db cannot tell a client payload
+    // from the server's own data; `serialization::LoadTrust` uses the load window for that.
     let db = unsafe { get_db_id(rdb) };
     if db < 0 {
         return;

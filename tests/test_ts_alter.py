@@ -171,6 +171,36 @@ class TestTimeSeriesAlter(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError):
             self.client.execute_command('TS.ALTER', self.key, 'UNKNOWN_OPTION', 'value')
 
+    def test_alter_encoding_is_validated_then_ignored(self):
+        """As on RedisTimeSeries, ENCODING is accepted but a series keeps the encoding it was
+        created with. Every chunk must keep it too, or the series would no longer load."""
+        client = self.client
+        for created in ('UNCOMPRESSED', 'GORILLA', 'CHIMP'):
+            key = f'alter:enc:{created}'
+            client.execute_command('TS.CREATE', key, 'ENCODING', created, 'CHUNK_SIZE', 64)
+            for ts in range(1, 41):
+                client.execute_command('TS.ADD', key, ts, ts)
+            before = self.ts_info(key)['chunkType']
+            next_ts = 41
+            for args in (['ENCODING', 'UNCOMPRESSED'], ['ENCODING', 'compressed'],
+                         ['ENCODING', 'gorilla'], ['ENCODING', 'chimp'],
+                         ['COMPRESSED'], ['UNCOMPRESSED']):
+                assert client.execute_command('TS.ALTER', key, *args) == b'OK', args
+                # Appends past the next chunk boundary still use the series' encoding.
+                for _ in range(40):
+                    client.execute_command('TS.ADD', key, next_ts, next_ts)
+                    next_ts += 1
+            assert self.ts_info(key)['chunkType'] == before
+            with pytest.raises(ResponseError, match='unknown ENCODING parameter'):
+                client.execute_command('TS.ALTER', key, 'ENCODING', 'foo')
+            with pytest.raises(ResponseError):
+                client.execute_command('TS.ALTER', key, 'ENCODING')
+            samples = client.execute_command('TS.RANGE', key, '-', '+')
+
+            client.execute_command('DEBUG', 'RELOAD')
+            assert client.execute_command('TS.RANGE', key, '-', '+') == samples
+            assert self.ts_info(key)['chunkType'] == before
+
     def test_alter_rounding(self):
         """Test altering SIGNIFICANT_DIGITS / DECIMAL_DIGITS"""
         self.setup_data()

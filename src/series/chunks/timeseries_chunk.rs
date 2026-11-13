@@ -200,6 +200,41 @@ impl TimeSeriesChunk {
     pub fn is_compressed(&self) -> bool {
         !matches!(self, TimeSeriesChunk::Uncompressed(_))
     }
+
+    /// Whether a loaded compressed chunk's header is exactly what its stream encodes; see
+    /// `XorChunk::verify_stream`. An uncompressed chunk has no header to disagree with, and its
+    /// loader already requires strictly increasing timestamps.
+    pub(crate) fn verify_stream(&self) -> Result<(), String> {
+        match self {
+            TimeSeriesChunk::Uncompressed(_) => Ok(()),
+            TimeSeriesChunk::Gorilla(chunk) => chunk.verify_stream(),
+            TimeSeriesChunk::Chimp(chunk) => chunk.verify_stream(),
+        }
+    }
+
+    /// The size limit and timestamp domain the write path keeps every stored chunk within; see
+    /// `XorChunk::check_write_limits`. O(1).
+    pub(crate) fn check_write_limits(&self) -> Result<(), String> {
+        match self {
+            TimeSeriesChunk::Uncompressed(chunk) => chunk.check_write_limits(),
+            TimeSeriesChunk::Gorilla(chunk) => chunk.check_write_limits(),
+            TimeSeriesChunk::Chimp(chunk) => chunk.check_write_limits(),
+        }
+    }
+
+    /// Lowers the chunk's budget to `max` if it is larger, and reports whether it was. The data
+    /// is untouched: a budget only decides when a chunk counts as full or needs a split.
+    pub(crate) fn clamp_max_size(&mut self, max: usize) -> bool {
+        if self.max_size() <= max {
+            return false;
+        }
+        match self {
+            TimeSeriesChunk::Uncompressed(chunk) => chunk.max_size = max,
+            TimeSeriesChunk::Gorilla(chunk) => chunk.clamp_max_size(max),
+            TimeSeriesChunk::Chimp(chunk) => chunk.clamp_max_size(max),
+        }
+        true
+    }
 }
 
 impl Default for TimeSeriesChunk {

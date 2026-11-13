@@ -30,8 +30,12 @@ TS.ALTER key
   `DECIMAL_DIGITS none` switches rounding off (and is a no-op on a series without rounding).
 
 `SIGNIFICANT_DIGITS` and `DECIMAL_DIGITS` are mutually exclusive. Options
-not included in the command remain unchanged. `ENCODING`, `ON_DUPLICATE`, and
+not included in the command remain unchanged. `ON_DUPLICATE` and
 `DEDUPE_INTERVAL` are not supported by `TS.ALTER`.
+
+`ENCODING` (or a bare `COMPRESSED` / `UNCOMPRESSED`) is accepted and its value
+checked as for [`TS.CREATE`](ts.create.md), but it has no effect: a series
+keeps the encoding it was created with. RedisTimeSeries behaves the same way.
 
 Changing `RETENTION` applies the new retention window immediately to existing
 samples. Changing labels updates the label index. Existing samples are not
