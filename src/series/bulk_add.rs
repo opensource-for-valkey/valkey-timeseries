@@ -1,13 +1,20 @@
-//! Ingest samples at ludicrous speed.
+//! Bulk ingest: merges a batch of samples into a series' chunks.
 //!
-//! This module provides bulk insertion of samples into a time series, with support for duplicate
-//! policies and automatic compaction handling. It is optimized for high-throughput data ingestion
-//! scenarios by leveraging parallel processing and efficient sample merging.
+//! The shared core of `TS.ADDBULK` ([`bulk_insert_samples`]) and `TS.MADD`
+//! (`sample_merge::merge_samples`): normalize the batch, group it by destination chunk, merge
+//! each group, and place each outcome back at its sample's input index.
+//!
+//! Groups are merged in parallel only when the batch is big enough to pay for a pool round
+//! trip ([`request_par_threads`] counts samples). [`MAX_SAMPLES_PER_INSERT`] keeps every
+//! `TS.ADDBULK` batch below that line, so the parallel branches run for large `TS.MADD`
+//! batches only; tune `TS.ADDBULK` on the sequential path.
 #[cfg(not(test))]
 use crate::common::block_on_keys::signal_timeseries_ready;
+use crate::common::context::key_for_display;
 #[cfg(not(test))]
 use crate::common::context::{create_key_string, notify_keyspace_event};
-use crate::common::threads::{IterIntoParRayon, ParCollectionRayon, request_par_threads};
+use crate::common::logging::log_warning;
+use crate::common::threads::{IterIntoParRayon, request_par_threads};
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 use crate::series::chunks::{ChunkOps, MIN_SAMPLES_FOR_BPS_ESTIMATE, TimeSeriesChunk};
@@ -22,7 +29,8 @@ use simd_json::prelude::ValueObjectAccess;
 use std::cell::OnceCell;
 use valkey_module::{Context, ValkeyError, ValkeyResult};
 
-pub const MAX_SAMPLES_PER_INSERT: usize = 1_000;
+/// Most samples one `TS.ADDBULK` payload may carry.
+pub(crate) const MAX_SAMPLES_PER_INSERT: usize = 1_000;
 
 // Chunk sizing for bulk ingest. Chunks are planned to `max_size` from an estimate of the
 // series' encoded bytes per sample. Where a chunk is sealed as soon as it is built (samples
@@ -48,98 +56,131 @@ const BPS_PROBE_WINDOWS: usize = 4;
 /// bound says fits needs no estimate at all.
 const WORST_CASE_BYTES_PER_SAMPLE: usize = 20;
 
-#[derive(Debug)]
-pub struct IngestedSamples {
-    pub key: String,
-    pub samples: Vec<Sample>,
-}
+/// Parses a `TS.ADDBULK` payload: a single JSON object with equal-length `values` and
+/// `timestamps` arrays of at most [`MAX_SAMPLES_PER_INSERT`] entries. Timestamps must be
+/// non-negative integers. Returns the samples sorted by timestamp.
+pub(crate) fn parse_bulk_payload(input: &mut [u8]) -> ValkeyResult<Vec<Sample>> {
+    let v: Value = simd_json::to_borrowed_value(input)?;
 
-impl IngestedSamples {
-    pub fn from_json_lines(input: &mut [u8]) -> ValkeyResult<Self> {
-        let v: Value = simd_json::to_borrowed_value(input)?;
+    let values_arr = v
+        .get("values")
+        .and_then(|v| v.as_array())
+        .ok_or(ValkeyError::Str(error_consts::BULK_MISSING_VALUES))?;
 
-        let values_arr = v
-            .get("values")
-            .and_then(|v| v.as_array())
-            .ok_or(ValkeyError::Str("TSDB: missing values"))?;
+    let timestamps_arr = v
+        .get("timestamps")
+        .and_then(|t| t.as_array())
+        .ok_or(ValkeyError::Str(error_consts::BULK_MISSING_TIMESTAMPS))?;
 
-        let timestamps_arr = v
-            .get("timestamps")
-            .and_then(|t| t.as_array())
-            .ok_or(ValkeyError::Str("TSDB: missing timestamps"))?;
-
-        if timestamps_arr.is_empty() || values_arr.is_empty() {
-            return Err(ValkeyError::Str("TSDB: no timestamps or values"));
-        }
-
-        if timestamps_arr.len() != values_arr.len() {
-            return Err(ValkeyError::Str(
-                "TSDB: timestamps and values length mismatch",
-            ));
-        }
-
-        if values_arr.len() > MAX_SAMPLES_PER_INSERT {
-            return Err(ValkeyError::Str(error_consts::TOO_MANY_SAMPLES));
-        }
-
-        let mut samples = Vec::with_capacity(values_arr.len());
-        for (val, ts) in values_arr.iter().zip(timestamps_arr.iter()) {
-            let value = val
-                .cast_f64()
-                .ok_or(ValkeyError::Str("TSDB: invalid value (expected number)"))?;
-
-            let timestamp_u64 = ts
-                .as_u64()
-                .ok_or(ValkeyError::Str("TSDB: invalid timestamp (expected u64)"))?;
-            // `TS.ADD`'s domain, `0..=i64::MAX`. An `as` cast stored 2^63 and up as negative
-            // timestamps, which reads skip and the RDB loader refuses.
-            let timestamp = Timestamp::try_from(timestamp_u64)
-                .map_err(|_| ValkeyError::Str(error_consts::INVALID_TIMESTAMP))?;
-
-            samples.push(Sample { timestamp, value });
-        }
-
-        samples.sort_by_key(|s| s.timestamp);
-
-        Ok(IngestedSamples {
-            key: String::new(),
-            samples,
-        })
+    if timestamps_arr.is_empty() || values_arr.is_empty() {
+        return Err(ValkeyError::Str(error_consts::BULK_EMPTY_PAYLOAD));
     }
+
+    if timestamps_arr.len() != values_arr.len() {
+        return Err(ValkeyError::Str(error_consts::BULK_LENGTH_MISMATCH));
+    }
+
+    if values_arr.len() > MAX_SAMPLES_PER_INSERT {
+        return Err(ValkeyError::Str(error_consts::TOO_MANY_SAMPLES));
+    }
+
+    let mut samples = Vec::with_capacity(values_arr.len());
+    for (val, ts) in values_arr.iter().zip(timestamps_arr.iter()) {
+        let value = val
+            .cast_f64()
+            .ok_or(ValkeyError::Str(error_consts::BULK_INVALID_VALUE))?;
+
+        let timestamp_u64 = ts
+            .as_u64()
+            .ok_or(ValkeyError::Str(error_consts::BULK_INVALID_TIMESTAMP))?;
+        // `TS.ADD`'s domain, `0..=i64::MAX`. An `as` cast stored 2^63 and up as negative
+        // timestamps, which reads skip and the RDB loader refuses.
+        let timestamp = Timestamp::try_from(timestamp_u64)
+            .map_err(|_| ValkeyError::Str(error_consts::INVALID_TIMESTAMP))?;
+
+        samples.push(Sample { timestamp, value });
+    }
+
+    // Stable on purpose: of two samples sharing a timestamp, the first in the payload must
+    // stay first, so that it is the one stored and the later one is reported `Duplicate`
+    // (see `normalize_batch`).
+    samples.sort_by_key(|s| s.timestamp);
+
+    Ok(samples)
 }
 
-/// A holder for either an existing chunk reference or new chunk info.
-#[derive(Debug, Copy, Clone)]
-enum ChunkHolder {
-    ExistingIdx(usize),
-    New,
+/// Where a [`ChunkSampleGroup`] is merged.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum GroupTarget {
+    /// The existing chunk at this index.
+    Existing(usize),
+    /// A new chunk placed before every existing chunk: samples older than the series.
+    NewBefore,
+    /// A new chunk placed after every existing chunk: samples the last chunk has no room for,
+    /// or any samples into a series without chunks.
+    NewAfter,
 }
 
-/// A grouped view of a contiguous sub-slice of `samples` that all map to the same destination chunk.
+/// A contiguous sub-slice of the batch that all goes to the same chunk.
 #[derive(Debug)]
 struct ChunkSampleGroup<'a> {
-    /// The chunk to insert samples into. None indicates a new chunk needs to be created.
-    pub chunk: ChunkHolder,
-    pub samples: &'a [Sample],
+    target: GroupTarget,
+    samples: &'a [Sample],
 }
 
-#[inline]
-fn exec_merge(
+/// A group into an existing chunk, with its offset into the normalized batch.
+struct ExistingGroup<'a> {
+    offset: usize,
+    chunk_idx: usize,
+    samples: &'a [Sample],
+}
+
+/// A group that becomes a new chunk, with its offset into the normalized batch.
+struct NewGroup<'a> {
+    offset: usize,
+    target: GroupTarget,
+    samples: &'a [Sample],
+}
+
+/// The merge outcome of one group: one result per sample of the group, which starts at
+/// `offset` in the normalized batch and holds `len` samples.
+struct GroupOutcome {
+    offset: usize,
+    len: usize,
+    results: Vec<SampleAddResult>,
+}
+
+/// Merges one group into `chunk`.
+///
+/// A merge that fails as a whole reports every sample of the group as `Error`. That is
+/// accurate because chunk merges either fail before changing the chunk or report failures
+/// per sample: the out-of-order path encodes into a fresh buffer and swaps it in only on
+/// success, and the append path (`merge::append_samples`) fails as a whole only on
+/// `CapacityFull`, which no encoding that uses it returns.
+fn merge_group(
     chunk: &mut TimeSeriesChunk,
     samples: &[Sample],
     policy: Option<DuplicatePolicy>,
+    key: &[u8],
 ) -> Vec<SampleAddResult> {
-    chunk.merge_samples(samples, policy).unwrap_or_else(|_| {
-        let err = SampleAddResult::Error(error_consts::CANNOT_ADD_SAMPLE);
-        std::iter::repeat_n(err, samples.len()).collect()
-    })
+    match chunk.merge_samples(samples, policy) {
+        Ok(results) => results,
+        Err(e) => {
+            log_warning(format!(
+                "TSDB: failed to merge {} samples into a chunk of '{}': {e}",
+                samples.len(),
+                key_for_display(key)
+            ));
+            vec![SampleAddResult::Error(error_consts::CANNOT_ADD_SAMPLE); samples.len()]
+        }
+    }
 }
 
 /// Encoded bytes per [`BPS_SCALE`] samples expected for new data in `series`.
 ///
 /// Averages the most recent chunks that hold enough samples for their ratio to mean something
-/// (sealed chunks are shrunk, so `size()` is encoded bytes, not allocation). A series with no
-/// such chunk is measured by encoding samples of `batch` into a scratch chunk.
+/// (`size()` counts encoded bytes, not allocation, sealed or not). A series with no such chunk
+/// is measured by encoding samples of `batch` into a scratch chunk.
 fn estimate_bps(series: &TimeSeries, batch: &[Sample]) -> usize {
     const UNCOMPRESSED: usize = size_of::<Sample>() * BPS_SCALE;
     if !series.is_compressed() {
@@ -163,8 +204,9 @@ fn estimate_bps(series: &TimeSeries, batch: &[Sample]) -> usize {
     // Probe contiguous windows spread across the batch (a prefix alone misjudges data whose
     // shape changes along the batch), each measured without its first sample: that one is
     // stored raw, and over a short window of very compressible data it would dominate.
-    // At most half the batch is probed, so a batch just past the no-estimate fast path is
-    // not encoded twice over.
+    // A batch with room for two windows or more is probed at most half, so a batch just past
+    // the no-estimate fast path is not encoded twice over. Below that one window is probed:
+    // all of a batch under `BPS_PROBE_WINDOW` samples, the first `BPS_PROBE_WINDOW` otherwise.
     let window = BPS_PROBE_WINDOW.min(batch.len());
     let windows = BPS_PROBE_WINDOWS.min(batch.len() / (2 * window)).max(1);
     let stride = batch.len() / windows;
@@ -203,6 +245,11 @@ fn samples_for(bytes: usize, bps: usize) -> usize {
 
 /// Number of samples to append to the tail chunk out of `rest` samples newer than it: as many
 /// as fill it to `max_size`, the rest being left for [`add_chunks_for_appends`].
+///
+/// Only these appends are counted against the room. Samples of the same group that land
+/// inside the tail's span or in the gap before it are inserts the estimate does not see, so a
+/// group mixing both can overshoot; the post-merge split halves a chunk that ends past the
+/// split threshold.
 fn tail_take(tail: &TimeSeriesChunk, rest: usize, bps: impl Fn() -> usize) -> usize {
     let room = tail.max_size().saturating_sub(tail.size());
     // The common TS.MADD case: a few samples into a roomy tail. No estimate needed.
@@ -212,12 +259,40 @@ fn tail_take(tail: &TimeSeriesChunk, rest: usize, bps: impl Fn() -> usize) -> us
     samples_for(room, bps()).min(rest)
 }
 
-fn push_new_groups<'a>(dest: &mut Vec<ChunkSampleGroup<'a>>, samples: &'a [Sample], size: usize) {
+/// Pushes `samples` as consecutive groups of `size` samples, the last taking the remainder.
+fn push_new_groups<'a>(
+    dest: &mut Vec<ChunkSampleGroup<'a>>,
+    samples: &'a [Sample],
+    size: usize,
+    target: GroupTarget,
+) {
+    dest.reserve(samples.len().div_ceil(size));
     for slice in samples.chunks(size) {
         dest.push(ChunkSampleGroup {
-            chunk: ChunkHolder::New,
+            target,
             samples: slice,
         });
+    }
+}
+
+/// Pushes `samples` as `count` consecutive groups whose sizes differ by at most one.
+/// `count` must be in `1..=samples.len()`.
+fn push_even_groups<'a>(
+    dest: &mut Vec<ChunkSampleGroup<'a>>,
+    samples: &'a [Sample],
+    count: usize,
+    target: GroupTarget,
+) {
+    let (base, extra) = (samples.len() / count, samples.len() % count);
+    dest.reserve(count);
+    let mut start = 0;
+    for k in 0..count {
+        let len = base + usize::from(k < extra);
+        dest.push(ChunkSampleGroup {
+            target,
+            samples: &samples[start..start + len],
+        });
+        start += len;
     }
 }
 
@@ -236,11 +311,11 @@ fn add_chunks_for_appends<'a>(
     }
     // Fits a single chunk even at the worst encoded size: skip the estimate.
     if samples.len().saturating_mul(WORST_CASE_BYTES_PER_SAMPLE) <= chunk_size {
-        push_new_groups(dest, samples, samples.len());
+        push_new_groups(dest, samples, samples.len(), GroupTarget::NewAfter);
         return;
     }
     let cap = samples_for(chunk_size, bps()).max(1);
-    push_new_groups(dest, samples, cap);
+    push_new_groups(dest, samples, cap, GroupTarget::NewAfter);
 }
 
 /// Groups samples older than every existing chunk into new chunks of `chunk_size` bytes.
@@ -259,7 +334,7 @@ fn add_chunks_for_backfill<'a>(
         return;
     }
     if n.saturating_mul(WORST_CASE_BYTES_PER_SAMPLE) <= chunk_size {
-        push_new_groups(dest, samples, n);
+        push_new_groups(dest, samples, n, GroupTarget::NewBefore);
         return;
     }
 
@@ -272,14 +347,15 @@ fn add_chunks_for_backfill<'a>(
     } else {
         n.div_ceil(cap)
     };
-    push_new_groups(dest, samples, n.div_ceil(count));
+    push_even_groups(dest, samples, count, GroupTarget::NewBefore);
 }
 
 /// Groups a sorted `samples` slice into the chunk they would belong to if inserted.
 ///
 /// Rules:
 /// - `samples` must be sorted by `timestamp` ascending, already normalized (retention
-///   filtering happens in [`normalize_batch`], not here).
+///   filtering happens in [`normalize_batch`], not here), and `series` must hold no empty
+///   chunk (see [`drop_empty_chunks_of_empty_series`]).
 /// - Samples older than the first existing chunk go to new chunk(s), consumed strictly
 ///   below the first chunk's start so the new chunks cannot overlap existing ones.
 /// - Each existing chunk consumes every remaining sample up to its last timestamp. This
@@ -292,7 +368,9 @@ fn add_chunks_for_backfill<'a>(
 ///   [`add_chunks_for_backfill`] and [`add_chunks_for_appends`]).
 /// - Capacity is estimated from the series' recent chunks (see [`estimate_bps`]), computed at
 ///   most once per call and only when a group could exceed a chunk.
-/// - Returns groups in ascending chunk order, each group borrowing from the input slice.
+/// - Returns groups in ascending timestamp order: every `NewBefore` group, then the existing
+///   chunks in index order, then every `NewAfter` group. Together they cover `samples`
+///   exactly, each group borrowing a contiguous sub-slice of it.
 ///
 /// # Arguments
 /// * `series` - The time series to group samples into
@@ -304,17 +382,22 @@ fn group_samples_by_chunk<'a>(
     if samples.is_empty() {
         return Vec::new();
     }
+    debug_assert!(
+        series.chunks.iter().all(|c| !c.is_empty()),
+        "grouping needs a series without empty chunks"
+    );
 
-    // Pre-allocate based on chunk count + potential new chunks
-    let estimated_groups = series.chunks.len().saturating_add(2);
+    // At most one group per sample, so a small batch into a long series reserves little;
+    // new-chunk groups reserve their own count (see `push_new_groups`).
+    let estimated_groups = series.chunks.len().min(samples.len()).saturating_add(2);
     let mut out: Vec<ChunkSampleGroup<'a>> = Vec::with_capacity(estimated_groups);
 
     let chunk_size = series.chunk_size_bytes;
     let bps_cell = OnceCell::new();
     let bps = || *bps_cell.get_or_init(|| estimate_bps(series, samples));
 
-    // Empty series: create new chunks from all samples.
-    if series.chunks.is_empty() || series.is_empty() {
+    // No chunks: create new chunks from all samples.
+    if series.chunks.is_empty() {
         add_chunks_for_appends(&mut out, samples, chunk_size, bps);
         return out;
     }
@@ -337,7 +420,15 @@ fn group_samples_by_chunk<'a>(
 
     let last_index = series.chunks.len() - 1;
 
-    for (chunk_idx, chunk) in series.chunks.iter().enumerate() {
+    // Visit only the chunks the batch reaches: chunks are sorted and disjoint, so the next one
+    // to take samples is the first ending at or after the next sample, found by binary search.
+    // Samples past every chunk land on the last one, the append target.
+    while i < samples.len() {
+        let chunk_idx = series
+            .chunks
+            .partition_point(|c| c.last_timestamp() < samples[i].timestamp)
+            .min(last_index);
+        let chunk = &series.chunks[chunk_idx];
         let start = i;
 
         let chunk_last = chunk.last_timestamp();
@@ -352,9 +443,12 @@ fn group_samples_by_chunk<'a>(
 
         if start < i {
             out.push(ChunkSampleGroup {
-                chunk: ChunkHolder::ExistingIdx(chunk_idx),
+                target: GroupTarget::Existing(chunk_idx),
                 samples: &samples[start..i],
             });
+        }
+        if chunk_idx == last_index {
+            break;
         }
     }
 
@@ -366,27 +460,18 @@ fn group_samples_by_chunk<'a>(
     out
 }
 
-/// Produces disjoint `&mut` references for unique indices.
+/// Disjoint `&mut` references to `slice[indices[0]]`, `slice[indices[1]]`, ...
 ///
-/// # Safety Requirements
-/// Callers MUST ensure that `indices`:
-/// - Are all within bounds of `slice`
-/// - Are strictly unique (no duplicates)
-/// - Are sorted in non-decreasing order
-///
-/// Violating these invariants leads to undefined behavior.
-///
-/// # Panics
-/// Panics in debug builds if indices are not non-decreasing.
-fn disjoint_get_many_mut_with_pos<'a, T>(slice: &'a mut [T], indices: &[usize]) -> Vec<&'a mut T> {
+/// `indices` must be strictly increasing and in bounds. This is safe code: a violation
+/// panics (in release builds too), it cannot alias.
+fn get_many_mut_ascending<'a, T>(slice: &'a mut [T], indices: &[usize]) -> Vec<&'a mut T> {
     let mut out: Vec<&'a mut T> = Vec::with_capacity(indices.len());
     let mut base = 0usize;
     let mut tail: &'a mut [T] = slice;
 
     for &idx in indices {
-        debug_assert!(idx >= base, "indices must be non-decreasing after sort");
-        let rel = idx - base;
-        let (_left, rest) = tail.split_at_mut(rel);
+        debug_assert!(idx >= base, "indices must be strictly increasing");
+        let (_, rest) = tail.split_at_mut(idx - base);
         let (item, rest) = rest.split_at_mut(1);
         out.push(&mut item[0]);
         tail = rest;
@@ -396,18 +481,157 @@ fn disjoint_get_many_mut_with_pos<'a, T>(slice: &'a mut [T], indices: &[usize]) 
     out
 }
 
-/// Shared bulk-merge core used by both `TS.ADDBULK` (`bulk_insert_samples`) and `TS.MADD`
-/// (`sample_merge::merge_samples`): normalize, group by destination chunk, merge in parallel,
-/// splice results back to input order, and refresh series metadata.
+/// A series with no samples may still hold one empty chunk: deletes, defrag and the trim drop
+/// the chunks they empty, but a load keeps a lone one (see `serialization::drop_empty_chunks`).
+/// An empty chunk reports `first_timestamp() == 0`, so left ahead of the new chunks it would
+/// pin the series' `first_timestamp` at 0. Cheap: a series without samples has at most a
+/// chunk or two.
+fn drop_empty_chunks_of_empty_series(series: &mut TimeSeries) {
+    if series.is_empty() && !series.chunks.is_empty() {
+        series.chunks.retain(|c| !c.is_empty());
+    }
+}
+
+/// Writes one group's merge results at the input indices of its samples.
 ///
-/// Parallel merge implementation:
-/// - existing-chunk groups: merge in parallel by taking disjoint `&mut` borrows
-/// - new-chunk groups: create and merge in parallel, then append sequentially
+/// A chunk merge returns exactly one result per sample of the group, in order. Should one
+/// ever return fewer, the samples without a result are reported `Error` rather than letting
+/// later results shift onto the wrong samples.
+fn place_results(results: &mut [SampleAddResult], insert_index: &[usize], outcome: GroupOutcome) {
+    debug_assert_eq!(
+        outcome.results.len(),
+        outcome.len,
+        "a chunk merge must return one result per sample"
+    );
+    let mut group_results = outcome.results.into_iter();
+    for &index in &insert_index[outcome.offset..outcome.offset + outcome.len] {
+        results[index] = group_results
+            .next()
+            .unwrap_or(SampleAddResult::Error(error_consts::CANNOT_ADD_SAMPLE));
+    }
+}
+
+/// Merges every group into its existing chunk, in parallel when the batch is big enough.
+/// Returns each group's outcome and how many samples the chunks grew by in all.
+fn merge_into_existing_chunks(
+    series: &mut TimeSeries,
+    groups: &[ExistingGroup<'_>],
+    policy: Option<DuplicatePolicy>,
+) -> (Vec<GroupOutcome>, usize) {
+    if groups.is_empty() {
+        return (Vec::new(), 0);
+    }
+
+    let key: &[u8] = &series.key;
+    let indices: Vec<usize> = groups.iter().map(|g| g.chunk_idx).collect();
+    let chunks = get_many_mut_ascending(series.chunks.as_mut_slice(), &indices);
+
+    let merge = |(chunk, group): (&mut TimeSeriesChunk, &ExistingGroup<'_>)| {
+        let len_before = chunk.len();
+        let results = merge_group(chunk, group.samples, policy, key);
+        let outcome = GroupOutcome {
+            offset: group.offset,
+            len: group.samples.len(),
+            results,
+        };
+        (outcome, chunk.len().saturating_sub(len_before))
+    };
+
+    // A MADD group is a handful of samples into one chunk; the parallel path is for bulk
+    // loads spanning many chunks.
+    let work: usize = groups.iter().map(|g| g.samples.len()).sum();
+    let threads = request_par_threads(groups.len(), work);
+    let merged: Vec<(GroupOutcome, usize)> = if threads == 1 {
+        chunks.into_iter().zip(groups.iter()).map(merge).collect()
+    } else {
+        chunks
+            .into_iter()
+            .zip(groups.iter())
+            .iter_into_par_rayon()
+            .num_threads(threads)
+            .map(merge)
+            .collect()
+    };
+
+    let grown = merged.iter().map(|(_, grown)| grown).sum();
+    (
+        merged.into_iter().map(|(outcome, _)| outcome).collect(),
+        grown,
+    )
+}
+
+/// A chunk built from one [`NewGroup`].
+struct NewChunk {
+    target: GroupTarget,
+    chunk: TimeSeriesChunk,
+    outcome: GroupOutcome,
+}
+
+/// Builds one sealed chunk per group, in parallel when the batch is big enough. Returns them
+/// in group order.
+fn build_new_chunks(
+    series: &TimeSeries,
+    groups: &[NewGroup<'_>],
+    policy: Option<DuplicatePolicy>,
+) -> Vec<NewChunk> {
+    if groups.is_empty() {
+        return Vec::new();
+    }
+
+    let encoding = series.chunk_encoding;
+    let chunk_size = series.chunk_size_bytes;
+    let key: &[u8] = &series.key;
+    let build = |group: &NewGroup<'_>| {
+        let mut chunk = TimeSeriesChunk::new(encoding, chunk_size);
+        let results = merge_group(&mut chunk, group.samples, policy, key);
+        // This group's samples are all this chunk will ever hold: it is placed among chunks
+        // that already own every neighbouring timestamp. (The one that lands last does become
+        // the new append target and will regrow once.)
+        seal_chunk(&mut chunk);
+        NewChunk {
+            target: group.target,
+            chunk,
+            outcome: GroupOutcome {
+                offset: group.offset,
+                len: group.samples.len(),
+                results,
+            },
+        }
+    };
+
+    let work: usize = groups.iter().map(|g| g.samples.len()).sum();
+    let threads = request_par_threads(groups.len(), work);
+    let mut built: Vec<NewChunk> = if threads == 1 {
+        groups.iter().map(build).collect()
+    } else {
+        groups
+            .iter()
+            .iter_into_par_rayon()
+            .num_threads(threads)
+            .map(build)
+            .collect()
+    };
+    // Group order is what places the chunks; don't depend on the pool's collect order.
+    if !built.is_sorted_by_key(|c| c.outcome.offset) {
+        built.sort_unstable_by_key(|c| c.outcome.offset);
+    }
+    built
+}
+
+/// Shared bulk-merge core used by both `TS.ADDBULK` (`bulk_insert_samples`) and `TS.MADD`
+/// (`sample_merge::merge_samples`): normalize, group by destination chunk, merge each group,
+/// place results back in input order, and refresh series metadata.
+///
+/// Existing-chunk groups are merged through disjoint `&mut` borrows of their chunks; new-chunk
+/// groups are built as standalone chunks, then spliced in before or after the existing ones.
+/// Both run in parallel when the batch is big enough.
 ///
 /// Callers are responsible for post-merge maintenance (`split_chunks_if_needed`),
 /// keyspace notification and compaction propagation.
 ///
-/// `samples` **must** be sorted by timestamp ascending. Returns one result per input sample.
+/// Returns one result per input sample. Of samples sharing a timestamp, only the first in
+/// input order is merged; the others are reported `Duplicate` without consulting the
+/// duplicate policy (see `normalize_batch`).
 pub(super) fn merge_samples_into_series(
     series: &mut TimeSeries,
     samples: &[Sample],
@@ -417,9 +641,9 @@ pub(super) fn merge_samples_into_series(
         return Vec::new();
     }
 
-    // Resolve the duplicate policy against the series/global defaults so that a `None` override
-    // honors the series' configured policy rather than silently defaulting to KeepLast.
-    let resolved_policy = Some(series.sample_duplicates.resolve_policy(policy));
+    // The one place the duplicate policy is resolved, so that a `None` override honors the
+    // series' configured policy rather than the chunk merge's KeepLast default.
+    let policy = Some(series.sample_duplicates.resolve_policy(policy));
 
     // Apply the same retention/rounding/IGNORE normalization as single-sample add.
     let NormalizedBatch {
@@ -432,133 +656,83 @@ pub(super) fn merge_samples_into_series(
         return results;
     }
 
+    drop_empty_chunks_of_empty_series(series);
+
+    // Split the groups by kind. They are contiguous, ascending and cover `to_insert`, so
+    // each one's offset into it is the running total of the lengths before it.
     let groups = group_samples_by_chunk(series, &to_insert);
+    let mut existing: Vec<ExistingGroup<'_>> = Vec::with_capacity(groups.len());
+    let mut new: Vec<NewGroup<'_>> = Vec::new();
+    let mut offset = 0usize;
+    for group in &groups {
+        match group.target {
+            GroupTarget::Existing(chunk_idx) => existing.push(ExistingGroup {
+                offset,
+                chunk_idx,
+                samples: group.samples,
+            }),
+            target => new.push(NewGroup {
+                offset,
+                target,
+                samples: group.samples,
+            }),
+        }
+        offset += group.samples.len();
+    }
+    debug_assert_eq!(offset, to_insert.len(), "groups must cover the batch");
 
-    if groups.is_empty() {
-        return results;
+    let (outcomes, mut grown) = merge_into_existing_chunks(series, &existing, policy);
+    for outcome in outcomes {
+        place_results(&mut results, &insert_index, outcome);
     }
 
-    // separate groups into existing-chunk and new-chunk categories.
-    let (new_groups, existing_groups): (Vec<_>, Vec<_>) = groups
-        .iter()
-        .enumerate()
-        .partition(|(_, g)| matches!(g.chunk, ChunkHolder::New));
-
-    let existing_groups: Vec<_> = existing_groups
-        .into_iter()
-        .filter_map(|(pos, g)| {
-            if let ChunkHolder::ExistingIdx(idx) = g.chunk {
-                Some((pos, idx, g.samples))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let new_groups: Vec<_> = new_groups
-        .into_iter()
-        .map(|(pos, g)| (pos, g.samples))
-        .collect();
-
-    // Prepare result slots.
-    let mut group_results: Vec<Option<Vec<SampleAddResult>>> = vec![None; groups.len()];
-
-    // Merge into existing chunks in parallel.
-    if !existing_groups.is_empty() {
-        let chunk_indices: Vec<usize> = existing_groups.iter().map(|(_, idx, _)| *idx).collect();
-        let chunk_refs =
-            disjoint_get_many_mut_with_pos(series.chunks.as_mut_slice(), &chunk_indices);
-
-        // A MADD group is a handful of samples into one chunk; the parallel path
-        // is for bulk loads spanning many chunks.
-        let work: usize = existing_groups.iter().map(|(_, _, s)| s.len()).sum();
-        let threads = request_par_threads(existing_groups.len(), work);
-        let existing_results: Vec<(usize, Vec<SampleAddResult>)> = if threads == 1 {
-            chunk_refs
-                .into_iter()
-                .zip(existing_groups.iter())
-                .map(|(chunk, &(group_pos, _, samples))| {
-                    (group_pos, exec_merge(chunk, samples, resolved_policy))
-                })
-                .collect()
+    // New chunks lie strictly before the first existing chunk or after the last one (see
+    // `group_samples_by_chunk`), and arrive in ascending order, so splicing them in at
+    // either end keeps the chunks sorted without a sort.
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    for NewChunk {
+        target,
+        chunk,
+        outcome,
+    } in build_new_chunks(series, &new, policy)
+    {
+        place_results(&mut results, &insert_index, outcome);
+        // A merge that failed as a whole leaves its chunk empty, and a series must not hold
+        // an empty chunk next to others.
+        if chunk.is_empty() {
+            continue;
+        }
+        grown += chunk.len();
+        if target == GroupTarget::NewBefore {
+            before.push(chunk);
         } else {
-            chunk_refs
-                .into_iter()
-                .zip(existing_groups.iter())
-                .iter_into_par_rayon()
-                .num_threads(threads)
-                .map(|(chunk, &(group_pos, _, samples))| {
-                    let res = exec_merge(chunk, samples, resolved_policy);
-                    (group_pos, res)
-                })
-                .collect()
-        };
-
-        for (group_pos, res) in existing_results {
-            group_results[group_pos] = Some(res);
+            after.push(chunk);
         }
     }
-
-    // Process new-chunk groups in parallel (each creates its own chunk).
-    if !new_groups.is_empty() {
-        let encoding = series.chunk_encoding;
-        let chunk_size = series.chunk_size_bytes;
-        let work: usize = new_groups.iter().map(|(_, s)| s.len()).sum();
-        let threads = request_par_threads(new_groups.len(), work);
-        let build = |&(group_pos, samples): &(usize, &[Sample])| {
-            let mut chunk = TimeSeriesChunk::new(encoding, chunk_size);
-            let res = exec_merge(&mut chunk, samples, resolved_policy);
-            // This group's samples are all this chunk will ever hold: the sort below places
-            // it among chunks that already own every neighbouring timestamp. (The one that
-            // lands last does become the new append target and will regrow once.)
-            seal_chunk(&mut chunk);
-            (group_pos, chunk, res)
-        };
-        let new_results: Vec<(usize, TimeSeriesChunk, Vec<SampleAddResult>)> = if threads == 1 {
-            new_groups.iter().map(build).collect()
-        } else {
-            new_groups
-                .par_rayon()
-                .num_threads(threads)
-                .map(build)
-                .collect::<Vec<_>>()
-        };
-
-        let chunk_count_before = series.chunks.len();
-
-        for (group_pos, chunk, res) in new_results {
-            group_results[group_pos] = Some(res);
-            series.chunks.push(chunk);
-        }
-
-        // append new chunks to the series
-        if series.chunks.len() != chunk_count_before {
-            // Sort chunks by the first timestamp to maintain order.
-            series.chunks.sort_by_key(|c| c.first_timestamp());
-        }
+    if !before.is_empty() {
+        series.chunks.splice(0..0, before);
     }
-
-    // Refresh metadata unconditionally: even without new chunks, a merge can append to the
-    // last chunk or update the value at the current last timestamp, and `total_samples` can
-    // only be derived from chunk lengths (upserts of existing timestamps report `Ok` too).
-    series.update_first_last_timestamps();
-    series.recalculate_total_samples();
-
-    // Merge results arrive in group order, which matches `to_insert` order (groups borrow
-    // contiguous, ascending sub-slices of `to_insert`). Splice each outcome back into `results`
-    // at its original input index so the returned vec has one entry per input sample.
-    let mut cursor = 0usize;
-    for opt in group_results.into_iter().flatten() {
-        for res in opt {
-            results[insert_index[cursor]] = res;
-            cursor += 1;
-        }
-    }
-    debug_assert_eq!(
-        cursor,
-        to_insert.len(),
-        "merge produced a different number of results than samples inserted"
+    series.chunks.extend(after);
+    debug_assert!(
+        series
+            .chunks
+            .windows(2)
+            .all(|w| w[0].last_timestamp() < w[1].first_timestamp()),
+        "chunks must stay sorted and disjoint"
     );
+
+    // Merges only add samples (an upsert of an existing timestamp replaces in place), so the
+    // count moves by the growth of the chunks this batch touched; no need to walk them all.
+    series.total_samples += grown;
+    debug_assert_eq!(
+        series.total_samples,
+        series.chunks.iter().map(|c| c.len()).sum::<usize>(),
+        "total_samples must match the chunks"
+    );
+    // Even without new chunks, a merge can append to the last chunk or update the value at
+    // the current last timestamp.
+    series.update_first_last_timestamps();
 
     results
 }
@@ -576,7 +750,8 @@ pub fn bulk_insert_samples(
         return Vec::new();
     }
 
-    let _saved_sample_count = series.total_samples;
+    #[cfg_attr(test, allow(unused_variables))]
+    let count_before = series.total_samples;
     // Last timestamp before the merge: batch compaction uses it to tell guaranteed-fresh
     // appends apart from samples that may have replaced existing values.
     let prev_last = series.last_sample.map(|s| s.timestamp);
@@ -590,12 +765,13 @@ pub fn bulk_insert_samples(
         ))
     });
 
-    // Always `ts.add`, even when the target is a compaction destination: `ts.add:dest` marks
-    // rule output only (emitted by the compaction path), matching TS.ADD/TS.MADD on RTS.
     #[cfg(not(test))]
-    if series.total_samples > _saved_sample_count {
-        notify_added(ctx, &series.key);
-    }
+    notify_added(
+        ctx,
+        &series.key,
+        results.iter().any(SampleAddResult::is_ok),
+        series.total_samples > count_before,
+    );
 
     // Propagate the accepted samples to compaction destinations in one batch.
     if !series.rules.is_empty() {
@@ -634,13 +810,21 @@ pub fn bulk_insert_samples(
     results
 }
 
+/// Emits the write's events. `ts.add` fires whenever a sample was accepted, upserts of
+/// existing timestamps included, as for TS.ADD and TS.MADD. It is `ts.add` even when the
+/// target is a compaction destination: `ts.add:dest` marks rule output only (emitted by the
+/// compaction path), matching TS.ADD/TS.MADD on RTS. A blocked `TS.READ` waits for new
+/// samples, so it is signalled only when the series grew.
 #[cfg(not(test))]
-fn notify_added(ctx: &Context, key: &[u8]) {
+fn notify_added(ctx: &Context, key: &[u8], accepted: bool, grew: bool) {
+    if !accepted {
+        return;
+    }
     let key = create_key_string(ctx, key);
     notify_keyspace_event(ctx, c"ts.add", &key);
-    // The sole caller already gated on the series' sample count having grown, which is
-    // exactly the condition that can satisfy a blocked `TS.READ`.
-    signal_timeseries_ready(ctx, &key);
+    if grew {
+        signal_timeseries_ready(ctx, &key);
+    }
 }
 
 #[cfg(test)]
@@ -677,11 +861,11 @@ mod tests {
         }"#
         .to_vec();
 
-        let parsed = IngestedSamples::from_json_lines(&mut data).unwrap();
-        assert_eq!(parsed.samples.len(), 3);
-        assert_eq!(parsed.samples[0].value, 1.0);
-        assert_eq!(parsed.samples[0].timestamp, 1549891472010);
-        assert_eq!(parsed.samples[2].timestamp, 1549891503438);
+        let parsed = parse_bulk_payload(&mut data).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].value, 1.0);
+        assert_eq!(parsed[0].timestamp, 1549891472010);
+        assert_eq!(parsed[2].timestamp, 1549891503438);
     }
 
     /// Timestamps share `TS.ADD`'s domain, `0..=i64::MAX`. A JSON integer from 2^63 up used to
@@ -691,7 +875,7 @@ mod tests {
         for ts in [i64::MAX as u64 + 1, u64::MAX] {
             let mut data =
                 format!(r#"{{"values": [1, 2], "timestamps": [1000, {ts}]}}"#).into_bytes();
-            match IngestedSamples::from_json_lines(&mut data) {
+            match parse_bulk_payload(&mut data) {
                 Err(ValkeyError::Str(msg)) => {
                     assert_eq!(msg, error_consts::INVALID_TIMESTAMP, "{ts}")
                 }
@@ -700,8 +884,8 @@ mod tests {
         }
 
         let mut data = format!(r#"{{"values": [1], "timestamps": [{}]}}"#, i64::MAX).into_bytes();
-        let parsed = IngestedSamples::from_json_lines(&mut data).unwrap();
-        assert_eq!(parsed.samples[0].timestamp, i64::MAX);
+        let parsed = parse_bulk_payload(&mut data).unwrap();
+        assert_eq!(parsed[0].timestamp, i64::MAX);
     }
 
     #[test]
@@ -713,7 +897,7 @@ mod tests {
         }"#
         .to_vec();
 
-        assert!(IngestedSamples::from_json_lines(&mut data).is_err());
+        assert!(parse_bulk_payload(&mut data).is_err());
     }
 
     fn s(ts: i64, v: f64) -> Sample {
@@ -1262,9 +1446,9 @@ mod tests {
     fn group_shape(groups: &[ChunkSampleGroup<'_>]) -> Vec<(Option<usize>, usize)> {
         groups
             .iter()
-            .map(|g| match g.chunk {
-                ChunkHolder::ExistingIdx(idx) => (Some(idx), g.samples.len()),
-                ChunkHolder::New => (None, g.samples.len()),
+            .map(|g| match g.target {
+                GroupTarget::Existing(idx) => (Some(idx), g.samples.len()),
+                GroupTarget::NewBefore | GroupTarget::NewAfter => (None, g.samples.len()),
             })
             .collect()
     }
@@ -1327,6 +1511,136 @@ mod tests {
             group_shape(&groups),
             vec![(None, 200), (None, 200), (None, 200)]
         );
+    }
+
+    #[test]
+    fn backfill_groups_differ_by_at_most_one_sample() {
+        let ctx = Context::dummy();
+        let mut series = uncompressed_series();
+        bulk_insert_samples(&ctx, &mut series, &run(1_000_000, 10), None);
+
+        // Four chunks: 1030 / 4 rounds up to 258, within the 288 limit. The remainder is
+        // spread one sample at a time, not left to the last chunk (258, 258, 258, 256).
+        let samples = run(0, 1_030);
+        let groups = group_samples_by_chunk(&series, &samples);
+        assert_eq!(
+            group_shape(&groups),
+            vec![(None, 258), (None, 258), (None, 257), (None, 257)]
+        );
+    }
+
+    /// A series without samples can hold one empty chunk (a load keeps a lone one). It reports
+    /// `first_timestamp() == 0`, so kept ahead of the new chunks it pinned the series'
+    /// `first_timestamp` at 0, and left an empty chunk among non-empty ones.
+    #[test]
+    fn bulk_insert_drops_the_lone_empty_chunk_of_an_empty_series() {
+        let ctx = Context::dummy();
+        for encoding in [ChunkEncoding::Chimp, ChunkEncoding::Uncompressed] {
+            let mut series = TimeSeries {
+                chunk_encoding: encoding,
+                chunk_size_bytes: 4096,
+                ..Default::default()
+            };
+            series.chunks.push(TimeSeriesChunk::new(encoding, 4096));
+
+            let samples = run(1_000, 600);
+            let results = bulk_insert_samples(&ctx, &mut series, &samples, None);
+
+            assert!(results.iter().all(|r| r.is_ok()), "{encoding:?}");
+            assert!(series.chunks.iter().all(|c| !c.is_empty()), "{encoding:?}");
+            assert_eq!(series.first_timestamp, 1_000, "{encoding:?}");
+            assert_eq!(series.total_samples, samples.len(), "{encoding:?}");
+            assert_eq!(series.iter().collect::<Vec<_>>(), samples, "{encoding:?}");
+        }
+    }
+
+    /// One batch that opens chunks before the series, upserts into an existing chunk and
+    /// overflows the tail into new chunks, given in descending order: every result must land
+    /// at its own input index.
+    #[test]
+    fn results_follow_input_order_across_backfill_existing_and_append_groups() {
+        let ctx = Context::dummy();
+        let mut series = uncompressed_series();
+        // One chunk of 250 samples at 10_000..10_250: room for 6 more.
+        let seed = run(10_000, 250);
+        bulk_insert_samples(&ctx, &mut series, &seed, None);
+        assert_eq!(series.chunks.len(), 1);
+
+        let backfill = (0..300).map(|i| s(i, 1_000.0 + i as f64));
+        let upserts = (0..10).map(|i| s(10_000 + i * 20, -(i as f64)));
+        let appends = (0..300).map(|i| s(20_000 + i, 5_000.0 + i as f64));
+        let mut samples: Vec<Sample> = backfill.chain(upserts).chain(appends).collect();
+        samples.reverse();
+
+        let results =
+            bulk_insert_samples(&ctx, &mut series, &samples, Some(DuplicatePolicy::KeepLast));
+
+        assert_eq!(results.len(), samples.len());
+        for (i, (result, sample)) in results.iter().zip(&samples).enumerate() {
+            match result {
+                SampleAddResult::Ok(stored) => assert_eq!(stored, sample, "input {i}"),
+                other => panic!("input {i} ({sample:?}): expected Ok, got {other:?}"),
+            }
+        }
+
+        // Backfill: 300 samples as two even chunks. Tail: 6 appends, then 256 + 38 new.
+        assert_eq!(series.chunks.len(), 5);
+        assert_eq!(series.total_samples, seed.len() + 300 + 300);
+        assert_eq!(series.first_timestamp, 0);
+        assert_eq!(series.last_timestamp(), 20_299);
+
+        let mut expected: Vec<Sample> = seed
+            .iter()
+            .map(|smp| {
+                let upserted = smp.timestamp < 10_200 && (smp.timestamp - 10_000) % 20 == 0;
+                if upserted {
+                    s(smp.timestamp, -(((smp.timestamp - 10_000) / 20) as f64))
+                } else {
+                    *smp
+                }
+            })
+            .collect();
+        expected.extend(
+            samples
+                .iter()
+                .filter(|smp| !(10_000..20_000).contains(&smp.timestamp)),
+        );
+        expected.sort_by_key(|smp| smp.timestamp);
+        assert_eq!(series.iter().collect::<Vec<_>>(), expected);
+    }
+
+    /// Upserts spread over many existing chunks, enough work for the parallel merge path.
+    #[test]
+    fn parallel_upserts_into_existing_chunks_keep_results_and_counts() {
+        let ctx = Context::dummy();
+        let mut series = uncompressed_series();
+        let seed = run(0, 20_000);
+        bulk_insert_samples(&ctx, &mut series, &seed, None);
+        let chunks_before = series.chunks.len();
+        assert!(chunks_before > 2);
+
+        let upserts: Vec<Sample> = (0..5_000).map(|i| s(i * 4, -(i as f64))).collect();
+        let work = upserts.len();
+        assert!(
+            request_par_threads(2, work) != 1,
+            "batch must take the parallel path"
+        );
+
+        let results =
+            bulk_insert_samples(&ctx, &mut series, &upserts, Some(DuplicatePolicy::KeepLast));
+
+        for (i, (result, sample)) in results.iter().zip(&upserts).enumerate() {
+            assert!(
+                matches!(result, SampleAddResult::Ok(stored) if stored == sample),
+                "input {i}: {result:?}"
+            );
+        }
+        assert_eq!(series.chunks.len(), chunks_before);
+        assert_eq!(series.total_samples, seed.len());
+        let stored: Vec<Sample> = series.iter().collect();
+        for upsert in &upserts {
+            assert_eq!(stored[upsert.timestamp as usize], *upsert);
+        }
     }
 
     #[test]

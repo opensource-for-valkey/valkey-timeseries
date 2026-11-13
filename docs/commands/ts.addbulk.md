@@ -156,11 +156,16 @@ The `data` argument expects a JSON object with the following structure:
 
 - **Sorting:** Input samples are automatically sorted by timestamp before insertion
 - **Retention filtering:** Samples older than the retention window are dropped before processing
-- **Duplicate handling:** Controlled by `DUPLICATE_POLICY` (or `ON_DUPLICATE` override)
+- **Duplicate handling:** A sample whose timestamp is already stored is resolved by `DUPLICATE_POLICY` (or the
+  `ON_DUPLICATE` override). Within one payload, timestamps must be unique: of samples sharing a timestamp, the first in
+  the payload is ingested and the others are refused as duplicates, whatever the policy (`TS.MADD` folds them by the
+  policy instead)
 - **Chunk allocation:** New chunks are created automatically as needed
 - **Series creation:** If the key doesn't exist, a new series is created with the provided options
 - **Ingestion count:** Only successfully inserted samples are counted; dropped or blocked samples are excluded from the
   success count
+- **Keyspace events:** `ts.add` is emitted once when at least one sample was ingested, including a sample that only
+  replaced the value at an existing timestamp. A payload with no sample ingested emits nothing
 
 ### Examples
 
@@ -191,8 +196,10 @@ TS.ADDBULK sensor:pressure:tank2 '{"values":[101.3,101.5],"timestamps":[16200000
 - **Wrong arity:** Incorrect number of arguments
 - **TSDB: missing values:** JSON payload lacks `values` array
 - **TSDB: missing timestamps:** JSON payload lacks `timestamps` array
-- **TSDB: values and timestamps length mismatch:** Arrays have different lengths
+- **TSDB: timestamps and values length mismatch:** Arrays have different lengths
 - **TSDB: no timestamps or values:** Arrays are empty
+- **TSDB: too many samples:** More than 1000 samples in the payload
+- **TSDB: invalid value (expected number):** A value is not a JSON number
 - **TSDB: invalid timestamp (expected u64):** A timestamp is not a non-negative JSON integer
 - **TSDB: invalid timestamp:** A timestamp is larger than `9223372036854775807`
 - **missing key or metric_name:** `metric` provided without `key` or `metric_name`

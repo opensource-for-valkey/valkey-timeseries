@@ -257,6 +257,43 @@ class TestNotifications(ValkeyTimeSeriesTestCaseBase):
         notifications = self.collect_notifications()
         assert_message(notifications, "ts.add", key)
 
+    def test_addbulk_upsert_only_notifications(self):
+        """A TS.ADDBULK that only replaces existing values still emits `ts.add`, as TS.ADD
+        and TS.MADD do for an upsert."""
+
+        self.create_subscribe_clients()
+
+        key = "ts:notifications:addbulk_upsert"
+        self.client.execute_command("TS.CREATE", key, "DUPLICATE_POLICY", "LAST")
+        self.client.execute_command("TS.ADD", key, 1000, 1.0)
+
+        self.collect_notifications(timeout=0.5)
+
+        payload = r'{"values":[9],"timestamps":[1000]}'
+        assert self.client.execute_command("TS.ADDBULK", key, payload) == [1, 1]
+
+        notifications = self.collect_notifications()
+        assert_message(notifications, "ts.add", key)
+
+    def test_addbulk_nothing_accepted_is_silent(self):
+        """A TS.ADDBULK whose every sample is refused writes nothing and emits no `ts.add`."""
+
+        self.create_subscribe_clients()
+
+        key = "ts:notifications:addbulk_refused"
+        self.client.execute_command("TS.CREATE", key, "DUPLICATE_POLICY", "BLOCK")
+        self.client.execute_command("TS.ADD", key, 1000, 1.0)
+
+        self.collect_notifications(timeout=0.5)
+
+        payload = r'{"values":[9],"timestamps":[1000]}'
+        assert self.client.execute_command("TS.ADDBULK", key, payload) == [0, 1]
+
+        notifications = self.collect_notifications()
+        assert not any(
+            n['data'] == 'ts.add' and n['channel'] == key for n in notifications
+        ), notifications
+
     def test_addbulk_into_compaction_dest_notifications(self):
         """A direct TS.ADDBULK into a compaction destination is a client write, not rule
         output: it emits `ts.add`, like TS.ADD/TS.MADD into a destination on RedisTimeSeries."""

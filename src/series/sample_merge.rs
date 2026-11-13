@@ -74,7 +74,9 @@ impl<'a> PerSeriesSamples<'a> {
 ///
 /// ## Note
 ///
-/// `samples` **must** be sorted by timestamp.
+/// `samples` is in argument order, which carries meaning: retention and IGNORE are decided
+/// item by item in that order, as sequential adds would (see `normalize_batch`). Only the
+/// samples handed on to the chunk merge are sorted.
 ///
 /// ### Arguments
 ///
@@ -322,6 +324,210 @@ fn run_group_compactions(ctx: &Context, groups: &mut [PerSeriesSamples]) {
             let key = key_for_display(&group.series.key);
             let msg = format!("TSDB: error running compaction for key '{key}': {e}");
             ctx.log_warning(&msg);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn s(timestamp: i64, value: f64) -> Sample {
+        Sample { timestamp, value }
+    }
+
+    type Outcome = (Vec<SampleAddResult>, Vec<Sample>);
+
+    /// `batch` applied to clones of `series` through the TS.MADD merge path and through
+    /// sequential single-sample adds (each without the retention trim): per-input results and
+    /// stored samples, in that order.
+    fn madd_vs_sequential(series: &TimeSeries, batch: &[Sample]) -> (Outcome, Outcome) {
+        let mut merged = series.clone();
+        let mut group = PerSeriesSamples::new(&mut merged);
+        for (index, sample) in batch.iter().enumerate() {
+            group.add_sample(*sample, index);
+        }
+        let mut pairs = multi_series_merge_samples(vec![group], None);
+        pairs.sort_by_key(|(index, _)| *index);
+        let merge_results = pairs.into_iter().map(|(_, result)| result).collect();
+
+        let mut sequential = series.clone();
+        let sequential_results = batch
+            .iter()
+            .map(|smp| sequential.add_deferring_retention(smp.timestamp, smp.value, None))
+            .collect();
+
+        (
+            (merge_results, merged.iter().collect()),
+            (sequential_results, sequential.iter().collect()),
+        )
+    }
+
+    fn ignoring_series(retention_ms: u64) -> TimeSeries {
+        let mut series = TimeSeries {
+            retention: Duration::from_millis(retention_ms),
+            ..Default::default()
+        };
+        series.sample_duplicates.policy = Some(DuplicatePolicy::KeepLast);
+        series.sample_duplicates.max_time_delta = 100;
+        series.sample_duplicates.max_value_delta = 1.0;
+        series
+    }
+
+    /// An item is in order (and so subject to IGNORE) by the items before it in argument order,
+    /// not by timestamp order: here 1000 arrives after 1002 and is an upsert, which IGNORE never
+    /// filters. Deciding IGNORE in sorted order dropped 1002 instead.
+    #[test]
+    fn madd_decides_ignore_in_argument_order() {
+        let series = ignoring_series(0);
+        let batch = [s(1002, 1.0), s(1000, 1.0)];
+
+        let (merged, sequential) = madd_vs_sequential(&series, &batch);
+
+        assert_eq!(
+            sequential.0,
+            vec![SampleAddResult::Ok(batch[0]), SampleAddResult::Ok(batch[1])]
+        );
+        assert_eq!(sequential.1, vec![s(1000, 1.0), s(1002, 1.0)]);
+        assert_eq!(merged, sequential);
+    }
+
+    /// An ignored item stores nothing, so it must not raise the retention floor: 960 is within
+    /// 50 ms of the stored 1000, whatever the ignored 1040 would have implied.
+    #[test]
+    fn madd_ignored_items_do_not_raise_the_retention_floor() {
+        let mut series = ignoring_series(50);
+        series.add(1000, 1.0, None);
+        let batch = [s(1040, 1.0), s(960, 5.0)];
+
+        let (merged, sequential) = madd_vs_sequential(&series, &batch);
+
+        assert_eq!(
+            sequential.0,
+            vec![
+                SampleAddResult::Ignored(1000),
+                SampleAddResult::Ok(batch[1])
+            ]
+        );
+        assert_eq!(sequential.1, vec![s(960, 5.0), s(1000, 1.0)]);
+        assert_eq!(merged, sequential);
+    }
+
+    /// An upsert onto the last sample leaves the policy-resolved value as the IGNORE baseline:
+    /// a NaN under LAST keeps the stored 1, so 1001 is within the IGNORE bounds of it.
+    /// Tracking the NaN input instead accepted 1001.
+    #[test]
+    fn madd_nan_upsert_keeps_the_stored_value_as_the_ignore_baseline() {
+        let mut series = ignoring_series(0);
+        series.add(1000, 1.0, None);
+        let batch = [s(1000, f64::NAN), s(1001, 1.0)];
+
+        let (merged, sequential) = madd_vs_sequential(&series, &batch);
+
+        assert_eq!(sequential.0[1], SampleAddResult::Ignored(1000));
+        assert_eq!(sequential.1, vec![s(1000, 1.0)]);
+        assert_eq!(merged.0[1], sequential.0[1]);
+        assert_eq!(merged.1, sequential.1);
+    }
+
+    /// Seeded batches over every duplicate policy, with and without IGNORE and retention, in
+    /// arbitrary argument order: the merge path must answer and store exactly what sequential
+    /// adds do.
+    #[test]
+    fn madd_merge_matches_sequential_adds() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let policies = [
+            DuplicatePolicy::Block,
+            DuplicatePolicy::KeepFirst,
+            DuplicatePolicy::KeepLast,
+            DuplicatePolicy::Min,
+            DuplicatePolicy::Max,
+            DuplicatePolicy::Sum,
+        ];
+
+        for case in 0..5_000 {
+            let mut series = TimeSeries {
+                retention: Duration::from_millis([0, 50, 500][next(3) as usize]),
+                ..Default::default()
+            };
+            series.sample_duplicates.policy = Some(policies[next(6) as usize]);
+            if next(2) == 0 {
+                series.sample_duplicates.max_time_delta = 100;
+                series.sample_duplicates.max_value_delta = 1.0;
+            }
+            for _ in 0..next(5) {
+                series.add(900 + 20 * next(10) as i64, next(4) as f64, None);
+            }
+
+            // Distinct timestamps: a batch with repeats takes the sequential path anyway.
+            let mut timestamps: Vec<i64> = Vec::new();
+            // Often upsert onto the last sample first: it moves the IGNORE baseline to whatever
+            // the policy stores there, which later in-order items are compared against.
+            let lead_upsert = series.last_sample.is_some() && next(3) == 0;
+            if let Some(last) = series.last_sample.filter(|_| lead_upsert) {
+                timestamps.push(last.timestamp);
+            }
+            for _ in 0..2 + next(10) {
+                let ts = 800 + 10 * next(40) as i64;
+                if !timestamps.contains(&ts) {
+                    timestamps.push(ts);
+                }
+            }
+            if timestamps.len() < 2 {
+                continue;
+            }
+            let mut batch: Vec<Sample> = timestamps
+                .iter()
+                .map(|&ts| {
+                    let value = match next(8) {
+                        0 => f64::NAN,
+                        v => v as f64 * 0.375,
+                    };
+                    s(ts, value)
+                })
+                .collect();
+            // The generator's consecutive draws are correlated; pick the leading upsert's value
+            // on its own so it is a NaN often enough (NaN under LAST keeps the stored value).
+            if lead_upsert && next(2) == 0 {
+                batch[0].value = f64::NAN;
+            }
+
+            let (merged, sequential) = madd_vs_sequential(&series, &batch);
+            // `Ok` carries the stored (merged) value on the merge path and the input value on
+            // the sequential one; compare what was decided, not that payload.
+            let decided = |results: &[SampleAddResult]| -> Vec<SampleAddResult> {
+                results
+                    .iter()
+                    .map(|r| match r {
+                        SampleAddResult::Ok(smp) => SampleAddResult::Ok(s(smp.timestamp, 0.0)),
+                        other => *other,
+                    })
+                    .collect()
+            };
+            // NaN is stored as-is under some policies; compare it by bit pattern.
+            let stored = |samples: &[Sample]| -> Vec<(i64, u64)> {
+                samples
+                    .iter()
+                    .map(|smp| (smp.timestamp, smp.value.to_bits()))
+                    .collect()
+            };
+            assert_eq!(
+                (decided(&merged.0), stored(&merged.1)),
+                (decided(&sequential.0), stored(&sequential.1)),
+                "case {case}: policy {:?}, ignore ({}, {}), retention {:?}, stored {:?}, batch {batch:?}",
+                series.sample_duplicates.policy,
+                series.sample_duplicates.max_time_delta,
+                series.sample_duplicates.max_value_delta,
+                series.retention,
+                series.iter().collect::<Vec<_>>(),
+            );
         }
     }
 }

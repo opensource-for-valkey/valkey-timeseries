@@ -295,6 +295,11 @@ impl SampleDuplicatePolicy {
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum SampleAddResult {
+    /// The sample was accepted. Its timestamp is where it was stored. Its value is the rounded
+    /// input for an append, but is unspecified for an upsert into an existing timestamp: the
+    /// bulk merge path reports the policy-merged value, single adds report the rounded input.
+    /// Nothing may depend on which — replies carry only the timestamp, and compaction re-reads
+    /// an upserted bucket from the source (`ingest_ignores_the_value_reported_for_an_upsert`).
     Ok(Sample),
     #[default]
     Duplicate,

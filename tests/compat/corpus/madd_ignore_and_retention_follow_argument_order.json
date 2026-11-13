@@ -1,0 +1,14 @@
+{
+  "description": "TS.MADD applies IGNORE and the retention floor item by item in argument order. An item older than the previous one is an upsert that IGNORE never filters, even when it would be a near-duplicate in timestamp order; an ignored item stores nothing, so it does not raise the retention floor for the items after it (black-box probe, 2026-11-13).",
+  "origin": "manual reproducer",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "mi:a", "DUPLICATE_POLICY", "LAST", "IGNORE", "100", "1"],
+    ["TS.MADD", "mi:a", "1002", "1", "mi:a", "1000", "1"],
+    ["TS.RANGE", "mi:a", "-", "+"],
+    ["TS.CREATE", "mi:b", "RETENTION", "50", "DUPLICATE_POLICY", "LAST", "IGNORE", "100", "1"],
+    ["TS.ADD", "mi:b", "1000", "1"],
+    ["TS.MADD", "mi:b", "1040", "1", "mi:b", "960", "5"],
+    ["TS.RANGE", "mi:b", "-", "+"]
+  ]
+}

@@ -2,7 +2,7 @@ use crate::commands::ts_create::parse_series_options;
 use crate::common::Sample;
 use crate::common::replies::{reply_with_array, reply_with_integer};
 use crate::series::{
-    DuplicatePolicy, IngestedSamples, TimeSeries, bulk_insert_samples, create_and_store_series,
+    DuplicatePolicy, TimeSeries, bulk_insert_samples, create_and_store_series, parse_bulk_payload,
     try_get_timeseries_mut,
 };
 use valkey_module::{AclPermissions, Context, ValkeyResult, ValkeyString, ValkeyValue};
@@ -38,21 +38,22 @@ pub fn ts_addbulk_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 
     let key = args[1].clone();
-    // I don't like the copying here, but we need a mutable buffer
-    let samples = {
-        let data = args[2].as_slice();
-        let mut buf = data.to_vec();
-        let sample_data = IngestedSamples::from_json_lines(&mut buf)?;
-        sample_data.samples
-    };
+    // simd_json parses in place, so the payload needs a buffer of its own.
+    let mut payload = args[2].as_slice().to_vec();
 
     // `TS.ADDBULK key data [options]`: options start at index 3.
     let options = parse_series_options(args, 3, &[])?;
     let on_duplicate = options.on_duplicate;
 
+    // The key is checked (type, ACL) before the payload is parsed, so a caller who may not
+    // write the key learns that rather than whether its payload parses.
     if let Some(mut guard) = try_get_timeseries_mut(ctx, &key, Some(AclPermissions::UPDATE))? {
+        let samples = parse_bulk_payload(&mut payload)?;
         return process_series(ctx, &mut guard, samples, on_duplicate);
     }
+
+    // Parsed before the series is created, so a bad payload leaves no empty series behind.
+    let samples = parse_bulk_payload(&mut payload)?;
 
     // Auto-create: no ts.create event. The create helper replicates the new series as a resolved
     // `TS.CREATE`, as for the TS.ADD family; this command then replicates itself.
@@ -83,9 +84,9 @@ fn handle_ingest(
     on_duplicate: Option<DuplicatePolicy>,
 ) -> ValkeyResult {
     let sample_count = samples.len();
-    let duplicate_policy = series.sample_duplicates.resolve_policy(on_duplicate);
 
-    let results = bulk_insert_samples(ctx, series, &samples, Some(duplicate_policy));
+    // The override is resolved against the series' policy inside the merge.
+    let results = bulk_insert_samples(ctx, series, &samples, on_duplicate);
 
     let success_count = results.iter().filter(|res| res.is_ok()).count();
 
