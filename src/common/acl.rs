@@ -752,7 +752,9 @@ fn resolve_api<F: Copy>(name: &std::ffi::CStr) -> Option<F> {
 /// database before anything else, and the server reports a database denial only when every
 /// selector refused on it (it is the lowest-ranked reason), so any other answer means some
 /// selector grants `db`. Like the per-key checks, this is not tied to one selector: a user
-/// granted `db` by one selector and a key by another passes both.
+/// granted `db` by one selector and the command or a key by another passes. That is accepted:
+/// the module assumes a user's rules are the same on every node, so this is a safeguard
+/// against an obvious mismatch, not a full re-check of the shard's rules.
 pub(crate) fn check_db_access(ctx: &Context, db: i32) -> ValkeyResult<()> {
     // Before the probe: its first use creates a server string.
     check_holds_gil();
