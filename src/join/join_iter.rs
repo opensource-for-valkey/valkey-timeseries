@@ -7,14 +7,14 @@ use itertools::{EitherOrBoth, Itertools};
 /// Every exact-timestamp join is one sorted merge (`merge_join_by`) filtered to the rows the
 /// join type keeps. A series holds at most one sample per timestamp, so the merge pairs
 /// samples one-to-one, and SEMI is INNER keeping only the left side.
-pub fn create_join_iter<L, R>(
+pub fn create_join_iter<'a, L, R>(
     left: impl IntoIterator<Item = Sample, IntoIter = L>,
     right: impl IntoIterator<Item = Sample, IntoIter = R>,
     join_type: JoinType,
-) -> Box<dyn Iterator<Item = JoinValue>>
+) -> Box<dyn Iterator<Item = JoinValue> + 'a>
 where
-    L: Iterator<Item = Sample> + 'static,
-    R: Iterator<Item = Sample> + 'static,
+    L: Iterator<Item = Sample> + 'a,
+    R: Iterator<Item = Sample> + 'a,
 {
     let keep: fn(JoinValue) -> Option<JoinValue> = match join_type {
         JoinType::AsOf(options) => {

@@ -9,6 +9,7 @@ mod tests {
     };
     use crate::series::TimeSeries;
     use crate::series::request_types::AggregationOptions;
+    use crate::series::types::ValueFilter;
     use itertools::EitherOrBoth;
     use std::time::Duration;
     use valkey_module::ValkeyResult;
@@ -1164,5 +1165,105 @@ mod tests {
             .map(|v| get_left_sample(v).timestamp)
             .collect();
         assert_eq!(timestamps, vec![20, 40]);
+    }
+
+    fn series(points: impl IntoIterator<Item = (i64, f64)>) -> TimeSeries {
+        let mut series = TimeSeries::new();
+        for (ts, value) in points {
+            assert!(series.add(ts, value, None).is_ok());
+        }
+        series
+    }
+
+    fn left_timestamps(result: JoinResultType) -> Vec<i64> {
+        let JoinResultType::Values(values) = result else {
+            panic!("Expected Values result type");
+        };
+        values
+            .iter()
+            .map(|v| v.as_ref().left().expect("left side").timestamp)
+            .collect()
+    }
+
+    #[test]
+    fn test_filters_apply_to_both_inputs() {
+        let left = series((0..10).map(|i| (i * 10, i as f64)));
+        let right = series((0..10).map(|i| (i * 10, (i * 10) as f64)));
+        let mut options = create_basic_options();
+        options.join_type = JoinType::Left;
+
+        // FILTER_BY_TS: only the listed timestamps, on both sides; unlisted and out-of-range
+        // timestamps are ignored.
+        options.timestamp_filter = Some(vec![30, 10, 55, 70, 10_000]);
+        assert_eq!(
+            left_timestamps(process_join(&left, &right, &options).unwrap()),
+            vec![10, 30, 70]
+        );
+
+        // FILTER_BY_VALUE [2, 50] on both sides: the left keeps timestamps 20..=90 (values
+        // 2..=9), the right 10..=50 (values 10..=50), so LEFT rows 60..=90 have no right sample.
+        options.timestamp_filter = None;
+        options.value_filter = Some(ValueFilter::new(2.0, 50.0).unwrap());
+        let JoinResultType::Values(values) = process_join(&left, &right, &options).unwrap() else {
+            panic!("Expected Values result type");
+        };
+        let rows: Vec<(i64, bool)> = values
+            .iter()
+            .map(|v| (v.as_ref().left().unwrap().timestamp, v.has_right()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (20, true),
+                (30, true),
+                (40, true),
+                (50, true),
+                (60, false),
+                (70, false),
+                (80, false),
+                (90, false)
+            ]
+        );
+
+        // Both filters together.
+        options.timestamp_filter = Some(vec![10, 20, 90]);
+        assert_eq!(
+            left_timestamps(process_join(&left, &right, &options).unwrap()),
+            vec![20, 90]
+        );
+    }
+
+    #[test]
+    fn test_parallel_and_lazy_decoding_agree() {
+        // Enough samples that a join without COUNT decodes both inputs in parallel; with COUNT
+        // it decodes lazily. Both must give the same rows.
+        let n = 20_000;
+        let left = series((0..n).map(|i| (i * 2, i as f64)));
+        let right = series((0..n).map(|i| (i * 3, -(i as f64))));
+        for join_type in [
+            JoinType::Inner,
+            JoinType::Full,
+            JoinType::Semi,
+            JoinType::Anti,
+            JoinType::AsOf(AsOfJoinOptions {
+                strategy: AsOfJoinStrategy::Nearest,
+                tolerance: None,
+                allow_exact_match: false,
+            }),
+        ] {
+            let mut options = create_basic_options();
+            options.join_type = join_type;
+            let JoinResultType::Values(parallel) = process_join(&left, &right, &options).unwrap()
+            else {
+                panic!("Expected Values result type");
+            };
+            options.count = Some(usize::MAX);
+            let JoinResultType::Values(lazy) = process_join(&left, &right, &options).unwrap()
+            else {
+                panic!("Expected Values result type");
+            };
+            assert!(!parallel.is_empty(), "{join_type:?}");
+            assert_eq!(parallel, lazy, "{join_type:?}");
+        }
     }
 }

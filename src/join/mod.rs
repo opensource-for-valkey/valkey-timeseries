@@ -18,7 +18,7 @@ mod join_handler_tests;
 
 pub use asof::AsOfJoinStrategy;
 use asof::JoinAsOfIter;
-pub use join_handler::{JoinResultType, process_join};
+pub use join_handler::{JoinInputs, JoinResultType};
 use join_iter::create_join_iter;
 pub use join_reducer::JoinReducer;
 

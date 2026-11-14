@@ -907,3 +907,52 @@ class TestTSJoin(ValkeyTimeSeriesTestCaseBase):
                                              'AGGREGATION', 'last', 25, 'EMPTY')
 
         assert result == [[0, b'2'], [25, b'2'], [50, b'2'], [75, b'2'], [100, b'4']]
+
+    def _fill(self, key, timestamps, value):
+        pipe = self.client.pipeline(transaction=False)
+        for ts in timestamps:
+            pipe.execute_command("TS.ADD", key, ts, value(ts))
+        pipe.execute()
+
+    def test_large_join_answers_from_the_analysis_lane(self):
+        """A join over more than the inline budget (65,536 samples) is answered from the
+        analysis lane; inside MULTI, where the client cannot block, it runs inline. Both
+        must give the same answer as a small join would."""
+        n = 40_000
+        self._fill("big:l", range(0, 2 * n, 2), lambda ts: ts)
+        self._fill("big:r", range(0, 3 * n, 3), lambda ts: -ts)
+
+        result = self.client.execute_command("TS.JOIN", "big:l", "big:r", "-", "+", "REDUCE", "sum")
+        # Common timestamps are the multiples of 6 below 2n; every sum is ts + (-ts) = 0.
+        expected = list(range(0, 2 * n, 6))
+        assert [row[0] for row in result] == expected
+        assert all(float(row[1]) == 0 for row in result)
+
+        limited = self.client.execute_command(
+            "TS.JOIN", "big:l", "big:r", "-", "+", "COUNT", 3, "REDUCE", "sum")
+        assert [row[0] for row in limited] == expected[:3]
+
+        pipe = self.client.pipeline(transaction=True)
+        pipe.execute_command("TS.JOIN", "big:l", "big:r", "-", "+", "REDUCE", "sum")
+        (in_multi,) = pipe.execute()
+        assert in_multi == result
+
+    def test_join_on_wrong_type_key(self):
+        self.client.execute_command("TS.ADD", "wt:ts", 10, 1)
+        self.client.execute_command("SET", "wt:str", "hello")
+        for left, right in (("wt:ts", "wt:str"), ("wt:str", "wt:ts")):
+            with pytest.raises(ResponseError, match="WRONGTYPE|not a TSDB key"):
+                self.client.execute_command("TS.JOIN", left, right, "-", "+")
+
+    def test_join_requires_read_access_to_both_keys(self):
+        for key in ("acl:allowed:a", "acl:allowed:b", "acl:denied:b"):
+            self.client.execute_command("TS.ADD", key, 10, 1)
+        self.client.execute_command(
+            "ACL", "SETUSER", "join_reader", "ON", ">pw", "+@all", "resetkeys", "%R~acl:allowed:*")
+        client = self.server.get_new_client()
+        client.execute_command("AUTH", "join_reader", "pw")
+
+        assert len(client.execute_command("TS.JOIN", "acl:allowed:a", "acl:allowed:b", "-", "+")) == 1
+        for left, right in (("acl:allowed:a", "acl:denied:b"), ("acl:denied:b", "acl:allowed:a")):
+            with pytest.raises(ResponseError, match="No permissions to access a key|NOPERM"):
+                client.execute_command("TS.JOIN", left, right, "-", "+")

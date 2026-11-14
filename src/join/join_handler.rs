@@ -1,12 +1,14 @@
 use crate::aggregators::AggregateIterator;
-use crate::common::threads::join;
+use crate::common::threads::{join, request_par_threads};
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::join::join_reducer::ReducerFn;
 use crate::join::{JoinOptions, JoinValue, create_join_iter};
-use crate::series::TimeSeries;
-use itertools::EitherOrBoth;
-use valkey_module::ValkeyResult;
+use crate::series::chunks::utils::filter_timestamp_slice;
+use crate::series::types::ValueFilter;
+use crate::series::{RangeSnapshot, TimeSeries};
+use itertools::{Either, EitherOrBoth};
+use valkey_module::{ValkeyError, ValkeyResult};
 
 /// The result of a join: scalar samples (reduced, or aggregated) or raw joined rows.
 pub enum JoinResultType {
@@ -14,29 +16,128 @@ pub enum JoinResultType {
     Values(Vec<JoinValue>),
 }
 
-pub fn process_join(
+/// Joins two series on the calling thread: [`JoinInputs::read`], then [`JoinInputs::join`].
+#[cfg(test)]
+pub(super) fn process_join(
     left_series: &TimeSeries,
     right_series: &TimeSeries,
     options: &JoinOptions,
 ) -> ValkeyResult<JoinResultType> {
-    options.validate()?;
-    // One clock reading per command, so `*` and relative bounds resolve identically for both
-    // inputs and for aggregation alignment.
-    let now = current_time_millis();
-    let (left_samples, right_samples) = join(
-        || fetch_samples(left_series, options, now),
-        || fetch_samples(right_series, options, now),
-    );
-    Ok(join_samples(left_samples, right_samples, options, now))
+    Ok(JoinInputs::read(left_series, right_series, options)?.join(options))
 }
 
-/// Joins two already-fetched, timestamp-sorted inputs. `options` must have been validated.
-pub(super) fn join_samples(
-    left: Vec<Sample>,
-    right: Vec<Sample>,
+/// Both inputs of a join, copied out of their series so the join can run after the series are
+/// released — on another thread if need be.
+pub struct JoinInputs {
+    left: JoinInput,
+    right: JoinInput,
+    /// The request time `*` and relative bounds were resolved against, reused for aggregation
+    /// alignment so one command sees one clock.
+    now: Timestamp,
+}
+
+enum JoinInput {
+    /// `FILTER_BY_TS`: the samples at the listed timestamps, already value-filtered. Point
+    /// lookups, so proportional to the filter rather than to the window.
+    Samples(Vec<Sample>),
+    /// The window's chunks, decoded as the join consumes them.
+    Range(RangeSnapshot),
+}
+
+impl JoinInputs {
+    /// Validates `options` and copies what the join needs from both series. Cheap compared to
+    /// the join: chunks are copied compressed, and decoded later.
+    pub fn read(
+        left_series: &TimeSeries,
+        right_series: &TimeSeries,
+        options: &JoinOptions,
+    ) -> ValkeyResult<Self> {
+        options.validate()?;
+        let now = current_time_millis();
+        Ok(Self {
+            left: JoinInput::read(left_series, options, now)?,
+            right: JoinInput::read(right_series, options, now)?,
+            now,
+        })
+    }
+
+    /// An upper bound on the samples the join reads.
+    pub fn estimated_samples(&self) -> usize {
+        self.left.estimated_samples() + self.right.estimated_samples()
+    }
+
+    pub fn join(&self, options: &JoinOptions) -> JoinResultType {
+        let filter = options.value_filter;
+        // Under COUNT the join usually needs only a prefix of each input, so decode lazily, as
+        // the merge consumes samples. Otherwise every sample is read anyway: decode both
+        // inputs in parallel when there are enough of them to pay for the pool round trip.
+        if options.count.is_none() && request_par_threads(2, self.estimated_samples()) != 1 {
+            let (left, right) = join(
+                || self.left.samples(filter).collect::<Vec<_>>(),
+                || self.right.samples(filter).collect::<Vec<_>>(),
+            );
+            join_samples(left, right, options, self.now)
+        } else {
+            join_samples(
+                self.left.samples(filter),
+                self.right.samples(filter),
+                options,
+                self.now,
+            )
+        }
+    }
+}
+
+impl JoinInput {
+    fn read(series: &TimeSeries, options: &JoinOptions, now: Timestamp) -> ValkeyResult<Self> {
+        // Both branches clamp the start to the retention floor themselves.
+        let (start, end) = options
+            .date_range
+            .get_series_range(series, Some(now), false);
+        let Some(timestamps) = &options.timestamp_filter else {
+            return Ok(JoinInput::Range(series.snapshot_range(start, end)));
+        };
+        let start = start.max(series.get_min_timestamp());
+        let mut samples = series
+            .samples_by_timestamps(&filter_timestamp_slice(timestamps, start, end))
+            .map_err(|e| ValkeyError::String(format!("TSDB: {e}")))?;
+        if let Some(filter) = options.value_filter {
+            samples.retain(|s| filter.is_match(s.value));
+        }
+        Ok(JoinInput::Samples(samples))
+    }
+
+    fn estimated_samples(&self) -> usize {
+        match self {
+            JoinInput::Samples(samples) => samples.len(),
+            JoinInput::Range(snapshot) => snapshot.estimated_samples(),
+        }
+    }
+
+    fn samples(&self, filter: Option<ValueFilter>) -> impl Iterator<Item = Sample> + '_ {
+        match self {
+            // Already value-filtered by `read`.
+            JoinInput::Samples(samples) => Either::Left(samples.iter().copied()),
+            JoinInput::Range(snapshot) => Either::Right(
+                snapshot
+                    .sample_iter(false)
+                    .filter(move |s| filter.is_none_or(|f| f.is_match(s.value))),
+            ),
+        }
+    }
+}
+
+/// Joins two timestamp-sorted inputs. `options` must have been validated.
+pub(super) fn join_samples<'a, L, R>(
+    left: impl IntoIterator<Item = Sample, IntoIter = L>,
+    right: impl IntoIterator<Item = Sample, IntoIter = R>,
     options: &JoinOptions,
     now: Timestamp,
-) -> JoinResultType {
+) -> JoinResultType
+where
+    L: Iterator<Item = Sample> + 'a,
+    R: Iterator<Item = Sample> + 'a,
+{
     let rows = create_join_iter(left, right, options.join_type);
 
     // COUNT limits the rows (or, with AGGREGATION, the buckets) the join returns. It is applied
@@ -76,15 +177,4 @@ fn project(row: &JoinValue, f: ReducerFn) -> Sample {
         EitherOrBoth::Left(l) => Sample::new(l.timestamp, f(l.value, f64::NAN)),
         EitherOrBoth::Right(r) => Sample::new(r.timestamp, f(f64::NAN, r.value)),
     }
-}
-
-fn fetch_samples(ts: &TimeSeries, options: &JoinOptions, now: Timestamp) -> Vec<Sample> {
-    // `get_range_filtered` clamps the start to the retention floor itself.
-    let (start, end) = options.date_range.get_series_range(ts, Some(now), false);
-    ts.get_range_filtered(
-        start,
-        end,
-        options.timestamp_filter.as_deref(),
-        options.value_filter,
-    )
 }
