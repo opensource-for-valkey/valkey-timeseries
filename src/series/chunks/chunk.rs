@@ -121,11 +121,13 @@ fn parse_encoding(encoding: &str) -> Option<ChunkEncoding> {
 ///   always `SAMPLE_SIZE`.
 /// - `TimeSeriesChunk::utilization` and `estimate_remaining_sample_capacity` derive from
 ///   the above.
-/// - Two split rules exist. The upsert path splits a chunk once
+/// - Two split rules exist. The upsert path splits a chunk before inserting once
 ///   `utilization() >= SPLIT_FACTOR` (1.2), via `TimeSeriesChunk::should_split`. The merge
-///   path splits once `is_full() && size() > max + max / SPLIT_SLACK_DIVISOR` (just over
-///   1.25), via `TimeSeries::needs_split`. The thresholds are nearly equal and no reason for
-///   keeping two is recorded; they are a candidate for unification.
+///   path splits once `size() > max + max / SPLIT_SLACK_DIVISOR` (just over 1.25), via
+///   `TimeSeries::needs_split`, and the upsert path applies that rule too after inserting:
+///   a sample inserted mid-chunk re-encodes the ones after it, so a chunk under 1.2 before
+///   an upsert can end far past its budget after it. The thresholds are nearly equal and no
+///   reason for keeping two is recorded; they are a candidate for unification.
 #[enum_dispatch]
 pub trait ChunkOps {
     /// The chunk's samples with timestamps in `[start, end]`, ascending. A decode error ends

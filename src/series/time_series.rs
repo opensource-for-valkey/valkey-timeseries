@@ -467,6 +467,7 @@ impl TimeSeries {
                     self.update_last_sample();
                 }
                 self.first_timestamp = sample.timestamp.min(self.first_timestamp);
+                self.split_if_grown(target_idx..target_idx + 1);
             }
             return res;
         }
@@ -511,10 +512,30 @@ impl TimeSeries {
                 // The insert above shifts chunk positions, so recompute both ends rather than
                 // relying on the pre-split `is_last`.
                 self.update_first_last_timestamps();
+                // The sample went into one of the two halves, which sit side by side.
+                self.split_if_grown(target_idx..target_idx + 2);
 
                 SampleAddResult::Ok(sample)
             }
             Err(_) => SampleAddResult::Error(error_consts::CHUNK_SPLIT),
+        }
+    }
+
+    /// After an upsert into the chunks at `touched`: split as a merge would if one grew past
+    /// [`Self::needs_split`]. An insert into the middle of a compressed chunk re-encodes the
+    /// samples after it as well, so one sample can grow a chunk by more than a sample's worth
+    /// — 70 bytes on a 48-byte Gorilla budget — and the pre-insert `should_split` cannot see
+    /// that coming. The sample is stored either way, so a failed split only leaves the chunk
+    /// oversized and is logged, as after a merge.
+    fn split_if_grown(&mut self, touched: std::ops::Range<usize>) {
+        let end = touched.end.min(self.chunks.len());
+        let start = touched.start.min(end);
+        if !self.chunks[start..end].iter().any(Self::needs_split) {
+            return;
+        }
+        if let Err(e) = self.split_chunks_if_needed() {
+            let key = crate::common::context::key_for_display(&self.key);
+            logging::log_warning(format!("TSDB: failed to split chunks for key '{key}': {e}"));
         }
     }
 

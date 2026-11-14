@@ -761,3 +761,33 @@ fn oversized_chunks_are_rejected() {
     series.recalculate_total_samples();
     assert!(check_series_invariants(&series).is_err());
 }
+
+/// A sample backfilled into the middle of a compressed chunk re-encodes the samples after it
+/// too, so one `TS.ADD` into the past can grow a chunk by more than one sample: here 70 bytes,
+/// taking a 48-byte Gorilla chunk from 56 to 126 bytes. Shrunk from
+/// `command_sequences_stay_loadable`.
+#[test]
+fn a_backfill_into_the_middle_of_a_chunk_keeps_it_in_budget() {
+    for encoding in ENCODINGS {
+        let mut ts = new_series(encoding, 48);
+        for op in [
+            Op::Backfill {
+                back: 0,
+                value: 1.5,
+            },
+            Op::Merge {
+                start: 0,
+                span: 35904,
+                count: 187,
+                noisy: false,
+            },
+            Op::Backfill {
+                back: 2113,
+                value: 616349.9743749496,
+            },
+        ] {
+            apply(&mut ts, 0, &op);
+        }
+        assert_loadable(&ts);
+    }
+}

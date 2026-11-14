@@ -240,14 +240,17 @@ class TestDebug(ValkeyTimeSeriesTestCaseBase):
 
     def test_digest_survives_dump_restore_of_overfull_chunk(self):
         """A lossless DUMP/RESTORE must not change the digest, even when an out-of-order
-        insert left an uncompressed chunk past its capacity (the load normalizes it)."""
+        insert left an uncompressed chunk past its capacity (the load normalizes it).
+
+        64 bytes holds four samples. The fifth, out of order, takes the chunk to 80 bytes:
+        past its capacity, but not past the split line (64 + 64 / 4), so it stays one chunk."""
         key = 'ts_overfull'
-        self.client.execute_command('TS.CREATE', key, 'ENCODING', 'UNCOMPRESSED', 'CHUNK_SIZE', 48)
-        for ts in (10, 20, 30, 15):
+        self.client.execute_command('TS.CREATE', key, 'ENCODING', 'UNCOMPRESSED', 'CHUNK_SIZE', 64)
+        for ts in (10, 20, 30, 40, 15):
             self.client.execute_command('TS.ADD', key, ts, ts)
 
         info = self.ts_info(key, debug=True)
-        assert info['chunks'][0]['samples'] == 4, "setup should leave one overfull chunk"
+        assert info['chunks'][0]['samples'] == 5, "setup should leave one overfull chunk"
 
         restored = 'ts_overfull_restored'
         self.client.restore(restored, 0, self.client.dump(key))
