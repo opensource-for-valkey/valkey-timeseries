@@ -941,6 +941,19 @@ impl TimeSeries {
         SeriesSampleIterator::new(self, start, end, false)
     }
 
+    /// Samples in the chunks `[start, end]` touches, without copying or decoding them: what
+    /// [`RangeSnapshot::estimated_samples`] would report for the same window.
+    pub fn estimated_range_samples(&self, start: Timestamp, end: Timestamp) -> usize {
+        let start = start.max(self.get_min_timestamp());
+        if start > end || !self.overlaps(start, end) {
+            return 0;
+        }
+        self.get_chunk_index_bounds(start, end)
+            .map_or(0, |(first, last)| {
+                self.chunks[first..=last].iter().map(|c| c.len()).sum()
+            })
+    }
+
     /// Copy the chunks `[start, end]` touches, for decoding after this series
     /// is no longer borrowed. See [`RangeSnapshot`]. Ported from the promql
     /// branch (9c845860e) for the deferred TS.MRANGE experiment.

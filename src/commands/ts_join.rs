@@ -49,17 +49,17 @@ pub fn ts_join_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::Str(error_consts::DUPLICATE_JOIN_KEYS));
     }
 
-    // A missing key is an error here, not an empty join. The inputs are copied out while the
-    // series are open; the join itself runs after they are released.
-    let inputs = {
-        let left_series = get_timeseries(ctx, &left_key, Some(AclPermissions::ACCESS))?;
-        let right_series = get_timeseries(ctx, &right_key, Some(AclPermissions::ACCESS))?;
-        JoinInputs::read(&left_series, &right_series, &options)?
-    };
+    // A missing key is an error here, not an empty join.
+    let left_series = get_timeseries(ctx, &left_key, Some(AclPermissions::ACCESS))?;
+    let right_series = get_timeseries(ctx, &right_key, Some(AclPermissions::ACCESS))?;
+    let inputs = JoinInputs::read(&left_series, &right_series, &options)?;
 
     // A large join answers from the analysis lane, so it does not hold the main thread for the
-    // decode. A client that cannot block (MULTI, a script, a module call) is answered inline.
+    // decode: the windows are copied out here, while the series are open, and joined there.
+    // A client that cannot block (MULTI, a script, a module call) is answered inline.
     if inputs.estimated_samples() > INLINE_JOIN_SAMPLES && !is_blocking_denied(ctx) {
+        // Owns copies of both windows: nothing in the job borrows the series.
+        let inputs = inputs.into_owned();
         return run_on_analysis_lane(ctx, "TS.JOIN", move |thread_ctx| {
             reply_with_join_result(thread_ctx, &inputs.join(&options));
         });
@@ -68,8 +68,9 @@ pub fn ts_join_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     Ok(ValkeyValue::NoReply)
 }
 
-/// Samples a join reads before it moves to the analysis lane. Inline, that is well under a
-/// millisecond of decode and merge; the lane hand-off costs tens of microseconds.
+/// Samples a join reads before it moves to the analysis lane. Inline, a join of that size
+/// takes about 0.6 ms (`benches/join.rs`, `join/end_to_end`: ~9 ns per input sample); the
+/// lane hand-off costs tens of microseconds.
 const INLINE_JOIN_SAMPLES: usize = 65_536;
 
 fn reply_with_join_result<C: IntoRawCtx + Copy>(ctx: C, result: &JoinResultType) {

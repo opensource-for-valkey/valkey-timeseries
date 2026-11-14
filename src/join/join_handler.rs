@@ -26,30 +26,36 @@ pub(super) fn process_join(
     Ok(JoinInputs::read(left_series, right_series, options)?.join(options))
 }
 
-/// Both inputs of a join, copied out of their series so the join can run after the series are
-/// released — on another thread if need be.
-pub struct JoinInputs {
-    left: JoinInput,
-    right: JoinInput,
+/// Both inputs of a join. [`Self::read`] borrows the open series and copies nothing;
+/// [`Self::into_owned`] copies the windows out, for a join that runs after the series are
+/// released — on another thread.
+pub struct JoinInputs<'a> {
+    left: JoinInput<'a>,
+    right: JoinInput<'a>,
     /// The request time `*` and relative bounds were resolved against, reused for aggregation
     /// alignment so one command sees one clock.
     now: Timestamp,
 }
 
-enum JoinInput {
+enum JoinInput<'a> {
     /// `FILTER_BY_TS`: the samples at the listed timestamps, already value-filtered. Point
     /// lookups, so proportional to the filter rather than to the window.
     Samples(Vec<Sample>),
-    /// The window's chunks, decoded as the join consumes them.
-    Range(RangeSnapshot),
+    /// A window of a series that is still open, read in place.
+    Live {
+        series: &'a TimeSeries,
+        start: Timestamp,
+        end: Timestamp,
+    },
+    /// A copy of a window's chunks, decoded as the join consumes them.
+    Snapshot(RangeSnapshot),
 }
 
-impl JoinInputs {
-    /// Validates `options` and copies what the join needs from both series. Cheap compared to
-    /// the join: chunks are copied compressed, and decoded later.
+impl<'a> JoinInputs<'a> {
+    /// Validates `options` and resolves both windows against one clock reading.
     pub fn read(
-        left_series: &TimeSeries,
-        right_series: &TimeSeries,
+        left_series: &'a TimeSeries,
+        right_series: &'a TimeSeries,
         options: &JoinOptions,
     ) -> ValkeyResult<Self> {
         options.validate()?;
@@ -61,6 +67,16 @@ impl JoinInputs {
         })
     }
 
+    /// Copies both windows out of their series. Cheap compared to the join: chunks are copied
+    /// compressed, and decoded later.
+    pub fn into_owned(self) -> JoinInputs<'static> {
+        JoinInputs {
+            left: self.left.into_owned(),
+            right: self.right.into_owned(),
+            now: self.now,
+        }
+    }
+
     /// An upper bound on the samples the join reads.
     pub fn estimated_samples(&self) -> usize {
         self.left.estimated_samples() + self.right.estimated_samples()
@@ -70,7 +86,8 @@ impl JoinInputs {
         let filter = options.value_filter;
         // Under COUNT the join usually needs only a prefix of each input, so decode lazily, as
         // the merge consumes samples. Otherwise every sample is read anyway: decode both
-        // inputs in parallel when there are enough of them to pay for the pool round trip.
+        // inputs in parallel when there are enough of them to pay for the pool round trip
+        // (break-even at about 4,096 samples, `benches/join.rs`, `join/decode`).
         if options.count.is_none() && request_par_threads(2, self.estimated_samples()) != 1 {
             let (left, right) = join(
                 || self.left.samples(filter).collect::<Vec<_>>(),
@@ -88,14 +105,14 @@ impl JoinInputs {
     }
 }
 
-impl JoinInput {
-    fn read(series: &TimeSeries, options: &JoinOptions, now: Timestamp) -> ValkeyResult<Self> {
-        // Both branches clamp the start to the retention floor themselves.
+impl<'a> JoinInput<'a> {
+    fn read(series: &'a TimeSeries, options: &JoinOptions, now: Timestamp) -> ValkeyResult<Self> {
+        // Every source clamps the start to the retention floor itself.
         let (start, end) = options
             .date_range
             .get_series_range(series, Some(now), false);
         let Some(timestamps) = &options.timestamp_filter else {
-            return Ok(JoinInput::Range(series.snapshot_range(start, end)));
+            return Ok(JoinInput::Live { series, start, end });
         };
         let start = start.max(series.get_min_timestamp());
         let mut samples = series
@@ -107,36 +124,45 @@ impl JoinInput {
         Ok(JoinInput::Samples(samples))
     }
 
+    fn into_owned(self) -> JoinInput<'static> {
+        match self {
+            JoinInput::Samples(samples) => JoinInput::Samples(samples),
+            JoinInput::Live { series, start, end } => {
+                JoinInput::Snapshot(series.snapshot_range(start, end))
+            }
+            JoinInput::Snapshot(snapshot) => JoinInput::Snapshot(snapshot),
+        }
+    }
+
     fn estimated_samples(&self) -> usize {
         match self {
             JoinInput::Samples(samples) => samples.len(),
-            JoinInput::Range(snapshot) => snapshot.estimated_samples(),
+            JoinInput::Live { series, start, end } => series.estimated_range_samples(*start, *end),
+            JoinInput::Snapshot(snapshot) => snapshot.estimated_samples(),
         }
     }
 
     fn samples(&self, filter: Option<ValueFilter>) -> impl Iterator<Item = Sample> + '_ {
-        match self {
+        let range = match self {
             // Already value-filtered by `read`.
-            JoinInput::Samples(samples) => Either::Left(samples.iter().copied()),
-            JoinInput::Range(snapshot) => Either::Right(
-                snapshot
-                    .sample_iter(false)
-                    .filter(move |s| filter.is_none_or(|f| f.is_match(s.value))),
-            ),
-        }
+            JoinInput::Samples(samples) => return Either::Left(samples.iter().copied()),
+            JoinInput::Live { series, start, end } => series.range_iter(*start, *end),
+            JoinInput::Snapshot(snapshot) => snapshot.sample_iter(false),
+        };
+        Either::Right(range.filter(move |s| filter.is_none_or(|f| f.is_match(s.value))))
     }
 }
 
 /// Joins two timestamp-sorted inputs. `options` must have been validated.
-pub(super) fn join_samples<'a, L, R>(
+pub(super) fn join_samples<L, R>(
     left: impl IntoIterator<Item = Sample, IntoIter = L>,
     right: impl IntoIterator<Item = Sample, IntoIter = R>,
     options: &JoinOptions,
     now: Timestamp,
 ) -> JoinResultType
 where
-    L: Iterator<Item = Sample> + 'a,
-    R: Iterator<Item = Sample> + 'a,
+    L: Iterator<Item = Sample>,
+    R: Iterator<Item = Sample>,
 {
     let rows = create_join_iter(left, right, options.join_type);
 
