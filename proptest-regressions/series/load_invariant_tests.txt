@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dccab35e5b44ad5cf59224c2803a97d37d3cec7767c353489df274d9fe4e4a5b # shrinks to encoding = 1, chunk_size = 48, ops = [Backfill { back: 0, value: 1.5 }, Merge { start: 0, span: 35904, count: 187, noisy: false }, Backfill { back: 2113, value: 616349.9743749496 }]
