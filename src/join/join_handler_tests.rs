@@ -2,7 +2,7 @@
 mod tests {
     use crate::aggregators::{AggregationType, BucketAlignment, BucketTimestamp};
     use crate::common::Sample;
-    use crate::join::join_handler::{join_internal, process_join};
+    use crate::join::join_handler::{join_samples, process_join};
     use crate::join::{
         AsOfJoinOptions, AsOfJoinStrategy, JoinOptions, JoinReducer, JoinResultType, JoinType,
         JoinValue,
@@ -10,8 +10,18 @@ mod tests {
     use crate::series::TimeSeries;
     use crate::series::request_types::AggregationOptions;
     use itertools::EitherOrBoth;
-    use std::ops::Deref;
     use std::time::Duration;
+    use valkey_module::ValkeyResult;
+
+    /// Validates, then joins, as `process_join` does once it has fetched both inputs.
+    fn join_internal(
+        left: Vec<Sample>,
+        right: Vec<Sample>,
+        options: &JoinOptions,
+    ) -> ValkeyResult<JoinResultType> {
+        options.validate()?;
+        Ok(join_samples(left, right, options, 0))
+    }
 
     fn create_basic_samples() -> (Vec<Sample>, Vec<Sample>) {
         let left = vec![
@@ -40,14 +50,14 @@ mod tests {
     }
 
     fn get_left_sample(value: &JoinValue) -> Sample {
-        match value.deref() {
+        match value {
             EitherOrBoth::Left(l) => *l,
             _ => panic!("Expected Left value"),
         }
     }
 
     fn get_right_sample(value: &JoinValue) -> Sample {
-        match value.deref() {
+        match value {
             EitherOrBoth::Right(r) => *r,
             _ => panic!("Expected Right value"),
         }
@@ -58,14 +68,14 @@ mod tests {
     }
 
     fn get_both_samples(value: &JoinValue) -> (Sample, Sample) {
-        match value.deref() {
+        match value {
             EitherOrBoth::Both(l, r) => (*l, *r),
             _ => panic!("Expected Both value"),
         }
     }
 
     fn get_timestamp(value: &JoinValue) -> i64 {
-        match value.deref() {
+        match value {
             EitherOrBoth::Left(l) => l.timestamp,
             EitherOrBoth::Right(r) => r.timestamp,
             EitherOrBoth::Both(l, _) => l.timestamp,
@@ -167,21 +177,21 @@ mod tests {
             // Verify timestamps are in order
 
             // Check value types at each timestamp
-            match values[0].deref() {
+            match &values[0] {
                 EitherOrBoth::Left(l) => {
                     assert_eq!(l.timestamp, 10);
                 }
                 _ => panic!("Expected Left value for timestamp 10"),
             }
 
-            match values[1].deref() {
+            match &values[1] {
                 EitherOrBoth::Right(r) => {
                     assert_eq!(r.timestamp, 15);
                 }
                 _ => panic!("Expected Right value for timestamp 15"),
             }
 
-            match values[2].deref() {
+            match &values[2] {
                 EitherOrBoth::Both(l, r) => {
                     assert_eq!(l.timestamp, 20);
                     assert_eq!(r.timestamp, 20);
@@ -189,14 +199,14 @@ mod tests {
                 _ => panic!("Expected Both values for timestamp 20"),
             }
 
-            match values[3].deref() {
+            match &values[3] {
                 EitherOrBoth::Right(r) => {
                     assert_eq!(r.timestamp, 25);
                 }
                 _ => panic!("Expected Right value for timestamp 25"),
             }
 
-            match values[4].deref() {
+            match &values[4] {
                 EitherOrBoth::Left(l) => {
                     assert_eq!(l.timestamp, 30);
                 }
@@ -304,6 +314,8 @@ mod tests {
         let result = join_internal(left.clone(), right.clone(), &options).unwrap();
         if let JoinResultType::Samples(samples) = result {
             assert_eq!(samples[0].value, 22.0); // 2.0 + 20.0 = 22.0
+        } else {
+            panic!("Expected Samples result type");
         }
 
         // Test Minus reducer
@@ -311,6 +323,8 @@ mod tests {
         let result = join_internal(left.clone(), right.clone(), &options).unwrap();
         if let JoinResultType::Samples(samples) = result {
             assert_eq!(samples[0].value, -18.0); // 2.0 - 20.0 = -18.0
+        } else {
+            panic!("Expected Samples result type");
         }
 
         // Test Mul reducer
@@ -318,6 +332,8 @@ mod tests {
         let result = join_internal(left.clone(), right.clone(), &options).unwrap();
         if let JoinResultType::Samples(samples) = result {
             assert_eq!(samples[0].value, 40.0); // 2.0 * 20.0 = 40.0
+        } else {
+            panic!("Expected Samples result type");
         }
 
         // Test Div reducer
@@ -325,6 +341,8 @@ mod tests {
         let result = join_internal(left.clone(), right.clone(), &options).unwrap();
         if let JoinResultType::Samples(samples) = result {
             assert_eq!(samples[0].value, 0.1); // 2.0 / 20.0 = 0.1
+        } else {
+            panic!("Expected Samples result type");
         }
     }
 
@@ -358,7 +376,7 @@ mod tests {
 
             // All should be right-only values
             for value in values {
-                match value.deref() {
+                match value {
                     EitherOrBoth::Right(_) => (),
                     _ => panic!("Expected only Right values"),
                 }
@@ -382,7 +400,7 @@ mod tests {
 
             // All should be left-only values
             for value in values {
-                match value.deref() {
+                match value {
                     EitherOrBoth::Left(_) => (),
                     _ => panic!("Expected only Left values"),
                 }
@@ -588,6 +606,8 @@ mod tests {
             assert_eq!(values.len(), 1);
             let value = get_left_value(&values[0]);
             assert_eq!(value, 2.0);
+        } else {
+            panic!("Expected Values result type");
         }
 
         // Test inner join for comparison
@@ -600,6 +620,8 @@ mod tests {
             let (l, r) = get_both_samples(&values[0]);
             assert_eq!(l.value, 2.0);
             assert_eq!(r.value, 20.0);
+        } else {
+            panic!("Expected Values result type");
         }
     }
 
@@ -621,6 +643,8 @@ mod tests {
         if let JoinResultType::Values(values) = result {
             assert_eq!(values.len(), 1);
             assert_eq!(get_timestamp(&values[0]), 20); // Only timestamp 20 matches
+        } else {
+            panic!("Expected Values result type");
         }
 
         // Test anti-join (should return rows where timestamps don't match)
@@ -632,6 +656,8 @@ mod tests {
             assert_eq!(values.len(), 2);
             assert_eq!(get_timestamp(&values[0]), 10); // Timestamps 10 and 30 don't match
             assert_eq!(get_timestamp(&values[1]), 30);
+        } else {
+            panic!("Expected Values result type");
         }
     }
 
@@ -761,7 +787,7 @@ mod tests {
 
             // Verify all values are from the left side
             for value in values {
-                match value.deref() {
+                match value {
                     EitherOrBoth::Left(_) => (),
                     _ => panic!("Expected Left value"),
                 }
@@ -846,6 +872,8 @@ mod tests {
             assert_eq!(values.len(), 2);
             assert_eq!(get_timestamp(&values[0]), 10); // Timestamps 10 and 30 don't match
             assert_eq!(get_timestamp(&values[1]), 30);
+        } else {
+            panic!("Expected Values result type");
         }
 
         // Test semi-join (should return rows where timestamps match)
@@ -856,39 +884,10 @@ mod tests {
         if let JoinResultType::Values(values) = result {
             assert_eq!(values.len(), 1);
             assert_eq!(get_timestamp(&values[0]), 20); // Only timestamp 20 matches
+        } else {
+            panic!("Expected Values result type");
         }
     }
-
-    // #[test]
-    // fn test_join_anti_different_reducer_operations() {
-    //     let left = vec![Sample::new(10, 5.0)];
-    //     let right: Vec<Sample> = vec![]; // Empty right to ensure all left rows are included
-    //
-    //     // Test with different reducers to ensure they handle NaN correctly
-    //     let reducers = [
-    //         JoinReducer::Sum, JoinReducer::Sub, JoinReducer::Mul, JoinReducer::Div,
-    //         JoinReducer::Max, JoinReducer::Min, JoinReducer::Avg
-    //     ];
-    //
-    //     for reducer in reducers {
-    //         let mut options = create_basic_options();
-    //         options.join_type = JoinType::Anti;
-    //         options.reducer = Some(reducer);
-    //
-    //         let result = join_internal(left.clone(), right.clone(), &options);
-    //
-    //         if let JoinResultType::Samples(samples) = result {
-    //             assert_eq!(samples.len(), 1);
-    //             assert_eq!(samples[0].timestamp, 10);
-    //
-    //             // For any reducer operation with NaN as one operand, the result should be NaN
-    //             assert!(samples[0].value.is_nan(),
-    //                     "Expected NaN result for reducer {:?}, got {}", reducer, samples[0].value);
-    //         } else {
-    //             panic!("Expected Samples result type");
-    //         }
-    //     }
-    // }
 
     #[test]
     fn test_join_anti_large_datasets() {
@@ -918,7 +917,7 @@ mod tests {
 
             // Verify that all returned timestamps are not multiples of 4
             for value in values {
-                let EitherOrBoth::Left(left) = &value.0 else {
+                let EitherOrBoth::Left(left) = value else {
                     panic!("Expected Left value")
                 };
                 assert_eq!(
@@ -1050,5 +1049,120 @@ mod tests {
                 "allow_exact_match={allow_exact_match}"
             );
         }
+    }
+
+    fn reduced(
+        left: &[(i64, f64)],
+        right: &[(i64, f64)],
+        options: &JoinOptions,
+    ) -> Vec<(i64, f64)> {
+        let to_samples =
+            |pairs: &[(i64, f64)]| pairs.iter().map(|&(t, v)| Sample::new(t, v)).collect();
+        let JoinResultType::Samples(samples) =
+            join_internal(to_samples(left), to_samples(right), options).unwrap()
+        else {
+            panic!("Expected Samples result type");
+        };
+        samples.iter().map(|s| (s.timestamp, s.value)).collect()
+    }
+
+    #[test]
+    fn test_comparison_reducers_return_booleans_and_nan_for_missing() {
+        // FULL join: 10 left-only, 20 both (7 vs 2), 30 both (7 vs 9), 40 right-only.
+        let left = [(10, 7.0), (20, 7.0), (30, 7.0)];
+        let right = [(20, 2.0), (30, 9.0), (40, 1.0)];
+        let mut options = create_basic_options();
+        options.join_type = JoinType::Full;
+        for (reducer, at_20, at_30) in [
+            (JoinReducer::Gt, 1.0, 0.0),
+            (JoinReducer::Lt, 0.0, 1.0),
+            (JoinReducer::Eq, 0.0, 0.0),
+            (JoinReducer::Ne, 1.0, 1.0),
+            (JoinReducer::Cmp, 1.0, -1.0),
+        ] {
+            options.reducer = Some(reducer);
+            let rows = reduced(&left, &right, &options);
+            let timestamps: Vec<i64> = rows.iter().map(|r| r.0).collect();
+            assert_eq!(timestamps, vec![10, 20, 30, 40], "{}", reducer.name());
+            assert!(rows[0].1.is_nan(), "{}: left-only row", reducer.name());
+            assert_eq!(rows[1].1, at_20, "{}", reducer.name());
+            assert_eq!(rows[2].1, at_30, "{}", reducer.name());
+            assert!(rows[3].1.is_nan(), "{}: right-only row", reducer.name());
+        }
+
+        // max/min/coalesce use the side that is present.
+        for reducer in [JoinReducer::Max, JoinReducer::Min, JoinReducer::Coalesce] {
+            options.reducer = Some(reducer);
+            let rows = reduced(&left, &right, &options);
+            assert_eq!(rows[0], (10, 7.0), "{}", reducer.name());
+            assert_eq!(rows[3], (40, 1.0), "{}", reducer.name());
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_aggregation_without_reducer() {
+        let (left, right) = create_basic_samples();
+        let mut options = create_basic_options();
+        options.aggregation = Some(AggregationOptions {
+            aggregations: smallvec::smallvec![AggregationType::Sum.into()],
+            bucket_duration: 10,
+            timestamp_output: BucketTimestamp::Start,
+            alignment: BucketAlignment::Default,
+            report_empty: false,
+        });
+        // An INNER join's rows are pairs: without a reducer there is nothing to aggregate.
+        assert!(join_internal(left.clone(), right.clone(), &options).is_err());
+
+        // SEMI/ANTI aggregate their left samples.
+        for join_type in [JoinType::Semi, JoinType::Anti] {
+            options.join_type = join_type;
+            assert!(join_internal(left.clone(), right.clone(), &options).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_aggregation_count_stops_after_the_buckets_it_returns() {
+        // Two samples 40 seconds apart with 1 ms EMPTY buckets: 40 million buckets in all.
+        // COUNT 2 must stop after two of them instead of building every bucket first.
+        let left = vec![Sample::new(0, 1.0), Sample::new(40_000_000, 2.0)];
+        let right = left.clone();
+        let mut options = create_basic_options();
+        options.reducer = Some(JoinReducer::Sum);
+        options.count = Some(2);
+        options.aggregation = Some(AggregationOptions {
+            aggregations: smallvec::smallvec![AggregationType::Sum.into()],
+            bucket_duration: 1,
+            timestamp_output: BucketTimestamp::Start,
+            alignment: BucketAlignment::Default,
+            report_empty: true,
+        });
+
+        let started = std::time::Instant::now();
+        let JoinResultType::Samples(samples) = join_internal(left, right, &options).unwrap() else {
+            panic!("Expected Samples result type");
+        };
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0], Sample::new(0, 2.0));
+        assert_eq!(samples[1].timestamp, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "aggregation built buckets past COUNT"
+        );
+    }
+
+    #[test]
+    fn test_semi_join_keeps_left_samples_of_inner_matches() {
+        let left = samples(&[10, 20, 30, 40, 50]);
+        let right = samples(&[5, 20, 40, 60]);
+        let mut options = create_basic_options();
+        options.join_type = JoinType::Semi;
+        let JoinResultType::Values(values) = join_internal(left, right, &options).unwrap() else {
+            panic!("Expected Values result type");
+        };
+        let timestamps: Vec<i64> = values
+            .iter()
+            .map(|v| get_left_sample(v).timestamp)
+            .collect();
+        assert_eq!(timestamps, vec![20, 40]);
     }
 }

@@ -7,8 +7,7 @@ use crate::common::rounding::{
 use crate::common::time::current_time_millis;
 use crate::config::is_strict_rts_compat;
 use crate::error_consts;
-use crate::join::join_reducer::JoinReducer;
-use crate::join::{AsOfJoinOptions, AsOfJoinStrategy, JoinOptions, JoinType};
+use crate::join::{AsOfJoinOptions, AsOfJoinStrategy, JoinOptions, JoinReducer, JoinType};
 use crate::labels::filters::SeriesSelector;
 use crate::labels::{Label, MAX_LABELS_PER_SERIES, parse_series_selector};
 use crate::parser::number::parse_number;
@@ -1323,30 +1322,26 @@ fn parse_asof_join_options(args: &mut CommandArgIterator) -> ValkeyResult<JoinTy
         };
     }
 
-    let mut allow_exact_match = true;
-    if args.peek().is_some() {
-        if let Some(next_arg) = args.peek()
-            && let Ok(arg_str) = next_arg.try_as_str()
-        {
-            // durations in all cases start with an ascii digit, e.g., 1000 or 40 ms.
-            // An empty argument is not a duration; fall through and let the syntax
-            // handling below report it rather than indexing into an empty string.
-            if arg_str.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
-                let tolerance_ms = parse_nonnegative_duration_ms(arg_str)?;
-                if tolerance_ms < 0 {
-                    return Err(ValkeyError::Str(error_consts::INVALID_ASOF_TOLERANCE));
-                }
-                tolerance = Some(Duration::from_millis(tolerance_ms as u64));
-                let _ = args.next_arg()?;
-            }
+    // Durations always start with an ASCII digit (`1000`, `40ms`); anything else is the next
+    // token, or an error the caller reports.
+    if let Some(next_arg) = args.peek()
+        && let Ok(arg_str) = next_arg.try_as_str()
+        && arg_str.starts_with(|ch: char| ch.is_ascii_digit())
+    {
+        let tolerance_ms = parse_nonnegative_duration_ms(arg_str)?;
+        if tolerance_ms < 0 {
+            return Err(ValkeyError::Str(error_consts::INVALID_ASOF_TOLERANCE));
         }
+        tolerance = Some(Duration::from_millis(tolerance_ms as u64));
+        let _ = args.next_arg()?;
+    }
 
-        if advance_if_next_token_one_of(args, &[AllowExactMatch]).is_some() {
-            match advance_if_next_token_one_of(args, &[True, False]) {
-                Some(True) => allow_exact_match = true,
-                Some(False) => allow_exact_match = false,
-                _ => {}
-            }
+    let mut allow_exact_match = true;
+    if advance_if_next_token_one_of(args, &[AllowExactMatch]).is_some() {
+        match advance_if_next_token_one_of(args, &[True, False]) {
+            Some(True) => allow_exact_match = true,
+            Some(False) => allow_exact_match = false,
+            _ => {}
         }
     }
 
@@ -1363,15 +1358,6 @@ pub(super) fn parse_join_args(
 ) -> ValkeyResult<()> {
     use CommandArgToken::*;
     let mut join_type_set = false;
-
-    fn check_join_type_set(is_set: &mut bool) -> ValkeyResult<()> {
-        if *is_set {
-            Err(ValkeyError::Str("TSDB: join type already set"))
-        } else {
-            *is_set = true;
-            Ok(())
-        }
-    }
 
     const VALID_TOKEN_ARGS: &[CommandArgToken] = &[
         Aggregation,
@@ -1390,6 +1376,24 @@ pub(super) fn parse_join_args(
 
     while let Some(arg) = args.next() {
         let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
+        let join_type = match token {
+            Anti => Some(JoinType::Anti),
+            Full => Some(JoinType::Full),
+            Inner => Some(JoinType::Inner),
+            Left => Some(JoinType::Left),
+            Right => Some(JoinType::Right),
+            Semi => Some(JoinType::Semi),
+            AsOf => Some(parse_asof_join_options(args)?),
+            _ => None,
+        };
+        if let Some(join_type) = join_type {
+            if join_type_set {
+                return Err(ValkeyError::Str("TSDB: join type already set"));
+            }
+            join_type_set = true;
+            options.join_type = join_type;
+            continue;
+        }
         match token {
             Aggregation => {
                 let aggregation = parse_aggregation_options(args)?;
@@ -1400,14 +1404,6 @@ pub(super) fn parse_join_args(
                 }
                 options.aggregation = Some(aggregation)
             }
-            Anti => {
-                check_join_type_set(&mut join_type_set)?;
-                options.join_type = JoinType::Anti;
-            }
-            AsOf => {
-                check_join_type_set(&mut join_type_set)?;
-                options.join_type = parse_asof_join_options(args)?;
-            }
             Count => {
                 options.count = Some(parse_count_arg(args)?);
             }
@@ -1417,54 +1413,15 @@ pub(super) fn parse_join_args(
             FilterByTs => {
                 options.timestamp_filter = Some(parse_timestamp_filter(args, VALID_TOKEN_ARGS)?);
             }
-            Full => {
-                check_join_type_set(&mut join_type_set)?;
-                options.join_type = JoinType::Full;
-            }
-            Inner => {
-                check_join_type_set(&mut join_type_set)?;
-                options.join_type = JoinType::Inner;
-            }
-            Left => {
-                check_join_type_set(&mut join_type_set)?;
-                options.join_type = JoinType::Left;
-            }
-            Right => {
-                check_join_type_set(&mut join_type_set)?;
-                options.join_type = JoinType::Right;
-            }
             Reduce => {
                 let arg = args.next_str()?;
                 options.reducer = Some(parse_join_operator(arg)?);
-            }
-            Semi => {
-                check_join_type_set(&mut join_type_set)?;
-                options.join_type = JoinType::Semi;
             }
             _ => return Err(ValkeyError::Str("TSDB: invalid JOIN command argument")),
         }
     }
 
-    // aggregations are only valid when the resulting join returns a single value per timestamp, i.e.,
-    // SEMI, ANTI, or when there is a transform
-    if options.aggregation.is_some()
-        && options.reducer.is_none()
-        && options.join_type != JoinType::Semi
-        && options.join_type != JoinType::Anti
-    {
-        // todo: better error message
-        return Err(ValkeyError::Str(error_consts::MISSING_JOIN_REDUCER));
-    }
-
-    // Disallow REDUCE for joins that only return single values per timestamp
-    if options.reducer.is_some()
-        && (options.join_type == JoinType::Semi || options.join_type == JoinType::Anti)
-    {
-        return Err(ValkeyError::Str(
-            "TSDB: cannot use REDUCE with SEMI or ANTI joins",
-        ));
-    }
-    Ok(())
+    options.validate()
 }
 
 pub(crate) fn parse_metadata_command_args(

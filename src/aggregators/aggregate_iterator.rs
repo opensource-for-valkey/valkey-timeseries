@@ -392,15 +392,6 @@ pub(crate) fn bucket_start_for(
     ts.saturating_sub_unsigned(offset)
 }
 
-pub fn aggregate(
-    options: &AggregationOptions,
-    aligned_timestamp: Timestamp,
-    iter: impl Iterator<Item = Sample>,
-) -> Vec<Sample> {
-    let iterator = AggregateIterator::new(iter, options, aligned_timestamp);
-    iterator.collect()
-}
-
 /// How far an `EMPTY` fill may run past the samples the query itself sees.
 ///
 /// A bucket is reported iff it falls in the intersection of the query window with the extent

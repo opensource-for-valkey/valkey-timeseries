@@ -1,3 +1,4 @@
+import math
 import pytest
 from valkey import ResponseError
 from valkeytestframework.util.waiters import *
@@ -415,7 +416,7 @@ class TestTSJoin(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command("TS.CREATE", ts_zero2)
 
         base = 5000
-        # When left = 0, should return 0.0 (per implementation)
+        # A zero base has no percentage change: NaN, not 0.
         self.client.execute_command("TS.ADD", ts_zero1, base, 0.0)
         self.client.execute_command("TS.ADD", ts_zero2, base, 100.0)
 
@@ -427,8 +428,7 @@ class TestTSJoin(ValkeyTimeSeriesTestCaseBase):
 
         assert len(result) == 1
         ts, value = result[0]
-        # Division by zero case should return 0.0
-        assert float(value) == 0.0
+        assert math.isnan(float(value))
 
         # Test 4: Small values with fractional change
         ts_frac1 = "test_pct_frac1"
@@ -765,29 +765,39 @@ class TestTSJoin(ValkeyTimeSeriesTestCaseBase):
             expected_sum = expected_left + expected_right
             assert float(value) == expected_sum
 
-    def smoketest_all_join_reducers(self):
-        """Test different join reducers"""
+    def test_all_join_reducers(self):
+        """Every reducer's value on a matched pair, and on a missing operand (LEFT join)."""
+        self.client.execute_command("TS.ADD", "red:l", 10, 7)
+        self.client.execute_command("TS.ADD", "red:l", 20, 7)
+        self.client.execute_command("TS.ADD", "red:r", 10, 2)
 
-        self.setup_data()
-
-        reducers = [
-            "abs_diff", "avg", "cmp", "div", "eq", "gt", "gte", "lt", "lte", "sum", "max", "min",
-            "ne", "mul", "mod", "pow", "sgn_diff", "pct_change", "coalesce"
-        ]
-
-        for reducer in reducers:
+        nan = float("nan")
+        # reducer -> (value at 10 for (7, 2), value at 20 for (7, missing))
+        expected = {
+            "abs_diff": (5, nan), "avg": (4.5, nan), "cmp": (1, nan), "coalesce": (7, 7),
+            "div": (3.5, nan), "eq": (0, nan), "gt": (1, nan), "gte": (1, nan),
+            "lt": (0, nan), "lte": (0, nan), "max": (7, 7), "min": (2, 7), "mod": (1, nan),
+            "mul": (14, nan), "ne": (1, nan), "pct_change": (-5 / 7, nan), "pow": (49, nan),
+            "sgn_diff": (1, nan), "sub": (5, nan), "sum": (9, nan),
+        }
+        for reducer, (matched, missing) in expected.items():
             result = self.client.execute_command(
-                "TS.JOIN", self.ts1, self.ts2,
-                self.now + 5000, self.now + 6000,  # Test one point for each
-                "INNER", "REDUCE", reducer
-            )
+                "TS.JOIN", "red:l", "red:r", "-", "+", "LEFT", "REDUCE", reducer)
+            assert [row[0] for row in result] == [10, 20], reducer
+            for (_, value), want in zip(result, (matched, missing)):
+                got = float(value)
+                if math.isnan(want):
+                    assert math.isnan(got), f"{reducer}: {got}"
+                else:
+                    assert got == pytest.approx(want), f"{reducer}: {got} != {want}"
 
-            # Should have at least one result
-            assert len(result) > 0
-
-            # Each result should be a [timestamp, value] pair
-            for item in result:
-                assert len(item) == 2
+        # Equal operands: comparisons and signs are exact, -0 equals +0.
+        self.client.execute_command("TS.ADD", "red:l", 30, 7)
+        self.client.execute_command("TS.ADD", "red:r", 30, 7)
+        for reducer, want in {"eq": 1, "ne": 0, "gte": 1, "lte": 1, "cmp": 0, "sgn_diff": 0}.items():
+            result = self.client.execute_command(
+                "TS.JOIN", "red:l", "red:r", 30, 30, "INNER", "REDUCE", reducer)
+            assert float(result[0][1]) == want, reducer
 
     def test_asof_edge_cases(self):
         """Test ASOF join edge cases"""

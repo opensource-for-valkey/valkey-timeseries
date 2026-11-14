@@ -10,7 +10,7 @@ use valkey_module::{
 
 acl_categories!(TS_JOIN, "ts.join", "read timeseries");
 /// TS.JOIN key1 key2 fromTimestamp toTimestamp
-///   [INNER | FULL | LEFT | RIGHT | ANTI | SEMI | ASOF [PREVIOUS | NEXT | NEAREST] tolerance [ALLOW_EXACT_MATCH [true|false]]]
+///   [INNER | FULL | LEFT | RIGHT | ANTI | SEMI | ASOF [PREVIOUS | NEXT | NEAREST] [tolerance] [ALLOW_EXACT_MATCH [true|false]]]
 ///   [FILTER_BY_TS ts...]
 ///   [FILTER_BY_VALUE min max]
 ///   [COUNT count]
@@ -22,7 +22,7 @@ acl_categories!(TS_JOIN, "ts.join", "read timeseries");
     summary: "Join the samples of two time series over a timestamp range.",
     complexity: "O(N+M) where N and M are the number of samples in each series within the range.",
     since: "1.0.0",
-    arity: -4,
+    arity: -5,
     key_spec: [{
         flags: [ReadOnly, Access],
         begin_search: Index({ index: 1 }),
@@ -63,16 +63,16 @@ pub fn ts_join_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             reply_with_array(ctx, values.len());
             for value in values.iter() {
                 reply_with_array(ctx, 2);
-                match value.0 {
-                    EitherOrBoth::Both(ref l, ref r) => {
+                match value {
+                    EitherOrBoth::Both(l, r) => {
                         reply_with_sample(ctx, l);
                         reply_with_sample(ctx, r);
                     }
-                    EitherOrBoth::Left(ref l) => {
+                    EitherOrBoth::Left(l) => {
                         reply_with_sample(ctx, l);
                         reply_with_null(ctx);
                     }
-                    EitherOrBoth::Right(ref r) => {
+                    EitherOrBoth::Right(r) => {
                         reply_with_null(ctx);
                         reply_with_sample(ctx, r);
                     }
