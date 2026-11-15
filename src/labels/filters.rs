@@ -406,8 +406,10 @@ pub enum PredicateMatch {
     NotEqual(PredicateValue),
     MatchAll,
     MatchNone,
-    RegexEqual(RegexMatcher),
-    RegexNotEqual(RegexMatcher),
+    // Boxed: a `RegexMatcher` is 168 bytes and most matchers are not regexes, so holding it
+    // inline made every `LabelFilter` 200 bytes and every `SeriesSelector` over 1 KiB.
+    RegexEqual(Box<RegexMatcher>),
+    RegexNotEqual(Box<RegexMatcher>),
     StartsWith(PredicateValue),
     NotStartsWith(PredicateValue),
     Contains(PredicateValue),
@@ -869,8 +871,9 @@ impl From<Vec<LabelFilter>> for FilterList {
     }
 }
 
-/// OrFiltersList is a small vector of FilterList, used for OR combinations of AND filters.
-pub type OrFiltersList = SmallVec<[FilterList; 2]>;
+/// The groups of an OR selector, each an AND of filters. A plain `Vec`: OR selectors are rare,
+/// and inline storage for two `FilterList`s made every `SeriesSelector`, OR or not, that big.
+pub type OrFiltersList = Vec<FilterList>;
 
 /// See [`SeriesSelector::is_bounded`]. An empty group matches every series, so it is unbounded.
 fn filter_group_is_bounded(filters: &FilterList) -> bool {
@@ -971,10 +974,7 @@ impl SeriesSelector {
         match (self, other) {
             // Both are And selectors - create Or with both
             (SeriesSelector::And(left), SeriesSelector::And(right)) => {
-                let mut or_list = OrFiltersList::new();
-                or_list.push(left);
-                or_list.push(right);
-                SeriesSelector::Or(or_list)
+                SeriesSelector::Or(vec![left, right])
             }
             // Left is And, right is Or - add left to right's Or list
             (SeriesSelector::And(left), SeriesSelector::Or(mut right)) => {
@@ -1030,7 +1030,7 @@ impl From<Vec<Vec<LabelFilter>>> for SeriesSelector {
             return SeriesSelector::And(FilterList::new(first));
         }
         let and_matchers: Vec<FilterList> = value.into_iter().map(FilterList::new).collect();
-        SeriesSelector::Or(and_matchers.into())
+        SeriesSelector::Or(and_matchers)
     }
 }
 

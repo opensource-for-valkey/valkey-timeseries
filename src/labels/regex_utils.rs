@@ -50,7 +50,12 @@ fn regex_predicate(
     let hints = regex_hints(inner, prefix.as_deref());
     // `regex` matches the entire string, prefix included; `expr` is kept as
     // `value` for display and serialization.
-    let matcher = RegexMatcher::with_hints(regex, expr.to_string(), prefix, hints);
+    let matcher = Box::new(RegexMatcher::with_hints(
+        regex,
+        expr.to_string(),
+        prefix,
+        hints,
+    ));
     if is_equal {
         PredicateMatch::RegexEqual(matcher)
     } else {

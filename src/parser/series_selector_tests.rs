@@ -1067,4 +1067,30 @@ mod tests {
             assert!(err.contains(expected), "{selector:?}: {err}");
         }
     }
+
+    /// P-4: selector values are moved and copied on every parse, plan and fan-out. Pins the
+    /// layout so an inline field cannot silently grow them back (sizes on 64-bit targets).
+    #[test]
+    fn test_selector_type_sizes() {
+        use std::mem::size_of;
+        let sizes = [
+            ("PredicateValue", size_of::<PredicateValue>()),
+            ("PredicateMatch", size_of::<PredicateMatch>()),
+            ("LabelFilter", size_of::<LabelFilter>()),
+            ("FilterList", size_of::<FilterList>()),
+            ("SeriesSelector", size_of::<SeriesSelector>()),
+        ];
+        // Was 112 / 176 / 200 / 616 / 1248 before `RegexMatcher` was boxed and `OrFiltersList`
+        // became a `Vec`.
+        assert_eq!(
+            sizes,
+            [
+                ("PredicateValue", 112),
+                ("PredicateMatch", 120),
+                ("LabelFilter", 144),
+                ("FilterList", 448),
+                ("SeriesSelector", 448),
+            ]
+        );
+    }
 }
