@@ -3,32 +3,62 @@ use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::{Label, MAX_LABELS_PER_SERIES};
 use crate::parser::{ParseError, ParseResult};
 
-/// Parses a `Prometheus` compatible metric name (as opposed to a metric selector), the
-/// `TS.CREATE ... METRIC` operand:
+/// Parses a metric definition, the `TS.CREATE ... METRIC` operand: a metric name and a label
+/// set, as Prometheus writes them.
 ///
-///    <metric_identifier> [ '{' [ <label_name> '=' <label_value> { ',' ... } [','] ] '}' ]
+/// ```text
+/// metric     := name [ "{" [ items ] "}" ] | "{" items "}"
+/// items      := item ( "," item )* [ "," ]
+/// item       := label_name "=" string | string
+/// name       := identifier | "or"
+/// label_name := identifier | "or" | string
+/// ```
 ///
-/// The whole input must be consumed. A label name is an identifier or a quoted string; a value
-/// is a quoted string. One trailing comma is allowed (as in PromQL and in selectors); an empty
-/// item (`{,a="1"}`, `{a="1",,}`) is not. Each label is held to what `LABELS` requires: a
-/// non-empty name without `=`, a non-empty value. A repeated name, and a `__name__` label
-/// (the measurement already is the `__name__`), are errors, as is more than
-/// `MAX_LABELS_PER_SERIES` labels counting the `__name__` ([`ParseError::TooManyLabels`]).
+/// The whole input must be consumed. A name that is not an identifier is written as a quoted
+/// string: a label name before its `=`, and the metric name as a bare string inside the braces,
+/// `{"my metric", a="1"}` (Prometheus 3's form for UTF-8 names). The metric name must be given
+/// exactly once. One trailing comma is allowed (as in PromQL and in selectors); an empty item
+/// (`{,a="1"}`, `{a="1",,}`) is not. Each label is held to what `LABELS` requires: a non-empty
+/// name without `=`, a non-empty value. A repeated name, and a `__name__` label (the metric
+/// name already is the `__name__`), are errors, as is more than `MAX_LABELS_PER_SERIES` labels
+/// counting the `__name__` ([`ParseError::TooManyLabels`]).
+/// [`MetricName`](crate::labels::MetricName)'s `Display` writes this syntax back.
 pub fn parse_metric_name(s: &str) -> ParseResult<Vec<Label>> {
     let mut cur = Cursor::new(s);
 
     // `or` lexes as a keyword but is a name here, as it is in selectors.
-    let measurement = cur.expect(&[Token::Identifier, Token::OpOr], "metric name")?;
-    let mut labels = vec![Label::new(METRIC_NAME_LABEL, measurement.text)];
-    if cur.next_if(Token::LeftBrace)?.is_some() {
-        parse_label_set(&mut cur, &mut labels)?;
+    let first = cur.expect(
+        &[Token::Identifier, Token::OpOr, Token::LeftBrace],
+        "metric name",
+    )?;
+    let mut measurement = None;
+    // The labels other than `__name__`, which goes first once it is known.
+    let mut labels = Vec::new();
+    if first.token == Token::LeftBrace {
+        parse_label_set(&mut cur, &mut measurement, &mut labels)?;
+    } else {
+        measurement = Some(first.text.to_string());
+        if cur.next_if(Token::LeftBrace)?.is_some() {
+            parse_label_set(&mut cur, &mut measurement, &mut labels)?;
+        }
     }
     cur.expect(&[Token::Eof], "metric name")?;
+
+    let Some(measurement) = measurement else {
+        return Err(ParseError::General("missing metric name".to_string()));
+    };
+    labels.insert(0, Label::new(METRIC_NAME_LABEL, &measurement));
     Ok(labels)
 }
 
-/// Parses `name="value", ...}` after the opening brace, appending to `labels`.
-fn parse_label_set(cur: &mut Cursor, labels: &mut Vec<Label>) -> ParseResult<()> {
+/// Parses the items of a label set after the opening brace, through the closing `}`, appending
+/// to `labels`. A bare quoted string is the metric name and is stored in `measurement`, which
+/// must not already be set.
+fn parse_label_set(
+    cur: &mut Cursor,
+    measurement: &mut Option<String>,
+    labels: &mut Vec<Label>,
+) -> ParseResult<()> {
     use Token::*;
 
     loop {
@@ -38,15 +68,37 @@ fn parse_label_set(cur: &mut Cursor, labels: &mut Vec<Label>) -> ParseResult<()>
         if name.token == RightBrace {
             return Ok(());
         }
+        let is_string = name.token == StringLiteral;
+        let name = name.decoded()?.into_owned();
+
+        // A quoted string not followed by `=` is the metric name; a bare identifier must be.
+        let next = if is_string {
+            cur.expect(&[Equal, Comma, RightBrace], "label set")?
+        } else {
+            cur.expect(&[Equal], "label set")?
+        };
+        if next.token != Equal {
+            if name.is_empty() {
+                return Err(ParseError::General("empty metric name".to_string()));
+            }
+            if let Some(first) = measurement.replace(name) {
+                return Err(ParseError::General(format!(
+                    "metric name given twice: `{first}`"
+                )));
+            }
+            if next.token == RightBrace {
+                return Ok(());
+            }
+            continue;
+        }
+
         // Checked before the duplicate scan in `check_label`, which is linear in the labels
-        // so far: past the limit the operand is rejected anyway.
-        if labels.len() == MAX_LABELS_PER_SERIES {
+        // so far: past the limit the operand is rejected anyway. The `__name__` counts.
+        if labels.len() + 1 == MAX_LABELS_PER_SERIES {
             return Err(ParseError::TooManyLabels);
         }
-        let name = name.decoded()?.into_owned();
         check_label(labels, &name)?;
 
-        cur.expect(&[Equal], "label set")?;
         let value = cur.expect_string("label value")?;
         if value.is_empty() {
             return Err(ParseError::General(format!(
@@ -67,12 +119,11 @@ fn check_label(labels: &[Label], name: &str) -> ParseResult<()> {
             "invalid label name `{name}`: must be non-empty and must not contain '='"
         )));
     }
-    // The measurement is the `__name__`; a second one would override it, with any value —
+    // The metric name is the `__name__`; a second one would override it, with any value —
     // including ones (empty, not an identifier) that no metric name renders back to.
     if name == METRIC_NAME_LABEL {
         return Err(ParseError::General(format!(
-            "{METRIC_NAME_LABEL} label conflicts with the measurement `{}`",
-            labels[0].value
+            "{METRIC_NAME_LABEL} label conflicts with the metric name"
         )));
     }
     if labels.iter().any(|label| label.name == name) {
@@ -251,5 +302,62 @@ mod tests {
                 Label::new("b-c", "d")
             ]
         );
+    }
+
+    #[test]
+    fn test_parse_metric_name_quoted_names() {
+        let ok = [
+            (r#"m{"a b"="v"}"#, vec![("__name__", "m"), ("a b", "v")]),
+            (
+                r#"m{"9"="v",ok="w"}"#,
+                vec![("__name__", "m"), ("9", "v"), ("ok", "w")],
+            ),
+            (r#"m{or="1"}"#, vec![("__name__", "m"), ("or", "1")]),
+            (r#"{"my metric"}"#, vec![("__name__", "my metric")]),
+            (
+                r#"{"my metric", "a b"="v"}"#,
+                vec![("__name__", "my metric"), ("a b", "v")],
+            ),
+            (r#"{a="v", "9m"}"#, vec![("__name__", "9m"), ("a", "v")]),
+            (r#"or{a="v"}"#, vec![("__name__", "or"), ("a", "v")]),
+            ("m{}", vec![("__name__", "m")]),
+            (r#"m{a="1",}"#, vec![("__name__", "m"), ("a", "1")]),
+        ];
+        for (input, want) in ok {
+            let got = parse_metric_name(input).unwrap_or_else(|e| panic!("{input}: {e}"));
+            let got: Vec<(&str, &str)> = got
+                .iter()
+                .map(|l| (l.name.as_str(), l.value.as_str()))
+                .collect();
+            assert_eq!(got, want, "{input}");
+        }
+        for bad in [
+            r#"{a="v"}"#,           // no metric name
+            "{}",                   // no metric name
+            r#"m{"other"}"#,        // named twice
+            r#"{"x", "y"}"#,        // named twice
+            r#"{""}"#,              // empty metric name
+            r#"m{""="v"}"#,         // empty label name
+            r#"m{a}"#,              // a bare name must be quoted to be the metric name
+            r#"m{a="1"} junk"#,     // trailing text
+            r#"m{"__name__"="x"}"#, // `__name__` again, quoted
+        ] {
+            assert!(parse_metric_name(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_parse_metric_name_label_limit_with_quoted_name() {
+        // The limit counts the `__name__` wherever it is written.
+        let labels: Vec<String> = (0..MAX_LABELS_PER_SERIES - 1)
+            .map(|i| format!(r#"l{i}="v""#))
+            .collect();
+        let at_limit = format!(r#"{{"m", {}}}"#, labels.join(","));
+        assert_eq!(
+            parse_metric_name(&at_limit).unwrap().len(),
+            MAX_LABELS_PER_SERIES
+        );
+        let past = format!(r#"{{"m", {}, x="v"}}"#, labels.join(","));
+        assert_eq!(parse_metric_name(&past), Err(ParseError::TooManyLabels));
     }
 }

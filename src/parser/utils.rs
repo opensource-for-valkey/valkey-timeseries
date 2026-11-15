@@ -1,6 +1,28 @@
 use crate::parser::{ParseError, ParseResult};
 use std::borrow::Cow;
 
+/// Whether `name` can be written unquoted where the parsers take a name: it lexes as one
+/// identifier (`[_a-zA-Z][_a-zA-Z0-9:.-]*`, the lexer's rule) and is not the keyword `or`, which
+/// the lexer matches in any case. Anything else is written as a quoted string.
+pub fn is_bare_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let starts_well = chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic());
+    starts_well
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '-'))
+        && !name.eq_ignore_ascii_case("or")
+}
+
+/// Writes `name` as the parsers read it back: bare when [`is_bare_name`], quoted otherwise.
+pub fn write_name(f: &mut impl std::fmt::Write, name: &str) -> std::fmt::Result {
+    if is_bare_name(name) {
+        f.write_str(name)
+    } else {
+        f.write_str(&quote_string(name))
+    }
+}
+
 /// Decodes a quoted PromQL string literal (the token, quotes included), with the escaping rules
 /// Prometheus uses, which are Go's:
 ///

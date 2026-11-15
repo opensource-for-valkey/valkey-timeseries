@@ -4,7 +4,7 @@ use crate::common::rdb::{MAX_RDB_COLLECTION_LEN, rdb_load_len, rdb_load_string, 
 use crate::common::string_interner::InternedString;
 use crate::parser::ParseError;
 use crate::parser::metric_name::parse_metric_name;
-use crate::parser::utils::quote_string;
+use crate::parser::utils::{is_bare_name, quote_string, write_name};
 use get_size2::{GetSize, GetSizeTracker};
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -279,24 +279,36 @@ impl FromStr for MetricName {
     }
 }
 
+/// Writes the metric definition [`parse_metric_name`] reads back: `name{label="value",…}`, with
+/// any name that is not an identifier quoted, and a metric name that is not one written inside
+/// the braces as Prometheus 3 does (`{"my metric", a="1"}`). A set without `__name__` renders
+/// as its label set alone (`{a="1"}`); it is a label set, not a metric definition, and does not
+/// parse back.
 impl Display for MetricName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}{{", self.get_measurement())?;
-
+        let name = self.get_measurement();
         let mut first = true;
+        if is_bare_name(name) {
+            write!(f, "{name}{{")?;
+        } else {
+            f.write_str("{")?;
+            if !name.is_empty() {
+                f.write_str(&quote_string(name))?;
+                first = false;
+            }
+        }
         for label in self
             .iter()
             .filter(|l| !l.name.is_empty() && l.name != METRIC_NAME_LABEL)
         {
             if !first {
-                write!(f, ",")?;
+                f.write_str(",")?;
             }
             first = false;
-            write!(f, "{}={}", label.name, quote_string(label.value))?;
+            write_name(f, label.name)?;
+            write!(f, "={}", quote_string(label.value))?;
         }
-
-        write!(f, "}}")?;
-        Ok(())
+        f.write_str("}")
     }
 }
 
@@ -607,5 +619,40 @@ mod tests {
             "{amortized} vs {pool_bytes}"
         );
         drop(names);
+    }
+
+    /// `Display` writes a definition `FromStr` reads back as the same label set, whatever the
+    /// names hold (LABELS-02: names were written raw, so `m{"a b"="v"}` rendered as `m{a b="v"}`).
+    #[test]
+    fn test_display_round_trips_through_from_str() {
+        let cases: &[(&[(&str, &str)], &str)] = &[
+            (&[("__name__", "m"), ("a", "v")], r#"m{a="v"}"#),
+            (&[("__name__", "m"), ("a b", "v")], r#"m{"a b"="v"}"#),
+            (&[("__name__", "m"), ("9", "v")], r#"m{"9"="v"}"#),
+            (
+                &[("__name__", "m"), ("or", "1"), ("OR", "2")],
+                r#"m{"OR"="2","or"="1"}"#,
+            ),
+            (&[("__name__", "m"), ("a.b-c:d", "v")], r#"m{a.b-c:d="v"}"#),
+            (&[("__name__", "m"), ("région", "v")], r#"m{"région"="v"}"#),
+            (&[("__name__", "a b")], r#"{"a b"}"#),
+            (&[("__name__", "9cpu"), ("x", "1")], r#"{"9cpu",x="1"}"#),
+            (&[("__name__", "or")], r#"{"or"}"#),
+            (
+                &[("__name__", "m"), ("q", "say \"hi\"\\")],
+                r#"m{q="say \"hi\"\\"}"#,
+            ),
+        ];
+        for (pairs, rendered) in cases {
+            let mn = MetricName::from_pairs(pairs.iter().copied());
+            let text = mn.to_string();
+            assert_eq!(&text, rendered, "{pairs:?}");
+            let back: MetricName = text.parse().unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(back, mn, "{text}");
+        }
+        // Without `__name__` it is a label set, not a metric definition.
+        let unnamed = MetricName::from_pairs([("a b", "v")]);
+        assert_eq!(unnamed.to_string(), r#"{"a b"="v"}"#);
+        assert!(unnamed.to_string().parse::<MetricName>().is_err());
     }
 }
