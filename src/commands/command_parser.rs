@@ -731,8 +731,11 @@ pub(crate) fn parse_ignore_options(args: &mut CommandArgIterator) -> ValkeyResul
     })?;
     // ignoreMaxValDiff
     str = args.next_str().map_err(|_| missing())?;
-    let ignore_max_val_diff =
-        parse_number(str).map_err(|_| ValkeyError::Str(error_consts::CANNOT_PARSE_IGNORE))?;
+    let ignore_max_val_diff = parse_number(str)
+        .ok()
+        // NaN passed the `< 0.0` check below and was stored; RTS rejects it as unparseable.
+        .filter(|v| !v.is_nan())
+        .ok_or(ValkeyError::Str(error_consts::CANNOT_PARSE_IGNORE))?;
     if ignore_max_timediff < 0 || ignore_max_val_diff < 0.0 {
         return Err(ValkeyError::Str(error_consts::NEGATIVE_IGNORE_VALUES));
     }

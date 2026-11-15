@@ -181,6 +181,17 @@ class TestIgnore:
         with pytest.raises(ResponseError):
             diff("TS.CREATE", "c:ign:bad", "IGNORE", "x", "y")
 
+    @pytest.mark.parametrize("value", ["010", "0010", "09", "0x10", ".5", "inf", "010.5"])
+    def test_ignore_value_operand_forms_agree(self, diff, value):
+        """A leading zero is decimal on both engines (`010` is 10, not octal 8)."""
+        diff("TS.CREATE", "c:ign:form", "DUPLICATE_POLICY", "LAST", "IGNORE", 0, value)
+        diff("TS.INFO", "c:ign:form")
+
+    @pytest.mark.parametrize("value", ["nan", "-010"])
+    def test_ignore_nan_and_negative_rejected(self, diff, value):
+        with pytest.raises(ResponseError):
+            diff("TS.CREATE", "c:ign:nan", "DUPLICATE_POLICY", "LAST", "IGNORE", 0, value)
+
 
 class TestLabels:
     def test_labels_accepted_and_ordered_in_info(self, diff):
@@ -387,3 +398,21 @@ class TestParserDivergences:
 
         assert labels(diff.reference) == {b"1": b"2"}
         assert labels(diff.subject) == {}
+
+
+class TestNumericOperandDivergences:
+    """DIV-0066: numeric forms accepted here and not by RTS (unit suffixes, `_`
+    separators, `0b`/`0o` prefixes, and anything but a plain integer for CHUNK_SIZE),
+    and the C99 hex float RTS accepts and we do not. Pinned per engine."""
+
+    @pytest.mark.parametrize("value", ["5m", "1k", "1_000", "0b1", "0o7"])
+    def test_ignore_operand_superset(self, diff, value):
+        args = ("TS.CREATE", "c:div:ign", "IGNORE", 0, value)
+        assert _errors(diff.reference, *args)
+        assert diff.subject.execute_command(*args) == b"OK"
+
+    @pytest.mark.parametrize("size", ["0256", "0x100", "256.0", "+256", "2_56", "4kb", "0b100000000"])
+    def test_chunk_size_superset(self, diff, size):
+        args = ("TS.CREATE", "c:div:cs", "CHUNK_SIZE", size)
+        assert _errors(diff.reference, *args)
+        assert diff.subject.execute_command(*args) == b"OK"

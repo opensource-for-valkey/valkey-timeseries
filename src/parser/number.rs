@@ -60,14 +60,9 @@ pub fn parse_positive_number(str: &str) -> ParseResult<f64> {
                 'b' | 'B' => from_str_radix(&rest[1..], 2),
                 'o' | 'O' => from_str_radix(&rest[1..], 8),
                 'x' | 'X' => from_str_radix(&rest[1..], 16),
-                _ => {
-                    if ch.is_numeric() {
-                        // try and match Go style octal
-                        return from_str_radix(rest, 8);
-                    }
-                    // punt to std num parser
-                    parse_basic(str)
-                }
+                // A leading zero is decimal (`010` is 10, `09` is 9), as `strtod` reads it and
+                // so RedisTimeSeries does. Go-style octal turned `FILTER_BY_VALUE 010` into 8.
+                _ => parse_basic(str),
             };
         }
         _ => return parse_basic(str),
@@ -217,7 +212,13 @@ mod tests {
         f("0xfe", 0xfe as f64);
         f("0b0110", 0b0110 as f64);
         f("0O765", 0o765 as f64);
-        f("0765", 0o765 as f64);
+        f("0765", 765.0);
+        f("010", 10.0);
+        f("0010", 10.0);
+        f("09", 9.0);
+        f("08", 8.0);
+        f("010.5", 10.5);
+        f("0.010", 0.010);
         f("2k", (2 * 1000) as f64);
         f("2.3Kb", 2.3 * 1000_f64);
         f("3ki", 3.0 * 1024_f64);
@@ -263,5 +264,23 @@ mod tests {
         // Signed parsing still works.
         assert_eq!(parse_number("-12").unwrap(), -12.0);
         assert_eq!(parse_number("+12").unwrap(), 12.0);
+    }
+
+    #[test]
+    fn test_leading_zero_is_decimal() {
+        // RTS reads these as `strtod` does; checked black-box against the compat reference.
+        for (s, expected) in [
+            ("010", 10.0),
+            ("-010", -10.0),
+            ("09", 9.0),
+            ("0010", 10.0),
+            ("010.5", 10.5),
+        ] {
+            assert_eq!(parse_number(s).unwrap(), expected, "{s}");
+        }
+        // The explicit radix prefixes are unchanged.
+        assert_eq!(parse_number("0o10").unwrap(), 8.0);
+        assert_eq!(parse_number("0x10").unwrap(), 16.0);
+        assert_eq!(parse_number("0b10").unwrap(), 2.0);
     }
 }

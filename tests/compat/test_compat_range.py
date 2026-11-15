@@ -619,6 +619,37 @@ class TestFilterByValue:
         with pytest.raises(ResponseError):
             diff(range_cmd, "r:fbvbad", "-", "+", "FILTER_BY_VALUE", "low", "high")
 
+    @pytest.mark.parametrize("low", [
+        "010", "0010", "09", "08", "010.5", "-010", "0x8", "+8", ".5", "5.", "0.010", "-inf",
+    ])
+    def test_filter_by_value_operand_forms_agree(self, diff, range_cmd, low):
+        """A leading zero is decimal on both engines: `010` is 10, not octal 8."""
+        mk_populated(diff, "r:fbvform", [(1, 8.0), (2, 9.0), (3, 10.0), (4, 10.5), (5, 11.0)])
+        diff(range_cmd, "r:fbvform", "-", "+", "FILTER_BY_VALUE", low, "20")
+
+    @pytest.mark.parametrize("low", ["nan", "0x", "1e"])
+    def test_filter_by_value_unparseable_operand_rejected(self, diff, range_cmd, low):
+        mk_populated(diff, "r:fbvunp", BASE_SAMPLES)
+        with pytest.raises(ResponseError):
+            diff(range_cmd, "r:fbvunp", "-", "+", "FILTER_BY_VALUE", low, "20")
+
+    @pytest.mark.parametrize("low", ["1_0", "5m", "1k", "0b1", "0o7"])
+    def test_filter_by_value_operand_superset(self, diff, range_cmd, low):
+        """DIV-0066: accepted here, rejected by RTS."""
+        mk_populated(diff, "r:fbvsup", BASE_SAMPLES)
+        args = (range_cmd, "r:fbvsup", "-", "+", "FILTER_BY_VALUE", low, "20")
+        with pytest.raises(ResponseError):
+            diff.reference.execute_command(*args)
+        diff.subject.execute_command(*args)
+
+    def test_filter_by_value_hex_float_only_on_reference(self, diff, range_cmd):
+        """DIV-0066, the other direction: RTS reads the C99 hex float `0x1p3` as 8."""
+        mk_populated(diff, "r:fbvhex", BASE_SAMPLES)
+        args = (range_cmd, "r:fbvhex", "-", "+", "FILTER_BY_VALUE", "0x1p3", "20")
+        diff.reference.execute_command(*args)
+        with pytest.raises(ResponseError):
+            diff.subject.execute_command(*args)
+
     def test_filter_by_ts_and_value_combined(self, diff, range_cmd):
         mk_populated(diff, "r:fbboth", BASE_SAMPLES)
         diff(

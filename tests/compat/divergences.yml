@@ -1421,7 +1421,7 @@
 # engines now agree there (pinned by TestRawFilterValues, which diffs normally). This entry
 # covers only the inputs RTS accepts without a consistent meaning, which we reject.
 #
-# ⚠️ `behavior`-kind: needs owner sign-off in the PR that introduces it (§5.3).
+# ⚠️ `behavior`-kind: owner sign-off 2026-11-14.
 
 - id: DIV-0065
   command: TS.QUERYINDEX
@@ -1433,9 +1433,41 @@
     them: `e=x=y` reads as `e=x`, `e==b`, `e=p,q`, `e=p)`, `e=a(b` and `t=()` match nothing,
     and `=1` matches every series. Applies to every FILTER-taking command.
   rationale: >
+    Accepted (owner sign-off 2026-11-14, §5.3).
     Stricter input (COMPATIBILITY.md, "A note on stricter input validation"): RTS truncates
     or ignores part of the matcher without an error, which is a wrong answer for any caller
     who meant the whole value. The Prometheus-style form (`{e="x=y"}`) matches such values
     exactly. Stricter input, so `ts-compatibility-mode strict` does not relax it. Pinned by
     TestRawFilterValueDivergences.
+  since: 0.1.0
+
+# DIV-0066 came with making a leading zero decimal in numeric operands (`010` was Go-style
+# octal 8). Reference behavior observed black-box against the pinned redis:8.10 image
+# (2026-11-14): RTS reads FILTER_BY_VALUE and the IGNORE value difference like `strtod`
+# (`010` = 10, `0x8` = 8, `.5`, `5.`, `-inf`) and takes CHUNK_SIZE only as a plain decimal
+# integer. The forms both engines read the same way are diffed normally
+# (TestFilterByValue::test_filter_by_value_operand_forms_agree,
+# TestIgnore::test_ignore_value_operand_forms_agree).
+#
+# ⚠️ `behavior`-kind: owner sign-off 2026-11-14 (keep the suffix superset as a divergence).
+
+- id: DIV-0066
+  command: TS.RANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    Numeric operands accept forms RTS rejects: SI/IEC unit suffixes (`5m` = 5e6, `1k`,
+    `4kb`), `_` digit separators (`1_000`), and `0b`/`0o` radix prefixes, in
+    FILTER_BY_VALUE (TS.RANGE/REVRANGE/MRANGE/MREVRANGE) and the IGNORE value difference;
+    CHUNK_SIZE additionally accepts a leading zero, `0x`, a sign, and an integral float
+    (`256.0`), where RTS takes only a plain decimal integer. In the other direction RTS
+    accepts a C99 hex float (`FILTER_BY_VALUE 0x1p3` = 8), which is rejected here.
+  rationale: >
+    Accepted (owner sign-off 2026-11-14, §5.3): the suffixes and separators are a deliberate
+    accepted-input superset shared with configuration values and CHUNK_SIZE, where they are
+    useful; RTS rejects every one of these inputs, so no RTS-compatible caller depends on
+    them. Hex floats are not worth a second float grammar. Pinned by
+    TestFilterByValue::test_filter_by_value_operand_superset,
+    TestFilterByValue::test_filter_by_value_hex_float_only_on_reference and
+    TestNumericOperandDivergences.
   since: 0.1.0
