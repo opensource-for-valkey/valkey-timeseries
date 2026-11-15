@@ -49,7 +49,8 @@ fn parse_nonnegative(s: &str, units: DurationUnits) -> ParseResult<i64> {
 /// Segments may be combined, e.g. `2h5m`, `-2h5m` or `2h-5m`. Once a segment is negative,
 /// every later segment is negated too (`2h-5m5s` is 2h - 5m - 5s). A segment without a unit is
 /// milliseconds. Integer segments are summed exactly, so `9007199254740993ms` and any plain
-/// integer up to `i64::MAX` come back unchanged; a fraction or exponent goes through `f64`.
+/// integer up to `i64::MAX` come back unchanged; a fraction or exponent goes through `f64`,
+/// but only that segment's own value: its whole part joins the exact sum as an integer.
 /// Values outside the `i64` range, and sums that are not finite, are errors.
 pub fn parse_duration_value(s: &str) -> ParseResult<i64> {
     sum_duration(s, DurationUnits::Standard)?.to_millis(s)
@@ -94,27 +95,50 @@ struct DurationSum {
 }
 
 impl DurationSum {
+    #[cfg(test)]
     fn total_f64(&self) -> f64 {
         self.exact as f64 + self.approx
     }
 
+    /// The sum as an integer part and a fraction in `(-1, 1)`: the whole part of `approx` is
+    /// added to `exact` as an integer, so an integral fractional-form segment (`1.0ms`) does
+    /// not round the exact subtotal through `f64` (`9007199254741s1.0ms`). `None` when the
+    /// integer part is beyond any `i64` total.
+    fn split(&self) -> Option<(i128, f64)> {
+        let whole = self.approx.trunc();
+        // Far outside `i64` either way, and inside `i128`, so the cast below is exact.
+        if whole.abs() > 1e30 {
+            return None;
+        }
+        let total = self.exact.checked_add(whole as i128)?;
+        // Exact: subtracting the truncation of a float leaves its representable fraction.
+        Some((total, self.approx - whole))
+    }
+
+    /// Whether the unrounded sum is below zero, so `-0.4ms` counts as negative.
     fn is_negative(&self) -> bool {
-        if self.has_approx {
-            self.total_f64() < 0.0
-        } else {
-            self.exact < 0
+        match self.split() {
+            Some((total, fraction)) => total < 0 || (total == 0 && fraction < 0.0),
+            // Out of range; `to_millis` rejects it whatever its sign.
+            None => self.approx < 0.0,
         }
     }
 
     fn to_millis(&self, s: &str) -> ParseResult<i64> {
         let total = if self.has_approx {
-            let rounded = self.total_f64().round();
-            // `i64::MAX as f64` is 2^63, one past the range, so `>` lets 2^63 through to
-            // `try_from` below, which rejects it.
-            if !rounded.is_finite() || rounded.abs() > i64::MAX as f64 {
-                return Err(out_of_range(s));
-            }
-            rounded as i128
+            let (total, fraction) = self.split().ok_or_else(|| out_of_range(s))?;
+            // Round half away from zero, like `f64::round`, on `total + fraction` without
+            // forming it in `f64`. With `|fraction| < 1` the sum has the sign of `total`, or
+            // of `fraction` when `total` is 0.
+            let negative = total < 0 || (total == 0 && fraction < 0.0);
+            let adjust = match (negative, fraction) {
+                (false, f) if f >= 0.5 => 1,
+                (false, f) if f < -0.5 => -1,
+                (true, f) if f <= -0.5 => -1,
+                (true, f) if f > 0.5 => 1,
+                _ => 0,
+            };
+            total + adjust
         } else {
             self.exact
         };
@@ -504,6 +528,38 @@ mod tests {
             "106751991168d",
             "1e19",
         ] {
+            assert!(parse_duration_value(s).is_err(), "{s}");
+        }
+    }
+
+    #[test]
+    fn test_mixed_segments_keep_the_exact_subtotal() {
+        // An integral value in fractional form adds to the exact subtotal as an integer: the
+        // sum used to go through `f64`, which has no odd integers above 2^53.
+        for (s, expected) in [
+            ("9007199254741s1.0ms", 9_007_199_254_741_001),
+            ("9007199254741s1e0ms", 9_007_199_254_741_001),
+            ("9223372036854775s807.0ms", i64::MAX),
+            ("9223372036854775s806.5ms", i64::MAX),
+            ("9007199254741s1.4ms", 9_007_199_254_741_001),
+            ("9007199254741s1.6ms", 9_007_199_254_741_002),
+            ("2s0.5ms", 2_001),
+            ("2s0.49ms", 2_000),
+        ] {
+            assert_eq!(parse_duration_value(s).unwrap(), expected, "{s}");
+        }
+        // Halves round away from zero, as `f64::round` does, including across a sign change.
+        for (s, expected) in [
+            ("-2s-0.5ms", -2_001),
+            ("2s-0.5ms", 2_000),
+            ("1s-1000.5ms", -1),
+            ("1s-1500.5ms", -501),
+            ("1s-999.6ms", 0),
+            ("-0.5ms", -1),
+        ] {
+            assert_eq!(parse_duration_value(s).unwrap(), expected, "{s}");
+        }
+        for s in ["9223372036854775s808.0ms", "9223372036854775s807.5ms"] {
             assert!(parse_duration_value(s).is_err(), "{s}");
         }
     }
