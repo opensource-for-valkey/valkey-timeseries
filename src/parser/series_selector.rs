@@ -17,21 +17,29 @@ const INITIAL_TOKENS: &[Token] = &[
     Token::StringLiteral,
 ];
 
-const SECONDARY_TOKENS: &[Token] = &[
-    Token::Equal,
-    Token::OpNotEqual,
-    Token::RegexEqual,
-    Token::RegexNotEqual,
-    Token::StartsWith,
-    Token::NotStartsWith,
-    Token::LeftBrace,
-    Token::Eof,
-];
+/// What may follow a bare metric name. An operator is not here: an argument whose first
+/// operator comes before any `{` is an RTS-form predicate and never reaches the lexer.
+const SECONDARY_TOKENS: &[Token] = &[Token::LeftBrace, Token::Eof];
+
+/// Characters an unquoted RTS-form value may not contain. RTS gives them no consistent meaning
+/// (`e=x=y` reads as `e=x`; `e=p,q` and `e=a)b` match nothing), so they are an error here and
+/// the braces form, where values are quoted strings, is the way to match them.
+const RTS_RESERVED_CHARS: [char; 4] = ['=', '(', ')', ','];
 
 /// Parses a series selector, either using RedisTimeSeries or Prometheus syntax.
+///
+/// An argument whose first operator (`=`, `!=`, `=~`, `!~`, `^=`, `^~`) comes before any `{` is
+/// an RTS-form predicate, `label<op>value`, read the way RedisTimeSeries reads it: the label is
+/// the raw text before the operator and the value the raw text after it, untrimmed, with quotes
+/// as ordinary characters. Everything else (`{...}`, `name{...}`, a bare metric name, and `or`
+/// between those) goes through the Prometheus-style grammar.
 pub fn parse_series_selector(s: &str) -> ParseResult<SeriesSelector> {
     if s.is_empty() {
         return Err(ParseError::EmptySeriesSelector);
+    }
+    if let Some((label, op, value)) = split_rts_predicate(s) {
+        let filter = parse_rts_predicate(label, op, value)?;
+        return Ok(SeriesSelector::with_filters(vec![filter]));
     }
     let mut lex = Token::lexer(s);
     let result = parse_series_selector_internal(&mut lex)?;
@@ -58,11 +66,7 @@ fn parse_series_selector_internal(p: &mut Lexer<Token>) -> ParseResult<SeriesSel
                     let matcher = LabelFilter::equals(METRIC_NAME_LABEL.into(), &text);
                     SeriesSelector::with_filters(vec![matcher])
                 }
-                LeftBrace => parse_prometheus_selector_internal(p, text)?,
-                _ => {
-                    let matcher = parse_redis_ts_predicate(text, tok, p)?;
-                    SeriesSelector::with_filters(vec![matcher])
-                }
+                _ => parse_prometheus_selector_internal(p, text)?,
             }
         };
 
@@ -124,21 +128,94 @@ fn create_selector_with_optional_name(
     SeriesSelector::And(filters)
 }
 
-/// Support RedisTimeseries style selectors
-fn parse_redis_ts_predicate(
-    label: String,
-    operator_token: Token,
-    lex: &mut Lexer<Token>,
-) -> ParseResult<LabelFilter> {
-    let op: MatchOp = operator_token.try_into()?;
-
-    if op.is_regex() {
-        let value = parse_string_literal(lex)?;
-        LabelFilter::create(op, label, value)
-    } else {
-        let value = parse_matcher_value(lex)?;
-        create_predicate_filter(label, op, value)
+/// Splits `label<op>value` at the first operator, or returns `None` when a `{` comes first (a
+/// Prometheus-style selector) or there is no operator (a bare metric name).
+///
+/// Indexing by byte is safe: every byte matched here is ASCII, and a UTF-8 continuation or
+/// lead byte never is.
+fn split_rts_predicate(s: &str) -> Option<(&str, MatchOp, &str)> {
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        let (op, len) = match (b, bytes.get(i + 1)) {
+            (b'{', _) => return None,
+            (b'=', Some(b'~')) => (MatchOp::RegexEqual, 2),
+            (b'=', _) => (MatchOp::Equal, 1),
+            (b'!', Some(b'=')) => (MatchOp::NotEqual, 2),
+            (b'!', Some(b'~')) => (MatchOp::RegexNotEqual, 2),
+            (b'^', Some(b'=')) => (MatchOp::StartsWith, 2),
+            (b'^', Some(b'~')) => (MatchOp::NotStartsWith, 2),
+            _ => continue,
+        };
+        return Some((&s[..i], op, &s[i + len..]));
     }
+    None
+}
+
+/// Builds the filter for an RTS-form predicate. `=` and `!=` are RTS; `=~`, `!~`, `^=` and `^~`
+/// are extensions. The regex operators take a quoted string literal (so a pattern can hold any
+/// character); the others take a raw value like `=` does.
+fn parse_rts_predicate(label: &str, op: MatchOp, value: &str) -> ParseResult<LabelFilter> {
+    if label.is_empty() {
+        return Err(ParseError::SyntaxError(format!(
+            "missing label name before `{op}`"
+        )));
+    }
+    if op.is_regex() {
+        let mut lex = Token::lexer(value);
+        let pattern = parse_string_literal(&mut lex)?;
+        expect_token(&mut lex, Token::Eof)?;
+        return LabelFilter::create(op, label, pattern);
+    }
+    LabelFilter::create_with_value(op, label, parse_rts_value(value)?)
+}
+
+/// Reads an RTS-form value: empty (the label is absent), `(v1,v2,...)`, or one raw value.
+/// Nothing is trimmed or unquoted, matching RTS: `( a)` lists `" a"`, and `"x"` is three
+/// characters long.
+fn parse_rts_value(raw: &str) -> ParseResult<PredicateValue> {
+    let reserved = |text: &str| {
+        text.chars().find(|c| RTS_RESERVED_CHARS.contains(c)).map(|c| {
+            ParseError::SyntaxError(format!(
+                "unquoted value `{raw}` contains `{c}`; match it with the {{label=\"value\"}} form"
+            ))
+        })
+    };
+
+    if raw.is_empty() {
+        return Ok(PredicateValue::Empty);
+    }
+    let Some(list) = raw.strip_prefix('(') else {
+        return match reserved(raw) {
+            Some(err) => Err(err),
+            None => Ok(PredicateValue::String(raw.to_string())),
+        };
+    };
+    let Some(list) = list.strip_suffix(')') else {
+        return Err(ParseError::SyntaxError(format!(
+            "value list `{raw}` must end with `)`"
+        )));
+    };
+    if list.is_empty() {
+        return Err(ParseError::SyntaxError("empty value list `()`".to_string()));
+    }
+
+    let mut values = ValueList::new();
+    for item in list.split(',') {
+        if item.is_empty() {
+            return Err(ParseError::SyntaxError(format!(
+                "empty item in value list `{raw}`"
+            )));
+        }
+        if let Some(err) = reserved(item) {
+            return Err(err);
+        }
+        values.push(item.to_string());
+    }
+    Ok(if values.len() == 1 {
+        PredicateValue::String(values.swap_remove(0))
+    } else {
+        PredicateValue::List(values)
+    })
 }
 
 fn create_predicate_filter(

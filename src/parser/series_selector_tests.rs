@@ -384,7 +384,8 @@ mod tests {
 
     #[test]
     fn test_selector_with_newline() {
-        let input = r#"label="\n""#;
+        // Escapes are decoded in the braces form only; RTS form takes the text as written.
+        let input = r#"{label="\n"}"#;
         let result = parse_series_selector(input).unwrap();
 
         with_and_matchers(&result, |matchers| {
@@ -392,6 +393,11 @@ mod tests {
 
             let temperature_matcher = &matchers[0];
             assert_matcher(temperature_matcher, "label", MatchOp::Equal, "\n");
+        });
+
+        let result = parse_series_selector(r#"label="\n""#).unwrap();
+        with_and_matchers(&result, |matchers| {
+            assert_matcher(&matchers[0], "label", MatchOp::Equal, r#""\n""#);
         });
     }
 
@@ -449,7 +455,7 @@ mod tests {
                 matcher,
                 "service",
                 MatchOp::StartsWith,
-                &["api", "worker", "batch-job"],
+                &["api", "worker", "\"batch-job\""],
             );
         });
     }
@@ -477,7 +483,12 @@ mod tests {
 
     #[test]
     fn starts_with_selector_rejects_empty_values() {
-        for input in ["service^=\"\"", "service^=(api,\"\")", "{service^=()}"] {
+        for input in [
+            "service^=",
+            "{service^=\"\"}",
+            "{service^=(api,\"\")}",
+            "{service^=()}",
+        ] {
             let err = parse_series_selector(input).expect_err("empty prefix values should fail");
             assert!(
                 err.to_string()
@@ -704,7 +715,7 @@ mod tests {
             r#"cpu{job="a", memory}"#,
             r#"cpu{job="a" or __name__="memory"}"#,
             r#"cpu{job="a" or memory}"#,
-            r#"job=a or cpu{__name__="memory"}"#,
+            r#"{job="a"} or cpu{__name__="memory"}"#,
         ] {
             match parse_series_selector(selector) {
                 Err(ParseError::MetricNameSetTwice(outer, _)) => {
@@ -761,12 +772,21 @@ mod tests {
     }
 
     // `#` used to start a lexer comment, so an unquoted value lost everything from it on, with
-    // no error. It is now an error until unquoted RTS-form values are read as raw text.
+    // no error. In RTS form it is now an ordinary character, as in RTS; elsewhere it is an error.
     #[test]
     fn test_hash_in_unquoted_value_is_not_a_comment() {
+        for (selector, value) in [("color=#ff0000", "#ff0000"), ("tag=foo#bar", "foo#bar")] {
+            let parsed = parse_series_selector(selector).unwrap();
+            with_and_matchers(&parsed, |matchers| {
+                assert_matcher(
+                    &matchers[0],
+                    selector.split('=').next().unwrap(),
+                    MatchOp::Equal,
+                    value,
+                );
+            });
+        }
         for selector in [
-            "color=#ff0000",
-            "tag=foo#bar",
             "a=b#c or d=e",
             "{color=#ff0000}",
             r#"cpu{job="a"} # trailing"#,
@@ -787,5 +807,116 @@ mod tests {
         };
         assert_contains_matcher(&filters, "color", MatchOp::Equal, "#ff0000");
         assert_contains_matcher(&filters, "tag", MatchOp::Equal, "foo#bar");
+    }
+
+    // RTS form: label and value are the raw text around the first operator, as RTS reads them
+    // (black-box checked against the compat reference). Quotes, spaces, `#`, `or` and non-ASCII
+    // text are ordinary characters.
+    #[test]
+    fn test_rts_form_values_are_raw_text() {
+        for (selector, label, value) in [
+            ("host=10.0.0.1", "host", "10.0.0.1"),
+            ("ver=1.2.3", "ver", "1.2.3"),
+            ("id=3f2a-9c", "id", "3f2a-9c"),
+            ("city=Zürich", "city", "Zürich"),
+            ("path=/var/log", "path", "/var/log"),
+            ("email=a@b.com", "email", "a@b.com"),
+            ("state=OR", "state", "OR"),
+            ("x=or", "x", "or"),
+            ("sp=a b", "sp", "a b"),
+            ("e=a or b", "e", "a or b"),
+            (r#"host="10.0.0.1""#, "host", r#""10.0.0.1""#),
+            ("host='h'", "host", "'h'"),
+            ("host =v", "host ", "v"),
+            ("t= x", "t", " x"),
+            ("über=1", "über", "1"),
+            ("my/label=1", "my/label", "1"),
+            ("1abc=1", "1abc", "1"),
+            (r#""q"=1"#, r#""q""#, "1"),
+            ("s=a\"b", "s", "a\"b"),
+            ("e!x=y", "e!x", "y"),
+        ] {
+            let parsed =
+                parse_series_selector(selector).unwrap_or_else(|e| panic!("{selector}: {e}"));
+            with_and_matchers(&parsed, |matchers| {
+                assert_eq!(matchers.len(), 1, "{selector}");
+                assert_matcher(&matchers[0], label, MatchOp::Equal, value);
+            });
+        }
+    }
+
+    #[test]
+    fn test_rts_form_lists_are_raw_items() {
+        let parsed = parse_series_selector("t=(temperature, humidity)").unwrap();
+        with_and_matchers(&parsed, |matchers| {
+            assert_list_matcher(
+                &matchers[0],
+                "t",
+                MatchOp::Equal,
+                &["temperature", " humidity"],
+            );
+        });
+        let parsed = parse_series_selector("t!=(a,\"b\")").unwrap();
+        with_and_matchers(&parsed, |matchers| {
+            assert_list_matcher(&matchers[0], "t", MatchOp::NotEqual, &["a", "\"b\""]);
+        });
+        // A one-item list is that value.
+        let parsed = parse_series_selector("t=( humidity)").unwrap();
+        with_and_matchers(&parsed, |matchers| {
+            assert_matcher(&matchers[0], "t", MatchOp::Equal, " humidity");
+        });
+    }
+
+    #[test]
+    fn test_rts_form_rejects_ambiguous_values() {
+        // RTS errors on the malformed lists and gives the others no consistent meaning
+        // (`e=x=y` reads as `e=x`; `e=p,q`, `e=a)b`, `t=()` match nothing).
+        for selector in [
+            "e=x=y",
+            "e==b",
+            "e=p,q",
+            "e=p)",
+            "e=a(b",
+            "e=(p",
+            "e=(p,q)z",
+            "e=(p),",
+            "e=(x=y,b)",
+            "t=()",
+            "t=(,a)",
+            "t=(a,)",
+            "t=(a,,b)",
+            "=1",
+            "!=a",
+            "status=999 or env=prod",
+        ] {
+            assert!(
+                parse_series_selector(selector).is_err(),
+                "{selector} parsed as {:?}",
+                parse_series_selector(selector)
+            );
+        }
+    }
+
+    #[test]
+    fn test_rts_form_regex_takes_a_string_literal() {
+        let parsed = parse_series_selector(r#"instance=~"host000[12]+""#).unwrap();
+        with_and_matchers(&parsed, |matchers| {
+            assert_matcher(
+                &matchers[0],
+                "instance",
+                MatchOp::RegexEqual,
+                "host000[12]+",
+            );
+        });
+        assert!(parse_series_selector("instance=~host.*").is_err());
+        assert!(parse_series_selector(r#"instance=~"a" or b=c"#).is_err());
+    }
+
+    #[test]
+    fn test_or_between_rts_predicates_moves_into_braces() {
+        // `a=1 or b=2` is now the single value `1 or b=2` (and rejected for its `=`); the
+        // braces form is the way to OR label matchers.
+        let parsed = parse_series_selector(r#"{status="999" or env="prod"}"#).unwrap();
+        with_or_matchers(&parsed, |branches| assert_eq!(branches.len(), 2));
     }
 }

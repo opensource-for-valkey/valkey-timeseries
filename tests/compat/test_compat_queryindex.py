@@ -125,3 +125,59 @@ class TestFilterSupersets:
         with pytest.raises(ResponseError):
             diff.reference.execute_command("TS.QUERYINDEX", "not-a-matcher")
         diff.subject.execute_command("TS.QUERYINDEX", "not-a-matcher")
+
+
+def _mk_raw_value_universe(diff):
+    """Series whose label values are not identifier- or number-shaped. Every one carries
+    `m=raw`, the positive matcher the queries below anchor on."""
+    for key, *labels in [
+        ("r:hash", "color", "#ff0000", "tag", "foo#bar"),
+        ("r:text", "host", "10.0.0.1", "ver", "1.2.3", "id", "3f2a-9c", "city", "Zürich",
+         "path", "/var/log", "email", "a@b.com", "state", "OR", "sp", "a b"),
+        ("r:quoted", "host", '"10.0.0.1"'),
+        ("r:space", "t", " humidity"),
+        ("r:plain", "t", "humidity"),
+        ("r:names", "host ", "v", '"q"', "1", "über", "1"),
+    ]:
+        diff("TS.CREATE", key, "LABELS", "m", "raw", *labels)
+
+
+class TestRawFilterValues:
+    """Basic FILTER matchers are read as raw text on both engines: label and value are the
+    text around the first operator, untrimmed, with quotes, `#`, spaces and non-ASCII text
+    as ordinary characters. Reference behavior observed black-box (2026-11-14)."""
+
+    @pytest.mark.parametrize("matcher", [
+        "color=#ff0000", "tag=foo#bar", "color=#",
+        "host=10.0.0.1", "ver=1.2.3", "id=3f2a-9c", "city=Zürich", "path=/var/log",
+        "email=a@b.com", "state=OR", "state=or", "sp=a b",
+        'host="10.0.0.1"', "host='10.0.0.1'",
+        "t=(humidity, humidity)", "t=( humidity)", "t=(humidity,x)", "host=(10.0.0.1,x)",
+        "host!=10.0.0.1", "t!=(humidity)",
+        "host =v", "host = v", '"q"=1', "q=1", "über=1",
+    ])
+    def test_value_is_raw_text(self, diff, matcher):
+        _mk_raw_value_universe(diff)
+        diff("TS.QUERYINDEX", "m=raw", matcher)
+
+    @pytest.mark.parametrize("matcher", ["e=(p", "e=(p,q)z", "e=(p),", "t=(,a)", "t=(a,)"])
+    def test_malformed_list_is_rejected_by_both(self, diff, matcher):
+        # Both reject; the wording differs, so per engine (see test_empty_matcher_rejected).
+        _mk_raw_value_universe(diff)
+        with pytest.raises(ResponseError):
+            diff.reference.execute_command("TS.QUERYINDEX", "m=raw", matcher)
+        with pytest.raises(ResponseError):
+            diff.subject.execute_command("TS.QUERYINDEX", "m=raw", matcher)
+
+
+class TestRawFilterValueDivergences:
+    """DIV-0065: inputs RTS accepts with no consistent meaning, which we reject."""
+
+    @pytest.mark.parametrize("matcher", [
+        "e=x=y", "e==b", "e=p,q", "e=p)", "e=a(b", "t=()", "=1", "status=999 or env=prod",
+    ])
+    def test_ambiguous_value_is_rejected_only_here(self, diff, matcher):
+        _mk_raw_value_universe(diff)
+        assert isinstance(diff.reference.execute_command("TS.QUERYINDEX", "m=raw", matcher), (list, set))
+        with pytest.raises(ResponseError):
+            diff.subject.execute_command("TS.QUERYINDEX", "m=raw", matcher)

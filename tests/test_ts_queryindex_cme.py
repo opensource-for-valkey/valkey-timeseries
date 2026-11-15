@@ -278,14 +278,14 @@ class TestTsQueryIndex(ValkeyTimeSeriesClusterTestCase):
         cluster = self.new_cluster_client()
         client = self.new_client_for_primary(0)
         self.setup_or_test_data(cluster)
-        result = client.execute_command('TS.QUERYINDEX', 'status=999 or env=prod')
+        result = client.execute_command('TS.QUERYINDEX', '{status="999" or env="prod"}')
         assert result == [TS5, TS6]
 
     def test_or_all_empty(self):
         cluster = self.new_cluster_client()
         client = self.new_client_for_primary(0)
         self.setup_or_test_data(cluster)
-        result = client.execute_command('TS.QUERYINDEX', 'status=999 or env=development')
+        result = client.execute_command('TS.QUERYINDEX', '{status="999" or env="development"}')
         assert result == []
 
     def test_or_overlapping(self):

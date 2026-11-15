@@ -10,7 +10,7 @@ series with specific label values.
 
 The filter syntax comes in 2 flavors:
 
-- **Basic**: `region=us-east-1` or `sensor_type=(temperature, humidity)`
+- **Basic**: `region=us-east-1` or `sensor_type=(temperature,humidity)`
 - **Prometheus style**: `metric_name{label1="value1",label2="value2",...}`
 
 ### Basic Filter Syntax (RedisTimeSeries compatible)
@@ -50,6 +50,29 @@ label!=(value1,value2,...)
 
 Example: `region!=(us-east-1,us-west-2)` matches series where the `region` label exists but is not `us-east-1` or
 `us-west-2`.
+
+Find series where a label is absent (`label=`) or present with any value (`label!=`).
+
+#### How basic filters are read
+
+A basic filter is read exactly as RedisTimeSeries reads it. The label is the text before the first operator and the
+value is the text after it, **as written**:
+
+- Nothing is trimmed: `host =a` names the label `host ` (with a trailing space), and `t=( humidity)` lists the value
+  ` humidity`.
+- Quotes are ordinary characters: `host="10.0.0.1"` matches a stored value that includes the quote marks. To match
+  `10.0.0.1`, write `host=10.0.0.1`.
+- Any other character is literal, including dots, spaces, `#`, `/`, `@`, non-ASCII text and the word `or`:
+  `ip=10.0.0.1`, `city=Zürich`, `color=#ff0000` and `state=OR` all match those exact values.
+- A value may not contain `=`, `,`, `(` or `)` outside the list form, and list items may not be empty or contain them.
+  RedisTimeSeries gives such filters no consistent meaning (`e=x=y` is read as `e=x`), so they are rejected here. To
+  match a value with those characters, use the Prometheus-style form, where values are quoted strings:
+  `{e="x=y"}`.
+- `or` does not combine basic filters: `a=1 or b=2` is one filter whose value is `1 or b=2` (rejected, because of the
+  `=`). Write `{a="1" or b="2"}` to OR label matchers.
+
+The extension operators `=~`, `!~`, `^=` and `^~` are also accepted in basic form. The regex operators take a quoted
+pattern (`instance=~"host0[12]"`); `^=` and `^~` take raw values like `=`.
 
 ### Prometheus-style Filter Syntax
 
@@ -117,13 +140,14 @@ Each label matcher supports different comparison operators:
 
 ### Label Value Quoting
 
-Label values can be quoted using:
+In the Prometheus-style form, label values are quoted using:
 
 - **Double quotes**: `"value"`
 - **Single quotes**: `'value'`
 - **Backticks**: `` `value` ``
 
-Escape sequences are supported within quoted strings (e.g., `\"`, `\n`, `\\`).
+Escape sequences are supported within double- and single-quoted strings (e.g., `\"`, `\n`, `\\`); backtick strings
+are raw. Basic filters (above) are never unquoted.
 
 ### Multiple Filters
 

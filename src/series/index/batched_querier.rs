@@ -1144,7 +1144,7 @@ mod tests {
             let mut cursor = SeriesCursor::plan(DB, selection, None).unwrap();
             drain(&mut cursor, 8).concat()
         };
-        let cpu = [SeriesSelector::parse(r#"__name__="cpu""#).unwrap()];
+        let cpu = [SeriesSelector::parse("__name__=cpu").unwrap()];
 
         assert_eq!(planned(SeriesSelection::All), vec![1, 2, 3]);
         assert_eq!(planned(SeriesSelection::Matching(&cpu)), vec![1, 2]);

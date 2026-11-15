@@ -1414,3 +1414,28 @@
     samples a client could no longer read stay unreadable.
     Pinned by TestAlterRetentionWidening::test_widening_brings_back_expired_samples_only_on_the_reference.
   since: 0.1.0
+
+# DIV-0065 came with reading basic FILTER matchers as raw text, the way RTS does. Reference
+# behavior was observed black-box against the pinned redis:8.10 image (2026-11-14): RTS takes
+# the text around the first operator as label and value, untrimmed and unquoted, and both
+# engines now agree there (pinned by TestRawFilterValues, which diffs normally). This entry
+# covers only the inputs RTS accepts without a consistent meaning, which we reject.
+#
+# ⚠️ `behavior`-kind: needs owner sign-off in the PR that introduces it (§5.3).
+
+- id: DIV-0065
+  command: TS.QUERYINDEX
+  kind: behavior
+  documentation_only: true
+  description: >
+    A basic FILTER matcher whose value contains `=`, `,`, `(` or `)` outside the list form,
+    an empty list (`t=()`), and an empty label name (`=1`) are rejected. RTS 8.10 accepts
+    them: `e=x=y` reads as `e=x`, `e==b`, `e=p,q`, `e=p)`, `e=a(b` and `t=()` match nothing,
+    and `=1` matches every series. Applies to every FILTER-taking command.
+  rationale: >
+    Stricter input (COMPATIBILITY.md, "A note on stricter input validation"): RTS truncates
+    or ignores part of the matcher without an error, which is a wrong answer for any caller
+    who meant the whole value. The Prometheus-style form (`{e="x=y"}`) matches such values
+    exactly. Stricter input, so `ts-compatibility-mode strict` does not relax it. Pinned by
+    TestRawFilterValueDivergences.
+  since: 0.1.0

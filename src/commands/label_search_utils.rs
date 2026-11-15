@@ -560,7 +560,7 @@ mod tests {
         };
 
         assert_eq!(planned(vec![]), Some(3));
-        let api = parse_series_selector("job=\"api\"").unwrap();
+        let api = parse_series_selector("job=api").unwrap();
         assert_eq!(planned(vec![api]), Some(2));
         assert!(
             plan_match_filter(DB, &MatchFilterOptions::default())

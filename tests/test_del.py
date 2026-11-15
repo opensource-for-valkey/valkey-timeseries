@@ -35,7 +35,7 @@ class TestDel(ValkeyTimeSeriesTestCaseBase):
         keys = self.client.execute_command("TS.QUERYINDEX", f"key={key}")
         assert len(keys) == 0
 
-        keys = self.client.execute_command("TS.QUERYINDEX", 'sensor="temp"')
+        keys = self.client.execute_command("TS.QUERYINDEX", 'sensor=temp')
         assert len(keys) == 0
 
         # Create the key again - should succeed without index interference
