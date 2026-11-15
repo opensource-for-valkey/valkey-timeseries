@@ -1,6 +1,5 @@
 use crate::parser::{ParseError, ParseResult};
 use std::borrow::Cow;
-use std::num::ParseIntError;
 
 /// Decodes a quoted PromQL string literal (the token, quotes included), with the escaping rules
 /// Prometheus uses, which are Go's:
@@ -136,70 +135,6 @@ pub fn quote_string(s: &str) -> String {
     }
     out.push('"');
     out
-}
-
-pub fn unescape_ident(s: &'_ str) -> ParseResult<Cow<'_, str>> {
-    let v = s.find('\\');
-    if v.is_none() {
-        return Ok(Cow::Borrowed(s));
-    }
-    let mut unescaped = String::with_capacity(s.len() - 1);
-    let v = v.unwrap();
-    unescaped.insert_str(0, &s[..v]);
-    let s = &s[v..];
-    let mut chars = s.chars();
-
-    fn map_err(_e: ParseIntError) -> ParseError {
-        ParseError::SyntaxError("invalid escape sequence".to_string())
-    }
-
-    loop {
-        match chars.next() {
-            None => break,
-            Some(c) => unescaped.push(match c {
-                '\\' => match chars.next() {
-                    None => return Err(ParseError::UnexpectedEOF),
-                    Some(c) => match c {
-                        _ if c == '\\' => c,
-                        // octal
-                        '0'..='9' => {
-                            let octal = c.to_string() + &take(&mut chars, 2);
-                            u8::from_str_radix(&octal, 8).map_err(map_err)? as char
-                        }
-                        // hex
-                        'x' => {
-                            let hex = take(&mut chars, 2);
-                            u8::from_str_radix(&hex, 16).map_err(map_err)? as char
-                        }
-                        // unicode
-                        'u' => decode_unicode(&take(&mut chars, 4))?,
-                        'U' => decode_unicode(&take(&mut chars, 8))?,
-                        _ => c,
-                    },
-                },
-                _ => c,
-            }),
-        }
-    }
-
-    Ok(Cow::Owned(unescaped))
-}
-
-#[inline]
-// Iterator#take cannot be used because it consumes the iterator
-fn take<I: Iterator<Item = char>>(iterator: &mut I, n: usize) -> String {
-    let mut s = String::with_capacity(n);
-    for _ in 0..n {
-        s.push(iterator.next().unwrap_or_default());
-    }
-    s
-}
-
-fn decode_unicode(code_point: &str) -> Result<char, ParseError> {
-    match u32::from_str_radix(code_point, 16) {
-        Err(_) => Err(ParseError::General("unrecognized escape".to_string())),
-        Ok(n) => std::char::from_u32(n).ok_or(ParseError::General("invalid unicode".to_string())),
-    }
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use crate::labels::filters::{
 };
 use crate::parser::lex::{Token, expect_one_of_tokens, expect_token};
 use crate::parser::parse_error::unexpected;
-use crate::parser::utils::{extract_string_value, unescape_ident};
+use crate::parser::utils::extract_string_value;
 use crate::parser::{ParseError, ParseResult};
 use logos::{Lexer, Logos};
 use smallvec::SmallVec;
@@ -90,7 +90,8 @@ fn parse_series_selector_internal(p: &mut Lexer<Token>) -> ParseResult<SeriesSel
 
 fn parse_identifier_or_string(tok: Token, text: &str) -> ParseResult<String> {
     match tok {
-        Token::Identifier => Ok(unescape_ident(text)?.to_string()),
+        // The identifier rule admits no `\\`, so there is nothing to unescape.
+        Token::Identifier => Ok(text.to_string()),
         Token::StringLiteral => Ok(extract_string_value(text)?.to_string()),
         _ => Ok(text.to_string()),
     }
@@ -414,7 +415,8 @@ fn parse_label_filter(
 fn expect_label_name(lex: &mut Lexer<Token>) -> ParseResult<String> {
     let (tok, text) = expect_one_of_tokens(lex, &[Token::Identifier, Token::StringLiteral])?;
     match tok {
-        Token::Identifier => Ok(unescape_ident(text)?.to_string()),
+        // The identifier rule admits no `\\`, so there is nothing to unescape.
+        Token::Identifier => Ok(text.to_string()),
         Token::StringLiteral => Ok(extract_string_value(text)?.to_string()),
         _ => unreachable!("expect_label_name: unexpected token"),
     }

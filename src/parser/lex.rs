@@ -58,9 +58,6 @@ pub enum Token {
     #[token("=")]
     Equal,
 
-    #[token("==")]
-    OpEqual,
-
     #[token("!=")]
     OpNotEqual,
 
@@ -76,9 +73,11 @@ pub enum Token {
     #[token("^~")]
     NotStartsWith,
 
+    /// Never produced as a token: these patterns match a string literal with no closing
+    /// quote, and their callback turns the match into an "unterminated string literal" error.
+    /// Logos attaches patterns to a variant, so the variant has to exist.
     #[regex("\"(?s:[^\"\\\\]|\\\\.)*", unterminated_string_literal)]
     #[regex("'(?s:[^'\\\\]|\\\\.)*", unterminated_string_literal)]
-    #[regex("@[^\"'\\s]\\S+", unterminated_string_literal)]
     ErrorStringUnterminated,
 
     /// Marker for end of stream.
@@ -95,7 +94,6 @@ impl Token {
             Self::Number => "<number>",
 
             // symbols
-            // Plain strings, not format strings: `{{` here printed as two braces.
             Self::LeftBrace => "{",
             Self::RightBrace => "}",
             Self::Comma => ",",
@@ -105,7 +103,6 @@ impl Token {
 
             // operators
             Self::OpOr => "or",
-            Self::OpEqual => "==",
             Self::OpNotEqual => "!=",
             Self::RegexEqual => "=~",
             Self::RegexNotEqual => "!~",
@@ -147,7 +144,6 @@ pub(crate) fn expect_token<'a>(lex: &'a mut Lexer<Token>, expected: Token) -> Pa
         Ok(res.1)
     } else {
         let actual = res.1.to_string();
-        // let span = lex.span();
         Err(unexpected(
             "label name",
             &actual,
@@ -166,7 +162,6 @@ pub(crate) fn expect_one_of_tokens<'a>(
         Ok((res.0, res.1))
     } else {
         let actual = res.1.to_string();
-        // let span = lex.span();
         let expected = expected
             .iter()
             .map(|t| t.as_str())
@@ -234,7 +229,6 @@ mod tests {
         test_tokens!(src, [tok]);
     }
 
-    #[test_case("==", OpEqual)]
     #[test_case("!=", OpNotEqual)]
     #[test_case("=~", RegexEqual)]
     #[test_case("!~", RegexNotEqual)]
@@ -321,6 +315,12 @@ mod tests {
         assert!(matches!(lex.next(), Some(Err(_))));
         // Inside a string literal it is an ordinary character.
         test_tokens!(r##""#ff0000""##, [StringLiteral => r##""#ff0000""##]);
+    }
+
+    #[test]
+    fn double_equals_is_two_tokens() {
+        // No grammar accepts `==`, so it is not a token of its own.
+        test_tokens!("==", [Equal, Equal]);
     }
 
     #[test]

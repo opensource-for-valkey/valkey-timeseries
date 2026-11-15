@@ -9,9 +9,7 @@ pub type ParseResult<T> = Result<T, ParseError>;
 #[derive(Default, Debug, PartialEq, Clone, Error)]
 pub enum ParseError {
     #[error(transparent)]
-    Unexpected(ParseErr), // TODO !!!!!!
-    #[error("Unexpected end of text")]
-    UnexpectedEOF,
+    Unexpected(ParseErr),
     #[error("Expected positive duration: found `{0}`")]
     InvalidDuration(String),
     #[error("Expected positive unix millis or rfc3339 timestamp: found `{0}`")]
@@ -38,20 +36,18 @@ pub enum ParseError {
     /// the second field is the matcher's value as written, already quoted.
     #[error("metric name must not be set twice: {0:?} or {1}")]
     MetricNameSetTwice(String, String),
-    #[error("Invalid series selector")]
-    InvalidSeriesSelector,
+    /// What the lexer reports for input no token matches: logos builds its error value with
+    /// `Default`. `get_next_token` replaces it with an `Unexpected` naming the text.
     #[default]
     #[error("Parse error")]
     Other,
 }
 
-/// ParseErr wraps a parser error with line and position context.
+/// ParseErr wraps a parser error with its byte span in the input.
 #[derive(Debug, PartialEq, Clone, Error)]
 pub struct ParseErr {
     pub range: Span,
     pub err: String,
-    /// line_offset is an additional line offset to be added. Only used inside unit tests.
-    pub line_offset: usize,
 }
 
 impl ParseErr {
@@ -59,21 +55,15 @@ impl ParseErr {
         Self {
             range: range.into(),
             err: msg.to_string(),
-            line_offset: 0,
         }
     }
 }
 
 impl Display for ParseErr {
+    /// Renders `1:<byte offset>: parse error: ...`. The line is always 1 and the "column" is
+    /// the 0-based byte offset; clients see this text, so changing it is a separate decision.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let pos: usize = self.range.start;
-        let last_line_break = 0;
-        let line = self.line_offset + 1;
-
-        let col = pos - last_line_break;
-        let position_str = format!("{line}:{col}:").to_string();
-        write!(f, "{} parse error: {}", position_str, self.err)?;
-        Ok(())
+        write!(f, "1:{}: parse error: {}", self.range.start, self.err)
     }
 }
 
