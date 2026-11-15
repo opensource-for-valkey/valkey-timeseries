@@ -1,9 +1,8 @@
-use super::lex::{Token, expect_one_of_tokens, expect_token};
+use super::lex::{Cursor, Token};
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::Label;
 use crate::parser::utils::extract_string_value;
 use crate::parser::{ParseError, ParseResult};
-use logos::{Lexer, Logos};
 
 /// Parses a `Prometheus` compatible metric name (as opposed to a metric selector), the
 /// `TS.CREATE ... METRIC` operand:
@@ -16,34 +15,34 @@ use logos::{Lexer, Logos};
 /// non-empty name without `=`, a non-empty value. A repeated name, and a `__name__` label
 /// (the measurement already is the `__name__`), are errors.
 pub fn parse_metric_name(s: &str) -> ParseResult<Vec<Label>> {
-    let mut lex = Token::lexer(s);
+    let mut cur = Cursor::new(s);
 
-    let measurement = expect_token(&mut lex, Token::Identifier)?;
-    let mut labels = vec![Label::new(METRIC_NAME_LABEL, measurement)];
-    let (tok, _) = expect_one_of_tokens(&mut lex, &[Token::LeftBrace, Token::Eof])?;
-    if tok == Token::LeftBrace {
-        parse_label_set(&mut lex, &mut labels)?;
-        expect_token(&mut lex, Token::Eof)?;
+    let measurement = cur.expect(&[Token::Identifier], "metric name")?;
+    let mut labels = vec![Label::new(METRIC_NAME_LABEL, measurement.text)];
+    if cur.next_if(Token::LeftBrace)?.is_some() {
+        parse_label_set(&mut cur, &mut labels)?;
     }
+    cur.expect(&[Token::Eof], "metric name")?;
     Ok(labels)
 }
 
 /// Parses `name="value", ...}` after the opening brace, appending to `labels`.
-fn parse_label_set(lex: &mut Lexer<Token>, labels: &mut Vec<Label>) -> ParseResult<()> {
+fn parse_label_set(cur: &mut Cursor, labels: &mut Vec<Label>) -> ParseResult<()> {
     use Token::*;
 
     loop {
-        // `}` here closes an empty set or follows a trailing comma.
-        let (tok, text) = expect_one_of_tokens(lex, &[Identifier, StringLiteral, RightBrace])?;
-        let name = match tok {
+        // `}` here closes an empty set or follows a trailing comma. `or` is a name here, as
+        // everywhere a name is expected.
+        let name = cur.expect(&[Identifier, StringLiteral, OpOr, RightBrace], "label set")?;
+        let name = match name.token {
             RightBrace => return Ok(()),
-            StringLiteral => extract_string_value(text)?.into_owned(),
-            _ => text.to_string(),
+            StringLiteral => extract_string_value(name.text)?.into_owned(),
+            _ => name.text.to_string(),
         };
         check_label(labels, &name)?;
 
-        expect_token(lex, Equal)?;
-        let value = extract_string_value(expect_token(lex, StringLiteral)?)?;
+        cur.expect(&[Equal], "label set")?;
+        let value = extract_string_value(cur.expect(&[StringLiteral], "label value")?.text)?;
         if value.is_empty() {
             return Err(ParseError::General(format!(
                 "label `{name}` has an empty value"
@@ -51,8 +50,7 @@ fn parse_label_set(lex: &mut Lexer<Token>, labels: &mut Vec<Label>) -> ParseResu
         }
         labels.push(Label::new(name, value.into_owned()));
 
-        let (tok, _) = expect_one_of_tokens(lex, &[Comma, RightBrace])?;
-        if tok == RightBrace {
+        if cur.expect(&[Comma, RightBrace], "label set")?.token == RightBrace {
             return Ok(());
         }
     }

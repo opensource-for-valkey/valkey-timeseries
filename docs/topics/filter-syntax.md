@@ -145,7 +145,8 @@ Each label matcher supports different comparison operators:
 | `^=`     | Starts with (extension)                       | `city^="New"`  |
 | `^~`     | Does not start with (extension)               | `city^~"San"`  |
 
-`=`, `!=`, `^=` and `^~` also take a value list: `{city=("NYC","LA")}` matches either value. An empty value means the
+`=`, `!=`, `^=` and `^~` also take a value list: `{city=("NYC","LA")}` matches either value. A list needs at
+least one value, separated by single commas: `()`, `(,"NYC")` and `("NYC",)` are rejected. An empty value means the
 label is absent: `humidity{city=""}` matches humidity series without a `city` label, and `humidity{city!=""}` those
 that have one. (On its own, `{city=""}` has no positive matcher and is rejected; see below.)
 

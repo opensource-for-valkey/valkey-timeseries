@@ -483,12 +483,9 @@ mod tests {
 
     #[test]
     fn starts_with_selector_rejects_empty_values() {
-        for input in [
-            "service^=",
-            "{service^=\"\"}",
-            "{service^=(api,\"\")}",
-            "{service^=()}",
-        ] {
+        // `{service^=()}` is rejected earlier, as an empty value list.
+        assert!(parse_series_selector("{service^=()}").is_err());
+        for input in ["service^=", "{service^=\"\"}", "{service^=(api,\"\")}"] {
             let err = parse_series_selector(input).expect_err("empty prefix values should fail");
             assert!(
                 err.to_string()
@@ -940,6 +937,134 @@ mod tests {
             r#"{a="1", or b="2"}"#,
         ] {
             assert!(parse_series_selector(selector).is_err(), "{selector}");
+        }
+    }
+
+    // PARSER-06: one token of lookahead; each production leaves its terminator to its caller.
+    #[test]
+    fn test_bare_metric_names_combine_with_or() {
+        let parsed = parse_series_selector("foo or bar").unwrap();
+        assert_eq!(parsed, parse_series_selector("foo{} or bar{}").unwrap());
+        with_or_matchers(&parsed, |branches| {
+            assert_matcher(&branches[0][0], "__name__", MatchOp::Equal, "foo");
+            assert_matcher(&branches[1][0], "__name__", MatchOp::Equal, "bar");
+        });
+        assert!(parse_series_selector("foo bar").is_err());
+        assert!(parse_series_selector("foo or").is_err());
+    }
+
+    #[test]
+    fn test_or_is_a_name_where_a_name_is_expected() {
+        for (selector, label, value) in [
+            (r#"{or="1"}"#, "or", "1"),
+            (r#"{OR="1"}"#, "OR", "1"),
+            (r#"{x=or}"#, "x", "or"),
+        ] {
+            let parsed =
+                parse_series_selector(selector).unwrap_or_else(|e| panic!("{selector}: {e}"));
+            with_and_matchers(&parsed, |m| {
+                assert_matcher(&m[0], label, MatchOp::Equal, value)
+            });
+        }
+        let parsed = parse_series_selector(r#"{a="1" or or="2"}"#).unwrap();
+        with_or_matchers(&parsed, |branches| {
+            assert_matcher(&branches[1][0], "or", MatchOp::Equal, "2");
+        });
+        let parsed = parse_series_selector(r#"or{a="1"}"#).unwrap();
+        assert_eq!(parsed.get_metric_name(), Some("or"));
+    }
+
+    #[test]
+    fn test_empty_braces_with_whitespace() {
+        assert_eq!(
+            parse_series_selector("cpu{ }").unwrap(),
+            parse_series_selector("cpu").unwrap()
+        );
+        assert_eq!(
+            parse_series_selector("{\n}").unwrap(),
+            parse_series_selector("{}").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_braces_value_lists_are_strict() {
+        let parsed = parse_series_selector(r#"{job=(a, "b")}"#).unwrap();
+        with_and_matchers(&parsed, |m| {
+            assert_list_matcher(&m[0], "job", MatchOp::Equal, &["a", "b"])
+        });
+        for selector in [
+            "{job=()}",
+            "{job=(,a)}",
+            "{job=(a,,b)}",
+            "{job=(a,)}",
+            "{job=(,a,,)}",
+            "{job=}",
+        ] {
+            assert!(
+                parse_series_selector(selector).is_err(),
+                "{selector}: {:?}",
+                parse_series_selector(selector)
+            );
+        }
+    }
+
+    #[test]
+    fn test_one_metric_name_per_group_is_judged_as_written() {
+        // Two equalities, or an equality and the shorthand, name the metric twice.
+        for selector in [
+            r#"{__name__="a", __name__="b"}"#,
+            "{a, b}",
+            r#"{a, __name__="b"}"#,
+        ] {
+            assert!(parse_series_selector(selector).is_err(), "{selector}");
+        }
+        // A literal regex is not an equality as written, whatever it decomposes to.
+        assert!(parse_series_selector(r#"{__name__="a", __name__=~"b"}"#).is_ok());
+        assert!(parse_series_selector(r#"{__name__="a", __name__=~"b.*"}"#).is_ok());
+    }
+
+    #[test]
+    fn test_whitespace_only_is_empty() {
+        for selector in [" ", "\t", "\n "] {
+            assert!(matches!(
+                parse_series_selector(selector),
+                Err(ParseError::EmptySeriesSelector)
+            ));
+        }
+    }
+
+    // PARSER-08: errors keep the lexer's message, place end of input at the end, name the
+    // production, and report a real line and column.
+    #[test]
+    fn test_error_messages_and_positions() {
+        for (selector, expected) in [
+            (
+                "foo{",
+                "1:5: parse error: unexpected end of input in label matcher",
+            ),
+            (
+                "{a=\"1\" x}",
+                "1:8: parse error: unexpected \"x\" in label matchers, expected or or }",
+            ),
+            ("{x=}", "1:4: parse error: unexpected \"}\" in label value"),
+            (
+                "{x=(a,,b)}",
+                "1:7: parse error: unexpected \",\" in value list",
+            ),
+            ("{a=\"1\",\nb!!\"2\"}", "2:2: parse error:"),
+            ("{x=\"open}", "unterminated string literal"),
+            ("n=~[abc", "1:4: parse error: unexpected token \"[\""),
+            (
+                "n=~\"a\" x",
+                "1:8: parse error: unexpected \"x\" in regex matcher, expected end of input",
+            ),
+            (
+                "foo bar",
+                "1:5: parse error: unexpected \"bar\" in series selector",
+            ),
+        ] {
+            let err = parse_series_selector(selector).unwrap_err().to_string();
+            assert!(err.contains(expected), "{selector:?}: {err}");
         }
     }
 }

@@ -109,7 +109,7 @@ impl Token {
             Self::StartsWith => "^=",
             Self::NotStartsWith => "^~",
 
-            Self::Eof => "<eof>",
+            Self::Eof => "end of input",
 
             // other
             Self::ErrorStringUnterminated => "<unterminated string literal>",
@@ -123,52 +123,122 @@ impl Display for Token {
     }
 }
 
-pub(crate) fn get_next_token<'a>(lex: &'a mut Lexer<Token>) -> ParseResult<(Token, &'a str, Span)> {
-    match lex.next() {
-        Some(Ok(tok)) => Ok((tok, lex.slice(), lex.span())),
-        Some(Err(_)) => {
-            let span = lex.span();
-            let inner = ParseErr::new(
-                format!("unexpected token \"{}\"", lex.slice().trim()).as_str(),
-                span,
-            );
-            Err(ParseError::Unexpected(inner))
+/// One token and where it came from. `text` borrows the source, not the lexer, so a lexeme
+/// outlives the next read.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Lexeme<'s> {
+    pub token: Token,
+    pub text: &'s str,
+    pub span: Span,
+}
+
+/// A token stream with one token of lookahead, the shared front end of the selector and
+/// metric-name grammars. End of input is a `Token::Eof` lexeme positioned at the end of the
+/// source; reading past it keeps returning it.
+pub(crate) struct Cursor<'s> {
+    lex: Lexer<'s, Token>,
+    peeked: Option<Lexeme<'s>>,
+}
+
+impl<'s> Cursor<'s> {
+    pub fn new(source: &'s str) -> Self {
+        Self::at(source, 0)
+    }
+
+    /// A cursor over `source` that starts at byte `offset`, so errors report positions in the
+    /// whole input. `offset` must be a char boundary.
+    pub fn at(source: &'s str, offset: usize) -> Self {
+        let mut lex = Token::lexer(source);
+        lex.bump(offset);
+        Self { lex, peeked: None }
+    }
+
+    pub fn source(&self) -> &'s str {
+        self.lex.source()
+    }
+
+    fn read(&mut self) -> ParseResult<Lexeme<'s>> {
+        match self.lex.next() {
+            Some(Ok(token)) => Ok(Lexeme {
+                token,
+                text: self.lex.slice(),
+                span: self.lex.span(),
+            }),
+            Some(Err(err)) => {
+                // A callback's own message ("unterminated string literal") is kept; input no
+                // rule matches is reported by its text.
+                let msg = match err {
+                    ParseError::SyntaxError(msg) => msg,
+                    _ => format!("unexpected token \"{}\"", self.lex.slice().trim()),
+                };
+                Err(ParseError::Unexpected(ParseErr::new(
+                    &msg,
+                    self.lex.span(),
+                    self.source(),
+                )))
+            }
+            None => {
+                let end = self.source().len();
+                Ok(Lexeme {
+                    token: Token::Eof,
+                    text: "",
+                    span: end..end,
+                })
+            }
         }
-        None => Ok((Token::Eof, "", Span::default())),
+    }
+
+    pub fn peek(&mut self) -> ParseResult<Lexeme<'s>> {
+        if let Some(lexeme) = &self.peeked {
+            return Ok(lexeme.clone());
+        }
+        let lexeme = self.read()?;
+        self.peeked = Some(lexeme.clone());
+        Ok(lexeme)
+    }
+
+    pub fn next(&mut self) -> ParseResult<Lexeme<'s>> {
+        match self.peeked.take() {
+            Some(lexeme) => Ok(lexeme),
+            None => self.read(),
+        }
+    }
+
+    /// Consumes the next token if it is `token`.
+    pub fn next_if(&mut self, token: Token) -> ParseResult<Option<Lexeme<'s>>> {
+        if self.peek()?.token == token {
+            self.next().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Consumes the next token, which must be one of `expected`; otherwise reports it as
+    /// unexpected in `context` (a grammar production, e.g. "label matcher").
+    pub fn expect(&mut self, expected: &[Token], context: &str) -> ParseResult<Lexeme<'s>> {
+        let lexeme = self.next()?;
+        if expected.contains(&lexeme.token) {
+            Ok(lexeme)
+        } else {
+            Err(self.unexpected(&lexeme, context, &describe_tokens(expected)))
+        }
+    }
+
+    pub fn unexpected(&self, found: &Lexeme, context: &str, expected: &str) -> ParseError {
+        unexpected(context, found, expected, self.source())
     }
 }
 
-pub(crate) fn expect_token<'a>(lex: &'a mut Lexer<Token>, expected: Token) -> ParseResult<&'a str> {
-    let res = get_next_token(lex)?;
-    if res.0 == expected {
-        Ok(res.1)
-    } else {
-        let actual = res.1.to_string();
-        Err(unexpected(
-            "label name",
-            &actual,
-            expected.as_str(),
-            Some(&res.2),
-        ))
-    }
-}
-
-pub(crate) fn expect_one_of_tokens<'a>(
-    lex: &'a mut Lexer<Token>,
-    expected: &[Token],
-) -> ParseResult<(Token, &'a str)> {
-    let res = get_next_token(lex)?;
-    if expected.contains(&res.0) {
-        Ok((res.0, res.1))
-    } else {
-        let actual = res.1.to_string();
-        let expected = expected
-            .iter()
-            .map(|t| t.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let msg = format!("one of: {expected}");
-        Err(unexpected("label name", &actual, &msg, Some(&res.2)))
+/// `a`, `a or b`, `one of: a, b, c`.
+pub(crate) fn describe_tokens(tokens: &[Token]) -> String {
+    match tokens {
+        [] => String::new(),
+        [one] => one.as_str().to_string(),
+        [a, b] => format!("{} or {}", a.as_str(), b.as_str()),
+        _ => {
+            let names: Vec<_> = tokens.iter().map(Token::as_str).collect();
+            format!("one of: {}", names.join(", "))
+        }
     }
 }
 
