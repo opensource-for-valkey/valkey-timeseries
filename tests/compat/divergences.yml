@@ -1477,7 +1477,7 @@
 # observed black-box against the pinned redis:8.10 image (2026-11-14): RTS takes exactly one
 # integer and one unit, `m` (ms), `s`, `M` (minutes), `h` or `d`, per policy duration.
 #
-# ⚠️ `behavior`-kind: needs owner sign-off in the PR that introduces it (§5.3).
+# ⚠️ `behavior`-kind: owner sign-off 2026-11-14.
 
 - id: DIV-0067
   command: CONFIG
@@ -1488,7 +1488,8 @@
     as 60030 ms), a bare number (milliseconds), a fraction (`1.5M`), and the `ms`, `w` and `y`
     units. RTS 8.10 accepts one integer with one of `m`, `s`, `M`, `h`, `d`.
   rationale: >
-    Accepted-input superset on a configuration surface that already differs from RTS by
+    Accepted (owner sign-off 2026-11-14, §5.3). Accepted-input superset on a configuration
+    surface that already differs from RTS by
     design (COMPATIBILITY.md, "Configuration"); every RTS-valid policy is read the same way.
     Pinned by TestValueValidation::test_compaction_policy_duration_superset.
   since: 0.1.0
