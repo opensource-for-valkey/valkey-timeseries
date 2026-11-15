@@ -10,7 +10,6 @@ use super::{EMPTY_BITMAP, Postings, PostingsBitmap};
 use crate::labels::filters::{FilterList, LabelFilter, PredicateMatch, SeriesSelector};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::cmp::Ordering;
 use valkey_module::ValkeyResult;
 
 impl<'a> Terms<'a> {
@@ -38,61 +37,24 @@ impl<'a> Terms<'a> {
         let mut its: SmallVec<[_; 4]> = SmallVec::new();
         let mut not_its: SmallVec<[Cow<PostingsBitmap>; 4]> = SmallVec::new();
 
-        let mut sorted_matchers: SmallVec<[(&LabelFilter, bool, bool); 4]> = SmallVec::new();
+        // A filter that accepts "" also selects the series without its label, so it can only
+        // remove series (`not_its`, or nothing for `.*`). One that rejects "" needs the label
+        // present and intersects (`its`), even when negative (`l!=""`, `l!~"a*"`). Intersecting
+        // filters run first, cheapest first, so an empty one returns before any subtracting work.
+        let mut sorted_matchers: SmallVec<[(&LabelFilter, bool); 4]> =
+            filters.iter().map(|f| (f, f.matches_empty())).collect();
+        sorted_matchers.sort_by_key(|&(filter, matches_empty)| (matches_empty, filter.cost()));
 
-        let mut has_subtracting_matchers = false;
-        let mut has_intersecting_matchers = false;
-        for m in filters {
-            let matches_empty = m.matches("");
-
-            // A matcher that rejects "" needs the label present, so it intersects even when
-            // negative (`l!=""`, `l!~"a*"`): the loop below puts every such matcher in `its`.
-            // Counting it as subtracting would seed `its` with all postings for nothing.
-            let is_subtracting = matches_empty;
-
-            if is_subtracting {
-                has_subtracting_matchers = true;
-            } else {
-                has_intersecting_matchers = true;
-            }
-
-            sorted_matchers.push((m, matches_empty, is_subtracting))
-        }
-
-        if has_subtracting_matchers && !has_intersecting_matchers {
-            // If there's nothing to subtract from, add in everything and remove the not_its later.
-            // We prefer to get all_postings so that the base of subtraction (i.e., all_postings)
-            // doesn't include series that may be added to the index reader during this function call.
-            its.push(Cow::Borrowed(self.all()));
-        };
-
-        // Sort matchers to have the intersecting matchers first.
-        // This way the base for subtraction is smaller, and there is no chance that the set we subtract
-        // from contains postings of series that didn't exist when we constructed the set we subtract by.
-        sorted_matchers.sort_by(|i, j| -> Ordering {
-            let is_i_subtracting = i.2;
-            let is_j_subtracting = j.2;
-            if !is_i_subtracting && is_j_subtracting {
-                return Ordering::Less;
-            }
-            // sort by match cost
-            let cost_i = i.0.cost();
-            let cost_j = j.0.cost();
-            cost_i.cmp(&cost_j)
-        });
-
-        for (filter, matches_empty, _is_subtracting) in sorted_matchers {
-            if matches!(filter.matcher, PredicateMatch::MatchAll) {
-                continue;
-            }
-
-            if matches!(filter.matcher, PredicateMatch::MatchNone) {
-                return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
-            }
-
+        for (filter, matches_empty) in sorted_matchers {
             // `.*` and its spellings were turned into MatchAll / MatchNone above, when the
             // pattern was parsed; `.+` and its spellings are recognized the same way.
             match &filter.matcher {
+                PredicateMatch::MatchAll => {
+                    continue;
+                }
+                PredicateMatch::MatchNone => {
+                    return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
+                }
                 // l=~".+": every series carrying the label, without running the regex.
                 PredicateMatch::RegexEqual(re) if re.matches_any_non_empty() => {
                     its.push(self.postings_for_all_label_values(&filter.label));
@@ -141,6 +103,7 @@ impl<'a> Terms<'a> {
         }
 
         let base = match its.len() {
+            // No intersecting filter: subtract from every series.
             0 => Cow::Borrowed(self.all()),
             // a single intersecting set stays borrowed if nothing is subtracted from it
             1 => its
@@ -148,7 +111,7 @@ impl<'a> Terms<'a> {
                 .expect("index planner: intersecting set must have at least one element"),
             _ => {
                 // sort by cardinality first to reduce the amount of work
-                its.sort_by_key(|a| a.cardinality());
+                its.sort_by_cached_key(|a| a.cardinality());
                 Cow::Owned(intersection(its))
             }
         };
