@@ -131,7 +131,7 @@ O(n) where n is the number of time series that match the filter(s).
 ## Notes
 
 - All filter selectors must match for a series to be included (logical AND)
-- Label names and command arguments are **case-insensitive**
+- Label names and values are **case-sensitive**; command keywords are case-insensitive
 - Returns only series that exist and match the filters
 - For clustered deployments, the command fans out to all shards automatically
 - The `LATEST` option is particularly useful when you have compaction rules and want the most recent aggregated value

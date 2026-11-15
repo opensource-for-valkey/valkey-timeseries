@@ -1,6 +1,8 @@
 use crate::parser::parse_error::unexpected;
+use crate::parser::utils::extract_string_value;
 use crate::parser::{ParseErr, ParseError, ParseResult};
 use logos::{Lexer, Logos, Span};
+use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 
 fn unterminated_string_literal(_: &mut Lexer<Token>) -> ParseResult<()> {
@@ -16,8 +18,9 @@ fn unterminated_string_literal(_: &mut Lexer<Token>) -> ParseResult<()> {
 #[logos(subpattern octal = r"-?0[oO]?[1-7][_0-7]*")]
 #[logos(subpattern binary = r"-?0[bB][0-1][_0-1]*")]
 #[logos(subpattern float = r"-?(?:([0-9]*[.])?[0-9][0-9_]*)(?:[eE][+-]?[0-9][0-9_]*)?")]
+// No comment rule: a selector is a single command argument, and skipping `#…` silently cut
+// unquoted values short (`color=#ff0000` became `color=`, which selects series *without* the label).
 #[logos(skip r"[ \t\n\f\r]+")]
-#[logos(skip(r"#[^\r\n]*(\r\n|\n)?", allow_greedy = true))] // single line comment
 pub enum Token {
     #[token(b"or", ignore(case))]
     OpOr,
@@ -26,7 +29,9 @@ pub enum Token {
     Identifier,
 
     #[regex(r#"'(?s:[^'\\]|\\.)*'"#)]
-    #[regex(r#"`(?s:[^`\\]|\\.)*`"#)]
+    // Backtick strings are raw, as in Go and PromQL: `\` is an ordinary character and a
+    // backtick always ends the string, so `C:\` is valid and no backtick can be escaped.
+    #[regex(r#"`[^`]*`"#)]
     #[regex(r#""(?s:[^"\\]|\\.)*""#)]
     StringLiteral,
 
@@ -55,9 +60,6 @@ pub enum Token {
     #[token("=")]
     Equal,
 
-    #[token("==")]
-    OpEqual,
-
     #[token("!=")]
     OpNotEqual,
 
@@ -73,9 +75,11 @@ pub enum Token {
     #[token("^~")]
     NotStartsWith,
 
+    /// Never produced as a token: these patterns match a string literal with no closing
+    /// quote, and their callback turns the match into an "unterminated string literal" error.
+    /// Logos attaches patterns to a variant, so the variant has to exist.
     #[regex("\"(?s:[^\"\\\\]|\\\\.)*", unterminated_string_literal)]
     #[regex("'(?s:[^'\\\\]|\\\\.)*", unterminated_string_literal)]
-    #[regex("@[^\"'\\s]\\S+", unterminated_string_literal)]
     ErrorStringUnterminated,
 
     /// Marker for end of stream.
@@ -92,7 +96,6 @@ impl Token {
             Self::Number => "<number>",
 
             // symbols
-            // Plain strings, not format strings: `{{` here printed as two braces.
             Self::LeftBrace => "{",
             Self::RightBrace => "}",
             Self::Comma => ",",
@@ -102,14 +105,13 @@ impl Token {
 
             // operators
             Self::OpOr => "or",
-            Self::OpEqual => "==",
             Self::OpNotEqual => "!=",
             Self::RegexEqual => "=~",
             Self::RegexNotEqual => "!~",
             Self::StartsWith => "^=",
             Self::NotStartsWith => "^~",
 
-            Self::Eof => "<eof>",
+            Self::Eof => "end of input",
 
             // other
             Self::ErrorStringUnterminated => "<unterminated string literal>",
@@ -123,54 +125,142 @@ impl Display for Token {
     }
 }
 
-pub(crate) fn get_next_token<'a>(lex: &'a mut Lexer<Token>) -> ParseResult<(Token, &'a str, Span)> {
-    match lex.next() {
-        Some(Ok(tok)) => Ok((tok, lex.slice(), lex.span())),
-        Some(Err(_)) => {
-            let span = lex.span();
-            let inner = ParseErr::new(
-                format!("unexpected token \"{}\"", lex.slice().trim()).as_str(),
-                span,
-            );
-            Err(ParseError::Unexpected(inner))
+/// One token and where it came from. `text` borrows the source, not the lexer, so a lexeme
+/// outlives the next read.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Lexeme<'s> {
+    pub token: Token,
+    pub text: &'s str,
+    pub span: Span,
+}
+
+impl<'s> Lexeme<'s> {
+    /// The token's text as a name or value: a quoted string decoded, anything else (an
+    /// identifier, which admits no `\`, a number, the word `or`) as written.
+    pub fn decoded(&self) -> ParseResult<Cow<'s, str>> {
+        if self.token == Token::StringLiteral {
+            extract_string_value(self.text)
+        } else {
+            Ok(Cow::Borrowed(self.text))
         }
-        None => Ok((Token::Eof, "", Span::default())),
     }
 }
 
-pub(crate) fn expect_token<'a>(lex: &'a mut Lexer<Token>, expected: Token) -> ParseResult<&'a str> {
-    let res = get_next_token(lex)?;
-    if res.0 == expected {
-        Ok(res.1)
-    } else {
-        let actual = res.1.to_string();
-        // let span = lex.span();
-        Err(unexpected(
-            "label name",
-            &actual,
-            expected.as_str(),
-            Some(&res.2),
-        ))
+/// A token stream with one token of lookahead, the shared front end of the selector and
+/// metric-name grammars. End of input is a `Token::Eof` lexeme positioned at the end of the
+/// source; reading past it keeps returning it.
+pub(crate) struct Cursor<'s> {
+    lex: Lexer<'s, Token>,
+    peeked: Option<Lexeme<'s>>,
+}
+
+impl<'s> Cursor<'s> {
+    pub fn new(source: &'s str) -> Self {
+        Self::at(source, 0)
+    }
+
+    /// A cursor over `source` that starts at byte `offset`, so errors report positions in the
+    /// whole input. `offset` must be a char boundary.
+    pub fn at(source: &'s str, offset: usize) -> Self {
+        let mut lex = Token::lexer(source);
+        lex.bump(offset);
+        Self { lex, peeked: None }
+    }
+
+    pub fn source(&self) -> &'s str {
+        self.lex.source()
+    }
+
+    fn read(&mut self) -> ParseResult<Lexeme<'s>> {
+        match self.lex.next() {
+            Some(Ok(token)) => Ok(Lexeme {
+                token,
+                text: self.lex.slice(),
+                span: self.lex.span(),
+            }),
+            Some(Err(err)) => {
+                // A callback's own message ("unterminated string literal") is kept; input no
+                // rule matches is reported by its text.
+                let msg = match err {
+                    ParseError::SyntaxError(msg) => msg,
+                    _ => format!("unexpected token \"{}\"", self.lex.slice().trim()),
+                };
+                Err(ParseError::Unexpected(ParseErr::new(
+                    &msg,
+                    self.lex.span(),
+                    self.source(),
+                )))
+            }
+            None => {
+                let end = self.source().len();
+                Ok(Lexeme {
+                    token: Token::Eof,
+                    text: "",
+                    span: end..end,
+                })
+            }
+        }
+    }
+
+    pub fn peek(&mut self) -> ParseResult<Lexeme<'s>> {
+        if let Some(lexeme) = &self.peeked {
+            return Ok(lexeme.clone());
+        }
+        let lexeme = self.read()?;
+        self.peeked = Some(lexeme.clone());
+        Ok(lexeme)
+    }
+
+    pub fn next(&mut self) -> ParseResult<Lexeme<'s>> {
+        match self.peeked.take() {
+            Some(lexeme) => Ok(lexeme),
+            None => self.read(),
+        }
+    }
+
+    /// Consumes the next token if it is `token`.
+    pub fn next_if(&mut self, token: Token) -> ParseResult<Option<Lexeme<'s>>> {
+        if self.peek()?.token == token {
+            self.next().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Consumes the next token, which must be one of `expected`; otherwise reports it as
+    /// unexpected in `context` (a grammar production, e.g. "label matcher").
+    pub fn expect(&mut self, expected: &[Token], context: &str) -> ParseResult<Lexeme<'s>> {
+        let lexeme = self.next()?;
+        if expected.contains(&lexeme.token) {
+            Ok(lexeme)
+        } else {
+            Err(self.unexpected(&lexeme, context, &describe_tokens(expected)))
+        }
+    }
+
+    /// Consumes a quoted string and returns its decoded value.
+    pub fn expect_string(&mut self, context: &str) -> ParseResult<String> {
+        Ok(self
+            .expect(&[Token::StringLiteral], context)?
+            .decoded()?
+            .into_owned())
+    }
+
+    pub fn unexpected(&self, found: &Lexeme, context: &str, expected: &str) -> ParseError {
+        unexpected(context, found, expected, self.source())
     }
 }
 
-pub(crate) fn expect_one_of_tokens<'a>(
-    lex: &'a mut Lexer<Token>,
-    expected: &[Token],
-) -> ParseResult<(Token, &'a str)> {
-    let res = get_next_token(lex)?;
-    if expected.contains(&res.0) {
-        Ok((res.0, res.1))
-    } else {
-        let actual = res.1.to_string();
-        // let span = lex.span();
-        let expected = expected
-            .iter()
-            .map(|t| t.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let msg = format!("one of: {expected}");
-        Err(unexpected("label name", &actual, &msg, Some(&res.2)))
+/// `a`, `a or b`, `one of: a, b, c`.
+pub(crate) fn describe_tokens(tokens: &[Token]) -> String {
+    match tokens {
+        [] => String::new(),
+        [one] => one.as_str().to_string(),
+        [a, b] => format!("{} or {}", a.as_str(), b.as_str()),
+        _ => {
+            let names: Vec<_> = tokens.iter().map(Token::as_str).collect();
+            format!("one of: {}", names.join(", "))
+        }
     }
 }
 
@@ -231,7 +321,6 @@ mod tests {
         test_tokens!(src, [tok]);
     }
 
-    #[test_case("==", OpEqual)]
     #[test_case("!=", OpNotEqual)]
     #[test_case("=~", RegexEqual)]
     #[test_case("!~", RegexNotEqual)]
@@ -310,6 +399,23 @@ mod tests {
     }
 
     #[test]
+    fn hash_is_not_a_comment() {
+        // `#` is not skipped: it starts no token, so the lexer reports it rather than
+        // dropping the rest of the input.
+        let mut lex = Token::lexer("a #b");
+        assert_eq!(lex.next(), Some(Ok(Identifier)));
+        assert!(matches!(lex.next(), Some(Err(_))));
+        // Inside a string literal it is an ordinary character.
+        test_tokens!(r##""#ff0000""##, [StringLiteral => r##""#ff0000""##]);
+    }
+
+    #[test]
+    fn double_equals_is_two_tokens() {
+        // No grammar accepts `==`, so it is not a token of its own.
+        test_tokens!("==", [Equal, Equal]);
+    }
+
+    #[test]
     fn junk() {
         let src = "💩";
         let mut lex = Token::lexer(src);
@@ -356,8 +462,8 @@ mod tests {
 
     #[test]
     fn miscellaneous() {
-        let s = "   `foo\\\\\\`бар`  ";
-        let expected = vec!["`foo\\\\\\`бар`"];
+        let s = "   `foo\\\\бар`  `C:\\`";
+        let expected = vec!["`foo\\\\бар`", "`C:\\`"];
         test_success(s, &expected);
     }
 

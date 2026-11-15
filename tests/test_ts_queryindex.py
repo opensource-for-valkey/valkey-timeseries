@@ -222,12 +222,12 @@ class TestTsQueryIndex(ValkeyTimeSeriesTestCaseBase):
 
     def test_or_empty_branch(self):
         self.setup_or_test_data(self.client)
-        result = self.client.execute_command('TS.QUERYINDEX', 'status=999 or env=prod')
+        result = self.client.execute_command('TS.QUERYINDEX', '{status="999" or env="prod"}')
         assert result == [b'ts5', b'ts6']
 
     def test_or_all_empty(self):
         self.setup_or_test_data(self.client)
-        result = self.client.execute_command('TS.QUERYINDEX', 'status=999 or env=development')
+        result = self.client.execute_command('TS.QUERYINDEX', '{status="999" or env="development"}')
         assert result == []
 
     def test_or_overlapping(self):

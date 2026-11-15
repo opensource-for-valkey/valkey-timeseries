@@ -47,7 +47,7 @@ class TestFlushDb(ValkeyTimeSeriesTestCaseBase):
         keys = self.client.execute_command("TS.QUERYINDEX", 'key=~"ts:flush*"')
         assert len(keys) == 0
 
-        keys = self.client.execute_command("TS.QUERYINDEX", 'sensor="temp"')
+        keys = self.client.execute_command("TS.QUERYINDEX", 'sensor=temp')
         assert len(keys) == 0
 
         # Create a new key - should work without index interference

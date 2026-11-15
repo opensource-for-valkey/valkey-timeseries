@@ -39,7 +39,7 @@ class TestServerEvents(ValkeyTimeSeriesTestCaseBase):
         keys = self.client.execute_command("TS.QUERYINDEX", f"key={key}")
         assert len(keys) == 0
 
-        keys = self.client.execute_command("TS.QUERYINDEX", 'sensor="temp"')
+        keys = self.client.execute_command("TS.QUERYINDEX", 'sensor=temp')
         assert len(keys) == 1
         assert keys[0].decode('utf-8') == key
 
@@ -61,7 +61,7 @@ class TestServerEvents(ValkeyTimeSeriesTestCaseBase):
         assert len(keys) == 1
         assert keys[0].decode('utf-8') == key
 
-        keys = self.client.execute_command("TS.QUERYINDEX", 'sensor="temp"')
+        keys = self.client.execute_command("TS.QUERYINDEX", 'sensor=temp')
         assert len(keys) == 1
 
 
@@ -90,7 +90,7 @@ class TestServerEvents(ValkeyTimeSeriesTestCaseBase):
         # The key should not be queryable
         keys = self.client.execute_command("TS.QUERYINDEX", f"key={key}")
         assert len(keys) == 0
-        keys = self.client.execute_command("TS.QUERYINDEX", 'sensor="temp"')
+        keys = self.client.execute_command("TS.QUERYINDEX", 'sensor=temp')
         assert len(keys) == 0
 
         # Create the key again - should succeed without index interference

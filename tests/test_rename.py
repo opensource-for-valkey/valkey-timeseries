@@ -44,7 +44,7 @@ class TestRename(ValkeyTimeSeriesTestCaseBase):
         assert float(sample[1]) == 1.5
 
         # The old key should not be queryable
-        keys = self.client.execute_command("TS.QUERYINDEX", 'sensor="temp"')
+        keys = self.client.execute_command("TS.QUERYINDEX", 'sensor=temp')
         assert keys[0].decode('utf-8') == new_key
 
         # The new key should be queryable

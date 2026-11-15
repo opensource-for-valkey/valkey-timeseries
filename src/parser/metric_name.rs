@@ -1,82 +1,83 @@
-use super::lex::{Token, expect_one_of_tokens, expect_token, get_next_token};
-use super::parse_error::unexpected;
+use super::lex::{Cursor, Token};
 use crate::common::constants::METRIC_NAME_LABEL;
-use crate::labels::Label;
-use crate::parser::utils::extract_string_value;
+use crate::labels::{Label, MAX_LABELS_PER_SERIES};
 use crate::parser::{ParseError, ParseResult};
-use logos::{Lexer, Logos};
 
-/// specialized parser for a `Prometheus` compatible metric name (as opposed to a metric selector).
+/// Parses a `Prometheus` compatible metric name (as opposed to a metric selector), the
+/// `TS.CREATE ... METRIC` operand:
 ///
-///    <label_set>
+///    <metric_identifier> [ '{' [ <label_name> '=' <label_value> { ',' ... } [','] ] '}' ]
 ///
-///    <metric_identifier> [<label_set>]
-///
+/// The whole input must be consumed. A label name is an identifier or a quoted string; a value
+/// is a quoted string. One trailing comma is allowed (as in PromQL and in selectors); an empty
+/// item (`{,a="1"}`, `{a="1",,}`) is not. Each label is held to what `LABELS` requires: a
+/// non-empty name without `=`, a non-empty value. A repeated name, and a `__name__` label
+/// (the measurement already is the `__name__`), are errors, as is more than
+/// `MAX_LABELS_PER_SERIES` labels counting the `__name__` ([`ParseError::TooManyLabels`]).
 pub fn parse_metric_name(s: &str) -> ParseResult<Vec<Label>> {
-    let mut lex = Token::lexer(s);
+    let mut cur = Cursor::new(s);
 
-    let mut labels: Vec<Label> = Vec::new();
-
-    let measurement = expect_token(&mut lex, Token::Identifier)?;
-    labels.push(Label::new(METRIC_NAME_LABEL, measurement));
-    let res = get_next_token(&mut lex)?;
-    if res.0 == Token::Eof {
-        return Ok(labels);
+    // `or` lexes as a keyword but is a name here, as it is in selectors.
+    let measurement = cur.expect(&[Token::Identifier, Token::OpOr], "metric name")?;
+    let mut labels = vec![Label::new(METRIC_NAME_LABEL, measurement.text)];
+    if cur.next_if(Token::LeftBrace)?.is_some() {
+        parse_label_set(&mut cur, &mut labels)?;
     }
-    if res.0 == Token::LeftBrace {
-        parse_label_filters(&mut lex, &mut labels)?;
-        // The measurement is the `__name__`; a second one would override it, with any value —
-        // including ones (empty, not an identifier) that no metric name renders back to.
-        if labels[1..]
-            .iter()
-            .any(|label| label.name == METRIC_NAME_LABEL)
-        {
-            return Err(ParseError::General(format!(
-                "{METRIC_NAME_LABEL} label conflicts with the measurement `{}`",
-                labels[0].value
-            )));
-        }
-    }
-    // todo: expect eof
+    cur.expect(&[Token::Eof], "metric name")?;
     Ok(labels)
 }
 
-/// parse a set of label matchers.
-///
-/// '{' [ <label_name> <match_op> <match_string>, ... ] '}'
-///
-pub(crate) fn parse_label_filters(
-    lex: &mut Lexer<Token>,
-    labels: &mut Vec<Label>,
-) -> ParseResult<()> {
+/// Parses `name="value", ...}` after the opening brace, appending to `labels`.
+fn parse_label_set(cur: &mut Cursor, labels: &mut Vec<Label>) -> ParseResult<()> {
     use Token::*;
 
-    let mut was_value = false;
-
     loop {
-        let (tok, name) = if was_value {
-            expect_one_of_tokens(lex, &[Comma, RightBrace])
-        } else {
-            expect_one_of_tokens(lex, &[Identifier, Comma, RightBrace])
-        }?;
-        match tok {
-            Identifier => {
-                let name = name.to_string();
-                let _ = expect_token(lex, Equal)?;
-                let value = expect_token(lex, StringLiteral)?;
-                let contents = extract_string_value(value)?;
-                labels.push(Label::new(name, contents.to_string()));
-                was_value = true;
-            }
-            Comma => {
-                was_value = false;
-            }
-            RightBrace => break,
-            _ => return Err(unexpected("metric name label", name, ", or }", None)),
+        // `}` here closes an empty set or follows a trailing comma. `or` is a name here, as
+        // everywhere a name is expected.
+        let name = cur.expect(&[Identifier, StringLiteral, OpOr, RightBrace], "label set")?;
+        if name.token == RightBrace {
+            return Ok(());
+        }
+        // Checked before the duplicate scan in `check_label`, which is linear in the labels
+        // so far: past the limit the operand is rejected anyway.
+        if labels.len() == MAX_LABELS_PER_SERIES {
+            return Err(ParseError::TooManyLabels);
+        }
+        let name = name.decoded()?.into_owned();
+        check_label(labels, &name)?;
+
+        cur.expect(&[Equal], "label set")?;
+        let value = cur.expect_string("label value")?;
+        if value.is_empty() {
+            return Err(ParseError::General(format!(
+                "label `{name}` has an empty value"
+            )));
+        }
+        labels.push(Label::new(name, value));
+
+        if cur.expect(&[Comma, RightBrace], "label set")?.token == RightBrace {
+            return Ok(());
         }
     }
-    // make sure we're at eof
+}
 
+fn check_label(labels: &[Label], name: &str) -> ParseResult<()> {
+    if name.is_empty() || name.contains('=') {
+        return Err(ParseError::General(format!(
+            "invalid label name `{name}`: must be non-empty and must not contain '='"
+        )));
+    }
+    // The measurement is the `__name__`; a second one would override it, with any value —
+    // including ones (empty, not an identifier) that no metric name renders back to.
+    if name == METRIC_NAME_LABEL {
+        return Err(ParseError::General(format!(
+            "{METRIC_NAME_LABEL} label conflicts with the measurement `{}`",
+            labels[0].value
+        )));
+    }
+    if labels.iter().any(|label| label.name == name) {
+        return Err(ParseError::General(format!("duplicate label `{name}`")));
+    }
     Ok(())
 }
 
@@ -145,5 +146,110 @@ mod tests {
         ] {
             assert!(parse_metric_name(input).is_err(), "{input}");
         }
+    }
+
+    #[test]
+    fn test_parse_metric_name_requires_complete_input() {
+        for input in [
+            "cpu garbage",
+            "cpu=garbage",
+            "cpu{} garbage",
+            r#"cpu{job="a"}x"#,
+            r#"cpu{job="a"}}"#,
+            "cpu{",
+            r#"cpu{job="a""#,
+            "123",
+        ] {
+            assert!(
+                parse_metric_name(input).is_err(),
+                "{input}: {:?}",
+                parse_metric_name(input)
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_metric_name_comma_policy() {
+        // One trailing comma, as in PromQL; no empty items.
+        let got = parse_metric_name(r#"cpu{a="b",}"#).unwrap();
+        assert_eq!(
+            got,
+            vec![Label::new("__name__", "cpu"), Label::new("a", "b")]
+        );
+        for input in [
+            r#"cpu{,a="b"}"#,
+            r#"cpu{a="b",,}"#,
+            r#"cpu{,,job="api",,}"#,
+            "cpu{,}",
+        ] {
+            assert!(parse_metric_name(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn test_parse_metric_name_validates_labels_like_labels_option() {
+        for input in [
+            r#"cpu{a=""}"#,
+            r#"cpu{a="1",a="2"}"#,
+            r#"cpu{""="1"}"#,
+            r#"cpu{"a=b"="1"}"#,
+        ] {
+            assert!(
+                parse_metric_name(input).is_err(),
+                "{input}: {:?}",
+                parse_metric_name(input)
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_metric_name_or_is_a_name() {
+        for (input, expected) in [
+            ("or", vec![Label::new("__name__", "or")]),
+            ("OR", vec![Label::new("__name__", "OR")]),
+            (
+                r#"or{host="a"}"#,
+                vec![Label::new("__name__", "or"), Label::new("host", "a")],
+            ),
+            (
+                r#"or{or="b"}"#,
+                vec![Label::new("__name__", "or"), Label::new("or", "b")],
+            ),
+        ] {
+            assert_eq!(parse_metric_name(input), Ok(expected), "{input}");
+        }
+    }
+
+    #[test]
+    fn test_parse_metric_name_label_limit() {
+        // `n` labels besides the `__name__`.
+        let metric = |n: usize| {
+            let labels: Vec<String> = (0..n).map(|i| format!(r#"l{i}="v""#)).collect();
+            format!("cpu{{{}}}", labels.join(","))
+        };
+        let at_limit = parse_metric_name(&metric(MAX_LABELS_PER_SERIES - 1)).unwrap();
+        assert_eq!(at_limit.len(), MAX_LABELS_PER_SERIES);
+        assert_eq!(
+            parse_metric_name(&metric(MAX_LABELS_PER_SERIES)),
+            Err(ParseError::TooManyLabels)
+        );
+        // Rejected at the first label past the limit: neither a later duplicate nor a later
+        // syntax error is reached.
+        let mut past = metric(MAX_LABELS_PER_SERIES);
+        past.insert_str(past.len() - 1, r#",l0="v",!"#);
+        assert_eq!(parse_metric_name(&past), Err(ParseError::TooManyLabels));
+    }
+
+    #[test]
+    fn test_parse_metric_name_accepts_quoted_label_names() {
+        let got = parse_metric_name(r#"cpu{"host.name"="a", 'b-c'="d"}"#).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                Label::new("__name__", "cpu"),
+                Label::new("host.name", "a"),
+                Label::new("b-c", "d")
+            ]
+        );
     }
 }

@@ -100,7 +100,7 @@ impl TryFrom<&str> for BucketAlignment {
         match alignment {
             Some(alignment) => Ok(alignment),
             None => {
-                let timestamp = parse_timestamp(value, false)
+                let timestamp = parse_timestamp(value)
                     .map_err(|_| ValkeyError::Str(error_consts::INVALID_ALIGN))?;
                 Ok(BucketAlignment::Timestamp(timestamp))
             }

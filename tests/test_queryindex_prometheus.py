@@ -32,11 +32,11 @@ class TestTsQueryIndex(ValkeyTimeSeriesTestCaseBase):
         self.setup_test_data(self.client)
 
         # Basic filter matching all 'n=1' series
-        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'n="1"'))
+        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'n=1'))
         assert result == [b'ts1', b'ts2', b'ts3', b'ts4']
 
         # Match specific label combination
-        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'n="1"', 'i=a'))
+        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'n=1', 'i=a'))
         assert result == [b'ts2']
 
         # Non-existent value
@@ -131,7 +131,7 @@ class TestTsQueryIndex(ValkeyTimeSeriesTestCaseBase):
         self.setup_test_data(self.client)
 
         # Match newline character
-        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'i="\n"'))
+        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'i=\n'))
         assert result == [b'ts4']
 
         # Match with regex for a special character
@@ -139,7 +139,7 @@ class TestTsQueryIndex(ValkeyTimeSeriesTestCaseBase):
         assert result == [b'ts4']
 
         # Match ampersand in value
-        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'complex="val1&val2"'))
+        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'complex=val1&val2'))
         assert result == [b'ts8']
 
     def test_error_cases(self):

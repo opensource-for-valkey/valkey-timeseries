@@ -4,7 +4,7 @@
 //! `docs/plans/ts-read-implementation-plan.md` §1 and §6 for the captured observations behind each
 //! decision here.
 
-use crate::commands::parse_duration_ms;
+use crate::commands::parse_nonnegative_duration_ms;
 use crate::common::binop::ComparisonOperator;
 use crate::common::block_on_keys::{BlockedKeyHandler, ReadyStatus, block_client_on_key};
 use crate::common::context::is_blocking_denied;
@@ -145,7 +145,7 @@ fn parse_read_options(args: &[&str]) -> ValkeyResult<ReadOptions> {
                     }
                     value
                 } else {
-                    parse_duration_ms(timeout_str).map_err(|_| {
+                    parse_nonnegative_duration_ms(timeout_str).map_err(|_| {
                         ValkeyError::Str(error_consts::READ_BLOCK_MS_MUST_BE_NON_NEGATIVE)
                     })?
                 };

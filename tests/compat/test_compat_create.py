@@ -31,7 +31,21 @@ class TestRetention:
         diff("TS.CREATE", "c:ret", "RETENTION", retention)
         diff("TS.INFO", "c:ret")
 
-    @pytest.mark.parametrize("retention", [-1, -1000])
+    @pytest.mark.parametrize("retention", [
+        "9007199254740993", "2305843009213693953", "9223372036854775807",
+    ])
+    def test_large_retention_is_exact(self, diff, retention):
+        """Both engines take any integer up to i64::MAX exactly. Here it used to go
+        through f64 (2^53 + 1 came back as 2^53) and stop at 2^61."""
+        diff("TS.CREATE", "c:ret:big", "RETENTION", retention)
+        diff("TS.INFO", "c:ret:big")
+
+    @pytest.mark.parametrize("retention", ["9223372036854775808", "18446744073709551615"])
+    def test_retention_above_i64_max_rejected(self, diff, retention):
+        with pytest.raises(ResponseError):
+            diff("TS.CREATE", "c:ret:huge", "RETENTION", retention)
+
+    @pytest.mark.parametrize("retention", [-1, -1000, "-0"])
     def test_negative_retention_rejected(self, diff, retention):
         with pytest.raises(ResponseError):
             diff("TS.CREATE", "c:ret:neg", "RETENTION", retention)
@@ -180,6 +194,22 @@ class TestIgnore:
     def test_ignore_non_numeric_rejected(self, diff):
         with pytest.raises(ResponseError):
             diff("TS.CREATE", "c:ign:bad", "IGNORE", "x", "y")
+
+    @pytest.mark.parametrize("value", ["010", "0010", "09", "0x10", ".5", "inf", "010.5"])
+    def test_ignore_value_operand_forms_agree(self, diff, value):
+        """A leading zero is decimal on both engines (`010` is 10, not octal 8)."""
+        diff("TS.CREATE", "c:ign:form", "DUPLICATE_POLICY", "LAST", "IGNORE", 0, value)
+        diff("TS.INFO", "c:ign:form")
+
+    @pytest.mark.parametrize("timediff", ["9007199254740993", "9223372036854775807"])
+    def test_large_ignore_time_diff_is_exact(self, diff, timediff):
+        diff("TS.CREATE", "c:ign:big", "DUPLICATE_POLICY", "LAST", "IGNORE", timediff, 1)
+        diff("TS.INFO", "c:ign:big")
+
+    @pytest.mark.parametrize("value", ["nan", "-010", "--1", "+-1", "1__0"])
+    def test_ignore_nan_and_negative_rejected(self, diff, value):
+        with pytest.raises(ResponseError):
+            diff("TS.CREATE", "c:ign:nan", "DUPLICATE_POLICY", "LAST", "IGNORE", 0, value)
 
 
 class TestLabels:
@@ -387,3 +417,21 @@ class TestParserDivergences:
 
         assert labels(diff.reference) == {b"1": b"2"}
         assert labels(diff.subject) == {}
+
+
+class TestNumericOperandDivergences:
+    """DIV-0066: numeric forms accepted here and not by RTS (unit suffixes, `_`
+    separators, `0b`/`0o` prefixes, and anything but a plain integer for CHUNK_SIZE),
+    and the C99 hex float RTS accepts and we do not. Pinned per engine."""
+
+    @pytest.mark.parametrize("value", ["5m", "1k", "1_000", "0b1", "0o7"])
+    def test_ignore_operand_superset(self, diff, value):
+        args = ("TS.CREATE", "c:div:ign", "IGNORE", 0, value)
+        assert _errors(diff.reference, *args)
+        assert diff.subject.execute_command(*args) == b"OK"
+
+    @pytest.mark.parametrize("size", ["0256", "0x100", "256.0", "+256", "2_56", "4kb", "0b100000000"])
+    def test_chunk_size_superset(self, diff, size):
+        args = ("TS.CREATE", "c:div:cs", "CHUNK_SIZE", size)
+        assert _errors(diff.reference, *args)
+        assert diff.subject.execute_command(*args) == b"OK"

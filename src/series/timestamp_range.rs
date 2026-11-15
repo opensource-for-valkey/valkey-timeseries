@@ -2,8 +2,7 @@ use crate::common::Timestamp;
 use crate::common::constants::MAX_TIMESTAMP;
 use crate::common::humanize::humanize_duration_ms;
 use crate::common::time::current_time_millis;
-use crate::error_consts;
-use crate::parser::duration::parse_duration_value;
+use crate::parser::parse_nonnegative_duration_value;
 use crate::parser::timestamp::{parse_timestamp, timestamp_error};
 use crate::series::TimeSeries;
 use std::cmp::Ordering;
@@ -105,8 +104,10 @@ impl TryFrom<&str> for TimestampValue {
             && (ch == '-' || ch == '+')
             && !value[1..].bytes().all(|b| b.is_ascii_digit())
         {
-            let value = &value[1..];
-            let mut ms = parse_duration_ms(value)?;
+            // The sign is the offset's direction, so the rest is a nonnegative duration:
+            // `-1m-2m` or `+-5m` are errors, not offsets.
+            let mut ms = parse_nonnegative_duration_value(&value[1..])
+                .map_err(|_| ValkeyError::Str(error_consts::INVALID_DURATION))?;
 
             if ch == '-' {
                 ms = -ms;
@@ -117,15 +118,10 @@ impl TryFrom<&str> for TimestampValue {
         // `parse_timestamp` already rejects negatives, reporting them distinctly from
         // unparseable input. Callers in the range family discard this in favour of a
         // positional `wrong fromTimestamp` / `wrong toTimestamp`.
-        let ts =
-            parse_timestamp(value, false).map_err(|e| ValkeyError::Str(timestamp_error(&e)))?;
+        let ts = parse_timestamp(value).map_err(|e| ValkeyError::Str(timestamp_error(&e)))?;
 
         Ok(Specific(ts))
     }
-}
-
-fn parse_duration_ms(arg: &str) -> ValkeyResult<i64> {
-    parse_duration_value(arg).map_err(|_| ValkeyError::Str(error_consts::INVALID_DURATION))
 }
 
 impl TryFrom<String> for TimestampValue {

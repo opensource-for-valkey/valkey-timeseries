@@ -1,7 +1,7 @@
 use crate::aggregators::AggregationType;
 use crate::commands::command_parser::{parse_inline_condition, split_aggregator_condition};
 use crate::common::Timestamp;
-use crate::parser::parse_positive_duration_value;
+use crate::parser::parse_policy_duration_ms;
 use crate::series::request_types::AggregatorConfig;
 use crate::series::{CompactionRule, SeriesLink};
 use ahash::{HashSet, HashSetExt};
@@ -245,29 +245,12 @@ impl PolicyConfig {
 pub static COMPACTION_POLICY_CONFIG: LazyLock<RwLock<PolicyConfig>> =
     LazyLock::new(|| RwLock::new(PolicyConfig::new()));
 
-fn parse_duration(val: &str) -> ValkeyResult<u64> {
-    // handle redis styled spec (capital M for minutes, m for milliseconds)
-    let Some(last_char) = val.chars().last() else {
-        return Err(ValkeyError::String(format!(
-            "TSDB: invalid duration value: '{val}'"
-        )));
-    };
-    let duration = match last_char {
-        'm' => {
-            let stripped = val.strip_suffix('m').unwrap_or(val);
-            let new_val = format!("{stripped}ms");
-            parse_positive_duration_value(&new_val)
-        }
-        'M' => {
-            let stripped = val.strip_suffix('M').unwrap_or(val);
-            let new_val = format!("{stripped}m");
-            parse_positive_duration_value(&new_val)
-        }
-        _ => parse_positive_duration_value(val),
-    }
-    .map_err(|_| ValkeyError::String(format!("TSDB: invalid duration value: '{val}'")))?;
-
-    Ok(duration as u64)
+/// A policy duration in milliseconds: `m` is milliseconds and `M` minutes (the RTS spelling),
+/// in every segment of a compound value. A bare number is milliseconds.
+fn parse_policy_duration(val: &str) -> ValkeyResult<u64> {
+    parse_policy_duration_ms(val)
+        .map(|ms| ms as u64)
+        .map_err(|_| ValkeyError::String(format!("TSDB: invalid duration value: '{val}'")))
 }
 
 /// A compaction policy is a set of rules that define how to compact time series data.
@@ -279,8 +262,9 @@ fn parse_duration(val: &str) -> ValkeyResult<u64> {
 /// Where:
 ///  - `aggregation_type` is the type of aggregation to use (e.g., `avg`, `sum`, etc.), with the
 ///    same inline condition `TS.CREATERULE` takes (`countif>5`) for a filtered aggregator
-///  - `bucket_duration` is the duration of each bucket in seconds
-///  - `retention` is the retention period in seconds
+///  - `bucket_duration` is the duration of each bucket (`m` = milliseconds, `M` = minutes,
+///    `s`, `h`, `d`; a bare number is milliseconds)
+///  - `retention` is the retention period, in the same units
 ///  - The `align_timestamp` is optional and defaults to 0 if not provided.
 ///
 fn parse_compaction_policy(val: &str) -> ValkeyResult<CompactionPolicy> {
@@ -292,7 +276,7 @@ fn parse_compaction_policy(val: &str) -> ValkeyResult<CompactionPolicy> {
         return Err(ValkeyError::String(msg));
     }
     let aggregator = parse_policy_aggregator(args[0])?;
-    let Ok(bucket_duration_ms) = parse_duration(args[1]) else {
+    let Ok(bucket_duration_ms) = parse_policy_duration(args[1]) else {
         return Err(ValkeyError::String(
             "TSDB: invalid bucket duration in compaction policy".to_string(),
         ));
@@ -302,7 +286,7 @@ fn parse_compaction_policy(val: &str) -> ValkeyResult<CompactionPolicy> {
             "TSDB: compaction policy bucket duration cannot be zero".to_string(),
         ));
     }
-    let Ok(retention_ms) = parse_duration(args[2]) else {
+    let Ok(retention_ms) = parse_policy_duration(args[2]) else {
         return Err(ValkeyError::Str(
             "TSDB: invalid retention in compaction policy",
         ));
@@ -312,7 +296,7 @@ fn parse_compaction_policy(val: &str) -> ValkeyResult<CompactionPolicy> {
     // modular, so an alignment larger than the bucket duration is simply
     // congruent to `align % bucket_duration` (RTS accepts these too).
     let bucket_alignment = if args.len() == 4 {
-        match parse_duration(args[3]) {
+        match parse_policy_duration(args[3]) {
             Ok(ts) => ts as i64,
             _ => {
                 return Err(ValkeyError::String(
@@ -521,20 +505,20 @@ mod tests {
     /// Make sure we can parse redis-style durations correctly.
     fn test_parse_duration_milliseconds() {
         // Test lowercase 'm' for milliseconds
-        assert_eq!(parse_duration("100m").unwrap(), 100);
-        assert_eq!(parse_duration("1m").unwrap(), 1);
-        assert_eq!(parse_duration("1000m").unwrap(), 1000);
-        assert_eq!(parse_duration("0m").unwrap(), 0);
+        assert_eq!(parse_policy_duration("100m").unwrap(), 100);
+        assert_eq!(parse_policy_duration("1m").unwrap(), 1);
+        assert_eq!(parse_policy_duration("1000m").unwrap(), 1000);
+        assert_eq!(parse_policy_duration("0m").unwrap(), 0);
     }
 
     #[test]
     /// Make sure we can parse redis-style durations correctly.
     fn test_parse_duration_minutes() {
         // Test uppercase 'M' for minutes
-        assert_eq!(parse_duration("1M").unwrap(), 60_000);
-        assert_eq!(parse_duration("5M").unwrap(), 300_000);
-        assert_eq!(parse_duration("60M").unwrap(), 3_600_000);
-        assert_eq!(parse_duration("0M").unwrap(), 0);
+        assert_eq!(parse_policy_duration("1M").unwrap(), 60_000);
+        assert_eq!(parse_policy_duration("5M").unwrap(), 300_000);
+        assert_eq!(parse_policy_duration("60M").unwrap(), 3_600_000);
+        assert_eq!(parse_policy_duration("0M").unwrap(), 0);
     }
 
     #[test]

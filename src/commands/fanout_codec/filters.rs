@@ -267,10 +267,10 @@ impl TryFrom<&FanoutFilter> for LabelFilter {
                 PredicateMatch::MatchNone
             }
             (MatcherOpType::RegexEqual, Some(Matcher::Regex(regex))) => {
-                PredicateMatch::RegexEqual(regex_matcher_from_fanout(regex)?)
+                PredicateMatch::RegexEqual(Box::new(regex_matcher_from_fanout(regex)?))
             }
             (MatcherOpType::RegexNotEqual, Some(Matcher::Regex(regex))) => {
-                PredicateMatch::RegexNotEqual(regex_matcher_from_fanout(regex)?)
+                PredicateMatch::RegexNotEqual(Box::new(regex_matcher_from_fanout(regex)?))
             }
             (MatcherOpType::StartsWith, Some(Matcher::Value(predicate))) => {
                 PredicateMatch::StartsWith(predicate_value_from_fanout(predicate))

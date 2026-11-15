@@ -294,3 +294,37 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError):
             self.client.execute_command("TS.CREATE", "metric:twice", "METRIC", "a", "METRIC", "b")
         assert self.client.exists("metric:twice") == 0
+
+    def test_create_metric_is_validated_like_labels(self):
+        """METRIC is held to LABELS' rules and must be consumed whole: trailing text used to be
+        ignored and an empty value was stored, which no LABELS replay could express."""
+        for i, metric in enumerate(('cpu garbage', 'cpu{} x', 'cpu{a="1"}x', 'cpu{a=""}',
+                                    'cpu{a="1",a="2"}', 'cpu{,a="1"}', 'cpu{a="1",,}',
+                                    'cpu{"a=b"="1"}')):
+            with pytest.raises(ResponseError, match="invalid metric name"):
+                self.client.execute_command("TS.CREATE", f"metric:bad:{i}", "METRIC", metric)
+            assert self.client.exists(f"metric:bad:{i}") == 0
+
+    def test_create_metric_label_limit(self):
+        """At most 128 labels, `__name__` included; past that the operand is rejected without
+        being parsed to the end (the duplicate check is linear per label)."""
+        def metric(n):
+            return "cpu{" + ",".join(f'l{i}="v"' for i in range(n)) + "}"
+
+        self.client.execute_command("TS.CREATE", "metric:limit", "METRIC", metric(127))
+        assert len(self.ts_info("metric:limit")["labels"]) == 128
+        for key, operand in (("metric:over", metric(128)), ("metric:huge", metric(50_000))):
+            with pytest.raises(ResponseError, match="too many labels"):
+                self.client.execute_command("TS.CREATE", key, "METRIC", operand)
+            assert self.client.exists(key) == 0
+
+    def test_create_metric_named_or(self):
+        """`or` is a keyword only between selectors; a metric can be called that, as a filter
+        on it already allowed."""
+        self.client.execute_command("TS.CREATE", "metric:or", "METRIC", 'or{host="a"}')
+        assert self.ts_info("metric:or")["labels"] == {"__name__": "or", "host": "a"}
+        assert self.client.execute_command("TS.QUERYINDEX", 'or{host="a"}') == [b"metric:or"]
+
+    def test_create_metric_trailing_comma_and_quoted_names(self):
+        self.client.execute_command("TS.CREATE", "metric:ok", "METRIC", 'cpu{"host.name"="a",}')
+        assert self.ts_info("metric:ok")["labels"] == {"__name__": "cpu", "host.name": "a"}

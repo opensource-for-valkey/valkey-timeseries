@@ -1,6 +1,7 @@
 use std::fmt;
 use std::fmt::{Display, Formatter};
 
+use crate::parser::lex::{Lexeme, Token};
 use logos::Span;
 use thiserror::Error;
 
@@ -9,10 +10,8 @@ pub type ParseResult<T> = Result<T, ParseError>;
 #[derive(Default, Debug, PartialEq, Clone, Error)]
 pub enum ParseError {
     #[error(transparent)]
-    Unexpected(ParseErr), // TODO !!!!!!
-    #[error("Unexpected end of text")]
-    UnexpectedEOF,
-    #[error("Expected positive duration: found `{0}`")]
+    Unexpected(ParseErr),
+    #[error("Invalid duration: `{0}`")]
     InvalidDuration(String),
     #[error("Expected positive unix millis or rfc3339 timestamp: found `{0}`")]
     InvalidTimestamp(String),
@@ -29,78 +28,86 @@ pub enum ParseError {
     General(String),
     #[error("Invalid regex: {0}")]
     InvalidRegex(String),
-    #[error("Invalid match operator: {0}")]
-    InvalidMatchOperator(String),
     #[error("Empty series selector")]
     EmptySeriesSelector,
-    #[error("Invalid series selector")]
-    InvalidSeriesSelector,
+    /// A selector names its metric before the braces and again with a `__name__` matcher
+    /// inside them (`cpu{__name__="mem"}`). Prometheus rejects this with the same text;
+    /// the second field is the matcher's value as written, already quoted.
+    #[error("metric name must not be set twice: {0:?} or {1}")]
+    MetricNameSetTwice(String, String),
+    /// A `METRIC` operand with more than `MAX_LABELS_PER_SERIES` labels, `__name__` included.
+    /// Reported as soon as the limit is passed, so an oversized operand is not parsed to the end.
+    #[error("too many labels")]
+    TooManyLabels,
+    /// What the lexer reports for input no token matches: logos builds its error value with
+    /// `Default`. `Cursor` replaces it with an `Unexpected` naming the text.
     #[default]
     #[error("Parse error")]
     Other,
 }
 
-/// ParseErr wraps a parser error with line and position context.
+/// ParseErr wraps a parser error with its position in the input.
 #[derive(Debug, PartialEq, Clone, Error)]
 pub struct ParseErr {
     pub range: Span,
     pub err: String,
-    /// line_offset is an additional line offset to be added. Only used inside unit tests.
-    pub line_offset: usize,
+    /// 1-based line of `range.start`.
+    pub line: usize,
+    /// 1-based byte column of `range.start` within its line.
+    pub column: usize,
 }
 
 impl ParseErr {
-    pub fn new<S: Into<Span>>(msg: &str, range: S) -> Self {
+    /// `source` is the whole input `range` indexes into; line and column are computed from it
+    /// the way Prometheus reports positions (`line:column:`, both 1-based, column in bytes).
+    pub fn new(msg: &str, range: Span, source: &str) -> Self {
+        let start = range.start.min(source.len());
+        let before = &source.as_bytes()[..start];
+        let line = 1 + before.iter().filter(|&&b| b == b'\n').count();
+        let line_start = before
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
         Self {
-            range: range.into(),
+            range,
             err: msg.to_string(),
-            line_offset: 0,
+            line,
+            column: start - line_start + 1,
         }
     }
 }
 
 impl Display for ParseErr {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let pos: usize = self.range.start;
-        let last_line_break = 0;
-        let line = self.line_offset + 1;
-
-        let col = pos - last_line_break;
-        let position_str = format!("{line}:{col}:").to_string();
-        write!(f, "{} parse error: {}", position_str, self.err)?;
-        Ok(())
+        write!(
+            f,
+            "{}:{}: parse error: {}",
+            self.line, self.column, self.err
+        )
     }
 }
 
-/// `unexpected` creates a parser error complaining about an unexpected lexer item.
-/// The item presented as unexpected is always the last item produced by the lexer.
+/// An error for an unexpected token: `unexpected "x" in <context>, expected <expected>`.
+/// End of input is named as such rather than as an empty string.
 pub(crate) fn unexpected(
     context: &str,
-    actual: &str,
+    found: &Lexeme,
     expected: &str,
-    span: Option<&Span>,
+    source: &str,
 ) -> ParseError {
-    let mut err_msg: String = String::with_capacity(25 + context.len() + expected.len());
-
-    err_msg.push_str("unexpected ");
-
-    let actual = format!("\"{actual}\"");
-    err_msg.push_str(&actual);
-
-    if !context.is_empty() {
-        err_msg.push_str(" in ");
-        err_msg.push_str(context)
-    }
-
-    if !expected.is_empty() {
-        err_msg.push_str(", expected ");
-        err_msg.push_str(expected)
-    }
-
-    let span = if let Some(sp) = span {
-        sp.clone()
+    let found_text = if found.token == Token::Eof {
+        "end of input".to_string()
     } else {
-        Span::default()
+        format!("\"{}\"", found.text)
     };
-    ParseError::Unexpected(ParseErr::new(&err_msg, span))
+    let mut msg = format!("unexpected {found_text}");
+    if !context.is_empty() {
+        msg.push_str(" in ");
+        msg.push_str(context);
+    }
+    if !expected.is_empty() {
+        msg.push_str(", expected ");
+        msg.push_str(expected);
+    }
+    ParseError::Unexpected(ParseErr::new(&msg, found.span.clone(), source))
 }

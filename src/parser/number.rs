@@ -1,102 +1,92 @@
 use crate::parser::ParseError::InvalidNumber;
-use crate::parser::{ParseError, ParseResult};
+use crate::parser::ParseResult;
+use std::borrow::Cow;
 
-fn from_str_radix(str: &str, radix: u32) -> Result<f64, ParseError> {
-    u64::from_str_radix(str, radix)
+/// Removes `_` digit separators. Each must sit between two digits of `radix` (`1_000`,
+/// `0xff_ff`); a leading, trailing or doubled one, or one next to `.` or `e`, is an error.
+fn strip_separators(s: &str, radix: u32) -> Option<Cow<'_, str>> {
+    if !s.contains('_') {
+        return Some(Cow::Borrowed(s));
+    }
+    let bytes = s.as_bytes();
+    let is_digit = |i: usize| bytes.get(i).is_some_and(|b| (*b as char).is_digit(radix));
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'_' && !(i > 0 && is_digit(i - 1) && is_digit(i + 1)) {
+            return None;
+        }
+    }
+    Some(Cow::Owned(s.replace('_', "")))
+}
+
+fn from_str_radix(digits: &str, radix: u32) -> ParseResult<f64> {
+    let invalid = || InvalidNumber(digits.to_string());
+    // `u64::from_str_radix` takes a leading `+`, so `0x+5` would be 5.
+    if !digits.starts_with(|c: char| c.is_digit(radix)) {
+        return Err(invalid());
+    }
+    let digits = strip_separators(digits, radix).ok_or_else(invalid)?;
+    u64::from_str_radix(&digits, radix)
         .map(|value| value as f64)
-        .map_err(|_| InvalidNumber(str.to_string()))
+        .map_err(|_| invalid())
 }
 
 fn parse_basic(str: &str) -> ParseResult<f64> {
-    let (str, multiplier) = if let Some((ending, mult)) = get_number_suffix(str) {
-        (&str[0..str.len() - ending.len()], mult)
-    } else {
-        (str, 1)
+    let (number, multiplier) = match get_number_suffix(str) {
+        Some((ending, mult)) => (&str[..str.len() - ending.len()], mult),
+        None => (str, 1),
     };
-
-    // this initial check is to avoid the cost of an allocation if not necessary
-    let res = if str.contains('_') {
-        let str = str.replace('_', "");
-        str.parse::<f64>()
+    let value = strip_separators(number, 10)
+        .and_then(|number| number.parse::<f64>().ok())
+        .ok_or_else(|| InvalidNumber(str.to_string()))?;
+    Ok(if multiplier > 1 {
+        value * multiplier as f64
     } else {
-        str.parse::<f64>()
-    };
-    match res {
-        Ok(value) => Ok(if multiplier > 1 {
-            value * multiplier as f64
-        } else {
-            value
-        }),
-        Err(_) => Err(InvalidNumber(str.to_string())),
-    }
+        value
+    })
 }
 
-/// Note. This should only be called on strings produced by the lexer. To be more
-/// specific, this assumes strings are ascii
-pub fn parse_positive_number(str: &str) -> ParseResult<f64> {
-    if str.is_empty() {
-        return Err(InvalidNumber(str.to_string()));
-    }
-    let ch = str.chars().next().unwrap();
-    match ch {
-        'i' | 'I' => {
-            if str.eq_ignore_ascii_case("inf") {
-                return Ok(f64::INFINITY);
-            }
-        }
-        'n' | 'N' => {
-            if str.eq_ignore_ascii_case("nan") {
-                return Ok(f64::NAN);
-            }
-        }
-        '0' => {
-            if str.len() == 1 {
-                return Ok(0_f64);
-            }
-            let rest = &str[1..];
-            let ch = rest.chars().next().unwrap();
-            return match ch {
-                '.' => parse_basic(str),
-                'b' | 'B' => from_str_radix(&rest[1..], 2),
-                'o' | 'O' => from_str_radix(&rest[1..], 8),
-                'x' | 'X' => from_str_radix(&rest[1..], 16),
-                _ => {
-                    if ch.is_numeric() {
-                        // try and match Go style octal
-                        return from_str_radix(rest, 8);
-                    }
-                    // punt to std num parser
-                    parse_basic(str)
-                }
-            };
-        }
-        _ => return parse_basic(str),
-    }
-
-    Err(InvalidNumber(str.to_string()))
-}
-
-pub fn parse_number(str: &str) -> ParseResult<f64> {
-    let mut str = str;
-    // Guard the leading-character read the same way `parse_positive_number` does: an
-    // empty operand reaches here from user input (e.g. `TS.CREATE k IGNORE 5 ""`).
+/// Parses an unsigned number: a decimal with optional fraction, exponent, `_` separators and
+/// unit suffix (`2.5k`, `4KiB`); a `0x`, `0o` or `0b` integer; `inf`; or `nan`. A leading
+/// zero is decimal. A sign is an error here; [`parse_number`] reads at most one.
+pub fn parse_magnitude(str: &str) -> ParseResult<f64> {
+    let invalid = || InvalidNumber(str.to_string());
     let Some(ch) = str.chars().next() else {
-        return Err(InvalidNumber(str.to_string()));
+        return Err(invalid());
     };
-    let mut is_negative = false;
-
-    if ch == '+' {
-        str = &str[1..];
-    } else {
-        is_negative = if ch == '-' {
-            str = &str[1..];
-            true
-        } else {
-            false
-        };
+    match ch {
+        // `f64::from_str` would take a second sign, so `--12` was 12 and `+-12` was -12.
+        '+' | '-' => Err(invalid()),
+        'i' | 'I' if str.eq_ignore_ascii_case("inf") => Ok(f64::INFINITY),
+        'n' | 'N' if str.eq_ignore_ascii_case("nan") => Ok(f64::NAN),
+        // Other words, `infinity` included, are not numbers here.
+        c if c.is_ascii_alphabetic() => Err(invalid()),
+        '0' => match str.as_bytes().get(1) {
+            None => Ok(0.0),
+            Some(b'b' | b'B') => from_str_radix(&str[2..], 2),
+            Some(b'o' | b'O') => from_str_radix(&str[2..], 8),
+            Some(b'x' | b'X') => from_str_radix(&str[2..], 16),
+            // A leading zero is decimal (`010` is 10, `09` is 9), as `strtod` reads it and
+            // so RedisTimeSeries does. Go-style octal turned `FILTER_BY_VALUE 010` into 8.
+            _ => parse_basic(str),
+        },
+        _ => parse_basic(str),
     }
+}
 
-    parse_positive_number(str).map(|value| if is_negative { -value } else { value })
+/// Parses a number with at most one leading sign; see [`parse_magnitude`] for the rest.
+///
+/// NaN and both infinities are returned as such: whether an operand may be one is the
+/// caller's policy (`FILTER_BY_VALUE` and `IGNORE` reject NaN, numeric configuration values
+/// require a finite number, `CHUNK_SIZE` requires an integer in range).
+pub fn parse_number(str: &str) -> ParseResult<f64> {
+    let (negative, magnitude) = match str.as_bytes().first() {
+        Some(b'-') => (true, &str[1..]),
+        Some(b'+') => (false, &str[1..]),
+        _ => (false, str),
+    };
+    parse_magnitude(magnitude)
+        .map(|value| if negative { -value } else { value })
+        .map_err(|_| InvalidNumber(str.to_string()))
 }
 
 type SuffixValue = (&'static str, usize);
@@ -125,27 +115,24 @@ fn get_suffix_value(s: &str) -> Option<SuffixValue> {
     .copied()
 }
 
-// Note: must match above
-const SUFFIX_START_CHARS: [char; 8] = ['k', 'K', 'm', 'M', 'g', 'G', 't', 'T'];
-
+/// The unit suffix at the end of `s`, if any. Suffixes are at most three characters, so only the
+/// tail is looked at rather than scanning the mantissa.
 pub fn get_number_suffix(s: &str) -> Option<SuffixValue> {
-    // todo: check for !s[0].is_digit() before this
-    let suffix = s.trim_start_matches(|x| !SUFFIX_START_CHARS.contains(&x));
-    if suffix.is_empty() {
-        return None;
-    }
-    get_suffix_value(suffix)
+    (1..=3.min(s.len()))
+        .rev()
+        .filter(|len| s.is_char_boundary(s.len() - len))
+        .find_map(|len| get_suffix_value(&s[s.len() - len..]))
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::parser::number::{parse_number, parse_positive_number};
+    use crate::parser::number::{parse_magnitude, parse_number};
 
     fn expect_failure(s: &str) {
-        match parse_positive_number(s) {
+        match parse_magnitude(s) {
             Err(..) => {}
             Ok(ns) => {
-                panic!("expecting error in parse_positive_number({s}); got result {ns}")
+                panic!("expecting error in parse_magnitude({s}); got result {ns}")
             }
         }
     }
@@ -153,7 +140,7 @@ mod tests {
     #[test]
     fn test_parse_number_with_unit() {
         fn f(s: &str, expected: f64) {
-            let v = parse_positive_number(s).unwrap();
+            let v = parse_magnitude(s).unwrap();
             if v.is_nan() {
                 assert!(
                     expected.is_nan(),
@@ -186,22 +173,22 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_positive_number_success() {
+    fn test_parse_magnitude_success() {
         fn f(s: &str, expected: f64) {
-            match parse_positive_number(s) {
+            match parse_magnitude(s) {
                 Err(err) => {
-                    panic!("unexpected error in parse_positive_number({s}): {err:?}")
+                    panic!("unexpected error in parse_magnitude({s}): {err:?}")
                 }
                 Ok(v) => {
                     if v.is_nan() {
                         if !expected.is_nan() {
                             panic!(
-                                "unexpected value returned from parse_positive_number({s}); got {v}; want {expected}"
+                                "unexpected value returned from parse_magnitude({s}); got {v}; want {expected}"
                             )
                         }
                     } else if v != expected {
                         panic!(
-                            "unexpected value returned from parse_positive_number({s}); got {v}; want {expected}"
+                            "unexpected value returned from parse_magnitude({s}); got {v}; want {expected}"
                         )
                     }
                 }
@@ -217,7 +204,13 @@ mod tests {
         f("0xfe", 0xfe as f64);
         f("0b0110", 0b0110 as f64);
         f("0O765", 0o765 as f64);
-        f("0765", 0o765 as f64);
+        f("0765", 765.0);
+        f("010", 10.0);
+        f("0010", 10.0);
+        f("09", 9.0);
+        f("08", 8.0);
+        f("010.5", 10.5);
+        f("0.010", 0.010);
         f("2k", (2 * 1000) as f64);
         f("2.3Kb", 2.3 * 1000_f64);
         f("3ki", 3.0 * 1024_f64);
@@ -237,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_positive_number_failure() {
+    fn test_parse_magnitude_failure() {
         fn f(s: &str) {
             expect_failure(s)
         }
@@ -263,5 +256,64 @@ mod tests {
         // Signed parsing still works.
         assert_eq!(parse_number("-12").unwrap(), -12.0);
         assert_eq!(parse_number("+12").unwrap(), 12.0);
+    }
+
+    #[test]
+    fn test_sign_is_read_once() {
+        for s in ["--12", "+-12", "-+12", "++12", "- 12", "-", "+", ""] {
+            assert!(parse_number(s).is_err(), "{s}: {:?}", parse_number(s));
+        }
+        for s in ["-12", "+12", "-1e3", "1e-3", "-inf", "+inf", "-0x10"] {
+            assert!(parse_number(s).is_ok(), "{s}");
+        }
+        // The magnitude parser takes no sign at all.
+        for s in ["-12", "+12", "-inf"] {
+            assert!(parse_magnitude(s).is_err(), "{s}");
+        }
+        assert!(parse_number("-nan").unwrap().is_nan());
+        assert!(parse_number("infinity").is_err());
+        // The error names the whole operand.
+        assert_eq!(
+            parse_number("09x").unwrap_err(),
+            super::InvalidNumber("09x".to_string())
+        );
+    }
+
+    #[test]
+    fn test_digit_separators() {
+        for (s, expected) in [
+            ("1_000", 1000.0),
+            ("1_000.5", 1000.5),
+            ("1.000_5", 1.0005),
+            ("1_000k", 1_000_000.0),
+            ("0x1_0", 16.0),
+            ("0b1_0", 2.0),
+            ("0o1_0", 8.0),
+        ] {
+            assert_eq!(parse_number(s).unwrap(), expected, "{s}");
+        }
+        for s in [
+            "1__0", "1_", "_1", "1_.5", "1._5", "1_e3", "0x_10", "0x10_", "0x+5", "0x",
+        ] {
+            assert!(parse_number(s).is_err(), "{s}: {:?}", parse_number(s));
+        }
+    }
+
+    #[test]
+    fn test_leading_zero_is_decimal() {
+        // RTS reads these as `strtod` does; checked black-box against the compat reference.
+        for (s, expected) in [
+            ("010", 10.0),
+            ("-010", -10.0),
+            ("09", 9.0),
+            ("0010", 10.0),
+            ("010.5", 10.5),
+        ] {
+            assert_eq!(parse_number(s).unwrap(), expected, "{s}");
+        }
+        // The explicit radix prefixes are unchanged.
+        assert_eq!(parse_number("0o10").unwrap(), 8.0);
+        assert_eq!(parse_number("0x10").unwrap(), 16.0);
+        assert_eq!(parse_number("0b10").unwrap(), 2.0);
     }
 }

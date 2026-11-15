@@ -96,7 +96,7 @@ mod tests {
         index.index_timeseries(&ts, b"time-series-1");
 
         // Build a selector that matches the inserted series.
-        let selector = SeriesSelector::parse("region='us-east-1'").unwrap();
+        let selector = SeriesSelector::parse("region=us-east-1").unwrap();
         let selectors = vec![selector];
 
         let cardinality = index
@@ -127,8 +127,8 @@ mod tests {
         //
         // After AND-ing them, only ts1 should remain, so the
         // resulting cardinality must be 1.
-        let selector_env_qa = SeriesSelector::parse("env='qa'").unwrap();
-        let selector_region = SeriesSelector::parse(r#"region="us-east-1""#).unwrap();
+        let selector_env_qa = SeriesSelector::parse("env=qa").unwrap();
+        let selector_region = SeriesSelector::parse(r#"{region="us-east-1"}"#).unwrap();
 
         let selectors = vec![selector_region, selector_env_qa];
 
@@ -667,7 +667,7 @@ mod tests {
         index.index_timeseries(&doomed, b"s0");
         index.index_timeseries(&live, b"s1");
 
-        let selectors = vec![SeriesSelector::parse(r#"region="us""#).unwrap()];
+        let selectors = vec![SeriesSelector::parse("region=us").unwrap()];
 
         let before = index
             .stats_by_selectors(&selectors, Some("host"), 10)

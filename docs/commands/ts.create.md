@@ -34,6 +34,12 @@ is key name for time series. See https://prometheus.io/docs/concepts/data_model/
 
 The leading name (`node_memory_used_bytes`) is required and becomes the series' `__name__` label,
 so a `__name__` label inside the braces is rejected with `TSDB: invalid metric name`.
+
+The braces are optional and hold `name="value"` pairs separated by commas, with one trailing comma
+allowed. A label name is an identifier or a quoted string (`"host.name"="a"`); a value is a quoted
+string. Each label must satisfy the same rules as `LABELS`: the name non-empty and without `=`, the
+value non-empty. A repeated label name, an empty item (`{,a="1"}`), and any text after the metric
+name or the closing brace are rejected with `TSDB: invalid metric name`.
 </details>
 
 ### Optional Arguments

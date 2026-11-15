@@ -9,5 +9,7 @@ mod series_selector_tests;
 pub mod timestamp;
 pub(crate) mod utils;
 
-pub use duration::*;
-pub use parse_error::*;
+pub use duration::{
+    parse_duration_value, parse_nonnegative_duration_value, parse_policy_duration_ms,
+};
+pub use parse_error::{ParseErr, ParseError, ParseResult};

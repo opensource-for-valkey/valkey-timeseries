@@ -482,8 +482,8 @@ pub fn get_series_labels<'a>(
 mod tests {
     use super::*;
     use crate::commands::command_parser::{
-        parse_chunk_size, parse_duration, parse_duration_ms,
-        parse_metric_name as parse_create_metric,
+        parse_chunk_size, parse_metric_name as parse_create_metric, parse_nonnegative_duration,
+        parse_nonnegative_duration_ms,
     };
     use crate::parser::number::parse_number;
     use crate::series::DuplicatePolicy;
@@ -643,7 +643,7 @@ mod tests {
             let args = create_option_strings(&series);
             let rendered = &operands(&args, "RETENTION", 1)[0];
             assert_eq!(
-                parse_duration(rendered).unwrap(),
+                parse_nonnegative_duration(rendered).unwrap(),
                 Duration::from_millis(retention_ms),
                 "{rendered}"
             );
@@ -695,7 +695,7 @@ mod tests {
                 unreachable!()
             };
             assert_eq!(
-                parse_duration_ms(time).unwrap(),
+                parse_nonnegative_duration_ms(time).unwrap(),
                 time_delta as i64,
                 "{time}"
             );
@@ -748,9 +748,9 @@ mod tests {
                 Label::new("unicode", "caf\u{e9} \u{1f600}"),
                 Label::new("spaces", "  padded  "),
             ],
-            // An empty value can only be spelled through METRIC.
-            vec![Label::new("__name__", "cpu"), Label::new("a", "")],
         ];
+        // METRIC holds labels to what LABELS requires, so an empty value is spelled by neither.
+        assert!(parse_create_metric(r#"cpu{a=""}"#).is_err());
         for labels in &cases {
             let (series, args) = render_labels(labels);
             assert!(
@@ -766,14 +766,22 @@ mod tests {
     /// `LABELS __name__ …` is accepted by `TS.CREATE`/`TS.ALTER`, so a series can hold a name or
     /// label names the metric grammar cannot spell. Those fall back to `LABELS`, which keeps
     /// `__name__` as an ordinary pair; rendering them through `METRIC` would make the replica's
-    /// `TS.CREATE` fail and rebuild the series from its own defaults.
+    /// `TS.CREATE` fail and rebuild the series from its own defaults. `LABELS` does not cap the
+    /// label count, so more than `METRIC` takes falls back too.
     #[test]
     fn test_labels_the_metric_grammar_cannot_spell_fall_back_to_labels() {
+        let over_limit = std::iter::once(Label::new("__name__", "cpu"))
+            .chain(
+                (0..crate::labels::MAX_LABELS_PER_SERIES)
+                    .map(|i| Label::new(format!("l{i}"), "v".into())),
+            )
+            .collect();
         let cases: Vec<Vec<Label>> = vec![
             vec![Label::new("__name__", "cpu total"), Label::new("1x", "a")],
             vec![Label::new("__name__", "cpu"), Label::new("caf\u{e9}", "a")],
             vec![Label::new("__name__", "9cpu")],
             vec![Label::new("__name__", "cpu"), Label::new("a b", "c")],
+            over_limit,
         ];
         for labels in &cases {
             let (series, args) = render_labels(labels);

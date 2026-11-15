@@ -1,126 +1,260 @@
 use crate::parser::{ParseError, ParseResult};
 use std::str;
 
-const MILLIS_PER_SECOND: f64 = 1e3;
-const MILLIS_PER_MINUTE: f64 = 60.0 * MILLIS_PER_SECOND;
-const MILLIS_PER_HOUR: f64 = 60.0 * MILLIS_PER_MINUTE;
-const MILLIS_PER_DAY: f64 = 24.0 * MILLIS_PER_HOUR;
-const MILLIS_PER_WEEK: f64 = 7.0 * MILLIS_PER_DAY;
-const MILLIS_PER_YEAR: f64 = 365.0 * MILLIS_PER_DAY;
+const MILLIS_PER_SECOND: i64 = 1_000;
+const MILLIS_PER_MINUTE: i64 = 60 * MILLIS_PER_SECOND;
+const MILLIS_PER_HOUR: i64 = 60 * MILLIS_PER_MINUTE;
+const MILLIS_PER_DAY: i64 = 24 * MILLIS_PER_HOUR;
+const MILLIS_PER_WEEK: i64 = 7 * MILLIS_PER_DAY;
+const MILLIS_PER_YEAR: i64 = 365 * MILLIS_PER_DAY;
 
-/// `positive_duration_value` returns positive duration in milliseconds for the given s
-/// and the given step.
-///
-/// Duration in s may be combined, i.e., 2h5m or 2h-5m.
-///
-/// Error is returned if the duration in s is negative.
-pub fn parse_positive_duration_value(s: &str) -> Result<i64, ParseError> {
-    let d = parse_duration_value(s)?;
-    if d < 0 {
+/// Parses a nonnegative duration in milliseconds (`RETENTION`, `IGNORE`, bucket and policy
+/// durations). Accepts what [`parse_duration_value`] does, but rejects a negative total and
+/// any leading `-`, so `-0` and `-0.4ms` are errors rather than zero (RTS rejects
+/// `RETENTION -0`). The sign is checked before rounding.
+pub fn parse_nonnegative_duration_value(s: &str) -> Result<i64, ParseError> {
+    parse_nonnegative(s, DurationUnits::Standard)
+}
+
+/// Parses a nonnegative `ts-compaction-policy` duration. The RTS policy spelling: `m` is
+/// milliseconds and `M` minutes, in every segment (`1M30m` is 60 030 ms; `30m1M` is out of
+/// order and rejected). Otherwise as
+/// [`parse_nonnegative_duration_value`], including its extensions over RTS (a bare number is
+/// milliseconds; compound, fractional, `ms`, `w` and `y` values are accepted).
+pub fn parse_policy_duration_ms(s: &str) -> ParseResult<i64> {
+    parse_nonnegative(s, DurationUnits::CompactionPolicy)
+}
+
+/// Which letters name which unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurationUnits {
+    /// `ms`, `s`, `m` (minutes), `h`, `d`, `w`, `y`.
+    Standard,
+    /// As `Standard`, but `m` is milliseconds and `M` minutes.
+    CompactionPolicy,
+}
+
+fn parse_nonnegative(s: &str, units: DurationUnits) -> ParseResult<i64> {
+    let sum = sum_duration(s, units)?;
+    if s.starts_with('-') || sum.is_negative() {
         return Err(ParseError::InvalidDuration(format!(
             "duration cannot be negative; got {s}"
         )));
     }
-    Ok(d)
+    sum.to_millis(s)
 }
 
-fn validate_duration(ms: f64) -> ParseResult<f64> {
-    if ms.abs() > (1_i64 << (62 - 1)) as f64 {
-        let msg = format!("duration ({ms}) is too large");
-        return Err(ParseError::General(msg));
+/// Parses a duration in milliseconds, which may be negative.
+///
+/// Segments may be combined, e.g. `2h5m`, `-2h5m` or `2h-5m`. Once a segment is negative,
+/// every later segment is negated too (`2h-5m5s` is 2h - 5m - 5s). A segment without a unit is
+/// milliseconds. Integer segments are summed exactly, so `9007199254740993ms` and any plain
+/// integer up to `i64::MAX` come back unchanged; a fraction or exponent goes through `f64`,
+/// but only that segment's own value: its whole part joins the exact sum as an integer.
+/// Values outside the `i64` range, and sums that are not finite, are errors.
+pub fn parse_duration_value(s: &str) -> ParseResult<i64> {
+    sum_duration(s, DurationUnits::Standard)?.to_millis(s)
+}
+
+/// One segment's contribution in milliseconds: exact for an integer amount, `f64` otherwise.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SegmentMs {
+    Exact(i128),
+    Approx(f64),
+}
+
+impl SegmentMs {
+    fn is_negative(self) -> bool {
+        match self {
+            Self::Exact(v) => v < 0,
+            Self::Approx(v) => v < 0.0,
+        }
     }
-    Ok(ms)
+
+    fn negated(self) -> Self {
+        match self {
+            Self::Exact(v) => Self::Exact(-v),
+            Self::Approx(v) => Self::Approx(-v),
+        }
+    }
+
+    #[cfg(test)]
+    fn as_f64(self) -> f64 {
+        match self {
+            Self::Exact(v) => v as f64,
+            Self::Approx(v) => v,
+        }
+    }
 }
 
-/// `parse_duration_value` returns the duration in milliseconds for the given s
-///
-/// Duration in s may be combined, i.e., 2h5m, -2h5m or 2h-5m.
-///
-/// The returned duration value can be negative.
-pub fn parse_duration_internal(s: &str) -> ParseResult<f64> {
-    let mut duration: f64 = 0.0;
-    let mut s = s;
-    let mut is_minus = false;
+#[derive(Debug, Default)]
+struct DurationSum {
+    exact: i128,
+    approx: f64,
+    has_approx: bool,
+}
 
-    // todo: duration segments should go from courser to finer grain
-    // i.e. we should forbid something like 25s2d
+impl DurationSum {
+    #[cfg(test)]
+    fn total_f64(&self) -> f64 {
+        self.exact as f64 + self.approx
+    }
 
+    /// The sum as an integer part and a fraction in `(-1, 1)`: the whole part of `approx` is
+    /// added to `exact` as an integer, so an integral fractional-form segment (`1.0ms`) does
+    /// not round the exact subtotal through `f64` (`9007199254741s1.0ms`). `None` when the
+    /// integer part is beyond any `i64` total.
+    fn split(&self) -> Option<(i128, f64)> {
+        let whole = self.approx.trunc();
+        // Far outside `i64` either way, and inside `i128`, so the cast below is exact.
+        if whole.abs() > 1e30 {
+            return None;
+        }
+        let total = self.exact.checked_add(whole as i128)?;
+        // Exact: subtracting the truncation of a float leaves its representable fraction.
+        Some((total, self.approx - whole))
+    }
+
+    /// Whether the unrounded sum is below zero, so `-0.4ms` counts as negative.
+    fn is_negative(&self) -> bool {
+        match self.split() {
+            Some((total, fraction)) => total < 0 || (total == 0 && fraction < 0.0),
+            // Out of range; `to_millis` rejects it whatever its sign.
+            None => self.approx < 0.0,
+        }
+    }
+
+    fn to_millis(&self, s: &str) -> ParseResult<i64> {
+        let total = if self.has_approx {
+            let (total, fraction) = self.split().ok_or_else(|| out_of_range(s))?;
+            // Round half away from zero, like `f64::round`, on `total + fraction` without
+            // forming it in `f64`. With `|fraction| < 1` the sum has the sign of `total`, or
+            // of `fraction` when `total` is 0.
+            let negative = total < 0 || (total == 0 && fraction < 0.0);
+            let adjust = match (negative, fraction) {
+                (false, f) if f >= 0.5 => 1,
+                (false, f) if f < -0.5 => -1,
+                (true, f) if f <= -0.5 => -1,
+                (true, f) if f > 0.5 => 1,
+                _ => 0,
+            };
+            total + adjust
+        } else {
+            self.exact
+        };
+        // `i64::MIN` is excluded so a caller can always negate the result.
+        i64::try_from(total)
+            .ok()
+            .filter(|v| *v != i64::MIN)
+            .ok_or_else(|| out_of_range(s))
+    }
+}
+
+fn out_of_range(s: &str) -> ParseError {
+    ParseError::InvalidDuration(format!("{s} (out of range)"))
+}
+
+/// Sums the segments of `s`. Units must run from largest to smallest, each strictly smaller
+/// than the one before (`1h30m`, `2h-5m5s`); `25s2d`, `5s10m` and a repeated unit (`1s2s`) are
+/// errors. A segment without a unit is milliseconds, so it may only come last (`1s500`).
+fn sum_duration(s: &str, units: DurationUnits) -> ParseResult<DurationSum> {
     if s.is_empty() {
         return Err(ParseError::InvalidDuration(r##""""##.to_string()));
     }
 
-    while !s.is_empty() {
-        let cursor = match scan_duration_segment(s) {
-            Ok((mut value, cursor)) => {
-                if is_minus && (value > 0.0) {
-                    value = -value
-                }
-                duration += value;
-                if value < 0f64 {
-                    is_minus = true
-                }
-                cursor
+    let mut sum = DurationSum::default();
+    let mut rest = s;
+    let mut is_minus = false;
+    let mut previous_unit = i64::MAX;
+    while !rest.is_empty() {
+        let (mut segment, next, unit) = scan_duration_segment(rest, units)?;
+        if unit >= previous_unit {
+            return Err(ParseError::InvalidDuration(format!(
+                "{s} (units must go from largest to smallest)"
+            )));
+        }
+        previous_unit = unit;
+        if is_minus && !segment.is_negative() {
+            segment = segment.negated();
+        }
+        if segment.is_negative() {
+            is_minus = true;
+        }
+        match segment {
+            SegmentMs::Exact(v) => {
+                sum.exact = sum.exact.checked_add(v).ok_or_else(|| out_of_range(s))?;
             }
-            Err(e) => return Err(e),
-        };
-        s = cursor;
+            SegmentMs::Approx(v) => {
+                sum.approx += v;
+                sum.has_approx = true;
+                // inf + -inf is NaN, which every later range check would let through.
+                if !sum.approx.is_finite() {
+                    return Err(out_of_range(s));
+                }
+            }
+        }
+        rest = next;
     }
-
-    validate_duration(duration)
+    Ok(sum)
 }
 
-pub fn parse_duration_value(s: &str) -> ParseResult<i64> {
-    Ok(parse_duration_internal(s)?.round() as i64)
-}
+/// Reads one `<number>[unit]` segment: its value, the rest of the input, and the unit in
+/// milliseconds (1 for `ms` or no unit).
+fn scan_duration_segment(s: &str, units: DurationUnits) -> ParseResult<(SegmentMs, &str, i64)> {
+    let policy = units == DurationUnits::CompactionPolicy;
+    let suffix_start = s
+        .find(|c| matches!(c, 'd' | 'h' | 'm' | 's' | 'w' | 'y') || (policy && c == 'M'))
+        .unwrap_or(s.len());
+    let (multiplier, suffix_len): (i64, usize) = match &s.as_bytes()[suffix_start..] {
+        [b'm', b's', ..] => (1, 2),
+        [b'm', ..] if policy => (1, 1),
+        [b'm', ..] => (MILLIS_PER_MINUTE, 1),
+        [b'M', ..] => (MILLIS_PER_MINUTE, 1),
+        [b's', ..] => (MILLIS_PER_SECOND, 1),
+        [b'h', ..] => (MILLIS_PER_HOUR, 1),
+        [b'd', ..] => (MILLIS_PER_DAY, 1),
+        [b'w', ..] => (MILLIS_PER_WEEK, 1),
+        [b'y', ..] => (MILLIS_PER_YEAR, 1),
+        _ => (1, 0),
+    };
 
-fn scan_duration_segment(s: &str) -> ParseResult<(f64, &str)> {
-    fn parse_prefix(str: &str, end: usize) -> ParseResult<f64> {
-        let num_str = &str[..end];
+    let num_str = &s[..suffix_start];
+    let segment = if let Ok(n) = num_str.parse::<i64>() {
+        // |n| <= 2^63 and the largest multiplier is < 2^35, so the product fits in an i128.
+        SegmentMs::Exact(i128::from(n) * i128::from(multiplier))
+    } else {
         // `f64::parse` also accepts `nan`/`inf`/`infinity`. NaN in particular slipped past
         // every range check (all its comparisons are false) and came out as a zero duration,
         // so `RETENTION nan` and `RETENTION NaNms` were accepted.
         match num_str.parse::<f64>() {
-            Ok(num) if num.is_finite() => Ok(num),
-            _ => Err(ParseError::InvalidDuration(num_str.to_string())),
+            Ok(num) if num.is_finite() => {
+                let ms = num * multiplier as f64;
+                if !ms.is_finite() {
+                    return Err(out_of_range(s));
+                }
+                SegmentMs::Approx(ms)
+            }
+            _ => return Err(ParseError::InvalidDuration(num_str.to_string())),
         }
-    }
-
-    let mut suffix_start = s.len();
-    let mut suffix_char = None;
-
-    for (index, ch) in s.char_indices() {
-        if matches!(ch, 'd' | 'h' | 'm' | 's' | 'w' | 'y') {
-            suffix_start = index;
-            suffix_char = Some(ch);
-            break;
-        }
-    }
-
-    let number_part = parse_prefix(s, suffix_start)?;
-    let (multiplier, suffix_len) = match suffix_char {
-        Some('m') if s[suffix_start..].starts_with("ms") => (1.0, 2),
-        Some('m') => (MILLIS_PER_MINUTE, 1),
-        Some('s') => (MILLIS_PER_SECOND, 1),
-        Some('h') => (MILLIS_PER_HOUR, 1),
-        Some('d') => (MILLIS_PER_DAY, 1),
-        Some('w') => (MILLIS_PER_WEEK, 1),
-        Some('y') => (MILLIS_PER_YEAR, 1),
-        Some(_) => (1.0, 0),
-        None => (1.0, 0),
     };
-
-    let duration = number_part * multiplier;
-    let remaining = &s[suffix_start + suffix_len..];
-    Ok((duration, remaining))
+    Ok((segment, &s[suffix_start + suffix_len..], multiplier))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::duration::{
-        MILLIS_PER_DAY, MILLIS_PER_MINUTE, MILLIS_PER_SECOND, parse_duration_value,
-        parse_positive_duration_value, scan_duration_segment,
-    };
+
+    const MILLIS_PER_SECOND: f64 = super::MILLIS_PER_SECOND as f64;
+    const MILLIS_PER_MINUTE: f64 = super::MILLIS_PER_MINUTE as f64;
+    const MILLIS_PER_HOUR: f64 = super::MILLIS_PER_HOUR as f64;
+    const MILLIS_PER_DAY: f64 = super::MILLIS_PER_DAY as f64;
+    const MILLIS_PER_WEEK: f64 = super::MILLIS_PER_WEEK as f64;
+    const MILLIS_PER_YEAR: f64 = super::MILLIS_PER_YEAR as f64;
+
+    /// The unrounded sum, so fractional cases can be checked exactly.
+    fn unrounded_sum(s: &str) -> ParseResult<f64> {
+        sum_duration(s, DurationUnits::Standard).map(|sum| sum.total_f64())
+    }
 
     #[test]
     fn test_non_finite_numbers_are_not_durations() {
@@ -133,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_scan_duration_segment_empty() {
-        let result = scan_duration_segment("");
+        let result = scan_duration_segment("", DurationUnits::Standard);
         assert!(result.is_err());
         match result {
             Err(ParseError::InvalidDuration(msg)) => assert_eq!(msg, ""),
@@ -155,11 +289,14 @@ mod tests {
         ];
 
         for (input, expected_duration, expected_remaining) in cases {
-            let result = scan_duration_segment(input).unwrap();
+            let result = scan_duration_segment(input, DurationUnits::Standard).unwrap();
             assert_eq!(
-                result.0, expected_duration,
+                result.0.as_f64(),
+                expected_duration,
                 "Duration mismatch for {}: got {}, expected {}",
-                input, result.0, expected_duration
+                input,
+                result.0.as_f64(),
+                expected_duration
             );
             assert_eq!(
                 result.1, expected_remaining,
@@ -180,11 +317,14 @@ mod tests {
         ];
 
         for (input, expected_duration, expected_remaining) in cases {
-            let result = scan_duration_segment(input).unwrap();
+            let result = scan_duration_segment(input, DurationUnits::Standard).unwrap();
             assert_eq!(
-                result.0, expected_duration,
+                result.0.as_f64(),
+                expected_duration,
                 "Duration mismatch for {}: got {}, expected {}",
-                input, result.0, expected_duration
+                input,
+                result.0.as_f64(),
+                expected_duration
             );
             assert_eq!(
                 result.1, expected_remaining,
@@ -206,11 +346,14 @@ mod tests {
         ];
 
         for (input, expected_duration, expected_remaining) in cases {
-            let result = scan_duration_segment(input).unwrap();
+            let result = scan_duration_segment(input, DurationUnits::Standard).unwrap();
             assert_eq!(
-                result.0, expected_duration,
+                result.0.as_f64(),
+                expected_duration,
                 "Duration mismatch for {}: got {}, expected {}",
-                input, result.0, expected_duration
+                input,
+                result.0.as_f64(),
+                expected_duration
             );
             assert_eq!(
                 result.1, expected_remaining,
@@ -231,11 +374,14 @@ mod tests {
         ];
 
         for (input, expected_duration, expected_remaining) in cases {
-            let result = scan_duration_segment(input).unwrap();
+            let result = scan_duration_segment(input, DurationUnits::Standard).unwrap();
             assert_eq!(
-                result.0, expected_duration,
+                result.0.as_f64(),
+                expected_duration,
                 "Duration mismatch for {}: got {}, expected {}",
-                input, result.0, expected_duration
+                input,
+                result.0.as_f64(),
+                expected_duration
             );
             assert_eq!(
                 result.1, expected_remaining,
@@ -251,11 +397,14 @@ mod tests {
         let cases = [("0s", 0.0, ""), ("0ms", 0.0, ""), ("0.0h", 0.0, "")];
 
         for (input, expected_duration, expected_remaining) in cases {
-            let result = scan_duration_segment(input).unwrap();
+            let result = scan_duration_segment(input, DurationUnits::Standard).unwrap();
             assert_eq!(
-                result.0, expected_duration,
+                result.0.as_f64(),
+                expected_duration,
                 "Duration mismatch for {}: got {}, expected {}",
-                input, result.0, expected_duration
+                input,
+                result.0.as_f64(),
+                expected_duration
             );
             assert_eq!(
                 result.1, expected_remaining,
@@ -268,7 +417,7 @@ mod tests {
     #[test]
     fn test_duration_success() {
         fn f(s: &str, expected: f64) {
-            let d = parse_duration_internal(s).unwrap();
+            let d = unrounded_sum(s).unwrap();
             assert_eq!(
                 d, expected,
                 "unexpected duration; got {d}; want {expected}; expr {s}"
@@ -332,14 +481,152 @@ mod tests {
     }
 
     #[test]
+    fn test_non_finite_arithmetic_is_rejected() {
+        // Each prefix is finite, but the product or the sum is not: inf + -inf is NaN, which
+        // used to pass the range check and come out as 0.
+        for s in ["1e308y-1e308y", "1e308y", "1e308y1e308y", "1.5e308w"] {
+            assert!(parse_duration_value(s).is_err(), "{s}");
+            assert!(parse_nonnegative_duration_value(s).is_err(), "{s}");
+        }
+    }
+
+    #[test]
+    fn test_negative_is_checked_before_rounding() {
+        for s in ["-0.4ms", "-0", "-0s", "-0.0", "1ms-1.4ms"] {
+            assert!(parse_nonnegative_duration_value(s).is_err(), "{s}");
+        }
+        assert_eq!(parse_nonnegative_duration_value("0").unwrap(), 0);
+        assert_eq!(parse_nonnegative_duration_value("0.4ms").unwrap(), 0);
+        assert_eq!(parse_duration_value("-0.4ms").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_integer_durations_are_exact_to_i64_max() {
+        // RTS accepts RETENTION and IGNORE up to i64::MAX exactly (black-box checked).
+        for (s, expected) in [
+            ("9007199254740993", 9_007_199_254_740_993),
+            ("9007199254740993ms", 9_007_199_254_740_993),
+            ("2305843009213693953", (1_i64 << 61) + 1),
+            ("9223372036854775807", i64::MAX),
+            ("106751991167d", 106_751_991_167 * 86_400_000),
+            ("1y1ms", 31_536_000_001),
+        ] {
+            assert_eq!(
+                parse_nonnegative_duration_value(s).unwrap(),
+                expected,
+                "{s}"
+            );
+        }
+        assert_eq!(
+            parse_duration_value("-9223372036854775807").unwrap(),
+            -i64::MAX
+        );
+        for s in [
+            "9223372036854775808",
+            "-9223372036854775808",
+            "9223372036854775807ms1ms",
+            "106751991168d",
+            "1e19",
+        ] {
+            assert!(parse_duration_value(s).is_err(), "{s}");
+        }
+    }
+
+    #[test]
+    fn test_mixed_segments_keep_the_exact_subtotal() {
+        // An integral value in fractional form adds to the exact subtotal as an integer: the
+        // sum used to go through `f64`, which has no odd integers above 2^53.
+        for (s, expected) in [
+            ("9007199254741s1.0ms", 9_007_199_254_741_001),
+            ("9007199254741s1e0ms", 9_007_199_254_741_001),
+            ("9223372036854775s807.0ms", i64::MAX),
+            ("9223372036854775s806.5ms", i64::MAX),
+            ("9007199254741s1.4ms", 9_007_199_254_741_001),
+            ("9007199254741s1.6ms", 9_007_199_254_741_002),
+            ("2s0.5ms", 2_001),
+            ("2s0.49ms", 2_000),
+        ] {
+            assert_eq!(parse_duration_value(s).unwrap(), expected, "{s}");
+        }
+        // Halves round away from zero, as `f64::round` does, including across a sign change.
+        for (s, expected) in [
+            ("-2s-0.5ms", -2_001),
+            ("2s-0.5ms", 2_000),
+            ("1s-1000.5ms", -1),
+            ("1s-1500.5ms", -501),
+            ("1s-999.6ms", 0),
+            ("-0.5ms", -1),
+        ] {
+            assert_eq!(parse_duration_value(s).unwrap(), expected, "{s}");
+        }
+        for s in ["9223372036854775s808.0ms", "9223372036854775s807.5ms"] {
+            assert!(parse_duration_value(s).is_err(), "{s}");
+        }
+    }
+
+    #[test]
+    fn test_policy_units() {
+        // `m` is milliseconds and `M` minutes in every segment, not only the last one.
+        for (s, expected) in [
+            ("60m", 60),
+            ("1M", 60_000),
+            ("1M30m", 60_030),
+            ("1h30m", 3_600_030),
+            ("5ms", 5),
+            ("1M5ms", 60_005),
+            ("2s", 2_000),
+            ("1d", 86_400_000),
+            ("60", 60),
+        ] {
+            assert_eq!(parse_policy_duration_ms(s).unwrap(), expected, "{s}");
+        }
+        for s in ["", "-1m", "M", "1Mx", "nan", "30m1M", "5ms1M"] {
+            assert!(parse_policy_duration_ms(s).is_err(), "{s}");
+        }
+        // The standard grammar still has no `M`.
+        assert!(parse_duration_value("1M").is_err());
+    }
+
+    #[test]
+    fn test_units_go_from_largest_to_smallest() {
+        for (s, expected) in [
+            (
+                "1y2w3d4h5m6s7ms",
+                31_536_000_000 + 1_209_600_000 + 259_200_000 + 14_400_000 + 300_000 + 6_007,
+            ),
+            ("1h30m", 5_400_000),
+            ("1s500", 1_500),
+            ("1m500ms", 60_500),
+            ("2h-5m5s", 6_895_000),
+        ] {
+            assert_eq!(parse_duration_value(s).unwrap(), expected, "{s}");
+        }
+        for s in [
+            "25s2d", "5s10m", "1ms2s", "1s2s", "1m1m", "500ms5", "5 10", "1h2d", "1s1h",
+        ] {
+            assert!(
+                parse_duration_value(s).is_err(),
+                "{s}: {:?}",
+                parse_duration_value(s)
+            );
+        }
+    }
+
+    #[test]
+    fn test_sticky_sign_applies_to_later_segments() {
+        assert_eq!(parse_duration_value("2h-5m5s").unwrap(), 6_895_000);
+        assert_eq!(parse_duration_value("-1m30s").unwrap(), -90_000);
+    }
+
+    #[test]
     fn test_duration_unicode_prefix_returns_error() {
         assert!(parse_duration_value("éé1s").is_err());
     }
 
     #[test]
-    fn test_positive_duration_error() {
+    fn test_nonnegative_duration_error() {
         fn f(s: &str) {
-            if parse_positive_duration_value(s).is_ok() {
+            if parse_nonnegative_duration_value(s).is_ok() {
                 panic!("Expecting an error for duration {s}")
             }
         }

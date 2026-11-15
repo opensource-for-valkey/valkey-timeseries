@@ -361,12 +361,12 @@ mod tests {
                 PredicateMatch::Equal(PredicateValue::from(value)),
             )])
         };
-        let selector = SeriesSelector::Or(smallvec::smallvec![branch("api"), branch("missing")]);
+        let selector = SeriesSelector::Or(vec![branch("api"), branch("missing")]);
         let result = postings.postings_for_selector(&selector).unwrap();
         assert!(matches!(result, Cow::Borrowed(_)));
         assert_eq!(result.iter().collect::<Vec<_>>(), vec![1]);
 
-        let selector = SeriesSelector::Or(smallvec::smallvec![branch("api"), branch("web")]);
+        let selector = SeriesSelector::Or(vec![branch("api"), branch("web")]);
         let result = postings.postings_for_selector(&selector).unwrap();
         assert_eq!(result.iter().collect::<Vec<_>>(), vec![1, 2]);
     }

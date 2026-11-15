@@ -2,6 +2,7 @@ pub mod filters;
 mod label;
 mod metric_name;
 mod regex;
+mod regex_cache;
 mod regex_utils;
 
 pub use crate::parser::series_selector::*;
