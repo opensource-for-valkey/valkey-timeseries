@@ -27,7 +27,7 @@ impl<'a> Terms<'a> {
         if filters.len() == 1 {
             let filter = &filters[0];
             // follow Prometheus here: if we have an empty matcher and label, return all postings.
-            if filter.label.is_empty() && filter.matcher.is_empty() {
+            if filter.label.is_empty() && filter.matcher.has_absent_operand() {
                 return Ok(Cow::Borrowed(self.all()));
             }
             // shortcut the handling of simple equality matchers
@@ -126,9 +126,9 @@ impl<'a> Terms<'a> {
                 (MatchOp::RegexNotEqual, ".+") => {
                     not_its.push(self.postings_for_all_label_values(&filter.label));
                 }
-                // l!="" (the RTS `l!=` form parses to PredicateValue::Empty): any non-empty value.
-                // Go straight to all label values rather than inverting to l="" first.
-                _ if matches!(&filter.matcher, PredicateMatch::NotEqual(v) if v.is_empty()) => {
+                // l!="" (or the RTS `l!=` form, or `l!=("")`): any non-empty value. Go straight
+                // to all label values rather than inverting to l="" first.
+                _ if matches!(&filter.matcher, PredicateMatch::NotEqual(v) if v.is_absent()) => {
                     let it = self.postings_for_all_label_values(&filter.label);
                     if it.is_empty() {
                         return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
@@ -635,6 +635,30 @@ mod tests {
                     .collect();
                 assert_eq!(got, expected, "{op:?} with {} filter(s)", filters.len());
             }
+        }
+    }
+
+    /// `l!=""` has several spellings (`PredicateValue::Empty` from the RTS `l!=` form,
+    /// `String("")`, a list holding only `""`). All of them must select the series that carry
+    /// the label, through the same planner arm.
+    #[test]
+    fn not_equal_absent_selects_series_with_the_label_in_every_spelling() {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "env", "prod");
+        postings.add_posting_for_label_value(2, "env", "dev");
+        postings.add_posting_for_label_value(3, "job", "api");
+        for operand in [
+            PredicateValue::Empty,
+            PredicateValue::from(""),
+            PredicateValue::from(vec![String::new()]),
+            PredicateValue::from(vec![String::new(), String::new()]),
+        ] {
+            let filters = [
+                filter("env", PredicateMatch::NotEqual(operand.clone())),
+                filter("env", PredicateMatch::NotEqual(PredicateValue::from("dev"))),
+            ];
+            let result = postings.postings_for_label_filters(&filters).unwrap();
+            assert_eq!(result.iter().collect::<Vec<_>>(), vec![1], "{operand:?}");
         }
     }
 }

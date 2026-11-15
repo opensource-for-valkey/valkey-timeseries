@@ -107,60 +107,48 @@ impl PredicateValue {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
+    /// True when this value matches only a missing label: `Empty` (the RTS `l=` form),
+    /// `String("")`, or a list whose alternatives are all `""` (including none). These are three
+    /// spellings of one thing; code that asks "is this the absent value?" asks this, not which
+    /// variant it is.
+    pub fn is_absent(&self) -> bool {
         match self {
-            PredicateValue::List(list) => list.is_empty(),
-            PredicateValue::String(value) => value.is_empty(),
             PredicateValue::Empty => true,
+            PredicateValue::String(value) => value.is_empty(),
+            PredicateValue::List(list) => list.iter().all(String::is_empty),
         }
     }
 
+    /// True when every alternative is a value a series must actually carry: at least one, and
+    /// none empty. The operand rule for the prefix and substring matchers, and the case the
+    /// planner can answer from the index alone. A list mixing `""` with values is neither this
+    /// nor [`Self::is_absent`].
+    pub fn requires_present(&self) -> bool {
+        match self {
+            PredicateValue::Empty => false,
+            PredicateValue::String(value) => !value.is_empty(),
+            PredicateValue::List(list) => !list.is_empty() && list.iter().all(|v| !v.is_empty()),
+        }
+    }
+
+    /// Whether `value` contains any of the needles. Construction rejects empty needles and empty
+    /// lists ([`PredicateMatch::validate`]); without them this would be true (an empty needle) or
+    /// false (no needles), and `NotContains` is its exact complement either way.
     pub fn matches_contains_any(&self, value: &str) -> bool {
         match self {
             PredicateValue::Empty => false,
-            PredicateValue::String(s) => !s.is_empty() && value.contains(s),
-            PredicateValue::List(list) => {
-                !list.is_empty()
-                    && list.iter().all(|needle| !needle.is_empty())
-                    && list.iter().any(|needle| value.contains(needle.as_str()))
-            }
+            PredicateValue::String(needle) => value.contains(needle.as_str()),
+            PredicateValue::List(list) => list.iter().any(|needle| value.contains(needle.as_str())),
         }
     }
 
-    pub fn matches_not_contains_all(&self, value: &str) -> bool {
-        match self {
-            PredicateValue::Empty => false,
-            PredicateValue::String(s) => !s.is_empty() && !value.contains(s),
-            PredicateValue::List(list) => {
-                !list.is_empty()
-                    && list.iter().all(|needle| !needle.is_empty())
-                    && list.iter().all(|needle| !value.contains(needle.as_str()))
-            }
-        }
-    }
-
+    /// Whether `value` starts with any of the prefixes; see [`Self::matches_contains_any`].
     pub fn matches_starts_with_any(&self, value: &str) -> bool {
         match self {
             PredicateValue::Empty => false,
-            PredicateValue::String(prefix) => !prefix.is_empty() && value.starts_with(prefix),
+            PredicateValue::String(prefix) => value.starts_with(prefix.as_str()),
             PredicateValue::List(list) => {
-                !list.is_empty()
-                    && list.iter().all(|prefix| !prefix.is_empty())
-                    && list.iter().any(|prefix| value.starts_with(prefix.as_str()))
-            }
-        }
-    }
-
-    pub fn matches_not_starts_with_all(&self, value: &str) -> bool {
-        match self {
-            PredicateValue::Empty => false,
-            PredicateValue::String(prefix) => !prefix.is_empty() && !value.starts_with(prefix),
-            PredicateValue::List(list) => {
-                !list.is_empty()
-                    && list.iter().all(|prefix| !prefix.is_empty())
-                    && list
-                        .iter()
-                        .all(|prefix| !value.starts_with(prefix.as_str()))
+                list.iter().any(|prefix| value.starts_with(prefix.as_str()))
             }
         }
     }
@@ -174,40 +162,25 @@ impl PredicateValue {
     }
 }
 
-pub(crate) fn validate_contains_value(value: &PredicateValue) -> Result<(), ParseError> {
-    let is_valid = match value {
-        PredicateValue::Empty => false,
-        PredicateValue::String(s) => !s.is_empty(),
-        PredicateValue::List(list) => {
-            !list.is_empty() && list.iter().all(|needle| !needle.is_empty())
-        }
-    };
-
-    if is_valid {
+/// A prefix or substring operand must be needles a value can contain: at least one, none
+/// empty. An empty needle would match every value and no needles would match none, neither of
+/// which anyone writes on purpose.
+fn require_needles(value: &PredicateValue, matcher: &str) -> Result<(), ParseError> {
+    if value.requires_present() {
         Ok(())
     } else {
-        Err(ParseError::General(
-            "contains matcher does not allow empty values".to_string(),
-        ))
+        Err(ParseError::General(format!(
+            "{matcher} matcher does not allow empty values"
+        )))
     }
 }
 
-pub(crate) fn validate_starts_with_value(value: &PredicateValue) -> Result<(), ParseError> {
-    let is_valid = match value {
-        PredicateValue::Empty => false,
-        PredicateValue::String(prefix) => !prefix.is_empty(),
-        PredicateValue::List(list) => {
-            !list.is_empty() && list.iter().all(|prefix| !prefix.is_empty())
-        }
-    };
+pub(crate) fn validate_contains_value(value: &PredicateValue) -> Result<(), ParseError> {
+    require_needles(value, "contains")
+}
 
-    if is_valid {
-        Ok(())
-    } else {
-        Err(ParseError::General(
-            "starts with matcher does not allow empty values".to_string(),
-        ))
-    }
+pub(crate) fn validate_starts_with_value(value: &PredicateValue) -> Result<(), ParseError> {
+    require_needles(value, "starts with")
 }
 
 impl From<Vec<String>> for PredicateValue {
@@ -458,19 +431,21 @@ impl PredicateMatch {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
+    /// True when the operand is the absent value ([`PredicateValue::is_absent`]): `l=""`,
+    /// `l!=""` and their other spellings. A regex never is: an empty pattern decomposes to
+    /// `=""`, and construction rejects an absent prefix or substring operand.
+    pub fn has_absent_operand(&self) -> bool {
         match self {
-            PredicateMatch::Equal(value) | PredicateMatch::NotEqual(value) => value.is_empty(),
-            // A regex matcher's pattern is never empty: an empty pattern
-            // decomposes to `=""`, and the compiled form is always anchored.
+            PredicateMatch::Equal(value)
+            | PredicateMatch::NotEqual(value)
+            | PredicateMatch::StartsWith(value)
+            | PredicateMatch::NotStartsWith(value)
+            | PredicateMatch::Contains(value)
+            | PredicateMatch::NotContains(value) => value.is_absent(),
             PredicateMatch::MatchAll
             | PredicateMatch::MatchNone
             | PredicateMatch::RegexEqual(_)
             | PredicateMatch::RegexNotEqual(_) => false,
-            PredicateMatch::StartsWith(value) => value.is_empty(),
-            PredicateMatch::NotStartsWith(value) => value.is_empty(),
-            PredicateMatch::Contains(value) => value.is_empty(),
-            PredicateMatch::NotContains(value) => value.is_empty(),
         }
     }
 
@@ -487,9 +462,9 @@ impl PredicateMatch {
             PredicateMatch::RegexEqual(re) => re.is_match(other),
             PredicateMatch::RegexNotEqual(re) => !re.is_match(other),
             PredicateMatch::StartsWith(value) => value.matches_starts_with_any(other),
-            PredicateMatch::NotStartsWith(value) => value.matches_not_starts_with_all(other),
+            PredicateMatch::NotStartsWith(value) => !value.matches_starts_with_any(other),
             PredicateMatch::Contains(value) => value.matches_contains_any(other),
-            PredicateMatch::NotContains(value) => value.matches_not_contains_all(other),
+            PredicateMatch::NotContains(value) => !value.matches_contains_any(other),
         }
     }
 
@@ -1459,5 +1434,69 @@ mod tests {
         assert_eq!(name(r#"{__name__=~"m.*",__name__="cpu"}"#), none);
         assert_eq!(name(r#"{__name__!="cpu",__name__="cpu"}"#), none);
         assert_eq!(name(r#"{job="a"}"#), none);
+    }
+
+    #[test]
+    fn test_absent_and_present_operands() {
+        let list = |items: &[&str]| {
+            PredicateValue::from(items.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        // (operand, is_absent, requires_present)
+        let cases = [
+            (PredicateValue::Empty, true, false),
+            (PredicateValue::from(""), true, false),
+            (list(&[]), true, false),
+            (list(&["", ""]), true, false),
+            (PredicateValue::from("a"), false, true),
+            (list(&["a", "b"]), false, true),
+            // A mix is neither: it matches the absent value and some present ones.
+            (list(&["a", ""]), false, false),
+        ];
+        for (operand, absent, present) in cases {
+            assert_eq!(operand.is_absent(), absent, "{operand:?}");
+            assert_eq!(operand.requires_present(), present, "{operand:?}");
+            // An absent operand is exactly one that matches nothing but "".
+            if absent {
+                assert!(operand.matches(""));
+                assert!(!operand.matches("a"));
+            }
+        }
+    }
+
+    /// The negative prefix and substring matchers are the exact complements of the positive
+    /// ones, for any operand. They used to re-check the operand and return false for an empty
+    /// needle or an empty list, so `!*=` and `^~` rejected values `*=` and `^=` also rejected.
+    #[test]
+    fn test_negative_needle_matchers_are_complements() {
+        let operands = [
+            PredicateValue::Empty,
+            PredicateValue::from(""),
+            PredicateValue::from(vec![]),
+            PredicateValue::from(vec![String::new()]),
+            PredicateValue::from(vec!["ser".to_string(), String::new()]),
+            PredicateValue::from("ser"),
+            PredicateValue::from(vec!["ser".to_string(), "cli".to_string()]),
+        ];
+        for operand in operands {
+            for (positive, negative) in [
+                (
+                    PredicateMatch::StartsWith(operand.clone()),
+                    PredicateMatch::NotStartsWith(operand.clone()),
+                ),
+                (
+                    PredicateMatch::Contains(operand.clone()),
+                    PredicateMatch::NotContains(operand.clone()),
+                ),
+            ] {
+                for value in ["", "server", "client", "a-ser", "proxy"] {
+                    assert_ne!(
+                        positive.matches(value),
+                        negative.matches(value),
+                        "{positive:?} / {negative:?} on {value:?}"
+                    );
+                }
+                assert_eq!(positive.validate().is_ok(), operand.requires_present());
+            }
+        }
     }
 }

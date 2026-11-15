@@ -49,7 +49,7 @@ use crate::common::acl::KeyAccess;
 use crate::common::context::create_key_string;
 use crate::common::threads::GilSource;
 use crate::error_consts;
-use crate::labels::filters::{LabelFilter, PredicateMatch, PredicateValue, SeriesSelector};
+use crate::labels::filters::{LabelFilter, PredicateMatch, SeriesSelector};
 use crate::series::request_types::MetaDateRangeFilter;
 use crate::series::{
     SeriesGuard, SeriesRef, TimeSeries, try_get_timeseries, try_get_timeseries_as,
@@ -199,13 +199,7 @@ fn selectors_plan_cheaply(selectors: &[SeriesSelector]) -> bool {
 
 fn filter_plans_cheaply(filter: &LabelFilter) -> bool {
     match &filter.matcher {
-        PredicateMatch::Equal(value) | PredicateMatch::NotEqual(value) => match value {
-            PredicateValue::String(value) => !value.is_empty(),
-            PredicateValue::List(values) => {
-                !values.is_empty() && values.iter().all(|value| !value.is_empty())
-            }
-            PredicateValue::Empty => false,
-        },
+        PredicateMatch::Equal(value) | PredicateMatch::NotEqual(value) => value.requires_present(),
         PredicateMatch::MatchAll | PredicateMatch::MatchNone => true,
         PredicateMatch::RegexEqual(_)
         | PredicateMatch::RegexNotEqual(_)
