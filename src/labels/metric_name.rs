@@ -89,12 +89,6 @@ impl GetSize for MetricName {
 }
 
 impl MetricName {
-    /// An empty set. Kept for callers that build incrementally with [`Self::add_label`];
-    /// the capacity is irrelevant to the shared slice.
-    pub fn with_capacity(_capacity: usize) -> Self {
-        Self::default()
-    }
-
     pub fn new(labels: &[Label]) -> Self {
         Self::from_entries(
             labels
@@ -139,18 +133,6 @@ impl MetricName {
         } else {
             Arc::from(entries)
         }
-    }
-
-    /// The pairs as one shared slice, for holders that outlive the borrow (a query's copy of a
-    /// series' labels). A reference-count bump.
-    pub fn shared(&self) -> Arc<[InternedString]> {
-        Arc::clone(&self.0)
-    }
-
-    /// The stored `name=value` strings, in name order. For callers that hash or
-    /// compare whole labels and need neither half on its own.
-    pub fn raw_entries(&self) -> std::slice::Iter<'_, InternedString> {
-        self.0.iter()
     }
 
     /// Heap bytes of the slice itself, before dividing among its holders: the `Arc` counts plus
@@ -218,10 +200,6 @@ impl MetricName {
         }
     }
 
-    pub fn set_label(&mut self, key: &str, value: &str) {
-        self.add_label(key, value);
-    }
-
     pub fn get_measurement(&self) -> &str {
         self.get_value(METRIC_NAME_LABEL).unwrap_or(EMPTY_LABEL)
     }
@@ -237,16 +215,6 @@ impl MetricName {
         self.iter()
             .map(|label| Label::new(label.name, label.value))
             .collect()
-    }
-
-    /// Restore name order. Every constructor and mutator keeps it, so this is
-    /// only for a set assembled some other way; it orders by label *name*, not
-    /// by the raw `name=value` string (those differ when one name prefixes
-    /// another: `a1=…` sorts before `a=…` as strings).
-    pub fn sort(&mut self) {
-        if !self.0.is_sorted_by_key(Self::key_of) {
-            self.edit(|entries| entries.sort_by(|a, b| a.name().cmp(b.name())));
-        }
     }
 
     pub fn len(&self) -> usize {
@@ -283,9 +251,6 @@ impl MetricName {
         }
         Ok(Self::from_entries(entries))
     }
-
-    /// The shared slice is always exactly sized; kept for API compatibility.
-    pub fn shrink_to_fit(&mut self) {}
 }
 
 impl From<HashMap<String, String>> for MetricName {
@@ -341,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_add_label() {
-        let mut metric_name = MetricName::with_capacity(2);
+        let mut metric_name = MetricName::default();
         metric_name.add_label("key1", "value1");
         metric_name.add_label("key2", "value2");
 
@@ -361,18 +326,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sort() {
-        let mut metric_name = MetricName::default();
-        metric_name.add_label("key2", "value2");
-        metric_name.add_label("key1", "value1");
-        metric_name.sort();
-
-        let sorted_labels: Vec<_> = metric_name.iter().collect();
-        assert_eq!(sorted_labels[0].name, "key1");
-        assert_eq!(sorted_labels[1].name, "key2");
-    }
-
-    #[test]
     fn labels_are_kept_in_name_order_not_raw_order() {
         // "a1=x" < "a=x" as strings ('1' < '='), but `a` < `a1` as names.
         let mn = MetricName::from_pairs([("a1", "x"), ("a", "x"), ("__name__", "m")]);
@@ -380,10 +333,6 @@ mod tests {
         assert_eq!(names, ["__name__", "a", "a1"]);
         assert_eq!(mn.get_value("a"), Some("x"));
         assert_eq!(mn.get_value("a1"), Some("x"));
-
-        let mut sorted = mn.clone();
-        sorted.sort();
-        assert_eq!(sorted, mn);
     }
 
     #[test]
@@ -420,7 +369,7 @@ mod tests {
     #[test]
     fn clone_and_shared_are_the_same_allocation() {
         let mn: MetricName = r#"m{a="1",b="2"}"#.parse().unwrap();
-        let shared = mn.shared();
+        let shared = Arc::clone(&mn.0);
         assert!(Arc::ptr_eq(&shared, &mn.clone().0));
         assert_eq!(shared.len(), 3);
         assert_eq!(shared[1].split_pair(), Some(("a", "1")));
@@ -447,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_display() {
-        let mut metric_name = MetricName::with_capacity(3);
+        let mut metric_name = MetricName::default();
         metric_name.add_label(METRIC_NAME_LABEL, "metric");
         metric_name.add_label("key1", "value1");
         metric_name.add_label("key2", "value2");
@@ -465,7 +414,7 @@ mod tests {
         let _pool = crate::common::string_interner::test_pool::isolated();
         let empty = MetricName::default().get_heap_size();
 
-        let mut metric_name = MetricName::with_capacity(8);
+        let mut metric_name = MetricName::default();
         for i in 0..8 {
             metric_name.add_label(
                 &format!("heap_size_label_{i}"),
@@ -491,13 +440,13 @@ mod tests {
     #[test]
     fn test_shared_labels_are_amortized_across_holders() {
         let _pool = crate::common::string_interner::test_pool::isolated();
-        let mut only = MetricName::with_capacity(1);
+        let mut only = MetricName::default();
         only.add_label("amortize_probe", "shared_value_for_the_amortization_test");
         let sole_holder = only.get_heap_size();
 
         let mut sharers = Vec::new();
         for _ in 0..4 {
-            let mut mn = MetricName::with_capacity(1);
+            let mut mn = MetricName::default();
             mn.add_label("amortize_probe", "shared_value_for_the_amortization_test");
             sharers.push(mn);
         }
@@ -609,8 +558,7 @@ mod tests {
         // `stats.total_stats.count` after) instead tied the assertion to unrelated interner
         // traffic and left the `usize` subtraction able to underflow if the pool shrank between
         // the two reads.
-        let retained: HashSet<&InternedString> =
-            names.iter().flat_map(|mn| mn.raw_entries()).collect();
+        let retained: HashSet<&InternedString> = names.iter().flat_map(|mn| mn.0.iter()).collect();
         let retained_count = retained.len();
         assert!(
             retained_count <= unique.len() && retained_count + 64 >= unique.len(),

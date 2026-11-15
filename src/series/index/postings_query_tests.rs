@@ -10,11 +10,19 @@
 //! Licensed under the Apache License, Version 2.0 (the "License");
 #[cfg(test)]
 mod tests {
-    use crate::labels::filters::{LabelFilter, MatchOp, SeriesSelector};
+    use crate::labels::filters::{FilterList, LabelFilter, MatchOp, SeriesSelector};
     use crate::labels::{Label, MetricName};
     use crate::series::index::{TimeSeriesIndex, next_timeseries_id};
     use crate::series::{SeriesRef, TimeSeries};
     use std::collections::{HashMap, HashSet};
+
+    /// One group is an AND selector; several are ORed.
+    fn selector_from_groups(groups: Vec<Vec<LabelFilter>>) -> SeriesSelector {
+        match <[_; 1]>::try_from(groups) {
+            Ok([group]) => SeriesSelector::And(group.into()),
+            Err(groups) => SeriesSelector::Or(groups.into_iter().map(FilterList::from).collect()),
+        }
+    }
 
     fn labels_from_strings<S: Into<String> + Clone>(ss: &[S]) -> Vec<Label> {
         if ss.is_empty() {
@@ -842,7 +850,7 @@ mod tests {
 
         for case in cases {
             let name = case.name;
-            let filter: SeriesSelector = case.or_matchers.into();
+            let filter = selector_from_groups(case.or_matchers);
             let actual = ix.postings_for_selector(&filter).unwrap();
             let actual_ids: HashSet<SeriesRef> = actual.iter().collect();
 
@@ -931,7 +939,7 @@ mod tests {
         let or_matchers = vec![vec![
             LabelFilter::create(RegexEqual, "host", "^server[12]$").unwrap(),
         ]];
-        let filter: SeriesSelector = or_matchers.into();
+        let filter = selector_from_groups(or_matchers);
         let actual = ix.postings_for_selector(&filter).unwrap();
 
         assert!(actual.contains(5));

@@ -10,7 +10,6 @@ use std::cmp::PartialEq;
 use std::default::Default;
 use std::fmt;
 use std::fmt::{Display, Formatter};
-use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
 
 const MATCH_ALL_REGEX_TEXT: &str = ".*";
@@ -25,8 +24,6 @@ pub enum MatchOp {
     NotStartsWith,
     Contains,
     NotContains,
-    MatchAll,
-    MatchNone,
 }
 
 impl MatchOp {
@@ -46,8 +43,6 @@ impl Display for MatchOp {
             MatchOp::NotStartsWith => write!(f, "^~"),
             MatchOp::Contains => write!(f, "*="),
             MatchOp::NotContains => write!(f, "!*="),
-            MatchOp::MatchAll => write!(f, "*="),
-            MatchOp::MatchNone => write!(f, "!~"), // TODO
         }
     }
 }
@@ -212,24 +207,6 @@ impl PartialEq for PredicateValue {
     }
 }
 
-impl Hash for PredicateValue {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            PredicateValue::Empty => state.write_u8(1),
-            PredicateValue::String(s) => {
-                state.write_u8(2);
-                s.hash(state);
-            }
-            PredicateValue::List(values) => {
-                state.write_u8(3);
-                for value in values {
-                    value.hash(state);
-                }
-            }
-        }
-    }
-}
-
 /// A compiled regex plus the prefilters derived from it. The fields are private because the
 /// prefilters must agree with the regex: the postings planner trusts `prefix` to narrow its
 /// scan, so a prefix the regex does not imply would drop matching series. Build one with
@@ -242,16 +219,6 @@ pub struct RegexMatcher {
     required_literals: SmallVec<[String; 2]>,
     /// The pattern as the user wrote it; the fan-out codec sends this, and a shard recompiles it.
     value: String,
-}
-
-impl Hash for RegexMatcher {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.regex.as_str().hash(state);
-        self.prefix.hash(state);
-        self.suffix.hash(state);
-        self.required_literals.hash(state);
-        self.value.hash(state);
-    }
 }
 
 impl RegexMatcher {
@@ -381,12 +348,6 @@ impl TryFrom<&str> for RegexMatcher {
     }
 }
 
-impl Display for RegexMatcher {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}", quote_string(&self.value))
-    }
-}
-
 impl Eq for RegexMatcher {}
 
 impl PartialEq for RegexMatcher {
@@ -420,8 +381,9 @@ impl PredicateMatch {
         match self {
             PredicateMatch::Equal(_) => MatchOp::Equal,
             PredicateMatch::NotEqual(_) => MatchOp::NotEqual,
+            // `l=~".*"` and `l!~".*"`, which is how they are written and rendered.
             PredicateMatch::MatchAll => MatchOp::RegexEqual,
-            PredicateMatch::MatchNone => MatchOp::MatchNone,
+            PredicateMatch::MatchNone => MatchOp::RegexNotEqual,
             PredicateMatch::RegexEqual(_) => MatchOp::RegexEqual,
             PredicateMatch::RegexNotEqual(_) => MatchOp::RegexNotEqual,
             PredicateMatch::StartsWith(_) => MatchOp::StartsWith,
@@ -532,72 +494,6 @@ impl PredicateMatch {
     }
 }
 
-impl Display for PredicateMatch {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let value = match self {
-            PredicateMatch::Equal(v) | PredicateMatch::NotEqual(v) => v as &dyn Display,
-            PredicateMatch::MatchAll => &MATCH_ALL_REGEX_TEXT as &dyn Display,
-            PredicateMatch::MatchNone => {
-                return write!(f, "!{MATCH_ALL_REGEX_TEXT}");
-            }
-            PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re) => {
-                re as &dyn Display
-            }
-            PredicateMatch::StartsWith(value) => value as &dyn Display,
-            PredicateMatch::NotStartsWith(value) => value as &dyn Display,
-            PredicateMatch::Contains(value) => value as &dyn Display,
-            PredicateMatch::NotContains(value) => value as &dyn Display,
-        };
-
-        write!(f, "{value}")
-    }
-}
-
-impl Hash for PredicateMatch {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            PredicateMatch::Equal(value) => {
-                state.write_u8(1);
-                value.hash(state);
-            }
-            PredicateMatch::NotEqual(value) => {
-                state.write_u8(2);
-                value.hash(state);
-            }
-            PredicateMatch::MatchAll => {
-                state.write_u8(3);
-            }
-            PredicateMatch::MatchNone => {
-                state.write_u8(10);
-            }
-            PredicateMatch::RegexEqual(re) => {
-                state.write_u8(4);
-                re.hash(state);
-            }
-            PredicateMatch::RegexNotEqual(re) => {
-                state.write_u8(5);
-                re.hash(state);
-            }
-            PredicateMatch::StartsWith(p) => {
-                state.write_u8(6);
-                p.hash(state);
-            }
-            PredicateMatch::NotStartsWith(p) => {
-                state.write_u8(7);
-                p.hash(state);
-            }
-            PredicateMatch::Contains(value) => {
-                state.write_u8(8);
-                value.hash(state);
-            }
-            PredicateMatch::NotContains(value) => {
-                state.write_u8(9);
-                value.hash(state);
-            }
-        }
-    }
-}
-
 impl Eq for PredicateMatch {}
 
 impl PartialEq for PredicateMatch {
@@ -655,8 +551,6 @@ impl LabelFilter {
             MatchOp::NotStartsWith => PredicateMatch::NotStartsWith(value),
             MatchOp::Contains => PredicateMatch::Contains(value),
             MatchOp::NotContains => PredicateMatch::NotContains(value),
-            MatchOp::MatchAll => PredicateMatch::MatchAll,
-            MatchOp::MatchNone => PredicateMatch::MatchNone,
         };
         matcher.validate()?;
         Ok(Self {
@@ -704,13 +598,17 @@ impl LabelFilter {
     }
 
     #[inline]
+    /// A matcher written as a negation (`!=`, `!~`, `^~`, `!*=`), whose matches are found by
+    /// subtracting from a base set. `MatchNone` (`l!~".*"`) is not one, though it is written with
+    /// `!~`: it matches nothing, so the planner answers it directly and `is_bounded` counts it as
+    /// bounding the selector.
     pub fn is_negative_matcher(&self) -> bool {
         matches!(
-            self.op(),
-            MatchOp::NotEqual
-                | MatchOp::RegexNotEqual
-                | MatchOp::NotStartsWith
-                | MatchOp::NotContains
+            self.matcher,
+            PredicateMatch::NotEqual(_)
+                | PredicateMatch::RegexNotEqual(_)
+                | PredicateMatch::NotStartsWith(_)
+                | PredicateMatch::NotContains(_)
         )
     }
 
@@ -754,13 +652,6 @@ impl Display for LabelFilter {
     }
 }
 
-impl Hash for LabelFilter {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.label.hash(state);
-        self.matcher.hash(state);
-    }
-}
-
 /// The metric name every series matching `filters` (one AND group) must have, if the group
 /// pins a single one: an equality on `__name__` with one non-empty value, which every other
 /// `__name__` matcher in the group also accepts.
@@ -780,7 +671,7 @@ fn group_metric_name(filters: &[LabelFilter]) -> Option<&str> {
 /// FilterList is a small vector of LabelFilter, used for AND combinations of label filters.
 /// We try to minimize allocations by reserving stack space for 3 LabelFilter, which seems reasonable for the common
 /// case. e.g. http_requests_total{job="api",method="GET"}
-#[derive(Debug, Default, Clone, Hash, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct FilterList(SmallVec<[LabelFilter; 3]>);
 
 impl FilterList {
@@ -858,7 +749,7 @@ fn filter_group_is_bounded(filters: &FilterList) -> bool {
         .any(|f| !f.is_negative_matcher() && !f.matches_empty())
 }
 
-#[derive(Debug, Clone, Hash, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum SeriesSelector {
     Or(OrFiltersList),
@@ -992,17 +883,6 @@ impl From<Vec<LabelFilter>> for SeriesSelector {
         SeriesSelector::And(FilterList::new(value))
     }
 }
-impl From<Vec<Vec<LabelFilter>>> for SeriesSelector {
-    fn from(value: Vec<Vec<LabelFilter>>) -> Self {
-        if value.len() == 1 {
-            let first = value.into_iter().next().expect("value is not empty");
-            return SeriesSelector::And(FilterList::new(first));
-        }
-        let and_matchers: Vec<FilterList> = value.into_iter().map(FilterList::new).collect();
-        SeriesSelector::Or(and_matchers)
-    }
-}
-
 fn join_matchers(f: &mut Formatter<'_>, v: &[LabelFilter]) -> fmt::Result {
     // Find the metric name matcher (single __name__=value filter)
     let metric_name_info = find_metric_name_matcher(v);
