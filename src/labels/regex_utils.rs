@@ -6,10 +6,13 @@ use crate::labels::filters::{
     PredicateMatch, PredicateValue, RegexMatcher, validate_contains_value,
     validate_starts_with_value,
 };
-use crate::labels::regex::{RegexError, compile_matcher, compile_rust_syntax, parse_matcher_hir};
-use crate::labels::regex_cache::{PatternCache, REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN};
+use crate::labels::regex::{
+    CompiledRegex, RegexError, compile_matcher, compile_rust_syntax, parse_matcher_hir,
+};
+use crate::labels::regex_cache::{
+    MATCHER_CACHE_MAX_BYTES, PatternCache, REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN,
+};
 use crate::parser::{ParseError, ParseResult};
-use regex::Regex;
 use regex_syntax::hir::Class::{Bytes, Unicode};
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 use std::sync::LazyLock;
@@ -30,10 +33,18 @@ const MAX_REPETITION_PREFIX_BYTES: u64 = 4 * 1024;
 /// stored on the second sighting of its pattern: a miss that only decomposes is cheap enough
 /// that storing and evicting one-off patterns would cost a quarter of it.
 static EQUAL_MATCHERS: LazyLock<PatternCache<PredicateMatch>> = LazyLock::new(|| {
-    PatternCache::admitting_on_second_sighting(REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN)
+    PatternCache::admitting_on_second_sighting(
+        REGEX_CACHE_CAPACITY,
+        REGEX_CACHE_MAX_PATTERN_LEN,
+        MATCHER_CACHE_MAX_BYTES,
+    )
 });
 static NOT_EQUAL_MATCHERS: LazyLock<PatternCache<PredicateMatch>> = LazyLock::new(|| {
-    PatternCache::admitting_on_second_sighting(REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN)
+    PatternCache::admitting_on_second_sighting(
+        REGEX_CACHE_CAPACITY,
+        REGEX_CACHE_MAX_PATTERN_LEN,
+        MATCHER_CACHE_MAX_BYTES,
+    )
 });
 
 /// The matcher for `=~ expr` (or `!~ expr` when `is_equal` is false), decomposed into a
@@ -68,7 +79,7 @@ fn decompose_matcher(expr: &str, is_equal: bool) -> ParseResult<PredicateMatch> 
 fn regex_predicate(
     expr: &str,
     inner: &Hir,
-    regex: Regex,
+    regex: CompiledRegex,
     prefix: Option<String>,
     is_equal: bool,
 ) -> PredicateMatch {
@@ -342,9 +353,9 @@ pub enum RegexDecomposition {
     /// The regex is exactly `.*literal.*` or `.*(a|b|c).*` after anchor normalization.
     Contains(PredicateValue),
     /// The regex is an anchored literal prefix followed by a (non-.*) remainder.
-    PrefixWithRegex(String, Regex),
+    PrefixWithRegex(String, CompiledRegex),
     /// The regex could not be simplified
-    Regex(Regex),
+    Regex(CompiledRegex),
 }
 
 impl PartialEq for RegexDecomposition {
@@ -460,7 +471,7 @@ fn decompose_parsed(expr: &str, inner: &Hir) -> Result<RegexDecomposition, Regex
 
 /// Compile a user's pattern (Go syntax), anchored at both ends, through the process-wide
 /// cache of compiled matchers (`regex_cache`).
-pub(crate) fn compile_regex(expr: &str) -> Result<Regex, RegexError> {
+pub(crate) fn compile_regex(expr: &str) -> Result<CompiledRegex, RegexError> {
     compile_matcher(expr)
 }
 

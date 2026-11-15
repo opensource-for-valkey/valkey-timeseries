@@ -1,11 +1,12 @@
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::parse_series_selector;
+use crate::labels::regex::CompiledRegex;
 use crate::labels::regex::compile_matcher;
+use crate::labels::regex_cache::HeapSize;
 use crate::labels::regex_utils::{RegexHints, parse_regex_matcher, regex_hints_for_pattern};
 use crate::labels::render;
 use crate::parser::ParseError;
 use crate::parser::utils::quote_string;
-use regex::Regex;
 use smallvec::SmallVec;
 use std::cmp::PartialEq;
 use std::default::Default;
@@ -212,7 +213,7 @@ impl PartialEq for PredicateValue {
 /// [`Self::create`], [`Self::from_parts`] or [`Self::with_hints`].
 #[derive(Clone, Debug)]
 pub struct RegexMatcher {
-    regex: Regex,
+    regex: CompiledRegex,
     prefix: Option<String>,
     suffix: Option<String>,
     required_literals: SmallVec<[String; 2]>,
@@ -223,21 +224,21 @@ pub struct RegexMatcher {
 }
 
 impl RegexMatcher {
-    fn new(regex: Regex, value: String) -> Self {
+    fn new(regex: CompiledRegex, value: String) -> Self {
         Self::from_parts(regex, value, None)
     }
 
     /// Build a matcher for `value`, deriving the prefilter hints from it.
     /// This parses `value` once; callers that already hold its parsed form use
     /// [`Self::with_hints`].
-    pub(crate) fn from_parts(regex: Regex, value: String, prefix: Option<String>) -> Self {
+    pub(crate) fn from_parts(regex: CompiledRegex, value: String, prefix: Option<String>) -> Self {
         let hints = regex_hints_for_pattern(&value, prefix.as_deref());
         Self::with_hints(regex, value, prefix, hints)
     }
 
     /// Build a matcher from hints the caller already derived from `value`.
     pub(crate) fn with_hints(
-        regex: Regex,
+        regex: CompiledRegex,
         value: String,
         prefix: Option<String>,
         hints: RegexHints,
@@ -369,6 +370,55 @@ impl PartialEq for RegexMatcher {
             && self.required_literals == other.required_literals
             && self.any_non_empty == other.any_non_empty
             && self.value == other.value
+    }
+}
+
+/// What a decomposed matcher keeps alive, for the matcher caches in `regex_utils`. The regex
+/// dominates; strings are charged their capacity.
+impl HeapSize for PredicateValue {
+    fn heap_size(&self) -> usize {
+        match self {
+            PredicateValue::Empty => 0,
+            PredicateValue::String(value) => value.capacity(),
+            PredicateValue::List(values) => {
+                let spilled = if values.spilled() {
+                    values.capacity() * size_of::<String>()
+                } else {
+                    0
+                };
+                spilled + values.iter().map(String::capacity).sum::<usize>()
+            }
+        }
+    }
+}
+
+impl HeapSize for RegexMatcher {
+    fn heap_size(&self) -> usize {
+        let strings = self.value.capacity()
+            + self.prefix.as_ref().map_or(0, String::capacity)
+            + self.suffix.as_ref().map_or(0, String::capacity)
+            + self
+                .required_literals
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>();
+        // Boxed inside `PredicateMatch`.
+        size_of::<Self>() + self.regex.heap_size() + strings
+    }
+}
+
+impl HeapSize for PredicateMatch {
+    fn heap_size(&self) -> usize {
+        match self {
+            PredicateMatch::MatchAll | PredicateMatch::MatchNone => 0,
+            PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re) => re.heap_size(),
+            PredicateMatch::Equal(value)
+            | PredicateMatch::NotEqual(value)
+            | PredicateMatch::StartsWith(value)
+            | PredicateMatch::NotStartsWith(value)
+            | PredicateMatch::Contains(value)
+            | PredicateMatch::NotContains(value) => value.heap_size(),
+        }
     }
 }
 

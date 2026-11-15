@@ -21,13 +21,17 @@
 //! Patterns that come from the decomposition in `regex_utils` (a parsed tree printed back out)
 //! are already Rust syntax and go through [`compile_rust_syntax`] instead.
 
-use crate::labels::regex_cache::{REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN, RegexCache};
-use regex::{Regex, RegexBuilder};
+use crate::labels::regex_cache::{
+    HeapSize, REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_BYTES, REGEX_CACHE_MAX_PATTERN_LEN, RegexCache,
+};
+use regex_automata::MatchKind;
+use regex_automata::meta;
+use regex_automata::util::syntax;
 use regex_syntax::ast::{self, Ast, RepetitionKind, RepetitionRange};
 use regex_syntax::hir::Hir;
 use regex_syntax::hir::translate::TranslatorBuilder;
 use std::fmt::{self, Display, Formatter};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 /// The approximate size limit, in bytes, of a compiled matcher regex. Go has no equivalent
 /// limit, only the repeat-count rule below, so this is where the two can still differ: it
@@ -67,17 +71,72 @@ impl Display for RegexError {
     }
 }
 
-impl From<regex::Error> for RegexError {
-    fn from(err: regex::Error) -> Self {
-        match err {
-            regex::Error::CompiledTooBig(_) => RegexError::TooLarge,
-            other => RegexError::Syntax(other.to_string()),
+impl From<meta::BuildError> for RegexError {
+    /// As `regex::Regex` maps its builder's errors: over a size limit is "too large", a syntax
+    /// error is reported as the parser's.
+    fn from(err: meta::BuildError) -> Self {
+        if err.size_limit().is_some() {
+            return RegexError::TooLarge;
+        }
+        match err.syntax_error() {
+            Some(syntax) => RegexError::Syntax(syntax.to_string()),
+            None => RegexError::Syntax(err.to_string()),
         }
     }
 }
 
+/// A compiled label-matcher regex: the engine `regex::Regex` wraps (`regex_automata`'s meta
+/// regex), built with the settings `regex` 1.x uses. Only this layer reports its heap size,
+/// which the caches charge against their byte budgets (see `regex_cache`). A clone costs what a
+/// `regex::Regex` clone does: it shares the program and gets its own, empty match-cache pool.
+#[derive(Clone, Debug)]
+pub(crate) struct CompiledRegex {
+    regex: meta::Regex,
+    /// The anchored source it was compiled from.
+    source: Arc<str>,
+}
+
+impl CompiledRegex {
+    pub(crate) fn is_match(&self, haystack: &str) -> bool {
+        self.regex.is_match(haystack)
+    }
+
+    /// The anchored source it was compiled from.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.source
+    }
+
+    /// Compile `anchored`, a Rust-syntax pattern, with `.` matching a newline and the module's
+    /// limits. `regex::RegexBuilder` makes the same meta regex: its `size_limit` is the NFA
+    /// limit and its `dfa_size_limit` the lazy DFA's cache capacity.
+    fn build(anchored: &str) -> Result<Self, RegexError> {
+        let regex = meta::Builder::new()
+            .configure(
+                meta::Config::new()
+                    .match_kind(MatchKind::LeftmostFirst)
+                    .utf8_empty(true)
+                    .nfa_size_limit(Some(REGEX_SIZE_LIMIT))
+                    .hybrid_cache_capacity(DFA_SIZE_LIMIT),
+            )
+            .syntax(syntax::Config::new().dot_matches_new_line(true))
+            .build(anchored)?;
+        Ok(Self {
+            regex,
+            source: anchored.into(),
+        })
+    }
+}
+
+impl HeapSize for CompiledRegex {
+    /// The compiled program, as the engine reports it, and the source. Match caches belong to
+    /// the clones that run matches, not to the copy a cache stores.
+    fn heap_size(&self) -> usize {
+        self.regex.memory_usage() + self.source.len()
+    }
+}
+
 /// Compile a user's matcher pattern: Go syntax, anchored at both ends.
-pub(crate) fn compile_matcher(pattern: &str) -> Result<Regex, RegexError> {
+pub(crate) fn compile_matcher(pattern: &str) -> Result<CompiledRegex, RegexError> {
     let rust = go_to_rust_syntax(pattern)?;
     parse_ast(&rust)?;
     compile_rust_syntax(&rust)
@@ -99,22 +158,21 @@ pub(crate) fn parse_matcher_hir(pattern: &str) -> Result<Hir, RegexError> {
 /// Label-matcher regexes compiled so far, keyed by their anchored Rust-syntax source: see
 /// `regex_cache`. Keying on the translated source, not the user's Go pattern, keeps the two
 /// syntaxes from sharing a key (`\d` means different things in each).
-static COMPILED_MATCHERS: LazyLock<RegexCache> =
-    LazyLock::new(|| RegexCache::new(REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN));
+static COMPILED_MATCHERS: LazyLock<RegexCache> = LazyLock::new(|| {
+    RegexCache::new(
+        REGEX_CACHE_CAPACITY,
+        REGEX_CACHE_MAX_PATTERN_LEN,
+        REGEX_CACHE_MAX_BYTES,
+    )
+});
 
 /// Compile a pattern that is already Rust syntax (a printed `Hir`, or a literal escaped with
 /// `regex::escape`), anchored at both ends, under the same flags and limits, through the
 /// process-wide cache of compiled matchers. Callers must only call `is_match` on the result
 /// (see `regex_cache`).
-pub(crate) fn compile_rust_syntax(pattern: &str) -> Result<Regex, RegexError> {
+pub(crate) fn compile_rust_syntax(pattern: &str) -> Result<CompiledRegex, RegexError> {
     let anchored = format!("^(?:{pattern})$");
-    Ok(COMPILED_MATCHERS.get_or_compile(&anchored, |anchored| {
-        RegexBuilder::new(anchored)
-            .size_limit(REGEX_SIZE_LIMIT)
-            .dfa_size_limit(DFA_SIZE_LIMIT)
-            .dot_matches_new_line(true)
-            .build()
-    })?)
+    COMPILED_MATCHERS.get_or_compile(&anchored, CompiledRegex::build)
 }
 
 /// Parse the (already translated) pattern and apply Go's repeat-count rule.
