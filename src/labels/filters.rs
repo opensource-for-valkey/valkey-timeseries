@@ -786,11 +786,20 @@ impl Hash for LabelFilter {
     }
 }
 
-fn get_metric_name(filters: &[LabelFilter]) -> Option<&str> {
-    filters
-        .iter()
-        .find(|m| m.is_metric_name_filter())
-        .and_then(|m| m.text())
+/// The metric name every series matching `filters` (one AND group) must have, if the group
+/// pins a single one: an equality on `__name__` with one non-empty value, which every other
+/// `__name__` matcher in the group also accepts.
+///
+/// `None` when the group leaves the name open (no equality, or one listing several names), and
+/// when its `__name__` matchers contradict each other (`{__name__=~"m.*",__name__="cpu"}`):
+/// that group matches nothing, so no name describes what it matches.
+fn group_metric_name(filters: &[LabelFilter]) -> Option<&str> {
+    let mut name_filters = filters.iter().filter(|f| f.label == METRIC_NAME_LABEL);
+    let name = name_filters.clone().find_map(|f| match &f.matcher {
+        PredicateMatch::Equal(value) => value.text().filter(|name| !name.is_empty()),
+        _ => None,
+    })?;
+    name_filters.all(|f| f.matches(name)).then_some(name)
 }
 
 /// FilterList is a small vector of LabelFilter, used for AND combinations of label filters.
@@ -813,18 +822,15 @@ impl FilterList {
         self.0.is_empty()
     }
 
+    /// True when the group is exactly one metric-name equality: it selects every series with
+    /// that name and constrains nothing else.
     pub fn is_only_metric_name(&self) -> bool {
-        if self.0.len() == 1 {
-            let first = &self.0[0];
-            if first.is_metric_name_filter() {
-                return true;
-            }
-        }
-        false
+        self.0.len() == 1 && group_metric_name(&self.0).is_some()
     }
 
+    /// See [`SeriesSelector::get_metric_name`].
     pub fn get_metric_name(&self) -> Option<&str> {
-        get_metric_name(&self.0)
+        group_metric_name(&self.0)
     }
 
     pub fn push(&mut self, matcher: LabelFilter) {
@@ -924,37 +930,30 @@ impl SeriesSelector {
         }
     }
 
+    /// True when the selector is exactly "every series named X": each OR branch is a single
+    /// equality on the same metric name.
     pub fn is_only_metric_name(&self) -> bool {
         match self {
-            SeriesSelector::Or(_) => false,
-            SeriesSelector::And(and_matchers) => {
-                if and_matchers.len() == 1 {
-                    let first = &and_matchers.0[0];
-                    if first.is_metric_name_filter() {
-                        return true;
-                    }
-                }
-                false
+            SeriesSelector::And(filters) => filters.is_only_metric_name(),
+            SeriesSelector::Or(groups) => {
+                self.get_metric_name().is_some() && groups.iter().all(|g| g.len() == 1)
             }
         }
     }
 
+    /// The metric name every series this selector matches must have, if there is exactly one.
+    ///
+    /// A name is returned only when it is a constraint, safe to plan with: every OR branch
+    /// must pin the same name (see [`group_metric_name`]). `{__name__="cpu" or job="api"}` has
+    /// none, because its second branch matches any metric.
     pub fn get_metric_name(&self) -> Option<&str> {
         match self {
-            SeriesSelector::Or(or_matchers) => {
-                let mut name: Option<&str> = None;
-                for and_matchers in or_matchers.iter() {
-                    if let Some(current_name) = get_metric_name(and_matchers) {
-                        if name.is_some() && name != Some(current_name) {
-                            // Multiple different names found
-                            return None;
-                        }
-                        name = Some(current_name);
-                    }
-                }
-                name
+            SeriesSelector::And(filters) => filters.get_metric_name(),
+            SeriesSelector::Or(groups) => {
+                let mut names = groups.iter().map(|group| group.get_metric_name());
+                let first = names.next()??;
+                names.all(|name| name == Some(first)).then_some(first)
             }
-            SeriesSelector::And(and_matchers) => get_metric_name(and_matchers),
         }
     }
 
@@ -1420,5 +1419,45 @@ mod tests {
         assert!(filter.matches_empty());
         let filter = LabelFilter::create(MatchOp::RegexNotEqual, "l", "foo|").unwrap();
         assert!(!filter.matches_empty());
+    }
+
+    #[test]
+    fn test_metric_name_is_reported_only_when_it_constrains_every_match() {
+        use crate::labels::filters::SeriesSelector;
+        let name = |selector: &str| {
+            let parsed = SeriesSelector::parse(selector).unwrap();
+            (
+                parsed.get_metric_name().map(str::to_string),
+                parsed.is_only_metric_name(),
+            )
+        };
+        let some = |n: &str, only: bool| (Some(n.to_string()), only);
+        let none = (None, false);
+
+        assert_eq!(name("cpu"), some("cpu", true));
+        assert_eq!(name(r#"cpu{job="a"}"#), some("cpu", false));
+        assert_eq!(name(r#"{__name__="cpu"}"#), some("cpu", true));
+        // Every branch pins the same name.
+        assert_eq!(
+            name(r#"{__name__="cpu" or __name__="cpu"}"#),
+            some("cpu", true)
+        );
+        assert_eq!(
+            name(r#"{__name__="cpu" or __name__="cpu",job="a"}"#),
+            some("cpu", false)
+        );
+        // A branch that leaves the name open, or names another, gives no name.
+        assert_eq!(name(r#"{__name__="cpu" or job="api"}"#), none);
+        assert_eq!(name(r#"{__name__="cpu" or __name__="mem"}"#), none);
+        // A list of names is not one name.
+        assert_eq!(name(r#"{__name__=("cpu","mem")}"#), none);
+        // Other `__name__` matchers must accept the name; a contradiction matches nothing.
+        assert_eq!(
+            name(r#"{__name__=~"c.*",__name__="cpu"}"#),
+            some("cpu", false)
+        );
+        assert_eq!(name(r#"{__name__=~"m.*",__name__="cpu"}"#), none);
+        assert_eq!(name(r#"{__name__!="cpu",__name__="cpu"}"#), none);
+        assert_eq!(name(r#"{job="a"}"#), none);
     }
 }

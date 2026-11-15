@@ -764,11 +764,12 @@ mod tests {
                 r#"metric_name{a="b",foo!="bar",test="test",bar!="baz"}"#,
                 Some("metric_name"),
             ),
-            // OR groups; an outer metric name is repeated in every group.
+            // OR groups; an outer metric name is repeated in every group. A name pinned by only
+            // one group is not the selector's: the other group can match any metric.
             (
                 r#"{__name__="metric_name",label1="value1" or label2=~"value.*"}"#,
                 r#"metric_name{label1="value1"} or {label2^="value"}"#,
-                Some("metric_name"),
+                None,
             ),
             (
                 r#"{job="prometheus",env="prod" or datacenter=~"us-.*" or instance="localhost",role!="standby"}"#,
