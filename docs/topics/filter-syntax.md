@@ -167,6 +167,10 @@ as Go's `regexp` package reads it.
 - **Repeat counts are limited to 1000**, including the product of nested counts: `(a{10}){100}`
   is accepted, `(a{10}){101}` is not.
 - `\Q...\E` quotes literal text, and `[[:alpha:]]`-style POSIX classes are supported.
+- **Octal escapes** are characters: `\0`, `\012`, `\141` (`a`). A single digit `\1`-`\9` is a
+  backreference, which RE2 does not support, so it is rejected.
+- **Bracket classes read as in Go**: a `]` first in the class is an ordinary character (`[]-a]` is
+  the range `]` to `a`), and a `-` after a class escape is literal (`[\d-z]` is digits, `-` and `z`).
 
 A pattern that is valid but compiles to more than 4 MiB is rejected with an error saying it is
 too large. In practice this only happens with long repeats of large Unicode classes, such as

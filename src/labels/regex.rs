@@ -217,7 +217,10 @@ pub(crate) fn go_to_rust_syntax(pattern: &str) -> Result<String, RegexError> {
                     break;
                 };
                 rest = &rest[e.len_utf8()..];
-                if let Some(class) = perl_class(e) {
+                if let Some((ch, after)) = octal_escape(e, rest) {
+                    push_hex_escape(&mut out, ch);
+                    rest = after;
+                } else if let Some(class) = perl_class(e) {
                     out.push_str(&class);
                 } else if e == 'b' || e == 'B' {
                     // Go's word boundary is ASCII.
@@ -233,7 +236,7 @@ pub(crate) fn go_to_rust_syntax(pattern: &str) -> Result<String, RegexError> {
                 } else {
                     out.push('\\');
                     out.push(e);
-                    rest = copy_braced_argument(e, rest, &mut out);
+                    rest = copy_escape_argument(e, rest, &mut out);
                 }
             }
             '[' => {
@@ -268,17 +271,55 @@ pub(crate) fn go_to_rust_syntax(pattern: &str) -> Result<String, RegexError> {
     Ok(out)
 }
 
-/// After `\p`, `\P` or `\x`, copy a braced argument (`\p{Greek}`, `\x{41}`) through its `}`, so
-/// the brace is not mistaken for a repeat. Returns what follows it.
-fn copy_braced_argument<'a>(escape: char, rest: &'a str, out: &mut String) -> &'a str {
-    if matches!(escape, 'p' | 'P' | 'x')
-        && rest.starts_with('{')
-        && let Some(end) = rest.find('}')
-    {
-        out.push_str(&rest[..=end]);
-        return &rest[end + 1..];
+/// After `\p`, `\P` or `\x`, copy its argument: braced (`\p{Greek}`, `\x{41}`) through the `}`,
+/// or the short form, one letter after `\p`/`\P` (`\pL`) and two hex digits after `\x`
+/// (`\x41`). Copied whole, a brace is not mistaken for a repeat and, in a class, none of its
+/// characters for a range end. Returns what follows it.
+fn copy_escape_argument<'a>(escape: char, rest: &'a str, out: &mut String) -> &'a str {
+    let short_len = match escape {
+        'p' | 'P' => 1,
+        'x' => 2,
+        _ => return rest,
+    };
+    let len = if rest.starts_with('{') {
+        match rest.find('}') {
+            Some(end) => end + 1,
+            None => return rest,
+        }
+    } else {
+        rest.chars().take(short_len).map(char::len_utf8).sum()
+    };
+    out.push_str(&rest[..len]);
+    &rest[len..]
+}
+
+/// A Go octal escape, `first` being the digit after the `\`: `\0` and up to two more octal
+/// digits, or `\1`-`\7` and one or two more (`\141` is `a`). A lone non-zero digit is a
+/// backreference, which Go rejects, so it is not one: it stays as written and the parser
+/// rejects it too. Returns the character and what follows the escape.
+fn octal_escape(first: char, rest: &str) -> Option<(char, &str)> {
+    let mut value = first.to_digit(8)?;
+    let mut rest = rest;
+    let mut digits = 1;
+    while digits < 3 {
+        let Some(digit) = rest.chars().next().and_then(|c| c.to_digit(8)) else {
+            break;
+        };
+        value = value * 8 + digit;
+        rest = &rest[1..];
+        digits += 1;
     }
-    rest
+    if first != '0' && digits == 1 {
+        return None;
+    }
+    // At most `\777`, 511: always a valid character.
+    Some((char::from_u32(value)?, rest))
+}
+
+/// `ch` as a Rust escape, which reads the same inside and outside a class.
+fn push_hex_escape(out: &mut String, ch: char) {
+    use std::fmt::Write;
+    let _ = write!(out, "\\x{{{:x}}}", u32::from(ch));
 }
 
 /// If `rest` (what follows a `{`) is the rest of a repeat Go accepts — `n}`, `n,}` or `n,m}`,
@@ -318,29 +359,29 @@ fn repeat_len(rest: &str) -> usize {
 /// Translate the inside of a bracket class, `rest` being what follows its `[`, through the
 /// closing `]`. Returns what follows the class.
 ///
-/// Go reads a class as a sequence of items, each a character, a range `a-z`, an escape, or a
-/// POSIX class `[:alpha:]`. Everything else is literal, so `[`, `&` and `~` are escaped (they
-/// open nested classes and set operations in Rust), and so is a `-` that is not a range
-/// operator, which keeps `--` from reading as a set difference.
+/// Go reads a class as a sequence of items, each a character, a range `a-z`, a class escape
+/// (`\d`, `\pL`), or a POSIX class `[:alpha:]`. A `]` first in the class is a character like any
+/// other, so it can start a range (`[]-a]`). Only a character starts a range: a `-` after a class
+/// item is literal (`[\d-z]` is digits, `-` and `z`), and a class after `-` is an error. Everything
+/// else is literal, so `[`, `&` and `~` are escaped (they open nested classes and set operations in
+/// Rust), and so is a `-` that is not a range operator, which keeps `--` from reading as a set
+/// difference.
 fn translate_class<'a>(mut rest: &'a str, out: &mut String) -> Result<&'a str, RegexError> {
     if let Some(r) = rest.strip_prefix('^') {
         out.push('^');
         rest = r;
     }
-    // A `]` first in the class is a literal.
-    if let Some(r) = rest.strip_prefix(']') {
-        out.push_str(r"\]");
-        rest = r;
-    }
+    let mut first = true;
     loop {
         let Some(c) = rest.chars().next() else {
             // Unclosed: let the parser report it.
             return Ok(rest);
         };
-        if c == ']' {
+        if c == ']' && !first {
             out.push(']');
             return Ok(&rest[1..]);
         }
+        first = false;
         if c == '['
             && rest.starts_with("[:")
             && let Some(end) = rest.find(":]")
@@ -356,47 +397,65 @@ fn translate_class<'a>(mut rest: &'a str, out: &mut String) -> Result<&'a str, R
             rest = &rest[end + 2..];
             continue;
         }
-        rest = class_char(rest, out)?;
-        // A range: `-` between this item and a following one that is not the closing `]`.
-        if let Some(after) = rest.strip_prefix('-')
+        let item = rest;
+        let is_class;
+        (rest, is_class) = class_item(item, out)?;
+        // A range: `-` between this character and a following item that is not the closing `]`.
+        if !is_class
+            && let Some(after) = rest.strip_prefix('-')
             && !after.is_empty()
             && !after.starts_with(']')
         {
             out.push('-');
-            rest = class_char(after, out)?;
+            let hi_is_class;
+            (rest, hi_is_class) = class_item(after, out)?;
+            if hi_is_class {
+                let range = &item[..item.len() - rest.len()];
+                return Err(RegexError::Syntax(format!(
+                    "invalid character class range: `{range}`"
+                )));
+            }
         }
     }
 }
 
-/// Translate one character item of a class (a literal or an escape). Returns what follows it.
-fn class_char<'a>(rest: &'a str, out: &mut String) -> Result<&'a str, RegexError> {
+/// Translate one item of a class: a character (a literal or an escape) or a class escape
+/// (`\d`, `\pL`). Returns what follows it, and whether it was a class.
+fn class_item<'a>(rest: &'a str, out: &mut String) -> Result<(&'a str, bool), RegexError> {
     let Some(c) = rest.chars().next() else {
-        return Ok(rest);
+        return Ok((rest, false));
     };
     let mut rest = &rest[c.len_utf8()..];
+    let mut is_class = false;
     match c {
         '\\' => {
             let Some(e) = rest.chars().next() else {
                 out.push('\\');
-                return Ok(rest);
+                return Ok((rest, false));
             };
             rest = &rest[e.len_utf8()..];
-            if let Some(class) = perl_class(e) {
+            if let Some((ch, after)) = octal_escape(e, rest) {
+                push_hex_escape(out, ch);
+                rest = after;
+            } else if let Some(class) = perl_class(e) {
                 // A nested class is how Rust spells a union inside a class.
                 out.push_str(&class);
+                is_class = true;
             } else {
                 out.push('\\');
                 out.push(e);
-                rest = copy_braced_argument(e, rest, out);
+                rest = copy_escape_argument(e, rest, out);
+                is_class = matches!(e, 'p' | 'P');
             }
         }
-        '[' | '&' | '~' | '-' => {
+        // `]` is only an item when it comes first; the class closes on any later one.
+        '[' | ']' | '&' | '~' | '-' => {
             out.push('\\');
             out.push(c);
         }
         _ => out.push(c),
     }
-    Ok(rest)
+    Ok((rest, is_class))
 }
 
 #[cfg(test)]
@@ -417,6 +476,12 @@ mod tests {
             (r"[a-]", r"[a\-]"),
             (r"[]a]", r"[\]a]"),
             (r"[^]a]", r"[^\]a]"),
+            (r"[]-a]", r"[\]-a]"),
+            (r"[\d-z]", r"[[0-9]\-z]"),
+            (r"[\pL-z]", r"[\pL\-z]"),
+            (r"[\x41-\x5a]", r"[\x41-\x5a]"),
+            (r"\141", r"\x{61}"),
+            (r"[\0-\x01]", r"[\x{0}-\x01]"),
             (r"[[:^alpha:]x]", r"[[:^alpha:]x]"),
             (r"\Qa.b\E+", r"a\.b+"),
             (r"abc{def}", r"abc\{def}"),
@@ -493,6 +558,67 @@ mod tests {
             (r"\1", None),
             (r"[\b]", None),
             (r"(a{2}){500}*", None),
+        ];
+        for (pattern, want) in cases {
+            let got = compile_matcher(pattern).ok().map(|re| {
+                VALUES
+                    .iter()
+                    .copied()
+                    .filter(|v| re.is_match(v))
+                    .collect::<Vec<&str>>()
+            });
+            assert_eq!(got.as_deref(), *want, "{pattern:?}");
+        }
+    }
+
+    /// Class items and escapes the translator once got wrong, against Go as above (Go 1.22 on
+    /// these exact inputs): a `]` first in a class starts a range; a `-` after a class escape
+    /// (`\d`, `\pL`) is literal, and a class cannot end a range; octal escapes are characters,
+    /// while a lone non-zero digit is a backreference Go rejects.
+    #[test]
+    fn test_class_ranges_and_octal_escapes_match_like_go() {
+        const VALUES: [&str; 17] = [
+            "a", "b", "m", "z", "]", "^", "_", "-", "5", "A", "M", "\n", "\x00", "\x01", "x\x00y",
+            "Ω", "ǿ",
+        ];
+        let cases: &[(&str, Option<&[&str]>)] = &[
+            (r"[]-a]", Some(&["a", "]", "^", "_"])),
+            (
+                r"[^]-a]",
+                Some(&[
+                    "b", "m", "z", "-", "5", "A", "M", "\n", "\x00", "\x01", "Ω", "ǿ",
+                ]),
+            ),
+            (r"[]-]", Some(&["]", "-"])),
+            (r"[\d-a-z]", Some(&["a", "b", "m", "z", "-", "5"])),
+            (
+                r"[\w-z]",
+                Some(&["a", "b", "m", "z", "_", "-", "5", "A", "M"]),
+            ),
+            (
+                r"[\pL-z]",
+                Some(&["a", "b", "m", "z", "-", "A", "M", "Ω", "ǿ"]),
+            ),
+            (
+                r"[\PL-z]",
+                Some(&["z", "]", "^", "_", "-", "5", "\n", "\x00", "\x01"]),
+            ),
+            (r"[\p{Greek}-z]", Some(&["z", "-", "Ω"])),
+            (r"[[:digit:]-z]", Some(&["z", "-", "5"])),
+            (r"[a-\d]", None),
+            (r"[a-\pL]", None),
+            (r"[\x41-\x5a]", Some(&["A", "M"])),
+            (r"\141", Some(&["a"])),
+            (r"[\141-\143]", Some(&["a", "b"])),
+            (r"\0", Some(&["\x00"])),
+            (r"\012", Some(&["\n"])),
+            (r"x\0y", Some(&["x\x00y"])),
+            (r"\777", Some(&["ǿ"])),
+            (r"[\0-\x01]", Some(&["\x00", "\x01"])),
+            (r"\1", None),
+            (r"\18", None),
+            (r"[\1]", None),
+            (r"\8", None),
         ];
         for (pattern, want) in cases {
             let got = compile_matcher(pattern).ok().map(|re| {
