@@ -339,6 +339,7 @@ class TestValueValidation:
         ("max:1M", "error"),   # too few fields
         ("max", "error"),
         ("bogus:x:y", "error"),
+        ("avg:30m1M:1h", "error"),  # units out of order (RTS: not one integer + one unit)
     ]
 
     @pytest.mark.parametrize("value,expected", COMPACTION_POLICY_CASES)
@@ -348,7 +349,7 @@ class TestValueValidation:
         assert subject.set_outcome("ts-compaction-policy", value) == expected
 
     @pytest.mark.parametrize("value", [
-        "avg:30m1M:1h", "avg:1M30m:1h", "avg:60:1h", "avg:5ms:1h", "avg:1w:1h", "avg:1.5M:1h",
+        "avg:1M30m:1h", "avg:60:1h", "avg:5ms:1h", "avg:1w:1h", "avg:1.5M:1h",
     ])
     def test_compaction_policy_duration_superset(self, clients, value):
         """DIV-0067: RTS takes one integer and one unit (`m` ms, `s`, `M` min, `h`, `d`) per

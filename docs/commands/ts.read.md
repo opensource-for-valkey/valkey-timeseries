@@ -69,8 +69,8 @@ The `BLOCK` wait limit accepts either spelling:
 - **A bare number** — a count of milliseconds. `BLOCK 5000 1` waits up to five seconds.
 - **A unit-suffixed duration** — a number followed by one of `ms`, `s`, `m`, `h`, `d`, `w`, or `y`
   (milliseconds, seconds, minutes, hours, days, weeks, years; a week is 7 days and a year 365).
-  Segments may be chained and are summed, so `BLOCK 2h5m 1` waits up to two hours and five
-  minutes. The number may be fractional — `1.5s` is 1500 ms — and the total is rounded to whole
+  Segments may be chained and are summed, largest unit first, so `BLOCK 2h5m 1` waits up to two
+  hours and five minutes; out-of-order or repeated units (`5m2h`, `1s2s`) are rejected. The number may be fractional — `1.5s` is 1500 ms — and the total is rounded to whole
   milliseconds.
 
 A suffix is lowercase and joined to its number as a single argument, so `1S` and `3wk` are

@@ -1484,8 +1484,8 @@
   kind: behavior
   documentation_only: true
   description: >
-    `ts-compaction-policy` durations accept forms RTS rejects: compound values (`1M30m`, read
-    as 60030 ms), a bare number (milliseconds), a fraction (`1.5M`), and the `ms`, `w` and `y`
+    `ts-compaction-policy` durations accept forms RTS rejects: compound values with units from
+    largest to smallest (`1M30m`, read as 60030 ms; `30m1M` is rejected on both), a bare number (milliseconds), a fraction (`1.5M`), and the `ms`, `w` and `y`
     units. RTS 8.10 accepts one integer with one of `m`, `s`, `M`, `h`, `d`.
   rationale: >
     Accepted (owner sign-off 2026-11-14, §5.3). Accepted-input superset on a configuration

@@ -17,7 +17,8 @@ pub fn parse_positive_duration_value(s: &str) -> Result<i64, ParseError> {
 }
 
 /// Parses a nonnegative `ts-compaction-policy` duration. The RTS policy spelling: `m` is
-/// milliseconds and `M` minutes, in every segment (`1M30m` is 60 030 ms). Otherwise as
+/// milliseconds and `M` minutes, in every segment (`1M30m` is 60 030 ms; `30m1M` is out of
+/// order and rejected). Otherwise as
 /// [`parse_positive_duration_value`], including its extensions over RTS (a bare number is
 /// milliseconds; compound, fractional, `ms`, `w` and `y` values are accepted).
 pub fn parse_policy_duration_ms(s: &str) -> ParseResult<i64> {
@@ -129,9 +130,10 @@ fn out_of_range(s: &str) -> ParseError {
     ParseError::InvalidDuration(format!("{s} (out of range)"))
 }
 
+/// Sums the segments of `s`. Units must run from largest to smallest, each strictly smaller
+/// than the one before (`1h30m`, `2h-5m5s`); `25s2d`, `5s10m` and a repeated unit (`1s2s`) are
+/// errors. A segment without a unit is milliseconds, so it may only come last (`1s500`).
 fn sum_duration(s: &str, units: DurationUnits) -> ParseResult<DurationSum> {
-    // todo: duration segments should go from coarser to finer grain,
-    // i.e. we should forbid something like 25s2d
     if s.is_empty() {
         return Err(ParseError::InvalidDuration(r##""""##.to_string()));
     }
@@ -139,8 +141,15 @@ fn sum_duration(s: &str, units: DurationUnits) -> ParseResult<DurationSum> {
     let mut sum = DurationSum::default();
     let mut rest = s;
     let mut is_minus = false;
+    let mut previous_unit = i64::MAX;
     while !rest.is_empty() {
-        let (mut segment, next) = scan_duration_segment(rest, units)?;
+        let (mut segment, next, unit) = scan_duration_segment(rest, units)?;
+        if unit >= previous_unit {
+            return Err(ParseError::InvalidDuration(format!(
+                "{s} (units must go from largest to smallest)"
+            )));
+        }
+        previous_unit = unit;
         if is_minus && !segment.is_negative() {
             segment = segment.negated();
         }
@@ -165,7 +174,9 @@ fn sum_duration(s: &str, units: DurationUnits) -> ParseResult<DurationSum> {
     Ok(sum)
 }
 
-fn scan_duration_segment(s: &str, units: DurationUnits) -> ParseResult<(SegmentMs, &str)> {
+/// Reads one `<number>[unit]` segment: its value, the rest of the input, and the unit in
+/// milliseconds (1 for `ms` or no unit).
+fn scan_duration_segment(s: &str, units: DurationUnits) -> ParseResult<(SegmentMs, &str, i64)> {
     let policy = units == DurationUnits::CompactionPolicy;
     let suffix_start = s
         .find(|c| matches!(c, 'd' | 'h' | 'm' | 's' | 'w' | 'y') || (policy && c == 'M'))
@@ -202,7 +213,7 @@ fn scan_duration_segment(s: &str, units: DurationUnits) -> ParseResult<(SegmentM
             _ => return Err(ParseError::InvalidDuration(num_str.to_string())),
         }
     };
-    Ok((segment, &s[suffix_start + suffix_len..]))
+    Ok((segment, &s[suffix_start + suffix_len..], multiplier))
 }
 
 #[cfg(test)]
@@ -499,7 +510,6 @@ mod tests {
         for (s, expected) in [
             ("60m", 60),
             ("1M", 60_000),
-            ("30m1M", 60_030),
             ("1M30m", 60_030),
             ("1h30m", 3_600_030),
             ("5ms", 5),
@@ -510,11 +520,36 @@ mod tests {
         ] {
             assert_eq!(parse_policy_duration_ms(s).unwrap(), expected, "{s}");
         }
-        for s in ["", "-1m", "M", "1Mx", "nan"] {
+        for s in ["", "-1m", "M", "1Mx", "nan", "30m1M", "5ms1M"] {
             assert!(parse_policy_duration_ms(s).is_err(), "{s}");
         }
         // The standard grammar still has no `M`.
         assert!(parse_duration_value("1M").is_err());
+    }
+
+    #[test]
+    fn test_units_go_from_largest_to_smallest() {
+        for (s, expected) in [
+            (
+                "1y2w3d4h5m6s7ms",
+                31_536_000_000 + 1_209_600_000 + 259_200_000 + 14_400_000 + 300_000 + 6_007,
+            ),
+            ("1h30m", 5_400_000),
+            ("1s500", 1_500),
+            ("1m500ms", 60_500),
+            ("2h-5m5s", 6_895_000),
+        ] {
+            assert_eq!(parse_duration_value(s).unwrap(), expected, "{s}");
+        }
+        for s in [
+            "25s2d", "5s10m", "1ms2s", "1s2s", "1m1m", "500ms5", "5 10", "1h2d", "1s1h",
+        ] {
+            assert!(
+                parse_duration_value(s).is_err(),
+                "{s}: {:?}",
+                parse_duration_value(s)
+            );
+        }
     }
 
     #[test]
