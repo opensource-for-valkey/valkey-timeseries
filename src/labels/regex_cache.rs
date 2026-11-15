@@ -16,8 +16,11 @@
 //!
 //! Patterns come from client input, so the cache is bounded in both entries
 //! and pattern length, and failed compiles are not cached.
+//!
+//! The cache is generic over what it keeps: [`RegexCache`] holds compiled
+//! regexes, and `regex_utils` keeps whole decomposed label matchers in one too.
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet, RandomState};
 use regex::Regex;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -31,52 +34,104 @@ pub(crate) const REGEX_CACHE_CAPACITY: usize = 256;
 /// cache stay within `REGEX_CACHE_CAPACITY` × this many bytes (1 MiB).
 pub(crate) const REGEX_CACHE_MAX_PATTERN_LEN: usize = 4096;
 
-/// A bounded map from a fully anchored pattern to its compiled regex.
+/// A bounded map from a pattern to the value built from it.
 ///
 /// When full, the least recently used tenth of the entries makes room for the
 /// next one, so a burst of new patterns does not pay an eviction scan each.
-pub(crate) struct RegexCache {
+/// Values are handed out as clones, made outside the lock.
+pub(crate) struct PatternCache<T> {
     capacity: usize,
     max_pattern_len: usize,
-    inner: Mutex<Inner>,
+    hasher: RandomState,
+    inner: Mutex<Inner<T>>,
 }
 
-#[derive(Default)]
-struct Inner {
-    entries: AHashMap<Box<str>, Entry>,
+/// A bounded map from a fully anchored pattern to its compiled regex.
+pub(crate) type RegexCache = PatternCache<Regex>;
+
+struct Inner<T> {
+    entries: AHashMap<Box<str>, Entry<T>>,
     /// Advances on every hit and insertion: the recency stamp.
     clock: u64,
+    /// With admission on second sighting, the patterns built once and not stored.
+    seen: Option<Seen>,
 }
 
-struct Entry {
-    regex: Arc<Regex>,
+/// Hashes of patterns built but not yet admitted, in two generations of `generation` hashes:
+/// when the current one fills it becomes the previous one, and the old previous is dropped. A
+/// pattern is admitted when it is built again while its hash is still in either, that is, before
+/// about `2 × generation` other distinct patterns have been built. One that recurs less often
+/// would have been evicted before its next use anyway.
+struct Seen {
+    current: AHashSet<u64>,
+    previous: AHashSet<u64>,
+    generation: usize,
+}
+
+impl Seen {
+    /// Whether `hash` was seen before; it is recorded either way.
+    fn check_and_mark(&mut self, hash: u64) -> bool {
+        if self.current.contains(&hash) || self.previous.contains(&hash) {
+            return true;
+        }
+        if self.current.len() >= self.generation {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        self.current.insert(hash);
+        false
+    }
+}
+
+struct Entry<T> {
+    regex: Arc<T>,
     last_used: u64,
 }
 
-impl RegexCache {
+impl<T: Clone> PatternCache<T> {
     pub(crate) fn new(capacity: usize, max_pattern_len: usize) -> Self {
+        Self::with_seen(capacity, max_pattern_len, None)
+    }
+
+    /// A cache that stores a value only the second time its pattern is built (see [`Seen`]),
+    /// so a stream of patterns that never recur costs no insertions or evictions. For values
+    /// cheap enough to build that cache upkeep is a visible share of a miss.
+    pub(crate) fn admitting_on_second_sighting(capacity: usize, max_pattern_len: usize) -> Self {
+        let seen = Seen {
+            current: AHashSet::default(),
+            previous: AHashSet::default(),
+            generation: capacity,
+        };
+        Self::with_seen(capacity, max_pattern_len, Some(seen))
+    }
+
+    fn with_seen(capacity: usize, max_pattern_len: usize, seen: Option<Seen>) -> Self {
         Self {
             capacity,
             max_pattern_len,
-            inner: Mutex::new(Inner::default()),
+            hasher: RandomState::new(),
+            inner: Mutex::new(Inner {
+                entries: AHashMap::default(),
+                clock: 0,
+                seen,
+            }),
         }
     }
 
-    /// The compiled regex for `pattern`, compiling it with `compile` if it is
-    /// not cached. `compile` runs without the cache lock held, so concurrent
+    /// The value for `pattern`, building it with `compile` if it is not
+    /// cached. `compile` runs without the cache lock held, so concurrent
     /// misses on one pattern may each compile it; the first to finish is kept.
     /// An error from `compile` is returned as it is and not cached.
-    pub(crate) fn get_or_compile(
+    pub(crate) fn get_or_compile<E>(
         &self,
         pattern: &str,
-        compile: impl FnOnce(&str) -> Result<Regex, regex::Error>,
-    ) -> Result<Regex, regex::Error> {
+        compile: impl FnOnce(&str) -> Result<T, E>,
+    ) -> Result<T, E> {
         if self.capacity == 0 || pattern.len() > self.max_pattern_len {
             return compile(pattern);
         }
         if let Some(regex) = self.lookup(pattern) {
-            // Cloned outside the lock: a clone allocates its match cache pool.
-            return Ok(Regex::clone(&regex));
+            // Cloned outside the lock: a regex clone allocates its match cache pool.
+            return Ok(T::clone(&regex));
         }
         let regex = compile(pattern)?;
         let evicted = self.insert(pattern, &regex);
@@ -85,13 +140,13 @@ impl RegexCache {
         Ok(regex)
     }
 
-    fn lock(&self) -> MutexGuard<'_, Inner> {
+    fn lock(&self) -> MutexGuard<'_, Inner<T>> {
         // Only map operations run under the lock, so a panic cannot leave an
         // entry half-written; the worst a poisoned map holds is a stale stamp.
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn lookup(&self, pattern: &str) -> Option<Arc<Regex>> {
+    fn lookup(&self, pattern: &str) -> Option<Arc<T>> {
         let mut inner = self.lock();
         inner.clock += 1;
         let now = inner.clock;
@@ -101,13 +156,19 @@ impl RegexCache {
     }
 
     /// Stores a copy of `regex` under `pattern` unless another thread stored
-    /// one first. Returns the evicted regexes, for the caller to drop.
-    fn insert(&self, pattern: &str, regex: &Regex) -> Vec<Arc<Regex>> {
+    /// one first. Returns the evicted values, for the caller to drop.
+    fn insert(&self, pattern: &str, regex: &T) -> Vec<Arc<T>> {
+        let hash = self.hasher.hash_one(pattern);
         let mut inner = self.lock();
         inner.clock += 1;
         let now = inner.clock;
         if let Some(entry) = inner.entries.get_mut(pattern) {
             entry.last_used = now;
+            return Vec::new();
+        }
+        if let Some(seen) = &mut inner.seen
+            && !seen.check_and_mark(hash)
+        {
             return Vec::new();
         }
         let evicted = if inner.entries.len() >= self.capacity {
@@ -131,8 +192,8 @@ impl RegexCache {
     }
 }
 
-/// Removes the `count` least recently used entries and returns their regexes.
-fn evict_least_recent(entries: &mut AHashMap<Box<str>, Entry>, count: usize) -> Vec<Arc<Regex>> {
+/// Removes the `count` least recently used entries and returns their values.
+fn evict_least_recent<T>(entries: &mut AHashMap<Box<str>, Entry<T>>, count: usize) -> Vec<Arc<T>> {
     let count = count.min(entries.len());
     if count == 0 {
         return Vec::new();
@@ -275,5 +336,38 @@ mod tests {
             }
         });
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn second_sighting_admission_stores_only_recurring_patterns() {
+        let cache = PatternCache::<Regex>::admitting_on_second_sighting(4, 64);
+        let compiles = AtomicUsize::new(0);
+        let get = |p: &str| {
+            cache
+                .get_or_compile(p, counting_compile(&compiles))
+                .unwrap()
+        };
+
+        // Built twice before it is stored, then a hit.
+        get("a");
+        assert_eq!(cache.len(), 0);
+        get("a");
+        assert_eq!(cache.len(), 1);
+        get("a");
+        assert_eq!(compiles.load(Ordering::Relaxed), 2);
+
+        // Patterns that never recur are never stored, however many there are.
+        for i in 0..100 {
+            get(&format!("u{i}"));
+        }
+        assert_eq!(cache.len(), 1);
+
+        // A pattern last seen more than two generations (8 patterns) ago starts over.
+        get("b");
+        for i in 0..8 {
+            get(&format!("v{i}"));
+        }
+        get("b");
+        assert_eq!(cache.len(), 1, "b was forgotten, not admitted");
     }
 }

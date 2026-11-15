@@ -7,12 +7,14 @@ use crate::labels::filters::{
     validate_starts_with_value,
 };
 use crate::labels::regex::{build_cached, try_escape_for_repeat_re};
+use crate::labels::regex_cache::{PatternCache, REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN};
 use crate::parser::{ParseError, ParseResult};
 use regex::Error as RegexError;
 use regex::Regex;
 use regex_syntax::ParserBuilder;
 use regex_syntax::hir::Class::{Bytes, Unicode};
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
+use std::sync::LazyLock;
 
 // Beyond this, it's better to use regexp.
 const MAX_OR_VALUES: usize = 16;
@@ -21,6 +23,21 @@ const MAX_OR_VALUES: usize = 16;
 // fall back to the regular compiler, whose size limit applies.
 const MAX_REPETITION_PREFIX_BYTES: u64 = 4 * 1024;
 
+/// Decomposed `=~` and `!~` matchers by pattern. A matcher depends only on its pattern and
+/// operator, and building one costs a regex-syntax parse (1–5 µs) plus, when no literal, prefix
+/// or list form applies, a compile; a hit is one clone. Bounded like the regex cache, whose
+/// rules (only `is_match` is called, failures are not cached) apply here too. A matcher is
+/// stored on the second sighting of its pattern: a miss that only decomposes is cheap enough
+/// that storing and evicting one-off patterns would cost a quarter of it.
+static EQUAL_MATCHERS: LazyLock<PatternCache<PredicateMatch>> = LazyLock::new(|| {
+    PatternCache::admitting_on_second_sighting(REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN)
+});
+static NOT_EQUAL_MATCHERS: LazyLock<PatternCache<PredicateMatch>> = LazyLock::new(|| {
+    PatternCache::admitting_on_second_sighting(REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN)
+});
+
+/// The matcher for `=~ expr` (or `!~ expr` when `is_equal` is false), decomposed into a
+/// literal, prefix, list or contains match where the regex allows it.
 pub(crate) fn parse_regex_matcher(expr: &str, is_equal: bool) -> ParseResult<PredicateMatch> {
     if is_match_all_regex_pattern(expr) {
         return Ok(if is_equal {
@@ -29,7 +46,15 @@ pub(crate) fn parse_regex_matcher(expr: &str, is_equal: bool) -> ParseResult<Pre
             PredicateMatch::MatchNone
         });
     }
+    let cache = if is_equal {
+        &EQUAL_MATCHERS
+    } else {
+        &NOT_EQUAL_MATCHERS
+    };
+    cache.get_or_compile(expr, |expr| decompose_matcher(expr, is_equal))
+}
 
+fn decompose_matcher(expr: &str, is_equal: bool) -> ParseResult<PredicateMatch> {
     let invalid = |_| ParseError::InvalidRegex(expr.to_string());
     // Parse once: the decomposition and the matcher's prefilter hints both
     // read this tree.
@@ -1719,5 +1744,32 @@ mod test {
         assert!(!matcher.is_match("nodeeex{y}"));
         // Patterns that are invalid for another reason still fail.
         assert!(parse_regex_matcher("a{b}(", true).is_err());
+    }
+
+    #[test]
+    fn cached_matchers_equal_freshly_decomposed_ones() {
+        // Literal, list, prefix, contains, prefix + regex, plain regex, and an invalid pattern,
+        // each through the cache twice (miss, then hit) for both operators.
+        for pattern in [
+            "api",
+            "prod|staging|dev",
+            "api.*",
+            ".*server.*",
+            "api-[0-9]+",
+            "^host-(a|b)[0-9]{2}$",
+            "a{999999999}",
+        ] {
+            for is_equal in [true, false] {
+                let fresh = super::decompose_matcher(pattern, is_equal);
+                for _ in 0..2 {
+                    let cached = parse_regex_matcher(pattern, is_equal);
+                    match (&fresh, &cached) {
+                        (Ok(f), Ok(c)) => assert_eq!(f, c, "{pattern} {is_equal}"),
+                        (Err(_), Err(_)) => {}
+                        _ => panic!("{pattern} {is_equal}: {fresh:?} vs {cached:?}"),
+                    }
+                }
+            }
+        }
     }
 }
