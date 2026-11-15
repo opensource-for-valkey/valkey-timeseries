@@ -624,6 +624,32 @@ mod tests {
         }
     }
 
+    /// A quoted name can be empty, but no series has an empty label or metric name, so the
+    /// braces form rejects one as the RTS form does. An empty *value* is still the absent label.
+    #[test]
+    fn test_empty_names_are_rejected() {
+        for selector in [
+            r#"{""="x"}"#,
+            r#"{""=""}"#,
+            r#"{""!="x"}"#,
+            r#"{job="a", ""=""}"#,
+            r#"{job="a", ""=~".*"}"#,
+            r#"{job="a" or ""="x"}"#,
+            r#"{""}"#,
+            r#"{"", job="a"}"#,
+            r#"""{job="a"}"#,
+            r#""""#,
+        ] {
+            let err = parse_series_selector(selector).unwrap_err().to_string();
+            assert!(
+                err.contains("expected a non-empty name"),
+                "{selector}: {err}"
+            );
+        }
+        assert!(parse_series_selector(r#"{job="a", env=""}"#).is_ok());
+        assert!(parse_series_selector(r#"{__name__="", job="a"}"#).is_ok());
+    }
+
     #[test]
     fn test_one_metric_name_per_group_is_judged_as_written() {
         // Two equalities, or an equality and the shorthand, name the metric twice.

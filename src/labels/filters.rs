@@ -405,24 +405,6 @@ impl PredicateMatch {
         }
     }
 
-    /// True when the operand is the absent value ([`PredicateValue::is_absent`]): `l=""`,
-    /// `l!=""` and their other spellings. A regex never is: an empty pattern decomposes to
-    /// `=""`, and construction rejects an absent prefix or substring operand.
-    pub fn has_absent_operand(&self) -> bool {
-        match self {
-            PredicateMatch::Equal(value)
-            | PredicateMatch::NotEqual(value)
-            | PredicateMatch::StartsWith(value)
-            | PredicateMatch::NotStartsWith(value)
-            | PredicateMatch::Contains(value)
-            | PredicateMatch::NotContains(value) => value.is_absent(),
-            PredicateMatch::MatchAll
-            | PredicateMatch::MatchNone
-            | PredicateMatch::RegexEqual(_)
-            | PredicateMatch::RegexNotEqual(_) => false,
-        }
-    }
-
     pub fn matches_empty(&self) -> bool {
         self.matches("")
     }

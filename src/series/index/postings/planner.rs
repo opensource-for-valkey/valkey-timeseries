@@ -7,12 +7,11 @@
 
 use super::terms::{Terms, union_cow};
 use super::{EMPTY_BITMAP, Postings, PostingsBitmap};
-use crate::error_consts::MISSING_FILTER;
 use crate::labels::filters::{FilterList, LabelFilter, PredicateMatch, SeriesSelector};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use valkey_module::{ValkeyError, ValkeyResult};
+use valkey_module::ValkeyResult;
 
 impl<'a> Terms<'a> {
     /// `postings_for_label_filters` assembles a single postings iterator against the index
@@ -26,10 +25,6 @@ impl<'a> Terms<'a> {
         }
         if filters.len() == 1 {
             let filter = &filters[0];
-            // follow Prometheus here: if we have an empty matcher and label, return all postings.
-            if filter.label.is_empty() && filter.matcher.has_absent_operand() {
-                return Ok(Cow::Borrowed(self.all()));
-            }
             // shortcut the handling of simple equality matchers
             if !filter.is_negative_matcher() && !filter.matches_empty() {
                 let it = self.postings_for_filter(filter)?;
@@ -87,15 +82,6 @@ impl<'a> Terms<'a> {
         });
 
         for (filter, matches_empty, _is_subtracting) in sorted_matchers {
-            //let value = &m.value;
-            let name = &filter.label;
-
-            if name.is_empty() && matches_empty {
-                // We already handled the case at the top of the function,
-                // and it is unexpected to get all postings again here.
-                return Err(ValkeyError::Str(MISSING_FILTER));
-            }
-
             if matches!(filter.matcher, PredicateMatch::MatchAll) {
                 continue;
             }
@@ -689,6 +675,30 @@ mod tests {
         for pattern in [".+", "^.+$", "(.+)", ".+.*"] {
             assert_eq!(ids(MatchOp::RegexEqual, pattern), vec![1, 2], "{pattern}");
             assert_eq!(ids(MatchOp::RegexNotEqual, pattern), vec![3], "{pattern}");
+        }
+    }
+
+    /// The parser and the fan-out decoder reject an empty label name, so the planner needs no
+    /// guard for one: built directly, it reads as a label no series has.
+    #[test]
+    fn an_empty_label_name_reads_as_a_label_no_series_has() {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "job", "a");
+        postings.add_posting_for_label_value(2, "job", "b");
+        let job_a = filter("job", PredicateMatch::Equal(PredicateValue::from("a")));
+        let cases = [
+            // Accepts "": removes nothing.
+            (PredicateMatch::Equal(PredicateValue::from("")), vec![1]),
+            (PredicateMatch::NotEqual(PredicateValue::from("x")), vec![1]),
+            (PredicateMatch::MatchAll, vec![1]),
+            // Rejects "": matches nothing.
+            (PredicateMatch::Equal(PredicateValue::from("x")), vec![]),
+            (PredicateMatch::NotEqual(PredicateValue::from("")), vec![]),
+        ];
+        for (matcher, want) in cases {
+            let filters = [job_a.clone(), filter("", matcher.clone())];
+            let got = postings.postings_for_label_filters(&filters).unwrap();
+            assert_eq!(got.iter().collect::<Vec<_>>(), want, "{matcher:?}");
         }
     }
 }

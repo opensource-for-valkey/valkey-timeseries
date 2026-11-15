@@ -276,8 +276,9 @@ Returns hourly averages for temperature series from warehouses.
   [Combining selectors](#combining-selectors)).
 - Prometheus-style selectors follow Prometheus query language conventions for label matching.
 - In the Prometheus-style form, an unquoted label name starts with a letter or underscore and may contain letters,
-  digits, underscores, colons, dots and hyphens. Any other name can be quoted: `{"host name"="a"}`. In a basic filter
-  the label name is the raw text before the operator.
+  digits, underscores, colons, dots and hyphens. Any other name can be quoted: `{"host name"="a"}`. A quoted name may
+  not be empty (`{""="a"}`, `{""}` and `""{job="a"}` are rejected), since no series has an empty label or metric
+  name. In a basic filter the label name is the raw text before the operator, and must not be empty either.
 
 ## Related Commands
 
