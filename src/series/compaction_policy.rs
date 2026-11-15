@@ -1,7 +1,7 @@
 use crate::aggregators::AggregationType;
 use crate::commands::command_parser::{parse_inline_condition, split_aggregator_condition};
 use crate::common::Timestamp;
-use crate::parser::parse_positive_duration_value;
+use crate::parser::parse_policy_duration_ms;
 use crate::series::request_types::AggregatorConfig;
 use crate::series::{CompactionRule, SeriesLink};
 use ahash::{HashSet, HashSetExt};
@@ -245,29 +245,12 @@ impl PolicyConfig {
 pub static COMPACTION_POLICY_CONFIG: LazyLock<RwLock<PolicyConfig>> =
     LazyLock::new(|| RwLock::new(PolicyConfig::new()));
 
+/// A policy duration in milliseconds: `m` is milliseconds and `M` minutes (the RTS spelling),
+/// in every segment of a compound value. A bare number is milliseconds.
 fn parse_duration(val: &str) -> ValkeyResult<u64> {
-    // handle redis styled spec (capital M for minutes, m for milliseconds)
-    let Some(last_char) = val.chars().last() else {
-        return Err(ValkeyError::String(format!(
-            "TSDB: invalid duration value: '{val}'"
-        )));
-    };
-    let duration = match last_char {
-        'm' => {
-            let stripped = val.strip_suffix('m').unwrap_or(val);
-            let new_val = format!("{stripped}ms");
-            parse_positive_duration_value(&new_val)
-        }
-        'M' => {
-            let stripped = val.strip_suffix('M').unwrap_or(val);
-            let new_val = format!("{stripped}m");
-            parse_positive_duration_value(&new_val)
-        }
-        _ => parse_positive_duration_value(val),
-    }
-    .map_err(|_| ValkeyError::String(format!("TSDB: invalid duration value: '{val}'")))?;
-
-    Ok(duration as u64)
+    parse_policy_duration_ms(val)
+        .map(|ms| ms as u64)
+        .map_err(|_| ValkeyError::String(format!("TSDB: invalid duration value: '{val}'")))
 }
 
 /// A compaction policy is a set of rules that define how to compact time series data.
@@ -279,8 +262,9 @@ fn parse_duration(val: &str) -> ValkeyResult<u64> {
 /// Where:
 ///  - `aggregation_type` is the type of aggregation to use (e.g., `avg`, `sum`, etc.), with the
 ///    same inline condition `TS.CREATERULE` takes (`countif>5`) for a filtered aggregator
-///  - `bucket_duration` is the duration of each bucket in seconds
-///  - `retention` is the retention period in seconds
+///  - `bucket_duration` is the duration of each bucket (`m` = milliseconds, `M` = minutes,
+///    `s`, `h`, `d`; a bare number is milliseconds)
+///  - `retention` is the retention period, in the same units
 ///  - The `align_timestamp` is optional and defaults to 0 if not provided.
 ///
 fn parse_compaction_policy(val: &str) -> ValkeyResult<CompactionPolicy> {

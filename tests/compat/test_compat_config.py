@@ -347,6 +347,18 @@ class TestValueValidation:
         assert reference.set_outcome("ts-compaction-policy", value) == expected
         assert subject.set_outcome("ts-compaction-policy", value) == expected
 
+    @pytest.mark.parametrize("value", [
+        "avg:30m1M:1h", "avg:1M30m:1h", "avg:60:1h", "avg:5ms:1h", "avg:1w:1h", "avg:1.5M:1h",
+    ])
+    def test_compaction_policy_duration_superset(self, clients, value):
+        """DIV-0067: RTS takes one integer and one unit (`m` ms, `s`, `M` min, `h`, `d`) per
+        policy duration; compound, bare, fractional, `ms`, `w` and `y` durations are accepted
+        only here. `m`/`M` mean the same in every segment (unit-tested in parser::duration)."""
+        subject, reference = clients
+        assert reference.set_outcome("ts-compaction-policy", value) == "error"
+        assert subject.set_outcome("ts-compaction-policy", value) == "ok"
+        assert subject.set_outcome("ts-compaction-policy", "") == "ok"
+
     @pytest.mark.xfail(
         reason="TWA aggregator (RTS's 13th) is not implemented yet — findings doc #14",
         strict=True,

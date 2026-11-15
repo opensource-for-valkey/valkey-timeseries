@@ -1471,3 +1471,25 @@
     TestFilterByValue::test_filter_by_value_hex_float_only_on_reference and
     TestNumericOperandDivergences.
   since: 0.1.0
+
+# DIV-0067 came with parsing the compaction-policy duration spelling with its own unit table
+# instead of rewriting the last character (`30m1M` was read as 31 minutes). Reference behavior
+# observed black-box against the pinned redis:8.10 image (2026-11-14): RTS takes exactly one
+# integer and one unit, `m` (ms), `s`, `M` (minutes), `h` or `d`, per policy duration.
+#
+# ⚠️ `behavior`-kind: needs owner sign-off in the PR that introduces it (§5.3).
+
+- id: DIV-0067
+  command: CONFIG
+  kind: behavior
+  documentation_only: true
+  description: >
+    `ts-compaction-policy` durations accept forms RTS rejects: compound values (`1M30m`, read
+    as 60030 ms), a bare number (milliseconds), a fraction (`1.5M`), and the `ms`, `w` and `y`
+    units. RTS 8.10 accepts one integer with one of `m`, `s`, `M`, `h`, `d`.
+  rationale: >
+    Accepted-input superset on a configuration surface that already differs from RTS by
+    design (COMPATIBILITY.md, "Configuration"); every RTS-valid policy is read the same way.
+    Pinned by TestValueValidation::test_compaction_policy_duration_superset.
+  since: 0.1.0
+
