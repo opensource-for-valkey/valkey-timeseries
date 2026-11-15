@@ -8,7 +8,7 @@
 use super::terms::{Terms, union_cow};
 use super::{EMPTY_BITMAP, Postings, PostingsBitmap};
 use crate::error_consts::MISSING_FILTER;
-use crate::labels::filters::{FilterList, LabelFilter, MatchOp, PredicateMatch, SeriesSelector};
+use crate::labels::filters::{FilterList, LabelFilter, PredicateMatch, SeriesSelector};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -104,26 +104,15 @@ impl<'a> Terms<'a> {
                 return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
             }
 
-            let typ = filter.op();
-            let regex_value = filter.regex_text().unwrap_or("");
-
-            match (typ, regex_value) {
-                // .* regexp matches any string: do nothing
-                (MatchOp::RegexEqual, ".*") => continue,
-
-                // .* regexp does not match any string: return empty
-                (MatchOp::RegexNotEqual, ".*") => {
-                    return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
-                }
-
-                // .+ regexp matches any non-empty string
-                (MatchOp::RegexEqual, ".+") => {
-                    // .+ regexp matches any non-empty string: get postings for all label values.
+            // `.*` and its spellings were turned into MatchAll / MatchNone above, when the
+            // pattern was parsed; `.+` and its spellings are recognized the same way.
+            match &filter.matcher {
+                // l=~".+": every series carrying the label, without running the regex.
+                PredicateMatch::RegexEqual(re) if re.matches_any_non_empty() => {
                     its.push(self.postings_for_all_label_values(&filter.label));
                 }
-
-                // .+ regexp does not match any non-empty string
-                (MatchOp::RegexNotEqual, ".+") => {
+                // l!~".+": every series without the label.
+                PredicateMatch::RegexNotEqual(re) if re.matches_any_non_empty() => {
                     not_its.push(self.postings_for_all_label_values(&filter.label));
                 }
                 // l!="" (or the RTS `l!=` form, or `l!=("")`): any non-empty value. Go straight
@@ -310,7 +299,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::labels::filters::PredicateValue;
+    use crate::labels::filters::{MatchOp, PredicateValue};
 
     fn filter(label: &str, matcher: PredicateMatch) -> LabelFilter {
         LabelFilter {
@@ -680,5 +669,26 @@ mod tests {
             .postings_for_selector(&SeriesSelector::And(FilterList::default()))
             .unwrap();
         assert_eq!(all.iter().collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    /// Every spelling of `.+` takes the label-values path, not only the text `.+`.
+    #[test]
+    fn any_non_empty_regex_selects_by_label_presence_in_any_spelling() {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "env", "prod");
+        postings.add_posting_for_label_value(2, "env", "dev");
+        postings.add_posting_for_label_value(3, "job", "api");
+        let ids = |op, pattern: &str| {
+            let filters = [
+                LabelFilter::create(op, "env", pattern).unwrap(),
+                LabelFilter::create(MatchOp::RegexEqual, "job", ".*").unwrap(),
+            ];
+            let result = postings.postings_for_label_filters(&filters).unwrap();
+            result.iter().collect::<Vec<_>>()
+        };
+        for pattern in [".+", "^.+$", "(.+)", ".+.*"] {
+            assert_eq!(ids(MatchOp::RegexEqual, pattern), vec![1, 2], "{pattern}");
+            assert_eq!(ids(MatchOp::RegexNotEqual, pattern), vec![3], "{pattern}");
+        }
     }
 }

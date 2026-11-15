@@ -476,6 +476,19 @@ mod tests {
 
         let decoded = LabelFilter::try_from(&fanout).expect("legacy regex payload should decode");
         assert_eq!(decoded.matcher, PredicateMatch::MatchNone);
+
+        // Any spelling of `.*`, not only the text.
+        let fanout = FanoutFilter {
+            label: "instance".into(),
+            op: MatcherOpType::RegexEqual as i32,
+            matcher: Some(Matcher::Regex(FanoutRegexFilterValue {
+                regex: "^(.*)$".into(),
+                prefix: String::new(),
+                suffix: String::new(),
+            })),
+        };
+        let decoded = LabelFilter::try_from(&fanout).expect("legacy regex payload should decode");
+        assert_eq!(decoded.matcher, PredicateMatch::MatchAll);
     }
 
     #[test]

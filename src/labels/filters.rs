@@ -13,8 +13,6 @@ use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::ops::{Deref, DerefMut};
 
-const MATCH_ALL_REGEX_TEXT: &str = ".*";
-
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 pub enum MatchOp {
     Equal,
@@ -218,6 +216,8 @@ pub struct RegexMatcher {
     prefix: Option<String>,
     suffix: Option<String>,
     required_literals: SmallVec<[String; 2]>,
+    /// The pattern matches exactly the non-empty values (see [`RegexHints`]).
+    any_non_empty: bool,
     /// The pattern as the user wrote it; the fan-out codec sends this, and a shard recompiles it.
     value: String,
 }
@@ -248,7 +248,14 @@ impl RegexMatcher {
             prefix,
             suffix: hints.suffix,
             required_literals: hints.required_literals.into(),
+            any_non_empty: hints.matches_any_non_empty,
         }
+    }
+
+    /// True when the pattern matches exactly the non-empty values: `.+`, `^.+$`, `(.+)`,
+    /// `.+.*` and so on. Recognized on the parsed pattern, not its text.
+    pub fn matches_any_non_empty(&self) -> bool {
+        self.any_non_empty
     }
 
     /// The pattern as written.
@@ -278,6 +285,9 @@ impl RegexMatcher {
     }
 
     pub fn is_match(&self, other: &str) -> bool {
+        if self.any_non_empty {
+            return !other.is_empty();
+        }
         if other.is_empty() {
             if self
                 .prefix
@@ -357,6 +367,7 @@ impl PartialEq for RegexMatcher {
             && self.prefix == other.prefix
             && self.suffix == other.suffix
             && self.required_literals == other.required_literals
+            && self.any_non_empty == other.any_non_empty
             && self.value == other.value
     }
 }
@@ -569,15 +580,6 @@ impl LabelFilter {
         Self {
             label: self.label,
             matcher: self.matcher.inverse(),
-        }
-    }
-
-    pub fn regex_text(&self) -> Option<&str> {
-        match &self.matcher {
-            PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re) => Some(&re.value),
-            PredicateMatch::MatchAll => Some(MATCH_ALL_REGEX_TEXT),
-            PredicateMatch::MatchNone => Some(MATCH_ALL_REGEX_TEXT),
-            _ => None,
         }
     }
 

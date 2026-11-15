@@ -39,13 +39,6 @@ static NOT_EQUAL_MATCHERS: LazyLock<PatternCache<PredicateMatch>> = LazyLock::ne
 /// The matcher for `=~ expr` (or `!~ expr` when `is_equal` is false), decomposed into a
 /// literal, prefix, list or contains match where the regex allows it.
 pub(crate) fn parse_regex_matcher(expr: &str, is_equal: bool) -> ParseResult<PredicateMatch> {
-    if is_match_all_regex_pattern(expr) {
-        return Ok(if is_equal {
-            PredicateMatch::MatchAll
-        } else {
-            PredicateMatch::MatchNone
-        });
-    }
     let cache = if is_equal {
         &EQUAL_MATCHERS
     } else {
@@ -56,9 +49,16 @@ pub(crate) fn parse_regex_matcher(expr: &str, is_equal: bool) -> ParseResult<Pre
 
 fn decompose_matcher(expr: &str, is_equal: bool) -> ParseResult<PredicateMatch> {
     let invalid = |err: RegexError| ParseError::InvalidRegex(format!("`{expr}`: {err}"));
-    // Parse once: the decomposition and the matcher's prefilter hints both
-    // read this tree.
+    // Parse once: the degenerate-pattern check, the decomposition and the matcher's prefilter
+    // hints all read this tree.
     let inner = parse_anchored_hir(expr).map_err(invalid)?;
+    if is_match_all(&inner) {
+        return Ok(if is_equal {
+            PredicateMatch::MatchAll
+        } else {
+            PredicateMatch::MatchNone
+        });
+    }
     let decomposed = decompose_parsed(expr, &inner).map_err(invalid)?;
     Ok(decomposed_regex_to_predicate_match(
         expr, &inner, decomposed, is_equal,
@@ -140,20 +140,31 @@ fn decomposed_regex_to_predicate_match(
     }
 }
 
-/// remove_start_end_anchors removes '^' at the start of expr and '$' at the end of the expr.
-fn remove_start_end_anchors(expr: &str) -> &str {
-    let mut cursor = expr;
-    while let Some(t) = cursor.strip_prefix('^') {
-        cursor = t;
-    }
-    while cursor.ends_with('$') && !cursor.ends_with("\\$") {
-        cursor = &cursor[..cursor.len() - 1];
-    }
-    cursor
+/// Whether a (Go-syntax) pattern matches every value, judged on its parsed tree: `.*`, but
+/// also `^.*$`, `(.*)`, `.*.*`, `(?s:.*)` or `.*|foo`. A pattern that does not parse is not.
+pub(crate) fn is_match_all_regex_pattern(expr: &str) -> bool {
+    parse_anchored_hir(expr).is_ok_and(|inner| is_match_all(&inner))
 }
 
-pub(crate) fn is_match_all_regex_pattern(expr: &str) -> bool {
-    remove_start_end_anchors(expr) == ".*"
+/// `sre` (anchors already stripped) matches every value: a `.*`, or a concatenation of them.
+fn is_match_all(sre: &Hir) -> bool {
+    match sre.kind() {
+        HirKind::Concat(subs) => subs.iter().all(is_dot_star),
+        _ => is_dot_star(sre),
+    }
+}
+
+/// `sre` (anchors already stripped) matches exactly the non-empty values: `.+`, or a
+/// concatenation of one `.+` with any number of `.*` (`(.+)`, `.+.*`, `^.+$`). Two `.+`
+/// would need two characters.
+fn is_any_non_empty(sre: &Hir) -> bool {
+    match sre.kind() {
+        HirKind::Concat(subs) => {
+            subs.iter().all(|s| is_dot_star(s) || is_dot_plus(s))
+                && subs.iter().filter(|s| is_dot_plus(s)).count() == 1
+        }
+        _ => is_dot_plus(sre),
+    }
 }
 
 /// The finite set of strings `sre` matches, when it is small enough to look up value by value
@@ -620,6 +631,9 @@ pub(crate) struct RegexHints {
     pub(crate) required_literals: Vec<String>,
     /// A literal the value must end with.
     pub(crate) suffix: Option<String>,
+    /// The whole pattern matches exactly the non-empty values (`.+` and its spellings), so a
+    /// match needs no regex and the planner can answer it from the label's value list.
+    pub(crate) matches_any_non_empty: bool,
 }
 
 /// [`regex_hints`] for a pattern that has not been parsed yet. A pattern that
@@ -636,7 +650,10 @@ pub(crate) fn regex_hints_for_pattern(expr: &str, prefix: Option<&str>) -> Regex
 /// `inner` starts with exactly that literal prefix; otherwise there are none.
 fn regex_hints(inner: &Hir, prefix: Option<&str>) -> RegexHints {
     let Some(prefix) = prefix else {
-        return hints_from(inner);
+        return RegexHints {
+            matches_any_non_empty: is_any_non_empty(inner),
+            ..hints_from(inner)
+        };
     };
     match extract_anchored_prefix_or_remainder(inner) {
         Some((actual, PrefixTail::Rest(remainder))) if actual == prefix => hints_from(&remainder),
@@ -648,6 +665,7 @@ fn hints_from(sre: &Hir) -> RegexHints {
     RegexHints {
         required_literals: extract_literal_sequence(sre).unwrap_or_default(),
         suffix: extract_trailing_literal_sequence(sre),
+        matches_any_non_empty: false,
     }
 }
 
@@ -740,9 +758,7 @@ fn extract_trailing_literal_sequence(sre: &Hir) -> Option<String> {
 
 #[cfg(test)]
 mod test {
-    use super::{
-        RegexDecomposition, decompose_regex, parse_regex_matcher, remove_start_end_anchors,
-    };
+    use super::{RegexDecomposition, decompose_regex, parse_regex_matcher};
     use crate::labels::filters::{PredicateMatch, PredicateValue};
 
     #[test]
@@ -789,28 +805,6 @@ mod test {
         check("foo.*", false);
         check(".*foo.*bar.*baz.*qux.*quux.*quuz.*corge.*grault", false);
         check(".*foo.*bar.*baz.*qux.*quux.*quuz.*corge.*grault.*", false);
-    }
-
-    #[test]
-    fn test_remove_start_end_anchors() {
-        fn f(s: &str, result_expected: &str) {
-            let result = remove_start_end_anchors(s);
-            assert_eq!(
-                result, result_expected,
-                "unexpected result for remove_start_end_anchors({s}); got {result}; want {}",
-                result_expected
-            );
-        }
-
-        f("", "");
-        f("a", "a");
-        f("^^abc", "abc");
-        f("a^b$c", "a^b$c");
-        f("$$abc^", "$$abc^");
-        f("^abc|de$", "abc|de");
-        f("abc\\$", "abc\\$");
-        f("^abc\\$$$", "abc\\$");
-        f("^a\\$b\\$$", "a\\$b\\$")
     }
 
     #[test]
@@ -1657,6 +1651,11 @@ mod test {
                 );
                 assert_eq!(parsed.suffix(), rebuilt.suffix(), "suffix for {pattern:?}");
                 assert_eq!(
+                    parsed.matches_any_non_empty(),
+                    rebuilt.matches_any_non_empty(),
+                    "any-non-empty for {pattern:?}"
+                );
+                assert_eq!(
                     parsed.required_literals(),
                     rebuilt.required_literals(),
                     "required literals for {pattern:?}"
@@ -1837,5 +1836,62 @@ mod test {
         );
         // Guard against a filter that matched nothing and "passed" vacuously.
         assert!(stdout.contains("1 passed"), "child ran no test:\n{stdout}");
+    }
+
+    /// LABELS-13: degenerate patterns are recognized on the parsed tree, so every spelling of
+    /// `.*` becomes MatchAll / MatchNone and every spelling of `.+` is flagged, not only the
+    /// exact texts `.*` and `.+`.
+    #[test]
+    fn test_degenerate_patterns_are_recognized_in_any_spelling() {
+        for pattern in [
+            ".*", "^.*$", "(.*)", "(?:.*)", ".*.*", "(?s:.*)", ".*|foo", "^(.*)$",
+        ] {
+            assert_eq!(
+                parse_regex_matcher(pattern, true).unwrap(),
+                PredicateMatch::MatchAll,
+                "{pattern}"
+            );
+            assert_eq!(
+                parse_regex_matcher(pattern, false).unwrap(),
+                PredicateMatch::MatchNone,
+                "{pattern}"
+            );
+            assert!(super::is_match_all_regex_pattern(pattern), "{pattern}");
+        }
+        for pattern in ["", "a.*", ".*a", ".+", "(?-s:.*)", "[^a]*", "("] {
+            assert!(!super::is_match_all_regex_pattern(pattern), "{pattern}");
+        }
+
+        let values = ["", "a", "abc", "\n", "x\ny"];
+        for (pattern, any_non_empty) in [
+            (".+", true),
+            ("^.+$", true),
+            ("(.+)", true),
+            (".+.*", true),
+            (".*.+", true),
+            (".+.+", false), // needs two characters
+            ("a.+", false),
+            (".+a", false),
+            (".?", false),
+            ("(?-s:.+)", false), // `.` without newlines is not every character
+        ] {
+            for is_equal in [true, false] {
+                let matcher = parse_regex_matcher(pattern, is_equal).unwrap();
+                let (PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re)) = &matcher
+                else {
+                    panic!("{pattern}: {matcher:?}");
+                };
+                assert_eq!(re.matches_any_non_empty(), any_non_empty, "{pattern}");
+                // The shortcut must agree with the compiled regex on every value.
+                let direct = super::compile_regex(pattern).unwrap();
+                for v in values {
+                    assert_eq!(
+                        matcher.matches(v),
+                        direct.is_match(v) == is_equal,
+                        "{pattern} on {v:?}"
+                    );
+                }
+            }
+        }
     }
 }
