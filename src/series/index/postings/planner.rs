@@ -117,7 +117,7 @@ impl<'a> Terms<'a> {
                 }
                 // l!="" (or the RTS `l!=` form, or `l!=("")`): any non-empty value. Go straight
                 // to all label values rather than inverting to l="" first.
-                _ if matches!(&filter.matcher, PredicateMatch::NotEqual(v) if v.is_absent()) => {
+                PredicateMatch::NotEqual(v) if v.is_absent() => {
                     let it = self.postings_for_all_label_values(&filter.label);
                     if it.is_empty() {
                         return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
