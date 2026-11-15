@@ -113,6 +113,9 @@ inside them. `temperature{__name__="humidity"}`, `temperature{__name__=~"temp.*"
 operator, and so is the same thing in any `or` branch. To match on `__name__` with an operator,
 leave out the outer name: `{__name__=~"temp.*", city="NYC"}`.
 
+One trailing comma before `}` is allowed (`{city="NYC",}`), as in PromQL; an empty item
+(`{,city="NYC"}`, `{a="1",,b="2"}`) is rejected.
+
 **Label Matchers Only**
 
 ```

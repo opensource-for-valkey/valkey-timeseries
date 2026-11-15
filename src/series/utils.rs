@@ -748,9 +748,9 @@ mod tests {
                 Label::new("unicode", "caf\u{e9} \u{1f600}"),
                 Label::new("spaces", "  padded  "),
             ],
-            // An empty value can only be spelled through METRIC.
-            vec![Label::new("__name__", "cpu"), Label::new("a", "")],
         ];
+        // METRIC holds labels to what LABELS requires, so an empty value is spelled by neither.
+        assert!(parse_create_metric(r#"cpu{a=""}"#).is_err());
         for labels in &cases {
             let (series, args) = render_labels(labels);
             assert!(

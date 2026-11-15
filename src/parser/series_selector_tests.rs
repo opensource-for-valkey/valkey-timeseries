@@ -919,4 +919,27 @@ mod tests {
         let parsed = parse_series_selector(r#"{status="999" or env="prod"}"#).unwrap();
         with_or_matchers(&parsed, |branches| assert_eq!(branches.len(), 2));
     }
+
+    #[test]
+    fn test_selector_trailing_comma() {
+        // One trailing comma before `}`, as in PromQL; no empty items.
+        for (selector, expected) in [
+            (r#"{a="1",}"#, r#"{a="1"}"#),
+            (r#"cpu{a="1", }"#, r#"cpu{a="1"}"#),
+            (r#"{a="1", b="2",}"#, r#"{a="1", b="2"}"#),
+            (r#"{foo,}"#, r#"{foo}"#),
+        ] {
+            let got = parse_series_selector(selector).unwrap_or_else(|e| panic!("{selector}: {e}"));
+            assert_eq!(got, parse_series_selector(expected).unwrap(), "{selector}");
+        }
+        for selector in [
+            r#"{a="1",,}"#,
+            r#"{,a="1"}"#,
+            "{,}",
+            r#"{a="1",,b="2"}"#,
+            r#"{a="1", or b="2"}"#,
+        ] {
+            assert!(parse_series_selector(selector).is_err(), "{selector}");
+        }
+    }
 }

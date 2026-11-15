@@ -321,6 +321,12 @@ fn parse_label_filters_internal(
         if tok == RightBrace || tok == OpOr {
             return Ok((matchers, tok));
         }
+        // One trailing comma before `}` is allowed, as in PromQL and metric definitions.
+        let mut ahead = p.clone();
+        if let Some(Ok(RightBrace)) = ahead.next() {
+            *p = ahead;
+            return Ok((matchers, RightBrace));
+        }
     }
 }
 

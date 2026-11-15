@@ -294,3 +294,17 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError):
             self.client.execute_command("TS.CREATE", "metric:twice", "METRIC", "a", "METRIC", "b")
         assert self.client.exists("metric:twice") == 0
+
+    def test_create_metric_is_validated_like_labels(self):
+        """METRIC is held to LABELS' rules and must be consumed whole: trailing text used to be
+        ignored and an empty value was stored, which no LABELS replay could express."""
+        for i, metric in enumerate(('cpu garbage', 'cpu{} x', 'cpu{a="1"}x', 'cpu{a=""}',
+                                    'cpu{a="1",a="2"}', 'cpu{,a="1"}', 'cpu{a="1",,}',
+                                    'cpu{"a=b"="1"}')):
+            with pytest.raises(ResponseError, match="invalid metric name"):
+                self.client.execute_command("TS.CREATE", f"metric:bad:{i}", "METRIC", metric)
+            assert self.client.exists(f"metric:bad:{i}") == 0
+
+    def test_create_metric_trailing_comma_and_quoted_names(self):
+        self.client.execute_command("TS.CREATE", "metric:ok", "METRIC", 'cpu{"host.name"="a",}')
+        assert self.ts_info("metric:ok")["labels"] == {"__name__": "cpu", "host.name": "a"}
