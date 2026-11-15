@@ -13,7 +13,7 @@ use crate::labels::filters::SeriesSelector;
 use crate::labels::{Label, MAX_LABELS_PER_SERIES, parse_series_selector};
 use crate::parser::number::parse_number;
 use crate::parser::{
-    metric_name::parse_metric_name as parse_metric, parse_nonnegative_duration_value,
+    ParseError, metric_name::parse_metric_name as parse_metric, parse_nonnegative_duration_value,
     timestamp::parse_timestamp as parse_timestamp_internal, timestamp::timestamp_error,
 };
 use crate::series::chunks::{ChunkEncoding, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
@@ -194,12 +194,12 @@ pub fn parse_nonnegative_duration_ms(arg: &str) -> ValkeyResult<i64> {
 }
 
 pub fn parse_metric_name(arg: &str) -> ValkeyResult<Vec<Label>> {
-    let labels =
-        parse_metric(arg).map_err(|_e| ValkeyError::Str(error_consts::INVALID_METRIC_NAME))?;
-    if labels.len() > MAX_LABELS_PER_SERIES {
-        return Err(ValkeyError::Str(error_consts::TOO_MANY_LABELS));
-    }
-    Ok(labels)
+    parse_metric(arg).map_err(|e| {
+        ValkeyError::Str(match e {
+            ParseError::TooManyLabels => error_consts::TOO_MANY_LABELS,
+            _ => error_consts::INVALID_METRIC_NAME,
+        })
+    })
 }
 
 /// Parse a float value for use in a command argument, specifically ADD, MADD, and INCRBY/DECRBY.

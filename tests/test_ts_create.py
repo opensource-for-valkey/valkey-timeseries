@@ -305,6 +305,19 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
                 self.client.execute_command("TS.CREATE", f"metric:bad:{i}", "METRIC", metric)
             assert self.client.exists(f"metric:bad:{i}") == 0
 
+    def test_create_metric_label_limit(self):
+        """At most 128 labels, `__name__` included; past that the operand is rejected without
+        being parsed to the end (the duplicate check is linear per label)."""
+        def metric(n):
+            return "cpu{" + ",".join(f'l{i}="v"' for i in range(n)) + "}"
+
+        self.client.execute_command("TS.CREATE", "metric:limit", "METRIC", metric(127))
+        assert len(self.ts_info("metric:limit")["labels"]) == 128
+        for key, operand in (("metric:over", metric(128)), ("metric:huge", metric(50_000))):
+            with pytest.raises(ResponseError, match="too many labels"):
+                self.client.execute_command("TS.CREATE", key, "METRIC", operand)
+            assert self.client.exists(key) == 0
+
     def test_create_metric_trailing_comma_and_quoted_names(self):
         self.client.execute_command("TS.CREATE", "metric:ok", "METRIC", 'cpu{"host.name"="a",}')
         assert self.ts_info("metric:ok")["labels"] == {"__name__": "cpu", "host.name": "a"}

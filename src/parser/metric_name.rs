@@ -1,6 +1,6 @@
 use super::lex::{Cursor, Token};
 use crate::common::constants::METRIC_NAME_LABEL;
-use crate::labels::Label;
+use crate::labels::{Label, MAX_LABELS_PER_SERIES};
 use crate::parser::{ParseError, ParseResult};
 
 /// Parses a `Prometheus` compatible metric name (as opposed to a metric selector), the
@@ -12,7 +12,8 @@ use crate::parser::{ParseError, ParseResult};
 /// is a quoted string. One trailing comma is allowed (as in PromQL and in selectors); an empty
 /// item (`{,a="1"}`, `{a="1",,}`) is not. Each label is held to what `LABELS` requires: a
 /// non-empty name without `=`, a non-empty value. A repeated name, and a `__name__` label
-/// (the measurement already is the `__name__`), are errors.
+/// (the measurement already is the `__name__`), are errors, as is more than
+/// `MAX_LABELS_PER_SERIES` labels counting the `__name__` ([`ParseError::TooManyLabels`]).
 pub fn parse_metric_name(s: &str) -> ParseResult<Vec<Label>> {
     let mut cur = Cursor::new(s);
 
@@ -35,6 +36,11 @@ fn parse_label_set(cur: &mut Cursor, labels: &mut Vec<Label>) -> ParseResult<()>
         let name = cur.expect(&[Identifier, StringLiteral, OpOr, RightBrace], "label set")?;
         if name.token == RightBrace {
             return Ok(());
+        }
+        // Checked before the duplicate scan in `check_label`, which is linear in the labels
+        // so far: past the limit the operand is rejected anyway.
+        if labels.len() == MAX_LABELS_PER_SERIES {
+            return Err(ParseError::TooManyLabels);
         }
         let name = name.decoded()?.into_owned();
         check_label(labels, &name)?;
@@ -193,6 +199,26 @@ mod tests {
                 parse_metric_name(input)
             );
         }
+    }
+
+    #[test]
+    fn test_parse_metric_name_label_limit() {
+        // `n` labels besides the `__name__`.
+        let metric = |n: usize| {
+            let labels: Vec<String> = (0..n).map(|i| format!(r#"l{i}="v""#)).collect();
+            format!("cpu{{{}}}", labels.join(","))
+        };
+        let at_limit = parse_metric_name(&metric(MAX_LABELS_PER_SERIES - 1)).unwrap();
+        assert_eq!(at_limit.len(), MAX_LABELS_PER_SERIES);
+        assert_eq!(
+            parse_metric_name(&metric(MAX_LABELS_PER_SERIES)),
+            Err(ParseError::TooManyLabels)
+        );
+        // Rejected at the first label past the limit: neither a later duplicate nor a later
+        // syntax error is reached.
+        let mut past = metric(MAX_LABELS_PER_SERIES);
+        past.insert_str(past.len() - 1, r#",l0="v",!"#);
+        assert_eq!(parse_metric_name(&past), Err(ParseError::TooManyLabels));
     }
 
     #[test]

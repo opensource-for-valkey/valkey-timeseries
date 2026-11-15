@@ -766,14 +766,22 @@ mod tests {
     /// `LABELS __name__ …` is accepted by `TS.CREATE`/`TS.ALTER`, so a series can hold a name or
     /// label names the metric grammar cannot spell. Those fall back to `LABELS`, which keeps
     /// `__name__` as an ordinary pair; rendering them through `METRIC` would make the replica's
-    /// `TS.CREATE` fail and rebuild the series from its own defaults.
+    /// `TS.CREATE` fail and rebuild the series from its own defaults. `LABELS` does not cap the
+    /// label count, so more than `METRIC` takes falls back too.
     #[test]
     fn test_labels_the_metric_grammar_cannot_spell_fall_back_to_labels() {
+        let over_limit = std::iter::once(Label::new("__name__", "cpu"))
+            .chain(
+                (0..crate::labels::MAX_LABELS_PER_SERIES)
+                    .map(|i| Label::new(format!("l{i}"), "v".into())),
+            )
+            .collect();
         let cases: Vec<Vec<Label>> = vec![
             vec![Label::new("__name__", "cpu total"), Label::new("1x", "a")],
             vec![Label::new("__name__", "cpu"), Label::new("caf\u{e9}", "a")],
             vec![Label::new("__name__", "9cpu")],
             vec![Label::new("__name__", "cpu"), Label::new("a b", "c")],
+            over_limit,
         ];
         for labels in &cases {
             let (series, args) = render_labels(labels);

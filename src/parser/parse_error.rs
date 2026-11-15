@@ -35,6 +35,10 @@ pub enum ParseError {
     /// the second field is the matcher's value as written, already quoted.
     #[error("metric name must not be set twice: {0:?} or {1}")]
     MetricNameSetTwice(String, String),
+    /// A `METRIC` operand with more than `MAX_LABELS_PER_SERIES` labels, `__name__` included.
+    /// Reported as soon as the limit is passed, so an oversized operand is not parsed to the end.
+    #[error("too many labels")]
+    TooManyLabels,
     /// What the lexer reports for input no token matches: logos builds its error value with
     /// `Default`. `Cursor` replaces it with an `Unexpected` naming the text.
     #[default]
