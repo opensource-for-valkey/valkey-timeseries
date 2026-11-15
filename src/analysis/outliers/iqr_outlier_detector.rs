@@ -22,9 +22,11 @@ pub struct IQROutlierDetector {
 
 impl IQROutlierDetector {
     pub fn new(ts: &[f64], threshold: f64) -> Self {
-        // A missing reading is left out of the quartiles rather than counted as a zero.
-        let mut sorted_values: Vec<f64> = ts.iter().copied().filter(|x| !x.is_nan()).collect();
-        sorted_values.sort_by(|&a, &b| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal));
+        // Only finite readings fit the quartiles. A missing one would otherwise count as a zero,
+        // and an infinite one reaches an interpolation as `inf * 0.0`, a NaN quartile that leaves
+        // no fence to be past. Either is still classified against the fit.
+        let mut sorted_values: Vec<f64> = ts.iter().copied().filter(|x| x.is_finite()).collect();
+        sorted_values.sort_by(f64::total_cmp);
 
         // Hyndman & Fan type 7: interpolated between the order statistics either
         // side of the quantile, not the sample at a floored index.
@@ -153,6 +155,27 @@ mod tests {
         assert_eq!(gapped.lower_fence, clean.lower_fence);
         assert_eq!(gapped.upper_fence, clean.upper_fence);
         assert_eq!(gapped.center, clean.center);
+    }
+
+    /// An infinity is left out of the quartiles too. In `[1, 2, 3, 4, inf]` Q3 sits exactly on
+    /// the fourth value, so type 7 weighs the infinity next to it by zero: `inf * 0.0` made Q3,
+    /// and both fences, NaN, and nothing in the series could be flagged.
+    #[test]
+    fn infinite_samples_are_left_out_of_the_fit() {
+        let finite = [1.0, 2.0, 3.0, 4.0];
+        let clean = IQROutlierDetector::new(&finite, IQR_DEFAULT_THRESHOLD);
+        for extreme in [f64::INFINITY, f64::NEG_INFINITY] {
+            let with_extreme = [1.0, 2.0, 3.0, 4.0, extreme];
+            let detector = IQROutlierDetector::new(&with_extreme, IQR_DEFAULT_THRESHOLD);
+
+            assert_eq!(detector.lower_fence, clean.lower_fence);
+            assert_eq!(detector.upper_fence, clean.upper_fence);
+            assert_eq!(detector.center, clean.center);
+            // Finite observations are still classified against it.
+            assert_eq!(detector.classify(2.5), AnomalySignal::None);
+            assert_eq!(detector.classify(100.0), AnomalySignal::Positive);
+            assert_eq!(detector.classify(-100.0), AnomalySignal::Negative);
+        }
     }
 
     #[test]
