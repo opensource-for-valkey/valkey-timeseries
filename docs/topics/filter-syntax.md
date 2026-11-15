@@ -2,9 +2,10 @@
 
 ## Overview
 
-The `FILTER` argument in `TS.MRANGE`, `TS.MREVRANGE`, `TS.QUERYINDEX`, `TS.QUERYLABELS` and `TS.MDEL` commands allows
-you to select which time series to query based on their labels. You can provide one or more filter expressions to match
-series with specific label values.
+The `FILTER` argument of the multi-series commands (`TS.MRANGE`, `TS.MREVRANGE`, `TS.MGET`, `TS.MDEL`, `TS.QUERYLABELS`,
+`TS.CARD`, the label-discovery commands, and others) selects series by their labels. `TS.QUERYINDEX` takes the same
+selectors directly, without the `FILTER` keyword. Each selector is one command argument, and a command can take
+several (see [Combining selectors](#combining-selectors)).
 
 ## Syntax
 
@@ -32,7 +33,8 @@ Find series where a label exists but has a different value:
 label!=value 
 ```
 
-Example: `region!=us-east-1` matches series where the `region` label exists but is not `us-east-1`.
+Example: `region!=us-east-1` matches series whose `region` label is not `us-east-1`, including series that have no
+`region` label at all (as in RedisTimeSeries and Prometheus).
 
 Find series where a label matches any value in a list:
 
@@ -48,8 +50,8 @@ Find series where a label does not match any value in a list:
 label!=(value1,value2,...) 
 ```
 
-Example: `region!=(us-east-1,us-west-2)` matches series where the `region` label exists but is not `us-east-1` or
-`us-west-2`.
+Example: `region!=(us-east-1,us-west-2)` matches series whose `region` label is neither `us-east-1` nor `us-west-2`,
+including series without a `region` label.
 
 Find series where a label is absent (`label=`) or present with any value (`label!=`).
 
@@ -134,12 +136,21 @@ Matches any series with the specified label values, regardless of metric name.
 
 Each label matcher supports different comparison operators:
 
-| Operator | Description                  | Example        |
-|----------|------------------------------|----------------|
-| `=`      | Exact match                  | `city="NYC"`   |
-| `!=`     | Not equal                    | `city!="NYC"`  |
-| `=~`     | Regular expression match     | `city=~"NY.*"` |
-| `!~`     | Regular expression not match | `city!~"LA.*"` |
+| Operator | Description                                   | Example        |
+|----------|-----------------------------------------------|----------------|
+| `=`      | Exact match                                   | `city="NYC"`   |
+| `!=`     | Not equal (also matches series without it)    | `city!="NYC"`  |
+| `=~`     | Regular expression match (fully anchored)     | `city=~"NY.*"` |
+| `!~`     | Regular expression not match                  | `city!~"LA.*"` |
+| `^=`     | Starts with (extension)                       | `city^="New"`  |
+| `^~`     | Does not start with (extension)               | `city^~"San"`  |
+
+`=`, `!=`, `^=` and `^~` also take a value list: `{city=("NYC","LA")}` matches either value. An empty value means the
+label is absent: `humidity{city=""}` matches humidity series without a `city` label, and `humidity{city!=""}` those
+that have one. (On its own, `{city=""}` has no positive matcher and is rejected; see below.)
+
+Matchers inside one pair of braces are ANDed. `or` between groups of matchers ORs them, and `or` between whole
+selectors does the same: `{city="NYC" or city="LA"}` and `temperature{city="NYC"} or humidity` are single selectors.
 
 ### Label Value Quoting
 
@@ -160,21 +171,33 @@ Quoted strings follow PromQL's rules, which are Go's:
 The same rules apply to `METRIC` label values and to the quoted pattern of `=~` / `!~` in a basic filter. Basic filter
 values (above) are never unquoted.
 
-### Multiple Filters
+### Combining selectors
 
-You can specify multiple series selectors, separated by spaces. Series matching **any** of the selectors will be
-included (logical OR).
-
-**Example:**
+Separate selector arguments are **ANDed**: a series is selected only if it matches every one of them, as in
+RedisTimeSeries.
 
 ```
-FILTER temperature{city="NYC"} humidity{city="LA"}
+FILTER region=us-east-1 sensor_type=temperature
+FILTER temperature{city="NYC"} sensor!=outdoor
 ```
 
-This matches:
+The first selects series whose `region` is `us-east-1` **and** whose `sensor_type` is `temperature`. Two arguments
+that name different metrics, such as `temperature{city="NYC"} humidity{city="LA"}`, select nothing.
 
-- All temperature series in NYC, OR
-- All humidity series in LA
+At least one argument must contain a positive matcher (`label=value`, a list, a regex match, a metric name). A list of
+only negative or absence matchers, such as `FILTER region!=eu` or `FILTER region=`, is rejected with
+`TSDB: please provide at least one matcher`; it is accepted once another argument supplies the positive matcher
+(`FILTER metric=cpu region!=eu`).
+
+To select series that match **either** of two conditions, write one Prometheus-style selector with `or`. It is a
+single argument, so quote it in a shell or `valkey-cli`:
+
+```
+FILTER 'temperature{city="NYC"} or humidity{city="LA"}'
+```
+
+This matches all temperature series in NYC, and all humidity series in LA. Basic filters cannot be combined with `or`
+(see [How basic filters are read](#how-basic-filters-are-read)).
 
 ### Complete Examples
 
@@ -205,13 +228,11 @@ Returns series in cities starting with "NY" where sensor_type is "temp".
 ### Multiple Selectors
 
 ```
-TS.MRANGE - + FILTER temperature{city="NYC"} temperature{city="LA"} humidity
+TS.MRANGE - + FILTER 'temperature{city=~"NYC|LA"} or humidity'
 ```
 
-Returns:
-
-- Temperature series from NYC or LA, OR
-- Any humidity series
+Returns temperature series from NYC or LA, and every humidity series. Written as three separate arguments
+(`temperature{city="NYC"} temperature{city="LA"} humidity`), the same selectors would be ANDed and return nothing.
 
 ### Aggregation
 
@@ -225,10 +246,12 @@ Returns hourly averages for temperature series from warehouses.
 
 - Filter expressions are **case-sensitive** for label names and values.
 - The `FILTER` keyword itself is **case-insensitive**.
-- At least one filter expression is **required** for `TS.MRANGE` and `TS.MREVRANGE` commands.
-- Series selectors follow Prometheus query language conventions for label matching.
-- Label names must start with a letter, underscore, or colon, and can contain letters, numbers, underscores, colons, and
-  dots.
+- At least one selector is **required**, and at least one positive matcher across all of them (see
+  [Combining selectors](#combining-selectors)).
+- Prometheus-style selectors follow Prometheus query language conventions for label matching.
+- In the Prometheus-style form, an unquoted label name starts with a letter or underscore and may contain letters,
+  digits, underscores, colons, dots and hyphens. Any other name can be quoted: `{"host name"="a"}`. In a basic filter
+  the label name is the raw text before the operator.
 
 ## Related Commands
 
@@ -238,4 +261,5 @@ Returns hourly averages for temperature series from warehouses.
 
 ## See Also
 
-- [TS.MRANGE Command Documentation](./commands/mrange.md)
+- [TS.MRANGE Command Documentation](../commands/ts.mrange.md)
+- [TS.QUERYINDEX Command Documentation](../commands/ts.queryindex.md)
