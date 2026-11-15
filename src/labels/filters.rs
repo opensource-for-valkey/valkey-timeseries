@@ -4,7 +4,7 @@ use crate::labels::regex::parse_regex_anchored;
 use crate::labels::regex_utils::{RegexHints, parse_regex_matcher, regex_hints_for_pattern};
 use crate::parser::ParseError;
 use crate::parser::lex::Token;
-use enquote::enquote;
+use crate::parser::utils::quote_string;
 use regex::Regex;
 use smallvec::SmallVec;
 use std::cmp::PartialEq;
@@ -82,14 +82,14 @@ impl Display for PredicateValue {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             PredicateValue::Empty => write!(f, "\"\""),
-            PredicateValue::String(s) => write!(f, "{}", enquote('"', s)),
+            PredicateValue::String(s) => write!(f, "{}", quote_string(s)),
             PredicateValue::List(values) => {
                 write!(f, "(")?;
                 for (i, value) in values.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", enquote('"', value))?;
+                    write!(f, "{}", quote_string(value))?;
                 }
                 write!(f, ")")
             }
@@ -401,7 +401,7 @@ impl TryFrom<&str> for RegexMatcher {
 
 impl Display for RegexMatcher {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}", enquote('"', &self.value))
+        write!(f, "{}", quote_string(&self.value))
     }
 }
 
@@ -784,10 +784,10 @@ impl Display for LabelFilter {
             PredicateMatch::Equal(value) | PredicateMatch::NotEqual(value) => {
                 write!(f, "{value}")
             }
-            PredicateMatch::MatchAll => write!(f, "{}", enquote('"', MATCH_ALL_REGEX_TEXT)),
-            PredicateMatch::MatchNone => write!(f, "{}", enquote('"', MATCH_ALL_REGEX_TEXT)),
+            PredicateMatch::MatchAll => write!(f, "{}", quote_string(MATCH_ALL_REGEX_TEXT)),
+            PredicateMatch::MatchNone => write!(f, "{}", quote_string(MATCH_ALL_REGEX_TEXT)),
             PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re) => {
-                write!(f, "{}", enquote('"', &re.value))
+                write!(f, "{}", quote_string(&re.value))
             }
             PredicateMatch::StartsWith(value) | PredicateMatch::NotStartsWith(value) => {
                 write!(f, "{value}")

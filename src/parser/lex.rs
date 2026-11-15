@@ -27,7 +27,9 @@ pub enum Token {
     Identifier,
 
     #[regex(r#"'(?s:[^'\\]|\\.)*'"#)]
-    #[regex(r#"`(?s:[^`\\]|\\.)*`"#)]
+    // Backtick strings are raw, as in Go and PromQL: `\` is an ordinary character and a
+    // backtick always ends the string, so `C:\` is valid and no backtick can be escaped.
+    #[regex(r#"`[^`]*`"#)]
     #[regex(r#""(?s:[^"\\]|\\.)*""#)]
     StringLiteral,
 
@@ -368,8 +370,8 @@ mod tests {
 
     #[test]
     fn miscellaneous() {
-        let s = "   `foo\\\\\\`бар`  ";
-        let expected = vec!["`foo\\\\\\`бар`"];
+        let s = "   `foo\\\\бар`  `C:\\`";
+        let expected = vec!["`foo\\\\бар`", "`C:\\`"];
         test_success(s, &expected);
     }
 

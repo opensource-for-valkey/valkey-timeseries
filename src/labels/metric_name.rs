@@ -4,7 +4,7 @@ use crate::common::rdb::{MAX_RDB_COLLECTION_LEN, rdb_load_len, rdb_load_string, 
 use crate::common::string_interner::InternedString;
 use crate::parser::ParseError;
 use crate::parser::metric_name::parse_metric_name;
-use enquote::enquote;
+use crate::parser::utils::quote_string;
 use get_size2::{GetSize, GetSizeTracker};
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -302,7 +302,7 @@ impl Display for MetricName {
                 write!(f, ",")?;
             }
             first = false;
-            write!(f, "{}={}", label.name, enquote('"', label.value))?;
+            write!(f, "{}={}", label.name, quote_string(label.value))?;
         }
 
         write!(f, "}}")?;

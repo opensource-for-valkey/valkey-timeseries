@@ -149,8 +149,16 @@ In the Prometheus-style form, label values are quoted using:
 - **Single quotes**: `'value'`
 - **Backticks**: `` `value` ``
 
-Escape sequences are supported within double- and single-quoted strings (e.g., `\"`, `\n`, `\\`); backtick strings
-are raw. Basic filters (above) are never unquoted.
+Quoted strings follow PromQL's rules, which are Go's:
+
+- In double- and single-quoted strings a backslash starts an escape: `\a \b \f \n \r \t \v \\`, the enclosing quote
+  (`\"` in `"..."`, `\'` in `'...'`; the other quote needs no escape), `\xHH` or `\NNN` (a byte, in hex or three octal
+  digits; bytes may combine into UTF-8, so `\xc3\xa9` is `é`), and `\uHHHH` / `\UHHHHHHHH` (a Unicode character). Any
+  other escape is an error, as is a raw newline (write `\n`).
+- Backtick strings are raw: no escapes, so `` `C:\` `` is `C:\`, and they cannot contain a backtick.
+
+The same rules apply to `METRIC` label values and to the quoted pattern of `=~` / `!~` in a basic filter. Basic filter
+values (above) are never unquoted.
 
 ### Multiple Filters
 
