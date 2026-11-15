@@ -117,8 +117,7 @@ impl TryFrom<&str> for TimestampValue {
         // `parse_timestamp` already rejects negatives, reporting them distinctly from
         // unparseable input. Callers in the range family discard this in favour of a
         // positional `wrong fromTimestamp` / `wrong toTimestamp`.
-        let ts =
-            parse_timestamp(value, false).map_err(|e| ValkeyError::Str(timestamp_error(&e)))?;
+        let ts = parse_timestamp(value).map_err(|e| ValkeyError::Str(timestamp_error(&e)))?;
 
         Ok(Specific(ts))
     }

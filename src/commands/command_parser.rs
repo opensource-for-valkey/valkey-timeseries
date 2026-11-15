@@ -144,7 +144,7 @@ pub fn parse_timestamp(arg: &str) -> ValkeyResult<Timestamp> {
     if arg == "*" {
         return Ok(current_time_millis());
     }
-    parse_timestamp_internal(arg, false).map_err(|e| ValkeyError::Str(timestamp_error(&e)))
+    parse_timestamp_internal(arg).map_err(|e| ValkeyError::Str(timestamp_error(&e)))
 }
 
 pub fn parse_timestamp_range_value(arg: &str) -> ValkeyResult<TimestampValue> {

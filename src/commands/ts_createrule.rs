@@ -118,7 +118,7 @@ fn parse_args(args: &mut CommandArgIterator, dest: SeriesLink) -> ValkeyResult<C
 
     // possible align timestamp
     let align_timestamp = if let Ok(align_str) = args.next_str() {
-        parse_timestamp(align_str, false)
+        parse_timestamp(align_str)
             .map_err(|_| ValkeyError::Str(error_consts::INVALID_ALIGNMENT_TIMESTAMP))?
     } else {
         0
