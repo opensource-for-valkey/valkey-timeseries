@@ -3,8 +3,7 @@ use crate::labels::filters::{
     FilterList, LabelFilter, MatchOp, OrFiltersList, PredicateMatch, PredicateValue,
     SeriesSelector, ValueList,
 };
-use crate::parser::lex::{Cursor, Lexeme, Token};
-use crate::parser::utils::extract_string_value;
+use crate::parser::lex::{Cursor, Token};
 use crate::parser::{ParseError, ParseResult};
 
 /// Characters an unquoted RTS-form value may not contain. RTS gives them no consistent meaning
@@ -71,7 +70,7 @@ fn parse_one_selector(cur: &mut Cursor) -> ParseResult<SeriesSelector> {
     if first.token == Token::LeftBrace {
         return parse_braces(cur, None);
     }
-    let name = decode_name(&first)?;
+    let name = first.decoded()?.into_owned();
     if cur.next_if(Token::LeftBrace)?.is_some() {
         return parse_braces(cur, Some(name));
     }
@@ -143,7 +142,10 @@ fn parse_group(cur: &mut Cursor, outer: Option<&str>) -> ParseResult<FilterList>
 /// `LabelFilter::create`, so regex decomposition (which turns `=~"mem"` into `="mem"`) can't
 /// change the outcome.
 fn parse_matcher(cur: &mut Cursor, outer: Option<&str>) -> ParseResult<(LabelFilter, bool)> {
-    let name = decode_name(&cur.expect(NAME_TOKENS, "label matcher")?)?;
+    let name = cur
+        .expect(NAME_TOKENS, "label matcher")?
+        .decoded()?
+        .into_owned();
 
     // A bare name is the metric-name shorthand: `{cpu, job="a"}`.
     if matches!(
@@ -166,7 +168,7 @@ fn parse_matcher(cur: &mut Cursor, outer: Option<&str>) -> ParseResult<(LabelFil
     let names_metric = name == METRIC_NAME_LABEL && op == MatchOp::Equal;
 
     if op.is_regex() {
-        let pattern = expect_string(cur, "regex pattern")?;
+        let pattern = cur.expect_string("regex pattern")?;
         if let Some(outer) = names_metric_again {
             let inner = PredicateValue::String(pattern).to_string();
             return Err(ParseError::MetricNameSetTwice(outer.to_string(), inner));
@@ -198,20 +200,6 @@ fn match_op(token: Token) -> MatchOp {
     }
 }
 
-/// The text of a name token: a quoted string is decoded; an identifier (which admits no `\`)
-/// or the word `or` is taken as written.
-fn decode_name(lexeme: &Lexeme) -> ParseResult<String> {
-    match lexeme.token {
-        Token::StringLiteral => Ok(extract_string_value(lexeme.text)?.into_owned()),
-        _ => Ok(lexeme.text.to_string()),
-    }
-}
-
-fn expect_string(cur: &mut Cursor, context: &str) -> ParseResult<String> {
-    let lexeme = cur.expect(&[Token::StringLiteral], context)?;
-    Ok(extract_string_value(lexeme.text)?.into_owned())
-}
-
 /// A value in the braces form: a quoted string, an unquoted identifier or number (taken as
 /// written; `or` included), or a parenthesized list.
 fn parse_matcher_value(cur: &mut Cursor) -> ParseResult<PredicateValue> {
@@ -219,7 +207,7 @@ fn parse_matcher_value(cur: &mut Cursor) -> ParseResult<PredicateValue> {
     if lexeme.token == Token::LeftParen {
         return parse_value_list(cur);
     }
-    Ok(PredicateValue::String(decode_value(&lexeme)?))
+    Ok(PredicateValue::String(lexeme.decoded()?.into_owned()))
 }
 
 const VALUE_TOKENS: &[Token] = &[
@@ -236,17 +224,17 @@ const VALUE_TOKENS_OR_LIST: &[Token] = &[
     Token::LeftParen,
 ];
 
-fn decode_value(lexeme: &Lexeme) -> ParseResult<String> {
-    decode_name(lexeme)
-}
-
 /// `(v1, v2, ...)` after the `(`: one or more values separated by single commas. An empty
 /// list or an empty item is an error (as in the RTS form), so `(,a,,)` cannot quietly mean `a`
 /// and `()` cannot mean "label absent".
 fn parse_value_list(cur: &mut Cursor) -> ParseResult<PredicateValue> {
     let mut values = ValueList::new();
     loop {
-        values.push(decode_value(&cur.expect(VALUE_TOKENS, "value list")?)?);
+        values.push(
+            cur.expect(VALUE_TOKENS, "value list")?
+                .decoded()?
+                .into_owned(),
+        );
         if cur
             .expect(&[Token::Comma, Token::RightParen], "value list")?
             .token
@@ -303,7 +291,7 @@ fn parse_rts_predicate(
     if op.is_regex() {
         // Lexed in place, so an error reports its position in the whole argument.
         let mut cur = Cursor::at(s, value_at);
-        let pattern = expect_string(&mut cur, "regex pattern")?;
+        let pattern = cur.expect_string("regex pattern")?;
         cur.expect(&[Token::Eof], "regex matcher")?;
         return LabelFilter::create(op, label, pattern);
     }

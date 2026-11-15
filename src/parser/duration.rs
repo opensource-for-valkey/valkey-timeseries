@@ -12,14 +12,14 @@ const MILLIS_PER_YEAR: i64 = 365 * MILLIS_PER_DAY;
 /// durations). Accepts what [`parse_duration_value`] does, but rejects a negative total and
 /// any leading `-`, so `-0` and `-0.4ms` are errors rather than zero (RTS rejects
 /// `RETENTION -0`). The sign is checked before rounding.
-pub fn parse_positive_duration_value(s: &str) -> Result<i64, ParseError> {
+pub fn parse_nonnegative_duration_value(s: &str) -> Result<i64, ParseError> {
     parse_nonnegative(s, DurationUnits::Standard)
 }
 
 /// Parses a nonnegative `ts-compaction-policy` duration. The RTS policy spelling: `m` is
 /// milliseconds and `M` minutes, in every segment (`1M30m` is 60 030 ms; `30m1M` is out of
 /// order and rejected). Otherwise as
-/// [`parse_positive_duration_value`], including its extensions over RTS (a bare number is
+/// [`parse_nonnegative_duration_value`], including its extensions over RTS (a bare number is
 /// milliseconds; compound, fractional, `ms`, `w` and `y` values are accepted).
 pub fn parse_policy_duration_ms(s: &str) -> ParseResult<i64> {
     parse_nonnegative(s, DurationUnits::CompactionPolicy)
@@ -228,7 +228,7 @@ mod tests {
     const MILLIS_PER_YEAR: f64 = super::MILLIS_PER_YEAR as f64;
 
     /// The unrounded sum, so fractional cases can be checked exactly.
-    fn parse_duration_internal(s: &str) -> ParseResult<f64> {
+    fn unrounded_sum(s: &str) -> ParseResult<f64> {
         sum_duration(s, DurationUnits::Standard).map(|sum| sum.total_f64())
     }
 
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn test_duration_success() {
         fn f(s: &str, expected: f64) {
-            let d = parse_duration_internal(s).unwrap();
+            let d = unrounded_sum(s).unwrap();
             assert_eq!(
                 d, expected,
                 "unexpected duration; got {d}; want {expected}; expr {s}"
@@ -462,17 +462,17 @@ mod tests {
         // used to pass the range check and come out as 0.
         for s in ["1e308y-1e308y", "1e308y", "1e308y1e308y", "1.5e308w"] {
             assert!(parse_duration_value(s).is_err(), "{s}");
-            assert!(parse_positive_duration_value(s).is_err(), "{s}");
+            assert!(parse_nonnegative_duration_value(s).is_err(), "{s}");
         }
     }
 
     #[test]
     fn test_negative_is_checked_before_rounding() {
         for s in ["-0.4ms", "-0", "-0s", "-0.0", "1ms-1.4ms"] {
-            assert!(parse_positive_duration_value(s).is_err(), "{s}");
+            assert!(parse_nonnegative_duration_value(s).is_err(), "{s}");
         }
-        assert_eq!(parse_positive_duration_value("0").unwrap(), 0);
-        assert_eq!(parse_positive_duration_value("0.4ms").unwrap(), 0);
+        assert_eq!(parse_nonnegative_duration_value("0").unwrap(), 0);
+        assert_eq!(parse_nonnegative_duration_value("0.4ms").unwrap(), 0);
         assert_eq!(parse_duration_value("-0.4ms").unwrap(), 0);
     }
 
@@ -487,7 +487,11 @@ mod tests {
             ("106751991167d", 106_751_991_167 * 86_400_000),
             ("1y1ms", 31_536_000_001),
         ] {
-            assert_eq!(parse_positive_duration_value(s).unwrap(), expected, "{s}");
+            assert_eq!(
+                parse_nonnegative_duration_value(s).unwrap(),
+                expected,
+                "{s}"
+            );
         }
         assert_eq!(
             parse_duration_value("-9223372036854775807").unwrap(),
@@ -564,9 +568,9 @@ mod tests {
     }
 
     #[test]
-    fn test_positive_duration_error() {
+    fn test_nonnegative_duration_error() {
         fn f(s: &str) {
-            if parse_positive_duration_value(s).is_ok() {
+            if parse_nonnegative_duration_value(s).is_ok() {
                 panic!("Expecting an error for duration {s}")
             }
         }

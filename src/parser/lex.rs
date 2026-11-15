@@ -1,6 +1,8 @@
 use crate::parser::parse_error::unexpected;
+use crate::parser::utils::extract_string_value;
 use crate::parser::{ParseErr, ParseError, ParseResult};
 use logos::{Lexer, Logos, Span};
+use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 
 fn unterminated_string_literal(_: &mut Lexer<Token>) -> ParseResult<()> {
@@ -132,6 +134,18 @@ pub(crate) struct Lexeme<'s> {
     pub span: Span,
 }
 
+impl<'s> Lexeme<'s> {
+    /// The token's text as a name or value: a quoted string decoded, anything else (an
+    /// identifier, which admits no `\`, a number, the word `or`) as written.
+    pub fn decoded(&self) -> ParseResult<Cow<'s, str>> {
+        if self.token == Token::StringLiteral {
+            extract_string_value(self.text)
+        } else {
+            Ok(Cow::Borrowed(self.text))
+        }
+    }
+}
+
 /// A token stream with one token of lookahead, the shared front end of the selector and
 /// metric-name grammars. End of input is a `Token::Eof` lexeme positioned at the end of the
 /// source; reading past it keeps returning it.
@@ -222,6 +236,14 @@ impl<'s> Cursor<'s> {
         } else {
             Err(self.unexpected(&lexeme, context, &describe_tokens(expected)))
         }
+    }
+
+    /// Consumes a quoted string and returns its decoded value.
+    pub fn expect_string(&mut self, context: &str) -> ParseResult<String> {
+        Ok(self
+            .expect(&[Token::StringLiteral], context)?
+            .decoded()?
+            .into_owned())
     }
 
     pub fn unexpected(&self, found: &Lexeme, context: &str, expected: &str) -> ParseError {

@@ -11,7 +11,7 @@ pub type ParseResult<T> = Result<T, ParseError>;
 pub enum ParseError {
     #[error(transparent)]
     Unexpected(ParseErr),
-    #[error("Expected positive duration: found `{0}`")]
+    #[error("Invalid duration: `{0}`")]
     InvalidDuration(String),
     #[error("Expected positive unix millis or rfc3339 timestamp: found `{0}`")]
     InvalidTimestamp(String),

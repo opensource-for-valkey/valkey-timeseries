@@ -1,7 +1,6 @@
 use super::lex::{Cursor, Token};
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::Label;
-use crate::parser::utils::extract_string_value;
 use crate::parser::{ParseError, ParseResult};
 
 /// Parses a `Prometheus` compatible metric name (as opposed to a metric selector), the
@@ -34,21 +33,20 @@ fn parse_label_set(cur: &mut Cursor, labels: &mut Vec<Label>) -> ParseResult<()>
         // `}` here closes an empty set or follows a trailing comma. `or` is a name here, as
         // everywhere a name is expected.
         let name = cur.expect(&[Identifier, StringLiteral, OpOr, RightBrace], "label set")?;
-        let name = match name.token {
-            RightBrace => return Ok(()),
-            StringLiteral => extract_string_value(name.text)?.into_owned(),
-            _ => name.text.to_string(),
-        };
+        if name.token == RightBrace {
+            return Ok(());
+        }
+        let name = name.decoded()?.into_owned();
         check_label(labels, &name)?;
 
         cur.expect(&[Equal], "label set")?;
-        let value = extract_string_value(cur.expect(&[StringLiteral], "label value")?.text)?;
+        let value = cur.expect_string("label value")?;
         if value.is_empty() {
             return Err(ParseError::General(format!(
                 "label `{name}` has an empty value"
             )));
         }
-        labels.push(Label::new(name, value.into_owned()));
+        labels.push(Label::new(name, value));
 
         if cur.expect(&[Comma, RightBrace], "label set")?.token == RightBrace {
             return Ok(());
