@@ -1749,7 +1749,9 @@ mod test {
     #[test]
     fn cached_matchers_equal_freshly_decomposed_ones() {
         // Literal, list, prefix, contains, prefix + regex, plain regex, and an invalid pattern,
-        // each through the cache twice (miss, then hit) for both operators.
+        // each through the cache three times for both operators. The matcher caches admit a
+        // pattern on its second sighting, so on a cold cache the first request only records
+        // it, the second stores it, and the third is a hit; a warm one hits sooner.
         for pattern in [
             "api",
             "prod|staging|dev",
@@ -1761,7 +1763,7 @@ mod test {
         ] {
             for is_equal in [true, false] {
                 let fresh = super::decompose_matcher(pattern, is_equal);
-                for _ in 0..2 {
+                for _ in 0..3 {
                     let cached = parse_regex_matcher(pattern, is_equal);
                     match (&fresh, &cached) {
                         (Ok(f), Ok(c)) => assert_eq!(f, c, "{pattern} {is_equal}"),
