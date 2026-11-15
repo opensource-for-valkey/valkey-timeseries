@@ -16,8 +16,9 @@ fn unterminated_string_literal(_: &mut Lexer<Token>) -> ParseResult<()> {
 #[logos(subpattern octal = r"-?0[oO]?[1-7][_0-7]*")]
 #[logos(subpattern binary = r"-?0[bB][0-1][_0-1]*")]
 #[logos(subpattern float = r"-?(?:([0-9]*[.])?[0-9][0-9_]*)(?:[eE][+-]?[0-9][0-9_]*)?")]
+// No comment rule: a selector is a single command argument, and skipping `#…` silently cut
+// unquoted values short (`color=#ff0000` became `color=`, which selects series *without* the label).
 #[logos(skip r"[ \t\n\f\r]+")]
-#[logos(skip(r"#[^\r\n]*(\r\n|\n)?", allow_greedy = true))] // single line comment
 pub enum Token {
     #[token(b"or", ignore(case))]
     OpOr,
@@ -307,6 +308,17 @@ mod tests {
             Identifier=>"foo-bar",
           ]
         );
+    }
+
+    #[test]
+    fn hash_is_not_a_comment() {
+        // `#` is not skipped: it starts no token, so the lexer reports it rather than
+        // dropping the rest of the input.
+        let mut lex = Token::lexer("a #b");
+        assert_eq!(lex.next(), Some(Ok(Identifier)));
+        assert!(matches!(lex.next(), Some(Err(_))));
+        // Inside a string literal it is an ordinary character.
+        test_tokens!(r##""#ff0000""##, [StringLiteral => r##""#ff0000""##]);
     }
 
     #[test]

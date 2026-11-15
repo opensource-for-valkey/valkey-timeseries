@@ -759,4 +759,33 @@ mod tests {
             Some("cpu")
         );
     }
+
+    // `#` used to start a lexer comment, so an unquoted value lost everything from it on, with
+    // no error. It is now an error until unquoted RTS-form values are read as raw text.
+    #[test]
+    fn test_hash_in_unquoted_value_is_not_a_comment() {
+        for selector in [
+            "color=#ff0000",
+            "tag=foo#bar",
+            "a=b#c or d=e",
+            "{color=#ff0000}",
+            r#"cpu{job="a"} # trailing"#,
+        ] {
+            assert!(
+                parse_series_selector(selector).is_err(),
+                "{selector} parsed as {:?}",
+                parse_series_selector(selector)
+            );
+        }
+    }
+
+    #[test]
+    fn test_hash_in_quoted_value_is_kept() {
+        let parsed = parse_series_selector(r##"{color="#ff0000", tag=`foo#bar`}"##).unwrap();
+        let SeriesSelector::And(filters) = parsed else {
+            panic!("expected AND selector");
+        };
+        assert_contains_matcher(&filters, "color", MatchOp::Equal, "#ff0000");
+        assert_contains_matcher(&filters, "tag", MatchOp::Equal, "foo#bar");
+    }
 }
