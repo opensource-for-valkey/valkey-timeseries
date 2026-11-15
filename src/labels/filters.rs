@@ -3,7 +3,6 @@ use crate::labels::parse_series_selector;
 use crate::labels::regex::parse_regex_anchored;
 use crate::labels::regex_utils::{RegexHints, parse_regex_matcher, regex_hints_for_pattern};
 use crate::parser::ParseError;
-use crate::parser::lex::Token;
 use crate::parser::utils::quote_string;
 use regex::Regex;
 use smallvec::SmallVec;
@@ -49,22 +48,6 @@ impl Display for MatchOp {
             MatchOp::NotContains => write!(f, "!*="),
             MatchOp::MatchAll => write!(f, "*="),
             MatchOp::MatchNone => write!(f, "!~"), // TODO
-        }
-    }
-}
-
-impl TryFrom<Token> for MatchOp {
-    type Error = ParseError;
-
-    fn try_from(value: Token) -> Result<Self, Self::Error> {
-        match value {
-            Token::Equal => Ok(MatchOp::Equal),
-            Token::OpNotEqual => Ok(MatchOp::NotEqual),
-            Token::RegexEqual => Ok(MatchOp::RegexEqual),
-            Token::RegexNotEqual => Ok(MatchOp::RegexNotEqual),
-            Token::StartsWith => Ok(MatchOp::StartsWith),
-            Token::NotStartsWith => Ok(MatchOp::NotStartsWith),
-            _ => Err(ParseError::InvalidMatchOperator(value.to_string())),
         }
     }
 }

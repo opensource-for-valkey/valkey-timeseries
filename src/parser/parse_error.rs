@@ -28,8 +28,6 @@ pub enum ParseError {
     General(String),
     #[error("Invalid regex: {0}")]
     InvalidRegex(String),
-    #[error("Invalid match operator: {0}")]
-    InvalidMatchOperator(String),
     #[error("Empty series selector")]
     EmptySeriesSelector,
     /// A selector names its metric before the braces and again with a `__name__` matcher
