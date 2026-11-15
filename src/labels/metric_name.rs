@@ -65,13 +65,26 @@ impl GetSize for MetricName {
     /// the trait default of zero: a series carrying 40 labels and ~1.9KB of interned strings
     /// reported a `memoryUsage` of exactly `size_of::<TimeSeries>()`, labels included for free.
     ///
-    /// The tracker is deliberately not consulted for the strings themselves. It exists to charge
-    /// a shared allocation once per traversal, which here would bill one arbitrary series for a
-    /// label the whole keyspace shares and the rest nothing. [`InternedString::amortized_size`]
-    /// splits it evenly instead, so per-key numbers add up across the keyspace.
+    /// The tracker is deliberately not consulted. It exists to charge a shared allocation once
+    /// per traversal, which here would bill one arbitrary holder for memory others share and
+    /// the rest nothing. Both layers of sharing are split evenly instead, so per-key numbers add
+    /// up across the keyspace:
+    ///
+    /// - each interned string is shared by every slice that holds it, and
+    ///   [`InternedString::amortized_size`] gives this slice its share;
+    /// - the slice is shared by every `MetricName` cloned from it (`COPY` clones the series), so
+    ///   the slice and its string shares are divided again by [`Arc::strong_count`].
+    ///
+    /// The count includes holders that are not keys, such as a query or fan-out holding a
+    /// series' labels; while one lives, each key reports a smaller share. A set that is edited
+    /// gets a slice of its own and returns to the full charge.
     fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
         let string_bytes: usize = self.0.iter().map(InternedString::amortized_size).sum();
-        (self.slice_bytes() + string_bytes, tracker)
+        let holders = Arc::strong_count(&self.0);
+        (
+            (self.slice_bytes() + string_bytes).div_ceil(holders),
+            tracker,
+        )
     }
 }
 
@@ -114,7 +127,18 @@ impl MetricName {
             }
             same
         });
-        Self(Arc::from(entries))
+        Self(Self::share(entries))
+    }
+
+    /// The slice for `entries`. An empty set is the one shared empty slice
+    /// (`Arc::<[_]>::default()`), never an allocation of its own, so every empty set costs
+    /// the same: nothing.
+    fn share(entries: Vec<InternedString>) -> Arc<[InternedString]> {
+        if entries.is_empty() {
+            Arc::default()
+        } else {
+            Arc::from(entries)
+        }
     }
 
     /// The pairs as one shared slice, for holders that outlive the borrow (a query's copy of a
@@ -129,18 +153,19 @@ impl MetricName {
         self.0.iter()
     }
 
-    /// Heap bytes of the slice itself: the `Arc` counts plus one pointer per label.
+    /// Heap bytes of the slice itself, before dividing among its holders: the `Arc` counts plus
+    /// one pointer per label. The empty slice is shared process-wide (see [`Self::share`]), so it
+    /// is charged to no one.
     fn slice_bytes(&self) -> usize {
         if self.0.is_empty() {
-            // `Arc<[T]>::from(Vec::new())` still allocates the counts.
-            2 * size_of::<usize>()
+            0
         } else {
             2 * size_of::<usize>() + self.0.len() * size_of::<InternedString>()
         }
     }
 
     pub fn clear(&mut self) {
-        self.0 = Arc::from(Vec::new());
+        self.0 = Arc::default();
     }
 
     fn key_of(tag: &InternedString) -> &str {
@@ -165,7 +190,7 @@ impl MetricName {
     fn edit(&mut self, f: impl FnOnce(&mut Vec<InternedString>)) {
         let mut entries: Vec<InternedString> = self.0.to_vec();
         f(&mut entries);
-        self.0 = Arc::from(entries);
+        self.0 = Self::share(entries);
     }
 
     /// adds a new label to mn with the given key and value.
@@ -487,6 +512,70 @@ mod tests {
         for mn in &sharers {
             assert_eq!(mn.get_heap_size(), per_holder);
         }
+    }
+
+    /// `COPY` clones a series, which clones its `MetricName`: one slice, two holders. Each must
+    /// report half of what one holder alone reports, so the two keys' `MEMORY USAGE` add up to
+    /// the memory actually held, and an edit gives a holder its own slice and the full charge.
+    #[test]
+    fn test_cloned_labels_split_the_shared_slice() {
+        let _pool = crate::common::string_interner::test_pool::isolated();
+        let original = MetricName::from_pairs([
+            ("clone_probe_a", "value_for_the_clone_accounting_test"),
+            ("clone_probe_b", "another_value_for_the_clone_test"),
+        ]);
+        let alone = original.get_heap_size();
+        assert!(alone > 0);
+
+        let copy = original.clone();
+        assert!(
+            Arc::ptr_eq(&original.0, &copy.0),
+            "a clone shares the slice"
+        );
+        let (a, b) = (original.get_heap_size(), copy.get_heap_size());
+        assert_eq!(a, b);
+        // Each share is rounded up, so the pair can overshoot by a byte.
+        assert!(a + b >= alone && a + b <= alone + 1, "{a} + {b} vs {alone}");
+
+        // Editing the copy gives it a slice of its own; the original is alone again.
+        let mut edited = copy.clone();
+        drop(copy);
+        edited.add_label("clone_probe_c", "x");
+        assert!(!Arc::ptr_eq(&original.0, &edited.0));
+        // The two slices still share the two interned strings, so neither holder is back to
+        // the full charge, but neither is halved any more: the slice is no longer split.
+        assert!(
+            original.get_heap_size() > a,
+            "{} vs {a}",
+            original.get_heap_size()
+        );
+        assert!(original.get_heap_size() < alone);
+        drop(edited);
+        assert_eq!(original.get_heap_size(), alone);
+    }
+
+    /// An empty set is the one shared empty slice however it was made, and costs nothing.
+    #[test]
+    fn test_empty_label_sets_are_shared_and_free() {
+        let default = MetricName::default();
+        let built = MetricName::new(&[]);
+        let mut cleared = MetricName::from_pairs([("empty_probe", "v")]);
+        cleared.clear();
+        let mut emptied = MetricName::from_pairs([("empty_probe", "v")]);
+        emptied.remove_label("empty_probe");
+        for (what, mn) in [
+            ("built", &built),
+            ("cleared", &cleared),
+            ("emptied", &emptied),
+        ] {
+            assert!(mn.is_empty(), "{what}");
+            assert!(
+                Arc::ptr_eq(&mn.0, &default.0),
+                "{what} allocated its own empty slice"
+            );
+            assert_eq!(mn.get_heap_size(), 0, "{what}");
+        }
+        assert_eq!(default.get_heap_size(), 0);
     }
 
     /// Interning on a realistic fleet: every `key=value` pair the fleet repeats is held once,
