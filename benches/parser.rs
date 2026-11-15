@@ -110,10 +110,12 @@ fn run<T>(
 }
 
 /// Regex selectors that are all different, more of them than any regex cache keeps, so every
-/// parse compiles: the cost of a pattern seen for the first time.
+/// parse compiles: the cost of a pattern seen for the first time. The remainder after the
+/// literal prefix has to stay a regex (`api-{i}-.*` would become a plain prefix match and
+/// compile nothing), and the compiled pattern includes the prefix, so each one is distinct.
 fn bench_distinct_regexes(c: &mut Criterion) {
     let selectors: Vec<String> = (0..1024)
-        .map(|i| format!(r#"{{job=~"api-{i}-.*"}}"#))
+        .map(|i| format!(r#"{{job=~"api-{i}-[0-9]+"}}"#))
         .collect();
     let mut g = c.benchmark_group("selector");
     g.warm_up_time(Duration::from_millis(500))
