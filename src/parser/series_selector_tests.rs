@@ -6,6 +6,7 @@ mod tests {
         FilterList, LabelFilter, MatchOp, PredicateMatch, PredicateValue, SeriesSelector,
     };
     use crate::labels::parse_series_selector;
+    use crate::parser::ParseError;
 
     /// Asserts that `selector` parses, but is rejected as the sole filter of a command.
     fn assert_unbounded_alone(selector: &str) -> SeriesSelector {
@@ -679,5 +680,83 @@ mod tests {
             assert_contains_matcher(second, "service", MatchOp::Equal, "auth");
             assert_contains_matcher(second, "env", MatchOp::RegexEqual, "prod|staging");
         });
+    }
+
+    // PARSER-01: an outer metric name and a `__name__` matcher inside the braces are rejected,
+    // as Prometheus does, whatever the operator. Before this, an equality (or a literal regex,
+    // decomposed to one) silently replaced the outer name.
+    #[test]
+    fn test_outer_metric_name_with_explicit_name_matcher_is_rejected() {
+        for selector in [
+            r#"cpu{__name__="memory"}"#,
+            r#"cpu{__name__="cpu"}"#,
+            r#"cpu{__name__=~"memory"}"#,
+            r#"cpu{__name__=~"memory.*"}"#,
+            r#"cpu{__name__!="memory"}"#,
+            r#"cpu{__name__!~"mem.*"}"#,
+            r#"cpu{__name__^="mem"}"#,
+            r#"cpu{__name__^~"mem"}"#,
+            r#"cpu{__name__=(memory,disk)}"#,
+            r#"cpu{"__name__"="memory"}"#,
+            r#""cpu"{__name__="memory"}"#,
+            r#"cpu{job="a", __name__="memory"}"#,
+            r#"cpu{memory}"#,
+            r#"cpu{job="a", memory}"#,
+            r#"cpu{job="a" or __name__="memory"}"#,
+            r#"cpu{job="a" or memory}"#,
+            r#"job=a or cpu{__name__="memory"}"#,
+        ] {
+            match parse_series_selector(selector) {
+                Err(ParseError::MetricNameSetTwice(outer, _)) => {
+                    assert_eq!(outer, "cpu", "{selector}")
+                }
+                other => panic!("{selector}: expected MetricNameSetTwice, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_metric_name_set_twice_message_matches_prometheus() {
+        let err = parse_series_selector(r#"cpu{__name__="memory"}"#).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"metric name must not be set twice: "cpu" or "memory""#
+        );
+        let err = parse_series_selector(r#"cpu{memory}"#).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"metric name must not be set twice: "cpu" or "memory""#
+        );
+    }
+
+    #[test]
+    fn test_metric_name_set_twice_is_checked_before_the_regex_is_built() {
+        // An invalid pattern would fail in `LabelFilter::create`; the conflict is reported first.
+        let err = parse_series_selector(r#"cpu{__name__=~"("}"#).unwrap_err();
+        assert!(matches!(err, ParseError::MetricNameSetTwice(..)), "{err:?}");
+    }
+
+    #[test]
+    fn test_name_matchers_without_an_outer_name_are_unchanged() {
+        let parsed = parse_series_selector(r#"{__name__="memory", job="a"}"#).unwrap();
+        assert_eq!(parsed.get_metric_name(), Some("memory"));
+        assert!(parse_series_selector(r#"{__name__=~"mem.*", job="a"}"#).is_ok());
+        assert!(parse_series_selector(r#"{memory, job="a"}"#).is_ok());
+        assert!(parse_series_selector(r#"{job="a" or __name__="memory"}"#).is_ok());
+    }
+
+    #[test]
+    fn test_outer_metric_name_applies_to_every_or_branch() {
+        let parsed = parse_series_selector(r#"cpu{job="a" or job="b"}"#).unwrap();
+        with_or_matchers(&parsed, |branches| {
+            assert_eq!(branches.len(), 2);
+            for branch in branches {
+                assert_contains_matcher(branch, "__name__", MatchOp::Equal, "cpu");
+            }
+        });
+        assert_eq!(
+            parse_series_selector("cpu{}").unwrap().get_metric_name(),
+            Some("cpu")
+        );
     }
 }

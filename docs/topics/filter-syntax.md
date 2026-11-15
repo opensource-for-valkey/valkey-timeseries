@@ -84,6 +84,12 @@ Matches series with the specified metric name and label values.
 temperature{city="NYC",sensor="indoor"}
 ```
 
+As in Prometheus, a selector that names its metric before the braces must not name it again
+inside them. `temperature{__name__="humidity"}`, `temperature{__name__=~"temp.*"}` and
+`temperature{humidity}` are rejected with `metric name must not be set twice`, whatever the
+operator, and so is the same thing in any `or` branch. To match on `__name__` with an operator,
+leave out the outer name: `{__name__=~"temp.*", city="NYC"}`.
+
 **Label Matchers Only**
 
 ```

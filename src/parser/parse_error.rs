@@ -33,6 +33,11 @@ pub enum ParseError {
     InvalidMatchOperator(String),
     #[error("Empty series selector")]
     EmptySeriesSelector,
+    /// A selector names its metric before the braces and again with a `__name__` matcher
+    /// inside them (`cpu{__name__="mem"}`). Prometheus rejects this with the same text;
+    /// the second field is the matcher's value as written, already quoted.
+    #[error("metric name must not be set twice: {0:?} or {1}")]
+    MetricNameSetTwice(String, String),
     #[error("Invalid series selector")]
     InvalidSeriesSelector,
     #[default]

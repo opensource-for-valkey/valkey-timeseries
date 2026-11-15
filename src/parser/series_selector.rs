@@ -161,8 +161,8 @@ fn parse_label_filters(p: &mut Lexer<Token>, name: Option<String>) -> ParseResul
             or_matchers.push(std::mem::take(&mut current_filters));
         }
 
-        let (filters, last_token, has_metric_filter) = parse_label_filters_internal(p)?;
-        current_filters = add_metric_name_if_needed(filters, &name, has_metric_filter);
+        let (filters, last_token) = parse_label_filters_internal(p, name.as_deref())?;
+        current_filters = add_outer_metric_name(filters, &name);
 
         match last_token {
             RightBrace => break,
@@ -181,14 +181,10 @@ fn parse_label_filters(p: &mut Lexer<Token>, name: Option<String>) -> ParseResul
     build_selector_from_filters(current_filters, or_matchers, has_or)
 }
 
-fn add_metric_name_if_needed(
-    mut filters: FilterList,
-    name: &Option<String>,
-    has_metric_filter: bool,
-) -> FilterList {
-    if let Some(name) = name
-        && !has_metric_filter
-    {
+/// Adds the metric name written before the braces to one OR branch. Every branch gets it:
+/// `parse_label_filter` has already rejected a branch that names the metric again.
+fn add_outer_metric_name(mut filters: FilterList, name: &Option<String>) -> FilterList {
+    if let Some(name) = name {
         filters.push(LabelFilter::equals(METRIC_NAME_LABEL.into(), name));
     }
     filters
@@ -213,14 +209,17 @@ fn build_selector_from_filters(
     }
 }
 
-fn parse_label_filters_internal(p: &mut Lexer<Token>) -> ParseResult<(FilterList, Token, bool)> {
+fn parse_label_filters_internal(
+    p: &mut Lexer<Token>,
+    outer_name: Option<&str>,
+) -> ParseResult<(FilterList, Token)> {
     use Token::*;
 
     let mut matchers = FilterList::default();
     let mut metric_name_seen = false;
 
     loop {
-        let (matcher, tok) = parse_label_filter(p, !metric_name_seen)?;
+        let (matcher, tok) = parse_label_filter(p, !metric_name_seen, outer_name)?;
 
         if matcher.is_metric_name_filter() {
             if metric_name_seen {
@@ -243,14 +242,23 @@ fn parse_label_filters_internal(p: &mut Lexer<Token>) -> ParseResult<(FilterList
         };
 
         if tok == RightBrace || tok == OpOr {
-            return Ok((matchers, tok, metric_name_seen));
+            return Ok((matchers, tok));
         }
     }
 }
 
+/// Parses one matcher inside braces.
+///
+/// `outer_name` is the metric name written before the braces, if any. As in Prometheus, a
+/// selector that has one must not name the metric again inside the braces, with any operator
+/// or the bare-name shorthand: `cpu{__name__="mem"}`, `cpu{__name__=~"m.*"}` and `cpu{mem}` are
+/// all rejected. The check looks at the label name as written and runs before
+/// `LabelFilter::create`, so regex decomposition (which turns `=~"mem"` into `="mem"`) can't
+/// change the outcome.
 fn parse_label_filter(
     p: &mut Lexer<Token>,
     accept_single: bool,
+    outer_name: Option<&str>,
 ) -> ParseResult<(LabelFilter, Option<Token>)> {
     use Token::*;
 
@@ -285,6 +293,10 @@ fn parse_label_filter(
 
     // Handle metric name shorthand
     if matches!(tok, Comma | RightBrace | OpOr) {
+        if let Some(outer) = outer_name {
+            let inner = PredicateValue::String(label).to_string();
+            return Err(ParseError::MetricNameSetTwice(outer.to_string(), inner));
+        }
         return Ok((
             LabelFilter {
                 label: METRIC_NAME_LABEL.into(),
@@ -295,12 +307,23 @@ fn parse_label_filter(
     }
 
     let op: MatchOp = tok.try_into()?;
+    let names_metric_again = outer_name.filter(|_| label == METRIC_NAME_LABEL);
 
     if op.is_regex() {
         let value = parse_string_literal(p)?;
+        if let Some(outer) = names_metric_again {
+            let inner = PredicateValue::String(value).to_string();
+            return Err(ParseError::MetricNameSetTwice(outer.to_string(), inner));
+        }
         Ok((LabelFilter::create(op, label, value)?, None))
     } else {
         let value = parse_matcher_value(p)?;
+        if let Some(outer) = names_metric_again {
+            return Err(ParseError::MetricNameSetTwice(
+                outer.to_string(),
+                value.to_string(),
+            ));
+        }
         Ok((create_predicate_filter(label, op, value)?, None))
     }
 }
