@@ -722,12 +722,12 @@ mod tests {
             (r#"label="\n""#, r#"{label="\"\\n\""}"#, None),
             (
                 "size=(small,medium,large)",
-                r#"{size=("small", "medium", "large")}"#,
+                r#"{size=("small","medium","large")}"#,
                 None,
             ),
             (
                 r#"service^=(api,worker,"batch-job")"#,
-                r#"{service^=("api", "worker", "\"batch-job\"")}"#,
+                r#"{service^=("api","worker","\"batch-job\"")}"#,
                 None,
             ),
             // Braces form.
@@ -761,7 +761,7 @@ mod tests {
             ),
             (
                 r#"http_requests_total{method=(GET,SET,"POST"), status=~"2[0-9]{2}"}"#,
-                r#"http_requests_total{method=("GET", "SET", "POST"),status=~"2[0-9]{2}"}"#,
+                r#"http_requests_total{method=("GET","SET","POST"),status=~"2[0-9]{2}"}"#,
                 Some("http_requests_total"),
             ),
             (r#"foo{NaN="inf"}"#, r#"foo{NaN="inf"}"#, Some("foo")),
@@ -776,27 +776,27 @@ mod tests {
             // one group is not the selector's: the other group can match any metric.
             (
                 r#"{__name__="metric_name",label1="value1" or label2=~"value.*"}"#,
-                r#"metric_name{label1="value1"} or {label2^="value"}"#,
+                r#"{metric_name,label1="value1" or label2^="value"}"#,
                 None,
             ),
             (
                 r#"{job="prometheus",env="prod" or datacenter=~"us-.*" or instance="localhost",role!="standby"}"#,
-                r#"{job="prometheus",env="prod"} or {datacenter^="us-"} or {instance="localhost",role!="standby"}"#,
+                r#"{job="prometheus",env="prod" or datacenter^="us-" or instance="localhost",role!="standby"}"#,
                 None,
             ),
             (
                 r#"http_requests{status="400" or method="POST"}"#,
-                r#"http_requests{status="400"} or http_requests{method="POST"}"#,
+                r#"http_requests{status="400" or method="POST"}"#,
                 Some("http_requests"),
             ),
             (
                 r#"{a="b", foo!="bar" or size=(small,medium,large) or color="red",flavor!=(original,cajun,"extra spicy")}"#,
-                r#"{a="b",foo!="bar"} or {size=("small", "medium", "large")} or {color="red",flavor!=("original", "cajun", "extra spicy")}"#,
+                r#"{a="b",foo!="bar" or size=("small","medium","large") or color="red",flavor!=("original","cajun","extra spicy")}"#,
                 None,
             ),
             (
                 r#"http_status{status="500"} or api_host{service="auth", env=~"prod|staging"}"#,
-                r#"http_status{status="500"} or api_host{service="auth",env=("prod", "staging")}"#,
+                r#"{http_status,status="500" or api_host,service="auth",env=("prod","staging")}"#,
                 None,
             ),
         ] {

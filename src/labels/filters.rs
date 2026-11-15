@@ -2,6 +2,7 @@ use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::parse_series_selector;
 use crate::labels::regex::compile_matcher;
 use crate::labels::regex_utils::{RegexHints, parse_regex_matcher, regex_hints_for_pattern};
+use crate::labels::render;
 use crate::parser::ParseError;
 use crate::parser::utils::quote_string;
 use regex::Regex;
@@ -479,19 +480,6 @@ impl PredicateMatch {
             PredicateMatch::NotContains(value) => 25 + value.cost(),
         }
     }
-
-    fn text(&self) -> Option<&str> {
-        match self {
-            PredicateMatch::Equal(value) | PredicateMatch::NotEqual(value) => value.text(),
-            PredicateMatch::MatchAll => Some(MATCH_ALL_REGEX_TEXT),
-            PredicateMatch::MatchNone => Some(MATCH_ALL_REGEX_TEXT),
-            PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re) => Some(&re.value),
-            PredicateMatch::StartsWith(value) => value.text(),
-            PredicateMatch::NotStartsWith(value) => value.text(),
-            PredicateMatch::Contains(value) => value.text(),
-            PredicateMatch::NotContains(value) => value.text(),
-        }
-    }
 }
 
 impl Eq for PredicateMatch {}
@@ -624,31 +612,12 @@ impl LabelFilter {
     pub(crate) fn cost(&self) -> usize {
         self.matcher.cost()
     }
-
-    fn text(&self) -> Option<&str> {
-        self.matcher.text()
-    }
 }
 
+/// The matcher as the selector parser reads it back; see [`crate::labels::render`].
 impl Display for LabelFilter {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}{}", self.label, self.op())?;
-        match &self.matcher {
-            PredicateMatch::Equal(value) | PredicateMatch::NotEqual(value) => {
-                write!(f, "{value}")
-            }
-            PredicateMatch::MatchAll => write!(f, "{}", quote_string(MATCH_ALL_REGEX_TEXT)),
-            PredicateMatch::MatchNone => write!(f, "{}", quote_string(MATCH_ALL_REGEX_TEXT)),
-            PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re) => {
-                write!(f, "{}", quote_string(&re.value))
-            }
-            PredicateMatch::StartsWith(value) | PredicateMatch::NotStartsWith(value) => {
-                write!(f, "{value}")
-            }
-            PredicateMatch::Contains(value) | PredicateMatch::NotContains(value) => {
-                write!(f, "{value}")
-            }
-        }
+        render::write_filter(f, self)
     }
 }
 
@@ -712,9 +681,10 @@ impl FilterList {
     }
 }
 
+/// The group as an AND selector the parser reads back; see [`crate::labels::render`].
 impl Display for FilterList {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        join_matchers(f, &self.0)
+        render::write_and(f, self)
     }
 }
 
@@ -832,20 +802,11 @@ impl SeriesSelector {
     }
 }
 
+/// The selector as text the parser reads back as an equivalent selector; see
+/// [`crate::labels::render`].
 impl Display for SeriesSelector {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match &self {
-            SeriesSelector::Or(or_matchers) => {
-                for (i, matchers) in or_matchers.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " or ")?;
-                    }
-                    write!(f, "{matchers}")?;
-                }
-                Ok(())
-            }
-            SeriesSelector::And(and_matchers) => write!(f, "{and_matchers}"),
-        }
+        render::write_selector(f, self)
     }
 }
 
@@ -859,61 +820,6 @@ impl From<Vec<LabelFilter>> for SeriesSelector {
     fn from(value: Vec<LabelFilter>) -> Self {
         SeriesSelector::And(FilterList::new(value))
     }
-}
-fn join_matchers(f: &mut Formatter<'_>, v: &[LabelFilter]) -> fmt::Result {
-    // Find the metric name matcher (single __name__=value filter)
-    let metric_name_info = find_metric_name_matcher(v);
-
-    // If there's only a metric name filter, output it directly
-    if let Some((_, name)) = metric_name_info
-        && v.len() == 1
-    {
-        return write!(f, "{name}");
-    }
-
-    // Write metric name (if any) followed by labels in braces
-    let name = metric_name_info.map(|(_, n)| n).unwrap_or("");
-    write!(f, "{name}{{")?;
-
-    let mut first = true;
-    for (i, matcher) in v.iter().enumerate() {
-        // Skip the metric name matcher since we already wrote it
-        if metric_name_info.map(|(idx, _)| idx == i).unwrap_or(false) {
-            continue;
-        }
-
-        if !first {
-            write!(f, ",")?;
-        }
-        write!(f, "{matcher}")?;
-        first = false;
-    }
-
-    write!(f, "}}")
-}
-
-/// Finds the single __name__=value matcher in the filter list.
-/// Returns None if there are zero or multiple __name__ matchers.
-fn find_metric_name_matcher(filters: &[LabelFilter]) -> Option<(usize, &str)> {
-    let mut result: Option<(usize, &str)> = None;
-
-    for (i, matcher) in filters.iter().enumerate() {
-        if matcher.label == METRIC_NAME_LABEL {
-            // Multiple __name__ matchers found - invalid
-            if result.is_some() {
-                return None;
-            }
-
-            // Only Equal operations define a metric name
-            if matcher.matcher.op() == MatchOp::Equal
-                && let Some(name) = matcher.text()
-            {
-                result = Some((i, name));
-            }
-        }
-    }
-
-    result
 }
 
 #[cfg(test)]

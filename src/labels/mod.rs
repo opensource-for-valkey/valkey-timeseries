@@ -4,6 +4,7 @@ mod metric_name;
 mod regex;
 mod regex_cache;
 mod regex_utils;
+mod render;
 
 pub use crate::parser::series_selector::*;
 pub use label::*;
