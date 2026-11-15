@@ -765,46 +765,33 @@ impl SeriesSelector {
         SeriesSelector::And(matchers.into())
     }
 
+    /// The AND groups this selector is the union of. Every selector reads as an OR over its
+    /// groups: `And(g)` is the one group `g`, and `Or(gs)` is `gs`. An empty group matches every
+    /// series, and no groups at all (`Or([])`) match none.
+    pub fn groups(&self) -> std::slice::Iter<'_, FilterList> {
+        match self {
+            SeriesSelector::And(group) => std::slice::from_ref(group).iter(),
+            SeriesSelector::Or(groups) => groups.iter(),
+        }
+    }
+
     /// True if this selector on its own restricts the search to a bounded set of series,
     /// rather than requiring a full keyspace scan.
     ///
     /// A filter group is bounded when it holds at least one matcher that cannot be satisfied
     /// by a missing label — i.e. one that is neither negative (`l!=v`, `l!~re`) nor
-    /// empty-matching (`l=""`, `l=~".*"`). `Or` branches are unioned, so an `Or` selector is
-    /// bounded only when *every* branch is; `And` filters are intersected, so one bounded
-    /// matcher anywhere in the group suffices.
+    /// empty-matching (`l=""`, `l=~".*"`). Groups are unioned, so the selector is bounded only
+    /// when *every* group is (and there is at least one); within a group filters are
+    /// intersected, so one bounded matcher suffices.
     pub fn is_bounded(&self) -> bool {
-        match self {
-            SeriesSelector::And(filters) => filter_group_is_bounded(filters),
-            SeriesSelector::Or(groups) => {
-                !groups.is_empty() && groups.iter().all(filter_group_is_bounded)
-            }
-        }
+        let mut groups = self.groups().peekable();
+        groups.peek().is_some() && groups.all(filter_group_is_bounded)
     }
 
-    pub fn len(&self) -> usize {
-        match self {
-            SeriesSelector::Or(or_matchers) => or_matchers.len(),
-            SeriesSelector::And(and_matchers) => and_matchers.len(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        match self {
-            SeriesSelector::Or(or_matchers) => or_matchers.is_empty(),
-            SeriesSelector::And(and_matchers) => and_matchers.is_empty(),
-        }
-    }
-
-    /// True when the selector is exactly "every series named X": each OR branch is a single
+    /// True when the selector is exactly "every series named X": each group is a single
     /// equality on the same metric name.
     pub fn is_only_metric_name(&self) -> bool {
-        match self {
-            SeriesSelector::And(filters) => filters.is_only_metric_name(),
-            SeriesSelector::Or(groups) => {
-                self.get_metric_name().is_some() && groups.iter().all(|g| g.len() == 1)
-            }
-        }
+        self.get_metric_name().is_some() && self.groups().all(|group| group.len() == 1)
     }
 
     /// The metric name every series this selector matches must have, if there is exactly one.
@@ -813,24 +800,14 @@ impl SeriesSelector {
     /// must pin the same name (see [`group_metric_name`]). `{__name__="cpu" or job="api"}` has
     /// none, because its second branch matches any metric.
     pub fn get_metric_name(&self) -> Option<&str> {
-        match self {
-            SeriesSelector::And(filters) => filters.get_metric_name(),
-            SeriesSelector::Or(groups) => {
-                let mut names = groups.iter().map(|group| group.get_metric_name());
-                let first = names.next()??;
-                names.all(|name| name == Some(first)).then_some(first)
-            }
-        }
+        let mut names = self.groups().map(FilterList::get_metric_name);
+        let first = names.next()??;
+        names.all(|name| name == Some(first)).then_some(first)
     }
 
-    /// Merges two SeriesSelector instances into one.
-    ///
-    /// The merge logic follows these rules:
-    /// - And + And: Creates an Or selector with both filter lists
-    /// - And + Or: Adds the And filters to the Or list
-    /// - Or + And: Adds the And filters to the Or list
-    /// - Or + Or: Combines both Or lists
-    pub fn merge_with(self, other: SeriesSelector) -> Self {
+    /// The selector matching what either `self` or `other` matches: their groups, in order, as
+    /// one `Or`. (So two `And` selectors become an `Or` of two groups.) This is `a or b`.
+    pub fn or_with(self, other: SeriesSelector) -> Self {
         match (self, other) {
             // Both are And selectors - create Or with both
             (SeriesSelector::And(left), SeriesSelector::And(right)) => {
@@ -1378,5 +1355,39 @@ mod tests {
                 assert_eq!(positive.validate().is_ok(), operand.requires_present());
             }
         }
+    }
+
+    #[test]
+    fn test_selector_groups_and_or_with() {
+        use crate::labels::filters::{FilterList, SeriesSelector};
+        let group =
+            |label: &str| FilterList::from(vec![LabelFilter::equals(label.to_string(), "1")]);
+        let labels = |selector: &SeriesSelector| {
+            selector
+                .groups()
+                .map(|g| g.iter().map(|f| f.label.clone()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+
+        let a = SeriesSelector::And(group("a"));
+        assert_eq!(labels(&a), [["a"]]);
+        let empty_or = SeriesSelector::Or(vec![]);
+        assert_eq!(empty_or.groups().count(), 0);
+
+        // `or_with` keeps every group, in order; two ANDs become an OR of two.
+        let ab = a.clone().or_with(SeriesSelector::And(group("b")));
+        assert!(matches!(ab, SeriesSelector::Or(_)));
+        assert_eq!(labels(&ab), [["a"], ["b"]]);
+        let cd = SeriesSelector::Or(vec![group("c"), group("d")]);
+        assert_eq!(
+            labels(&ab.clone().or_with(cd.clone())),
+            [["a"], ["b"], ["c"], ["d"]]
+        );
+        assert_eq!(labels(&cd.or_with(a)), [["c"], ["d"], ["a"]]);
+
+        // An empty group matches everything and no groups match nothing; neither is bounded.
+        assert!(!SeriesSelector::And(FilterList::default()).is_bounded());
+        assert!(!empty_or.is_bounded());
+        assert!(ab.is_bounded());
     }
 }

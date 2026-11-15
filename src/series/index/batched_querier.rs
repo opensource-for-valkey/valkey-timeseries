@@ -189,12 +189,10 @@ pub fn plan_if_cheap(
 
 /// See [`plan_if_cheap`].
 fn selectors_plan_cheaply(selectors: &[SeriesSelector]) -> bool {
-    selectors.iter().all(|selector| match selector {
-        SeriesSelector::And(filters) => filters.iter().all(filter_plans_cheaply),
-        SeriesSelector::Or(groups) => groups
-            .iter()
-            .all(|filters| filters.iter().all(filter_plans_cheaply)),
-    })
+    selectors
+        .iter()
+        .flat_map(SeriesSelector::groups)
+        .all(|filters| filters.iter().all(filter_plans_cheaply))
 }
 
 fn filter_plans_cheaply(filter: &LabelFilter) -> bool {

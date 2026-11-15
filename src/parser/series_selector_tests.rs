@@ -84,6 +84,14 @@ mod tests {
         }
     }
 
+    /// The number of filters in an AND selector.
+    fn and_len(selector: &SeriesSelector) -> usize {
+        match selector {
+            SeriesSelector::And(filters) => filters.len(),
+            _ => panic!("expected AND matcher"),
+        }
+    }
+
     fn with_or_matchers<F>(matchers: &SeriesSelector, f: F)
     where
         F: Fn(&[FilterList]),
@@ -186,13 +194,13 @@ mod tests {
         let matchers = parse_series_selector(input).unwrap();
 
         assert_eq!(matchers.get_metric_name(), Some("metric_name"));
-        assert_eq!(matchers.len(), 1);
+        assert_eq!(and_len(&matchers), 1);
         assert!(matchers.is_only_metric_name());
 
         let input = "metric_name{}";
         let matchers = parse_series_selector(input).unwrap();
         assert_eq!(matchers.get_metric_name(), Some("metric_name"));
-        assert_eq!(matchers.len(), 1);
+        assert_eq!(and_len(&matchers), 1);
         assert!(matchers.is_only_metric_name());
     }
 

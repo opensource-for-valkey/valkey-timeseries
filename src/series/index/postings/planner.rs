@@ -238,7 +238,9 @@ impl<'a> Terms<'a> {
 
     fn process_or_matchers(self, filters: &[FilterList]) -> ValkeyResult<Cow<'a, PostingsBitmap>> {
         match filters {
-            [] => Ok(Cow::Borrowed(self.all())),
+            // A union of no groups is empty. The parser never builds one; a fan-out payload can,
+            // and it must not widen to every series.
+            [] => Ok(Cow::Borrowed(&*EMPTY_BITMAP)),
             [filters] => self.postings_for_label_filters(filters),
             _ => filters
                 .iter()
@@ -660,5 +662,23 @@ mod tests {
             let result = postings.postings_for_label_filters(&filters).unwrap();
             assert_eq!(result.iter().collect::<Vec<_>>(), vec![1], "{operand:?}");
         }
+    }
+
+    /// A union of no groups is empty. It used to return every series, so a fan-out payload
+    /// carrying `Or([])` made a shard answer with its whole keyspace.
+    #[test]
+    fn an_or_of_no_groups_matches_nothing() {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "job", "api");
+        postings.add_posting_for_label_value(2, "job", "web");
+        let result = postings
+            .postings_for_selector(&SeriesSelector::Or(vec![]))
+            .unwrap();
+        assert!(result.is_empty());
+        // An AND of no filters, by contrast, matches every series.
+        let all = postings
+            .postings_for_selector(&SeriesSelector::And(FilterList::default()))
+            .unwrap();
+        assert_eq!(all.iter().collect::<Vec<_>>(), vec![1, 2]);
     }
 }

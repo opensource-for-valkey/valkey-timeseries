@@ -49,7 +49,7 @@ pub fn parse_series_selector(s: &str) -> ParseResult<SeriesSelector> {
     let mut cur = Cursor::new(s);
     let mut selector = parse_one_selector(&mut cur)?;
     while cur.next_if(Token::OpOr)?.is_some() {
-        selector = selector.merge_with(parse_one_selector(&mut cur)?);
+        selector = selector.or_with(parse_one_selector(&mut cur)?);
     }
     cur.expect(&[Token::OpOr, Token::Eof], "series selector")?;
     Ok(selector)
