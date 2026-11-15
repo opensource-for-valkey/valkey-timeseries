@@ -206,7 +206,7 @@ class TestIgnore:
         diff("TS.CREATE", "c:ign:big", "DUPLICATE_POLICY", "LAST", "IGNORE", timediff, 1)
         diff("TS.INFO", "c:ign:big")
 
-    @pytest.mark.parametrize("value", ["nan", "-010"])
+    @pytest.mark.parametrize("value", ["nan", "-010", "--1", "+-1", "1__0"])
     def test_ignore_nan_and_negative_rejected(self, diff, value):
         with pytest.raises(ResponseError):
             diff("TS.CREATE", "c:ign:nan", "DUPLICATE_POLICY", "LAST", "IGNORE", 0, value)

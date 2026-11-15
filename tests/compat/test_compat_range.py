@@ -627,7 +627,7 @@ class TestFilterByValue:
         mk_populated(diff, "r:fbvform", [(1, 8.0), (2, 9.0), (3, 10.0), (4, 10.5), (5, 11.0)])
         diff(range_cmd, "r:fbvform", "-", "+", "FILTER_BY_VALUE", low, "20")
 
-    @pytest.mark.parametrize("low", ["nan", "0x", "1e"])
+    @pytest.mark.parametrize("low", ["nan", "0x", "1e", "--8", "+-8", "-+8", "1__0", "_10", "10_"])
     def test_filter_by_value_unparseable_operand_rejected(self, diff, range_cmd, low):
         mk_populated(diff, "r:fbvunp", BASE_SAMPLES)
         with pytest.raises(ResponseError):
