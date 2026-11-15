@@ -482,8 +482,8 @@ pub fn get_series_labels<'a>(
 mod tests {
     use super::*;
     use crate::commands::command_parser::{
-        parse_chunk_size, parse_duration, parse_duration_ms,
-        parse_metric_name as parse_create_metric,
+        parse_chunk_size, parse_metric_name as parse_create_metric, parse_nonnegative_duration,
+        parse_nonnegative_duration_ms,
     };
     use crate::parser::number::parse_number;
     use crate::series::DuplicatePolicy;
@@ -643,7 +643,7 @@ mod tests {
             let args = create_option_strings(&series);
             let rendered = &operands(&args, "RETENTION", 1)[0];
             assert_eq!(
-                parse_duration(rendered).unwrap(),
+                parse_nonnegative_duration(rendered).unwrap(),
                 Duration::from_millis(retention_ms),
                 "{rendered}"
             );
@@ -695,7 +695,7 @@ mod tests {
                 unreachable!()
             };
             assert_eq!(
-                parse_duration_ms(time).unwrap(),
+                parse_nonnegative_duration_ms(time).unwrap(),
                 time_delta as i64,
                 "{time}"
             );

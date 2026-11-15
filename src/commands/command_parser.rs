@@ -6,7 +6,6 @@ use crate::common::rounding::{
 };
 use crate::common::time::current_time_millis;
 use crate::config::is_strict_rts_compat;
-use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
 use crate::join::join_reducer::JoinReducer;
 use crate::join::{AsOfJoinOptions, AsOfJoinStrategy, JoinOptions, JoinType};
@@ -14,9 +13,8 @@ use crate::labels::filters::SeriesSelector;
 use crate::labels::{Label, MAX_LABELS_PER_SERIES, parse_series_selector};
 use crate::parser::number::parse_number;
 use crate::parser::{
-    metric_name::parse_metric_name as parse_metric, number::parse_number as parse_number_internal,
-    parse_positive_duration_value, timestamp::parse_timestamp as parse_timestamp_internal,
-    timestamp::timestamp_error,
+    metric_name::parse_metric_name as parse_metric, parse_nonnegative_duration_value,
+    timestamp::parse_timestamp as parse_timestamp_internal, timestamp::timestamp_error,
 };
 use crate::series::chunks::{ChunkEncoding, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::series::request_types::{
@@ -169,7 +167,7 @@ pub fn parse_bucket_duration_str(arg: &str) -> ValkeyResult<Duration> {
     if let Ok(value) = arg.parse::<i64>() {
         return bucket_duration_from_millis(value);
     }
-    let duration = parse_duration(arg)
+    let duration = parse_nonnegative_duration(arg)
         .map_err(|_| ValkeyError::Str(error_consts::CANNOT_PARSE_AGGREGATION))?;
     if duration.is_zero() {
         return Err(ValkeyError::Str(error_consts::BUCKET_DURATION_TOO_SMALL));
@@ -184,19 +182,15 @@ fn bucket_duration_from_millis(value: i64) -> ValkeyResult<Duration> {
     Ok(Duration::from_millis(value as u64))
 }
 
-pub fn parse_duration(arg: &str) -> ValkeyResult<Duration> {
-    parse_duration_ms(arg).map(|d| Duration::from_millis(d as u64))
+/// A nonnegative duration operand (`RETENTION`, `IGNORE`, `BLOCK`, ...) as a `Duration`.
+pub fn parse_nonnegative_duration(arg: &str) -> ValkeyResult<Duration> {
+    parse_nonnegative_duration_ms(arg).map(|d| Duration::from_millis(d as u64))
 }
 
-pub fn parse_duration_ms(arg: &str) -> ValkeyResult<i64> {
-    parse_positive_duration_value(arg).map_err(|_| ValkeyError::Str(error_consts::INVALID_DURATION))
-}
-
-pub fn parse_number_with_unit(arg: &str) -> TsdbResult<f64> {
-    if arg.is_empty() {
-        return Err(TsdbError::InvalidNumber(arg.to_string()));
-    }
-    parse_number_internal(arg).map_err(|_e| TsdbError::InvalidNumber(arg.to_string()))
+/// A nonnegative duration operand in milliseconds; `TSDB: invalid duration` otherwise.
+pub fn parse_nonnegative_duration_ms(arg: &str) -> ValkeyResult<i64> {
+    parse_nonnegative_duration_value(arg)
+        .map_err(|_| ValkeyError::Str(error_consts::INVALID_DURATION))
 }
 
 pub fn parse_metric_name(arg: &str) -> ValkeyResult<Vec<Label>> {
@@ -237,8 +231,8 @@ pub fn parse_chunk_size(arg: &str) -> ValkeyResult<usize> {
         return Err(ValkeyError::Str(error_consts::CANNOT_PARSE_CHUNK_SIZE));
     }
 
-    let chunk_size = parse_number_internal(arg)
-        .map_err(|_e| ValkeyError::Str(error_consts::CANNOT_PARSE_CHUNK_SIZE))?;
+    let chunk_size =
+        parse_number(arg).map_err(|_e| ValkeyError::Str(error_consts::CANNOT_PARSE_CHUNK_SIZE))?;
 
     if chunk_size != chunk_size.floor() {
         return get_error_result();
@@ -286,7 +280,8 @@ pub fn parse_timestamp_range(args: &mut CommandArgIterator) -> ValkeyResult<Time
 
 pub fn parse_retention(args: &mut CommandArgIterator) -> ValkeyResult<Duration> {
     if let Ok(next) = args.next_str() {
-        parse_duration(next).map_err(|_e| ValkeyError::Str(error_consts::CANNOT_PARSE_RETENTION))
+        parse_nonnegative_duration(next)
+            .map_err(|_e| ValkeyError::Str(error_consts::CANNOT_PARSE_RETENTION))
     } else {
         Err(ValkeyError::Str(error_consts::CANNOT_PARSE_RETENTION))
     }
@@ -331,13 +326,13 @@ pub fn parse_value_filter(args: &mut CommandArgIterator) -> ValkeyResult<ValueFi
     let min_arg = args
         .next_str()
         .map_err(|_| ValkeyError::Str(error_consts::FILTER_BY_VALUE_MISSING_ARGS))?;
-    let min = parse_number_with_unit(min_arg)
-        .map_err(|_| ValkeyError::Str(error_consts::CANNOT_PARSE_MIN))?;
+    let min =
+        parse_number(min_arg).map_err(|_| ValkeyError::Str(error_consts::CANNOT_PARSE_MIN))?;
     let max_arg = args
         .next_str()
         .map_err(|_| ValkeyError::Str(error_consts::FILTER_BY_VALUE_MISSING_ARGS))?;
-    let max = parse_number_with_unit(max_arg)
-        .map_err(|_| ValkeyError::Str(error_consts::CANNOT_PARSE_MAX))?;
+    let max =
+        parse_number(max_arg).map_err(|_| ValkeyError::Str(error_consts::CANNOT_PARSE_MAX))?;
     if min.is_nan() {
         return Err(ValkeyError::Str(error_consts::CANNOT_PARSE_MIN));
     }
@@ -720,7 +715,7 @@ pub(crate) fn parse_ignore_options(args: &mut CommandArgIterator) -> ValkeyResul
 
     // ignoreMaxTimediff
     let mut str = args.next_str().map_err(|_| missing())?;
-    let ignore_max_timediff = parse_duration_ms(str).map_err(|_| {
+    let ignore_max_timediff = parse_nonnegative_duration_ms(str).map_err(|_| {
         // A negative time diff does not parse as a duration; report it as the
         // negative-argument case rather than as unparseable (RTS text).
         if parse_number(str).is_ok_and(|n| n < 0.0) {
@@ -1337,7 +1332,7 @@ fn parse_asof_join_options(args: &mut CommandArgIterator) -> ValkeyResult<JoinTy
             // An empty argument is not a duration; fall through and let the syntax
             // handling below report it rather than indexing into an empty string.
             if arg_str.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
-                let tolerance_ms = parse_duration_ms(arg_str)?;
+                let tolerance_ms = parse_nonnegative_duration_ms(arg_str)?;
                 if tolerance_ms < 0 {
                     return Err(ValkeyError::Str(error_consts::INVALID_ASOF_TOLERANCE));
                 }
