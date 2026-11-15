@@ -257,13 +257,18 @@ impl Hash for PredicateValue {
     }
 }
 
+/// A compiled regex plus the prefilters derived from it. The fields are private because the
+/// prefilters must agree with the regex: the postings planner trusts `prefix` to narrow its
+/// scan, so a prefix the regex does not imply would drop matching series. Build one with
+/// [`Self::create`], [`Self::from_parts`] or [`Self::with_hints`].
 #[derive(Clone, Debug)]
 pub struct RegexMatcher {
-    pub regex: Regex,
-    pub prefix: Option<String>,
-    pub suffix: Option<String>,
-    pub required_literals: SmallVec<[String; 2]>,
-    pub value: String, // original (possibly unanchored) string
+    regex: Regex,
+    prefix: Option<String>,
+    suffix: Option<String>,
+    required_literals: SmallVec<[String; 2]>,
+    /// The pattern as the user wrote it; the fan-out codec sends this, and a shard recompiles it.
+    value: String,
 }
 
 impl Hash for RegexMatcher {
@@ -303,6 +308,26 @@ impl RegexMatcher {
             suffix: hints.suffix,
             required_literals: hints.required_literals.into(),
         }
+    }
+
+    /// The pattern as written.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// A literal every matching value starts with, if the decomposition found one.
+    pub fn prefix(&self) -> Option<&str> {
+        self.prefix.as_deref()
+    }
+
+    /// A literal every matching value ends with, if one was found.
+    pub fn suffix(&self) -> Option<&str> {
+        self.suffix.as_deref()
+    }
+
+    /// Literals every matching value contains, in order, after the prefix.
+    pub fn required_literals(&self) -> &[String] {
+        &self.required_literals
     }
 
     pub fn create(value: &str) -> Result<Self, ParseError> {
@@ -483,6 +508,26 @@ impl PredicateMatch {
         }
     }
 
+    /// Reject operands no matcher may hold: an empty needle, or no needles, for the prefix and
+    /// substring matchers. [`LabelFilter::create_with_value`] and the fan-out decoder both apply
+    /// this, so a constructed matcher's match functions can trust their operands.
+    pub(crate) fn validate(&self) -> Result<(), ParseError> {
+        match self {
+            PredicateMatch::StartsWith(value) | PredicateMatch::NotStartsWith(value) => {
+                validate_starts_with_value(value)
+            }
+            PredicateMatch::Contains(value) | PredicateMatch::NotContains(value) => {
+                validate_contains_value(value)
+            }
+            PredicateMatch::Equal(_)
+            | PredicateMatch::NotEqual(_)
+            | PredicateMatch::MatchAll
+            | PredicateMatch::MatchNone
+            | PredicateMatch::RegexEqual(_)
+            | PredicateMatch::RegexNotEqual(_) => Ok(()),
+        }
+    }
+
     pub(crate) fn cost(&self) -> usize {
         match &self {
             PredicateMatch::Equal(value) => value.cost(),
@@ -621,85 +666,34 @@ impl LabelFilter {
     where
         N: Into<String>,
     {
-        let label = label.into();
-
-        match match_op {
-            MatchOp::Equal => Ok(Self {
-                label,
-                matcher: PredicateMatch::Equal(value),
-            }),
-            MatchOp::NotEqual => Ok(Self {
-                label,
-                matcher: PredicateMatch::NotEqual(value),
-            }),
-            MatchOp::RegexEqual => {
-                let Some(value) = value.text() else {
-                    return Err(ParseError::General(
-                        "regex matcher requires a single value".to_string(),
-                    ));
-                };
-                let matcher = parse_regex_matcher(value, true)?;
-                Ok(Self { label, matcher })
-            }
-            MatchOp::RegexNotEqual => {
-                let Some(value) = value.text() else {
-                    return Err(ParseError::General(
-                        "regex matcher requires a single value".to_string(),
-                    ));
-                };
-                let matcher = parse_regex_matcher(value, false)?;
-                Ok(Self { label, matcher })
-            }
-            MatchOp::StartsWith => {
-                validate_starts_with_value(&value)?;
-                Ok(Self {
-                    label,
-                    matcher: PredicateMatch::StartsWith(value),
-                })
-            }
-            MatchOp::NotStartsWith => {
-                validate_starts_with_value(&value)?;
-                Ok(Self {
-                    label,
-                    matcher: PredicateMatch::NotStartsWith(value),
-                })
-            }
-            MatchOp::Contains => {
-                validate_contains_value(&value)?;
-                Ok(Self {
-                    label,
-                    matcher: PredicateMatch::Contains(value),
-                })
-            }
-            MatchOp::NotContains => {
-                validate_contains_value(&value)?;
-                Ok(Self {
-                    label,
-                    matcher: PredicateMatch::NotContains(value),
-                })
-            }
-            MatchOp::MatchAll => Ok(Self {
-                label,
-                matcher: PredicateMatch::MatchAll,
-            }),
-            MatchOp::MatchNone => Ok(Self {
-                label,
-                matcher: PredicateMatch::MatchNone,
-            }),
-        }
+        let regex_text = |value: &PredicateValue| {
+            value.text().map(str::to_owned).ok_or_else(|| {
+                ParseError::General("regex matcher requires a single value".to_string())
+            })
+        };
+        let matcher = match match_op {
+            MatchOp::Equal => PredicateMatch::Equal(value),
+            MatchOp::NotEqual => PredicateMatch::NotEqual(value),
+            MatchOp::RegexEqual => parse_regex_matcher(&regex_text(&value)?, true)?,
+            MatchOp::RegexNotEqual => parse_regex_matcher(&regex_text(&value)?, false)?,
+            MatchOp::StartsWith => PredicateMatch::StartsWith(value),
+            MatchOp::NotStartsWith => PredicateMatch::NotStartsWith(value),
+            MatchOp::Contains => PredicateMatch::Contains(value),
+            MatchOp::NotContains => PredicateMatch::NotContains(value),
+            MatchOp::MatchAll => PredicateMatch::MatchAll,
+            MatchOp::MatchNone => PredicateMatch::MatchNone,
+        };
+        matcher.validate()?;
+        Ok(Self {
+            label: label.into(),
+            matcher,
+        })
     }
 
     pub fn equals(label: String, value: &str) -> Self {
         Self {
             label,
             matcher: PredicateMatch::Equal(value.into()),
-        }
-    }
-
-    pub fn prefix(label: String, value: String) -> Self {
-        Self {
-            label,
-            matcher: PredicateMatch::StartsWith(PredicateValue::String(value)),
         }
     }
 

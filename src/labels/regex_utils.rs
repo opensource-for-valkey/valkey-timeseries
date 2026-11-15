@@ -1651,13 +1651,14 @@ mod test {
                 };
                 regex_matchers += 1;
                 let rebuilt = RegexMatcher::from_parts(
-                    super::compile_regex(&parsed.value).unwrap(),
-                    parsed.value.clone(),
-                    parsed.prefix.clone(),
+                    super::compile_regex(parsed.value()).unwrap(),
+                    parsed.value().to_string(),
+                    parsed.prefix().map(str::to_string),
                 );
-                assert_eq!(parsed.suffix, rebuilt.suffix, "suffix for {pattern:?}");
+                assert_eq!(parsed.suffix(), rebuilt.suffix(), "suffix for {pattern:?}");
                 assert_eq!(
-                    parsed.required_literals, rebuilt.required_literals,
+                    parsed.required_literals(),
+                    rebuilt.required_literals(),
                     "required literals for {pattern:?}"
                 );
             }

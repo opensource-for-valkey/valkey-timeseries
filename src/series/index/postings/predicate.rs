@@ -167,7 +167,7 @@ fn handle_regex_equal_match<'a>(
         debug_assert!(false, "unexpected matcher type in handle_regex_equal_match");
         return Err(ValkeyError::Str(INTERNAL_ERROR));
     };
-    let res = if let Some(prefix) = &re.prefix {
+    let res = if let Some(prefix) = re.prefix() {
         postings.postings_by_prefix_and_predicate(&filter.label, prefix, |v| re.is_match(v))
     } else {
         let mut state = ();
