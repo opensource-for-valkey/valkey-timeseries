@@ -5,4 +5,5 @@
 
 pub mod chunk_utils;
 pub mod generators;
+pub mod parsers;
 pub mod selectors;
