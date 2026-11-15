@@ -1,6 +1,6 @@
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::parse_series_selector;
-use crate::labels::regex::parse_regex_anchored;
+use crate::labels::regex::compile_matcher;
 use crate::labels::regex_utils::{RegexHints, parse_regex_matcher, regex_hints_for_pattern};
 use crate::parser::ParseError;
 use crate::parser::utils::quote_string;
@@ -306,8 +306,9 @@ impl RegexMatcher {
     }
 
     pub fn create(value: &str) -> Result<Self, ParseError> {
-        let (regex, unanchored) = parse_regex_anchored(value)?;
-        Ok(Self::new(regex, unanchored.to_string()))
+        let regex = compile_matcher(value)
+            .map_err(|err| ParseError::InvalidRegex(format!("`{value}`: {err}")))?;
+        Ok(Self::new(regex, value.to_string()))
     }
 
     pub fn is_match(&self, other: &str) -> bool {

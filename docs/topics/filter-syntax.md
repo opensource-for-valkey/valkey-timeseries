@@ -153,6 +153,31 @@ that have one. (On its own, `{city=""}` has no positive matcher and is rejected;
 Matchers inside one pair of braces are ANDed. `or` between groups of matchers ORs them, and `or` between whole
 selectors does the same: `{city="NYC" or city="LA"}` and `temperature{city="NYC"} or humidity` are single selectors.
 
+### Regular Expression Syntax
+
+Regular expressions follow Prometheus: [RE2 syntax](https://github.com/google/re2/wiki/Syntax),
+as Go's `regexp` package reads it.
+
+- **Fully anchored.** `city=~"NY"` matches only `NY`, not `NYC`; write `NY.*` for a prefix.
+  Explicit `^` and `$` are allowed and change nothing.
+- **`.` matches any character, newline included.**
+- **`\d`, `\w`, `\s` and `\b` are ASCII**, as in Go: `\d` is `[0-9]`, `\w` is `[0-9A-Za-z_]`,
+  `\s` is `[\t\n\f\r ]`. Use `\pN` or `\pL` to match Unicode digits or letters.
+- **A `{` that does not start a repeat is a literal**: `abc{def}` matches the text `abc{def}`.
+- **Repeat counts are limited to 1000**, including the product of nested counts: `(a{10}){100}`
+  is accepted, `(a{10}){101}` is not.
+- `\Q...\E` quotes literal text, and `[[:alpha:]]`-style POSIX classes are supported.
+
+A pattern that is valid but compiles to more than 4 MiB is rejected with an error saying it is
+too large. In practice this only happens with long repeats of large Unicode classes, such as
+`\pL{1000}`.
+
+Two kinds of pattern that Prometheus accepts are rejected:
+
+- Patterns that only parse because Prometheus inserts the pattern into its own `^(?s:...)$`
+  wrapper, such as an unbalanced `)(`.
+- A repeat applied to a bare flag group, such as `(?i)*`.
+
 ### Label Value Quoting
 
 In the Prometheus-style form, label values are quoted using:

@@ -6,12 +6,10 @@ use crate::labels::filters::{
     PredicateMatch, PredicateValue, RegexMatcher, validate_contains_value,
     validate_starts_with_value,
 };
-use crate::labels::regex::{build_cached, try_escape_for_repeat_re};
+use crate::labels::regex::{RegexError, compile_matcher, compile_rust_syntax, parse_matcher_hir};
 use crate::labels::regex_cache::{PatternCache, REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN};
 use crate::parser::{ParseError, ParseResult};
-use regex::Error as RegexError;
 use regex::Regex;
-use regex_syntax::ParserBuilder;
 use regex_syntax::hir::Class::{Bytes, Unicode};
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 use std::sync::LazyLock;
@@ -57,7 +55,7 @@ pub(crate) fn parse_regex_matcher(expr: &str, is_equal: bool) -> ParseResult<Pre
 }
 
 fn decompose_matcher(expr: &str, is_equal: bool) -> ParseResult<PredicateMatch> {
-    let invalid = |_| ParseError::InvalidRegex(expr.to_string());
+    let invalid = |err: RegexError| ParseError::InvalidRegex(format!("`{expr}`: {err}"));
     // Parse once: the decomposition and the matcher's prefilter hints both
     // read this tree.
     let inner = parse_anchored_hir(expr).map_err(invalid)?;
@@ -317,18 +315,10 @@ fn is_any_char_class(class: &Class) -> bool {
     }
 }
 
-/// Parse `pattern` the way `compile_regex` compiles it, so the decomposition
-/// and the compiled regex agree: the same flags (what `.` matches), and the
-/// same retry with Go-style literal braces (`abc{def}`) escaped.
+/// Parse `pattern` the way `compile_regex` compiles it (Go syntax, `.` matching a newline), so
+/// the decomposition and the compiled regex agree on what it means.
 fn build_hir(pattern: &str) -> Result<Hir, RegexError> {
-    let parse = |p: &str| {
-        ParserBuilder::new()
-            .dot_matches_new_line(true)
-            .build()
-            .parse(p)
-            .map_err(|err| RegexError::Syntax(err.to_string()))
-    };
-    parse(pattern).or_else(|err| parse(&try_escape_for_repeat_re(pattern)).map_err(|_| err))
+    parse_matcher_hir(pattern)
 }
 
 /// Result of decomposing a regex for postings-index optimization.
@@ -457,10 +447,10 @@ fn decompose_parsed(expr: &str, inner: &Hir) -> Result<RegexDecomposition, Regex
     Ok(RegexDecomposition::Regex(compile_regex(expr)?))
 }
 
-/// The fully anchored regex for `expr`, from the process-wide matcher cache (`regex_cache`).
+/// Compile a user's pattern (Go syntax), anchored at both ends, through the process-wide
+/// cache of compiled matchers (`regex_cache`).
 pub(crate) fn compile_regex(expr: &str) -> Result<Regex, RegexError> {
-    let anchored = format!("^(?:{})$", expr);
-    build_cached(&anchored)
+    compile_matcher(expr)
 }
 
 pub(crate) fn compile_prefixed_regex(
@@ -472,7 +462,8 @@ pub(crate) fn compile_prefixed_regex(
     // (including the prefix), prefix the (escaped) literal prefix to the
     // remainder pattern and compile the resulting expression.
     let combined = format!("{}{}", regex::escape(&prefix), pattern);
-    let compiled = compile_regex(&combined)?;
+    // `pattern` is a printed `Hir` or built here, so it is Rust syntax already.
+    let compiled = compile_rust_syntax(&combined)?;
     Ok(RegexDecomposition::PrefixWithRegex(prefix, compiled))
 }
 
