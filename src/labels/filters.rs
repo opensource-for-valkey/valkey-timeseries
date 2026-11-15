@@ -1,19 +1,18 @@
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::parse_series_selector;
-use crate::labels::regex::parse_regex_anchored;
+use crate::labels::regex::CompiledRegex;
+use crate::labels::regex::compile_matcher;
+use crate::labels::regex_cache::HeapSize;
 use crate::labels::regex_utils::{RegexHints, parse_regex_matcher, regex_hints_for_pattern};
+use crate::labels::render;
 use crate::parser::ParseError;
 use crate::parser::utils::quote_string;
-use regex::Regex;
 use smallvec::SmallVec;
 use std::cmp::PartialEq;
 use std::default::Default;
 use std::fmt;
 use std::fmt::{Display, Formatter};
-use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
-
-const MATCH_ALL_REGEX_TEXT: &str = ".*";
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 pub enum MatchOp {
@@ -25,8 +24,6 @@ pub enum MatchOp {
     NotStartsWith,
     Contains,
     NotContains,
-    MatchAll,
-    MatchNone,
 }
 
 impl MatchOp {
@@ -46,8 +43,6 @@ impl Display for MatchOp {
             MatchOp::NotStartsWith => write!(f, "^~"),
             MatchOp::Contains => write!(f, "*="),
             MatchOp::NotContains => write!(f, "!*="),
-            MatchOp::MatchAll => write!(f, "*="),
-            MatchOp::MatchNone => write!(f, "!~"), // TODO
         }
     }
 }
@@ -107,60 +102,48 @@ impl PredicateValue {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
+    /// True when this value matches only a missing label: `Empty` (the RTS `l=` form),
+    /// `String("")`, or a list whose alternatives are all `""` (including none). These are three
+    /// spellings of one thing; code that asks "is this the absent value?" asks this, not which
+    /// variant it is.
+    pub fn is_absent(&self) -> bool {
         match self {
-            PredicateValue::List(list) => list.is_empty(),
-            PredicateValue::String(value) => value.is_empty(),
             PredicateValue::Empty => true,
+            PredicateValue::String(value) => value.is_empty(),
+            PredicateValue::List(list) => list.iter().all(String::is_empty),
         }
     }
 
+    /// True when every alternative is a value a series must actually carry: at least one, and
+    /// none empty. The operand rule for the prefix and substring matchers, and the case the
+    /// planner can answer from the index alone. A list mixing `""` with values is neither this
+    /// nor [`Self::is_absent`].
+    pub fn requires_present(&self) -> bool {
+        match self {
+            PredicateValue::Empty => false,
+            PredicateValue::String(value) => !value.is_empty(),
+            PredicateValue::List(list) => !list.is_empty() && list.iter().all(|v| !v.is_empty()),
+        }
+    }
+
+    /// Whether `value` contains any of the needles. Construction rejects empty needles and empty
+    /// lists ([`PredicateMatch::validate`]); without them this would be true (an empty needle) or
+    /// false (no needles), and `NotContains` is its exact complement either way.
     pub fn matches_contains_any(&self, value: &str) -> bool {
         match self {
             PredicateValue::Empty => false,
-            PredicateValue::String(s) => !s.is_empty() && value.contains(s),
-            PredicateValue::List(list) => {
-                !list.is_empty()
-                    && list.iter().all(|needle| !needle.is_empty())
-                    && list.iter().any(|needle| value.contains(needle.as_str()))
-            }
+            PredicateValue::String(needle) => value.contains(needle.as_str()),
+            PredicateValue::List(list) => list.iter().any(|needle| value.contains(needle.as_str())),
         }
     }
 
-    pub fn matches_not_contains_all(&self, value: &str) -> bool {
-        match self {
-            PredicateValue::Empty => false,
-            PredicateValue::String(s) => !s.is_empty() && !value.contains(s),
-            PredicateValue::List(list) => {
-                !list.is_empty()
-                    && list.iter().all(|needle| !needle.is_empty())
-                    && list.iter().all(|needle| !value.contains(needle.as_str()))
-            }
-        }
-    }
-
+    /// Whether `value` starts with any of the prefixes; see [`Self::matches_contains_any`].
     pub fn matches_starts_with_any(&self, value: &str) -> bool {
         match self {
             PredicateValue::Empty => false,
-            PredicateValue::String(prefix) => !prefix.is_empty() && value.starts_with(prefix),
+            PredicateValue::String(prefix) => value.starts_with(prefix.as_str()),
             PredicateValue::List(list) => {
-                !list.is_empty()
-                    && list.iter().all(|prefix| !prefix.is_empty())
-                    && list.iter().any(|prefix| value.starts_with(prefix.as_str()))
-            }
-        }
-    }
-
-    pub fn matches_not_starts_with_all(&self, value: &str) -> bool {
-        match self {
-            PredicateValue::Empty => false,
-            PredicateValue::String(prefix) => !prefix.is_empty() && !value.starts_with(prefix),
-            PredicateValue::List(list) => {
-                !list.is_empty()
-                    && list.iter().all(|prefix| !prefix.is_empty())
-                    && list
-                        .iter()
-                        .all(|prefix| !value.starts_with(prefix.as_str()))
+                list.iter().any(|prefix| value.starts_with(prefix.as_str()))
             }
         }
     }
@@ -174,40 +157,25 @@ impl PredicateValue {
     }
 }
 
-pub(crate) fn validate_contains_value(value: &PredicateValue) -> Result<(), ParseError> {
-    let is_valid = match value {
-        PredicateValue::Empty => false,
-        PredicateValue::String(s) => !s.is_empty(),
-        PredicateValue::List(list) => {
-            !list.is_empty() && list.iter().all(|needle| !needle.is_empty())
-        }
-    };
-
-    if is_valid {
+/// A prefix or substring operand must be needles a value can contain: at least one, none
+/// empty. An empty needle would match every value and no needles would match none, neither of
+/// which anyone writes on purpose.
+fn require_needles(value: &PredicateValue, matcher: &str) -> Result<(), ParseError> {
+    if value.requires_present() {
         Ok(())
     } else {
-        Err(ParseError::General(
-            "contains matcher does not allow empty values".to_string(),
-        ))
+        Err(ParseError::General(format!(
+            "{matcher} matcher does not allow empty values"
+        )))
     }
 }
 
-pub(crate) fn validate_starts_with_value(value: &PredicateValue) -> Result<(), ParseError> {
-    let is_valid = match value {
-        PredicateValue::Empty => false,
-        PredicateValue::String(prefix) => !prefix.is_empty(),
-        PredicateValue::List(list) => {
-            !list.is_empty() && list.iter().all(|prefix| !prefix.is_empty())
-        }
-    };
+pub(crate) fn validate_contains_value(value: &PredicateValue) -> Result<(), ParseError> {
+    require_needles(value, "contains")
+}
 
-    if is_valid {
-        Ok(())
-    } else {
-        Err(ParseError::General(
-            "starts with matcher does not allow empty values".to_string(),
-        ))
-    }
+pub(crate) fn validate_starts_with_value(value: &PredicateValue) -> Result<(), ParseError> {
+    require_needles(value, "starts with")
 }
 
 impl From<Vec<String>> for PredicateValue {
@@ -239,59 +207,38 @@ impl PartialEq for PredicateValue {
     }
 }
 
-impl Hash for PredicateValue {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            PredicateValue::Empty => state.write_u8(1),
-            PredicateValue::String(s) => {
-                state.write_u8(2);
-                s.hash(state);
-            }
-            PredicateValue::List(values) => {
-                state.write_u8(3);
-                for value in values {
-                    value.hash(state);
-                }
-            }
-        }
-    }
-}
-
+/// A compiled regex plus the prefilters derived from it. The fields are private because the
+/// prefilters must agree with the regex: the postings planner trusts `prefix` to narrow its
+/// scan, so a prefix the regex does not imply would drop matching series. Build one with
+/// [`Self::create`], [`Self::from_parts`] or [`Self::with_hints`].
 #[derive(Clone, Debug)]
 pub struct RegexMatcher {
-    pub regex: Regex,
-    pub prefix: Option<String>,
-    pub suffix: Option<String>,
-    pub required_literals: SmallVec<[String; 2]>,
-    pub value: String, // original (possibly unanchored) string
-}
-
-impl Hash for RegexMatcher {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.regex.as_str().hash(state);
-        self.prefix.hash(state);
-        self.suffix.hash(state);
-        self.required_literals.hash(state);
-        self.value.hash(state);
-    }
+    regex: CompiledRegex,
+    prefix: Option<String>,
+    suffix: Option<String>,
+    required_literals: SmallVec<[String; 2]>,
+    /// The pattern matches exactly the non-empty values (see [`RegexHints`]).
+    any_non_empty: bool,
+    /// The pattern as the user wrote it; the fan-out codec sends this, and a shard recompiles it.
+    value: String,
 }
 
 impl RegexMatcher {
-    fn new(regex: Regex, value: String) -> Self {
+    fn new(regex: CompiledRegex, value: String) -> Self {
         Self::from_parts(regex, value, None)
     }
 
     /// Build a matcher for `value`, deriving the prefilter hints from it.
     /// This parses `value` once; callers that already hold its parsed form use
     /// [`Self::with_hints`].
-    pub(crate) fn from_parts(regex: Regex, value: String, prefix: Option<String>) -> Self {
+    pub(crate) fn from_parts(regex: CompiledRegex, value: String, prefix: Option<String>) -> Self {
         let hints = regex_hints_for_pattern(&value, prefix.as_deref());
         Self::with_hints(regex, value, prefix, hints)
     }
 
     /// Build a matcher from hints the caller already derived from `value`.
     pub(crate) fn with_hints(
-        regex: Regex,
+        regex: CompiledRegex,
         value: String,
         prefix: Option<String>,
         hints: RegexHints,
@@ -302,15 +249,46 @@ impl RegexMatcher {
             prefix,
             suffix: hints.suffix,
             required_literals: hints.required_literals.into(),
+            any_non_empty: hints.matches_any_non_empty,
         }
     }
 
+    /// True when the pattern matches exactly the non-empty values: `.+`, `^.+$`, `(.+)`,
+    /// `.+.*` and so on. Recognized on the parsed pattern, not its text.
+    pub fn matches_any_non_empty(&self) -> bool {
+        self.any_non_empty
+    }
+
+    /// The pattern as written.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// A literal every matching value starts with, if the decomposition found one.
+    pub fn prefix(&self) -> Option<&str> {
+        self.prefix.as_deref()
+    }
+
+    /// A literal every matching value ends with, if one was found.
+    pub fn suffix(&self) -> Option<&str> {
+        self.suffix.as_deref()
+    }
+
+    /// Literals every matching value contains, in order, after the prefix.
+    pub fn required_literals(&self) -> &[String] {
+        &self.required_literals
+    }
+
     pub fn create(value: &str) -> Result<Self, ParseError> {
-        let (regex, unanchored) = parse_regex_anchored(value)?;
-        Ok(Self::new(regex, unanchored.to_string()))
+        let regex = compile_matcher(value)
+            .map_err(|err| ParseError::InvalidRegex(format!("`{value}`: {err}")))?;
+        Ok(Self::new(regex, value.to_string()))
     }
 
     pub fn is_match(&self, other: &str) -> bool {
+        if self.any_non_empty {
+            return !other.is_empty();
+        }
         if other.is_empty() {
             if self
                 .prefix
@@ -382,12 +360,6 @@ impl TryFrom<&str> for RegexMatcher {
     }
 }
 
-impl Display for RegexMatcher {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}", quote_string(&self.value))
-    }
-}
-
 impl Eq for RegexMatcher {}
 
 impl PartialEq for RegexMatcher {
@@ -396,7 +368,57 @@ impl PartialEq for RegexMatcher {
             && self.prefix == other.prefix
             && self.suffix == other.suffix
             && self.required_literals == other.required_literals
+            && self.any_non_empty == other.any_non_empty
             && self.value == other.value
+    }
+}
+
+/// What a decomposed matcher keeps alive, for the matcher caches in `regex_utils`. The regex
+/// dominates; strings are charged their capacity.
+impl HeapSize for PredicateValue {
+    fn heap_size(&self) -> usize {
+        match self {
+            PredicateValue::Empty => 0,
+            PredicateValue::String(value) => value.capacity(),
+            PredicateValue::List(values) => {
+                let spilled = if values.spilled() {
+                    values.capacity() * size_of::<String>()
+                } else {
+                    0
+                };
+                spilled + values.iter().map(String::capacity).sum::<usize>()
+            }
+        }
+    }
+}
+
+impl HeapSize for RegexMatcher {
+    fn heap_size(&self) -> usize {
+        let strings = self.value.capacity()
+            + self.prefix.as_ref().map_or(0, String::capacity)
+            + self.suffix.as_ref().map_or(0, String::capacity)
+            + self
+                .required_literals
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>();
+        // Boxed inside `PredicateMatch`.
+        size_of::<Self>() + self.regex.heap_size() + strings
+    }
+}
+
+impl HeapSize for PredicateMatch {
+    fn heap_size(&self) -> usize {
+        match self {
+            PredicateMatch::MatchAll | PredicateMatch::MatchNone => 0,
+            PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re) => re.heap_size(),
+            PredicateMatch::Equal(value)
+            | PredicateMatch::NotEqual(value)
+            | PredicateMatch::StartsWith(value)
+            | PredicateMatch::NotStartsWith(value)
+            | PredicateMatch::Contains(value)
+            | PredicateMatch::NotContains(value) => value.heap_size(),
+        }
     }
 }
 
@@ -421,30 +443,15 @@ impl PredicateMatch {
         match self {
             PredicateMatch::Equal(_) => MatchOp::Equal,
             PredicateMatch::NotEqual(_) => MatchOp::NotEqual,
+            // `l=~".*"` and `l!~".*"`, which is how they are written and rendered.
             PredicateMatch::MatchAll => MatchOp::RegexEqual,
-            PredicateMatch::MatchNone => MatchOp::MatchNone,
+            PredicateMatch::MatchNone => MatchOp::RegexNotEqual,
             PredicateMatch::RegexEqual(_) => MatchOp::RegexEqual,
             PredicateMatch::RegexNotEqual(_) => MatchOp::RegexNotEqual,
             PredicateMatch::StartsWith(_) => MatchOp::StartsWith,
             PredicateMatch::NotStartsWith(_) => MatchOp::NotStartsWith,
             PredicateMatch::Contains(_) => MatchOp::Contains,
             PredicateMatch::NotContains(_) => MatchOp::NotContains,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        match self {
-            PredicateMatch::Equal(value) | PredicateMatch::NotEqual(value) => value.is_empty(),
-            // A regex matcher's pattern is never empty: an empty pattern
-            // decomposes to `=""`, and the compiled form is always anchored.
-            PredicateMatch::MatchAll
-            | PredicateMatch::MatchNone
-            | PredicateMatch::RegexEqual(_)
-            | PredicateMatch::RegexNotEqual(_) => false,
-            PredicateMatch::StartsWith(value) => value.is_empty(),
-            PredicateMatch::NotStartsWith(value) => value.is_empty(),
-            PredicateMatch::Contains(value) => value.is_empty(),
-            PredicateMatch::NotContains(value) => value.is_empty(),
         }
     }
 
@@ -461,9 +468,9 @@ impl PredicateMatch {
             PredicateMatch::RegexEqual(re) => re.is_match(other),
             PredicateMatch::RegexNotEqual(re) => !re.is_match(other),
             PredicateMatch::StartsWith(value) => value.matches_starts_with_any(other),
-            PredicateMatch::NotStartsWith(value) => value.matches_not_starts_with_all(other),
+            PredicateMatch::NotStartsWith(value) => !value.matches_starts_with_any(other),
             PredicateMatch::Contains(value) => value.matches_contains_any(other),
-            PredicateMatch::NotContains(value) => value.matches_not_contains_all(other),
+            PredicateMatch::NotContains(value) => !value.matches_contains_any(other),
         }
     }
 
@@ -482,6 +489,26 @@ impl PredicateMatch {
         }
     }
 
+    /// Reject operands no matcher may hold: an empty needle, or no needles, for the prefix and
+    /// substring matchers. [`LabelFilter::create_with_value`] and the fan-out decoder both apply
+    /// this, so a constructed matcher's match functions can trust their operands.
+    pub(crate) fn validate(&self) -> Result<(), ParseError> {
+        match self {
+            PredicateMatch::StartsWith(value) | PredicateMatch::NotStartsWith(value) => {
+                validate_starts_with_value(value)
+            }
+            PredicateMatch::Contains(value) | PredicateMatch::NotContains(value) => {
+                validate_contains_value(value)
+            }
+            PredicateMatch::Equal(_)
+            | PredicateMatch::NotEqual(_)
+            | PredicateMatch::MatchAll
+            | PredicateMatch::MatchNone
+            | PredicateMatch::RegexEqual(_)
+            | PredicateMatch::RegexNotEqual(_) => Ok(()),
+        }
+    }
+
     pub(crate) fn cost(&self) -> usize {
         match &self {
             PredicateMatch::Equal(value) => value.cost(),
@@ -494,85 +521,6 @@ impl PredicateMatch {
             PredicateMatch::NotStartsWith(value) => 10 + value.cost(),
             PredicateMatch::Contains(value) => 20 + value.cost(),
             PredicateMatch::NotContains(value) => 25 + value.cost(),
-        }
-    }
-
-    fn text(&self) -> Option<&str> {
-        match self {
-            PredicateMatch::Equal(value) | PredicateMatch::NotEqual(value) => value.text(),
-            PredicateMatch::MatchAll => Some(MATCH_ALL_REGEX_TEXT),
-            PredicateMatch::MatchNone => Some(MATCH_ALL_REGEX_TEXT),
-            PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re) => Some(&re.value),
-            PredicateMatch::StartsWith(value) => value.text(),
-            PredicateMatch::NotStartsWith(value) => value.text(),
-            PredicateMatch::Contains(value) => value.text(),
-            PredicateMatch::NotContains(value) => value.text(),
-        }
-    }
-}
-
-impl Display for PredicateMatch {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let value = match self {
-            PredicateMatch::Equal(v) | PredicateMatch::NotEqual(v) => v as &dyn Display,
-            PredicateMatch::MatchAll => &MATCH_ALL_REGEX_TEXT as &dyn Display,
-            PredicateMatch::MatchNone => {
-                return write!(f, "!{MATCH_ALL_REGEX_TEXT}");
-            }
-            PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re) => {
-                re as &dyn Display
-            }
-            PredicateMatch::StartsWith(value) => value as &dyn Display,
-            PredicateMatch::NotStartsWith(value) => value as &dyn Display,
-            PredicateMatch::Contains(value) => value as &dyn Display,
-            PredicateMatch::NotContains(value) => value as &dyn Display,
-        };
-
-        write!(f, "{value}")
-    }
-}
-
-impl Hash for PredicateMatch {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            PredicateMatch::Equal(value) => {
-                state.write_u8(1);
-                value.hash(state);
-            }
-            PredicateMatch::NotEqual(value) => {
-                state.write_u8(2);
-                value.hash(state);
-            }
-            PredicateMatch::MatchAll => {
-                state.write_u8(3);
-            }
-            PredicateMatch::MatchNone => {
-                state.write_u8(10);
-            }
-            PredicateMatch::RegexEqual(re) => {
-                state.write_u8(4);
-                re.hash(state);
-            }
-            PredicateMatch::RegexNotEqual(re) => {
-                state.write_u8(5);
-                re.hash(state);
-            }
-            PredicateMatch::StartsWith(p) => {
-                state.write_u8(6);
-                p.hash(state);
-            }
-            PredicateMatch::NotStartsWith(p) => {
-                state.write_u8(7);
-                p.hash(state);
-            }
-            PredicateMatch::Contains(value) => {
-                state.write_u8(8);
-                value.hash(state);
-            }
-            PredicateMatch::NotContains(value) => {
-                state.write_u8(9);
-                value.hash(state);
-            }
         }
     }
 }
@@ -620,85 +568,32 @@ impl LabelFilter {
     where
         N: Into<String>,
     {
-        let label = label.into();
-
-        match match_op {
-            MatchOp::Equal => Ok(Self {
-                label,
-                matcher: PredicateMatch::Equal(value),
-            }),
-            MatchOp::NotEqual => Ok(Self {
-                label,
-                matcher: PredicateMatch::NotEqual(value),
-            }),
-            MatchOp::RegexEqual => {
-                let Some(value) = value.text() else {
-                    return Err(ParseError::General(
-                        "regex matcher requires a single value".to_string(),
-                    ));
-                };
-                let matcher = parse_regex_matcher(value, true)?;
-                Ok(Self { label, matcher })
-            }
-            MatchOp::RegexNotEqual => {
-                let Some(value) = value.text() else {
-                    return Err(ParseError::General(
-                        "regex matcher requires a single value".to_string(),
-                    ));
-                };
-                let matcher = parse_regex_matcher(value, false)?;
-                Ok(Self { label, matcher })
-            }
-            MatchOp::StartsWith => {
-                validate_starts_with_value(&value)?;
-                Ok(Self {
-                    label,
-                    matcher: PredicateMatch::StartsWith(value),
-                })
-            }
-            MatchOp::NotStartsWith => {
-                validate_starts_with_value(&value)?;
-                Ok(Self {
-                    label,
-                    matcher: PredicateMatch::NotStartsWith(value),
-                })
-            }
-            MatchOp::Contains => {
-                validate_contains_value(&value)?;
-                Ok(Self {
-                    label,
-                    matcher: PredicateMatch::Contains(value),
-                })
-            }
-            MatchOp::NotContains => {
-                validate_contains_value(&value)?;
-                Ok(Self {
-                    label,
-                    matcher: PredicateMatch::NotContains(value),
-                })
-            }
-            MatchOp::MatchAll => Ok(Self {
-                label,
-                matcher: PredicateMatch::MatchAll,
-            }),
-            MatchOp::MatchNone => Ok(Self {
-                label,
-                matcher: PredicateMatch::MatchNone,
-            }),
-        }
+        let regex_text = |value: &PredicateValue| {
+            value.text().map(str::to_owned).ok_or_else(|| {
+                ParseError::General("regex matcher requires a single value".to_string())
+            })
+        };
+        let matcher = match match_op {
+            MatchOp::Equal => PredicateMatch::Equal(value),
+            MatchOp::NotEqual => PredicateMatch::NotEqual(value),
+            MatchOp::RegexEqual => parse_regex_matcher(&regex_text(&value)?, true)?,
+            MatchOp::RegexNotEqual => parse_regex_matcher(&regex_text(&value)?, false)?,
+            MatchOp::StartsWith => PredicateMatch::StartsWith(value),
+            MatchOp::NotStartsWith => PredicateMatch::NotStartsWith(value),
+            MatchOp::Contains => PredicateMatch::Contains(value),
+            MatchOp::NotContains => PredicateMatch::NotContains(value),
+        };
+        matcher.validate()?;
+        Ok(Self {
+            label: label.into(),
+            matcher,
+        })
     }
 
     pub fn equals(label: String, value: &str) -> Self {
         Self {
             label,
             matcher: PredicateMatch::Equal(value.into()),
-        }
-    }
-
-    pub fn prefix(label: String, value: String) -> Self {
-        Self {
-            label,
-            matcher: PredicateMatch::StartsWith(PredicateValue::String(value)),
         }
     }
 
@@ -720,27 +615,22 @@ impl LabelFilter {
         }
     }
 
-    pub fn regex_text(&self) -> Option<&str> {
-        match &self.matcher {
-            PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re) => Some(&re.value),
-            PredicateMatch::MatchAll => Some(MATCH_ALL_REGEX_TEXT),
-            PredicateMatch::MatchNone => Some(MATCH_ALL_REGEX_TEXT),
-            _ => None,
-        }
-    }
-
     pub fn matches_empty(&self) -> bool {
         self.matches("")
     }
 
     #[inline]
+    /// A matcher written as a negation (`!=`, `!~`, `^~`, `!*=`), whose matches are found by
+    /// subtracting from a base set. `MatchNone` (`l!~".*"`) is not one, though it is written with
+    /// `!~`: it matches nothing, so the planner answers it directly and `is_bounded` counts it as
+    /// bounding the selector.
     pub fn is_negative_matcher(&self) -> bool {
         matches!(
-            self.op(),
-            MatchOp::NotEqual
-                | MatchOp::RegexNotEqual
-                | MatchOp::NotStartsWith
-                | MatchOp::NotContains
+            self.matcher,
+            PredicateMatch::NotEqual(_)
+                | PredicateMatch::RegexNotEqual(_)
+                | PredicateMatch::NotStartsWith(_)
+                | PredicateMatch::NotContains(_)
         )
     }
 
@@ -756,52 +646,35 @@ impl LabelFilter {
     pub(crate) fn cost(&self) -> usize {
         self.matcher.cost()
     }
-
-    fn text(&self) -> Option<&str> {
-        self.matcher.text()
-    }
 }
 
+/// The matcher as the selector parser reads it back; see [`crate::labels::render`].
 impl Display for LabelFilter {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}{}", self.label, self.op())?;
-        match &self.matcher {
-            PredicateMatch::Equal(value) | PredicateMatch::NotEqual(value) => {
-                write!(f, "{value}")
-            }
-            PredicateMatch::MatchAll => write!(f, "{}", quote_string(MATCH_ALL_REGEX_TEXT)),
-            PredicateMatch::MatchNone => write!(f, "{}", quote_string(MATCH_ALL_REGEX_TEXT)),
-            PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re) => {
-                write!(f, "{}", quote_string(&re.value))
-            }
-            PredicateMatch::StartsWith(value) | PredicateMatch::NotStartsWith(value) => {
-                write!(f, "{value}")
-            }
-            PredicateMatch::Contains(value) | PredicateMatch::NotContains(value) => {
-                write!(f, "{value}")
-            }
-        }
+        render::write_filter(f, self)
     }
 }
 
-impl Hash for LabelFilter {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.label.hash(state);
-        self.matcher.hash(state);
-    }
-}
-
-fn get_metric_name(filters: &[LabelFilter]) -> Option<&str> {
-    filters
-        .iter()
-        .find(|m| m.is_metric_name_filter())
-        .and_then(|m| m.text())
+/// The metric name every series matching `filters` (one AND group) must have, if the group
+/// pins a single one: an equality on `__name__` with one non-empty value, which every other
+/// `__name__` matcher in the group also accepts.
+///
+/// `None` when the group leaves the name open (no equality, or one listing several names), and
+/// when its `__name__` matchers contradict each other (`{__name__=~"m.*",__name__="cpu"}`):
+/// that group matches nothing, so no name describes what it matches.
+fn group_metric_name(filters: &[LabelFilter]) -> Option<&str> {
+    let mut name_filters = filters.iter().filter(|f| f.label == METRIC_NAME_LABEL);
+    let name = name_filters.clone().find_map(|f| match &f.matcher {
+        PredicateMatch::Equal(value) => value.text().filter(|name| !name.is_empty()),
+        _ => None,
+    })?;
+    name_filters.all(|f| f.matches(name)).then_some(name)
 }
 
 /// FilterList is a small vector of LabelFilter, used for AND combinations of label filters.
 /// We try to minimize allocations by reserving stack space for 3 LabelFilter, which seems reasonable for the common
 /// case. e.g. http_requests_total{job="api",method="GET"}
-#[derive(Debug, Default, Clone, Hash, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct FilterList(SmallVec<[LabelFilter; 3]>);
 
 impl FilterList {
@@ -818,18 +691,15 @@ impl FilterList {
         self.0.is_empty()
     }
 
+    /// True when the group is exactly one metric-name equality: it selects every series with
+    /// that name and constrains nothing else.
     pub fn is_only_metric_name(&self) -> bool {
-        if self.0.len() == 1 {
-            let first = &self.0[0];
-            if first.is_metric_name_filter() {
-                return true;
-            }
-        }
-        false
+        self.0.len() == 1 && group_metric_name(&self.0).is_some()
     }
 
+    /// See [`SeriesSelector::get_metric_name`].
     pub fn get_metric_name(&self) -> Option<&str> {
-        get_metric_name(&self.0)
+        group_metric_name(&self.0)
     }
 
     pub fn push(&mut self, matcher: LabelFilter) {
@@ -845,9 +715,10 @@ impl FilterList {
     }
 }
 
+/// The group as an AND selector the parser reads back; see [`crate::labels::render`].
 impl Display for FilterList {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        join_matchers(f, &self.0)
+        render::write_and(f, self)
     }
 }
 
@@ -882,7 +753,7 @@ fn filter_group_is_bounded(filters: &FilterList) -> bool {
         .any(|f| !f.is_negative_matcher() && !f.matches_empty())
 }
 
-#[derive(Debug, Clone, Hash, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum SeriesSelector {
     Or(OrFiltersList),
@@ -898,79 +769,49 @@ impl SeriesSelector {
         SeriesSelector::And(matchers.into())
     }
 
+    /// The AND groups this selector is the union of. Every selector reads as an OR over its
+    /// groups: `And(g)` is the one group `g`, and `Or(gs)` is `gs`. An empty group matches every
+    /// series, and no groups at all (`Or([])`) match none.
+    pub fn groups(&self) -> std::slice::Iter<'_, FilterList> {
+        match self {
+            SeriesSelector::And(group) => std::slice::from_ref(group).iter(),
+            SeriesSelector::Or(groups) => groups.iter(),
+        }
+    }
+
     /// True if this selector on its own restricts the search to a bounded set of series,
     /// rather than requiring a full keyspace scan.
     ///
     /// A filter group is bounded when it holds at least one matcher that cannot be satisfied
     /// by a missing label — i.e. one that is neither negative (`l!=v`, `l!~re`) nor
-    /// empty-matching (`l=""`, `l=~".*"`). `Or` branches are unioned, so an `Or` selector is
-    /// bounded only when *every* branch is; `And` filters are intersected, so one bounded
-    /// matcher anywhere in the group suffices.
+    /// empty-matching (`l=""`, `l=~".*"`). Groups are unioned, so the selector is bounded only
+    /// when *every* group is (and there is at least one); within a group filters are
+    /// intersected, so one bounded matcher suffices.
     pub fn is_bounded(&self) -> bool {
-        match self {
-            SeriesSelector::And(filters) => filter_group_is_bounded(filters),
-            SeriesSelector::Or(groups) => {
-                !groups.is_empty() && groups.iter().all(filter_group_is_bounded)
-            }
-        }
+        let mut groups = self.groups().peekable();
+        groups.peek().is_some() && groups.all(filter_group_is_bounded)
     }
 
-    pub fn len(&self) -> usize {
-        match self {
-            SeriesSelector::Or(or_matchers) => or_matchers.len(),
-            SeriesSelector::And(and_matchers) => and_matchers.len(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        match self {
-            SeriesSelector::Or(or_matchers) => or_matchers.is_empty(),
-            SeriesSelector::And(and_matchers) => and_matchers.is_empty(),
-        }
-    }
-
+    /// True when the selector is exactly "every series named X": each group is a single
+    /// equality on the same metric name.
     pub fn is_only_metric_name(&self) -> bool {
-        match self {
-            SeriesSelector::Or(_) => false,
-            SeriesSelector::And(and_matchers) => {
-                if and_matchers.len() == 1 {
-                    let first = &and_matchers.0[0];
-                    if first.is_metric_name_filter() {
-                        return true;
-                    }
-                }
-                false
-            }
-        }
+        self.get_metric_name().is_some() && self.groups().all(|group| group.len() == 1)
     }
 
-    pub fn get_metric_name(&self) -> Option<&str> {
-        match self {
-            SeriesSelector::Or(or_matchers) => {
-                let mut name: Option<&str> = None;
-                for and_matchers in or_matchers.iter() {
-                    if let Some(current_name) = get_metric_name(and_matchers) {
-                        if name.is_some() && name != Some(current_name) {
-                            // Multiple different names found
-                            return None;
-                        }
-                        name = Some(current_name);
-                    }
-                }
-                name
-            }
-            SeriesSelector::And(and_matchers) => get_metric_name(and_matchers),
-        }
-    }
-
-    /// Merges two SeriesSelector instances into one.
+    /// The metric name every series this selector matches must have, if there is exactly one.
     ///
-    /// The merge logic follows these rules:
-    /// - And + And: Creates an Or selector with both filter lists
-    /// - And + Or: Adds the And filters to the Or list
-    /// - Or + And: Adds the And filters to the Or list
-    /// - Or + Or: Combines both Or lists
-    pub fn merge_with(self, other: SeriesSelector) -> Self {
+    /// A name is returned only when it is a constraint, safe to plan with: every OR branch
+    /// must pin the same name (see [`group_metric_name`]). `{__name__="cpu" or job="api"}` has
+    /// none, because its second branch matches any metric.
+    pub fn get_metric_name(&self) -> Option<&str> {
+        let mut names = self.groups().map(FilterList::get_metric_name);
+        let first = names.next()??;
+        names.all(|name| name == Some(first)).then_some(first)
+    }
+
+    /// The selector matching what either `self` or `other` matches: their groups, in order, as
+    /// one `Or`. (So two `And` selectors become an `Or` of two groups.) This is `a or b`.
+    pub fn or_with(self, other: SeriesSelector) -> Self {
         match (self, other) {
             // Both are And selectors - create Or with both
             (SeriesSelector::And(left), SeriesSelector::And(right)) => {
@@ -995,20 +836,11 @@ impl SeriesSelector {
     }
 }
 
+/// The selector as text the parser reads back as an equivalent selector; see
+/// [`crate::labels::render`].
 impl Display for SeriesSelector {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match &self {
-            SeriesSelector::Or(or_matchers) => {
-                for (i, matchers) in or_matchers.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " or ")?;
-                    }
-                    write!(f, "{matchers}")?;
-                }
-                Ok(())
-            }
-            SeriesSelector::And(and_matchers) => write!(f, "{and_matchers}"),
-        }
+        render::write_selector(f, self)
     }
 }
 
@@ -1022,72 +854,6 @@ impl From<Vec<LabelFilter>> for SeriesSelector {
     fn from(value: Vec<LabelFilter>) -> Self {
         SeriesSelector::And(FilterList::new(value))
     }
-}
-impl From<Vec<Vec<LabelFilter>>> for SeriesSelector {
-    fn from(value: Vec<Vec<LabelFilter>>) -> Self {
-        if value.len() == 1 {
-            let first = value.into_iter().next().expect("value is not empty");
-            return SeriesSelector::And(FilterList::new(first));
-        }
-        let and_matchers: Vec<FilterList> = value.into_iter().map(FilterList::new).collect();
-        SeriesSelector::Or(and_matchers)
-    }
-}
-
-fn join_matchers(f: &mut Formatter<'_>, v: &[LabelFilter]) -> fmt::Result {
-    // Find the metric name matcher (single __name__=value filter)
-    let metric_name_info = find_metric_name_matcher(v);
-
-    // If there's only a metric name filter, output it directly
-    if let Some((_, name)) = metric_name_info
-        && v.len() == 1
-    {
-        return write!(f, "{name}");
-    }
-
-    // Write metric name (if any) followed by labels in braces
-    let name = metric_name_info.map(|(_, n)| n).unwrap_or("");
-    write!(f, "{name}{{")?;
-
-    let mut first = true;
-    for (i, matcher) in v.iter().enumerate() {
-        // Skip the metric name matcher since we already wrote it
-        if metric_name_info.map(|(idx, _)| idx == i).unwrap_or(false) {
-            continue;
-        }
-
-        if !first {
-            write!(f, ",")?;
-        }
-        write!(f, "{matcher}")?;
-        first = false;
-    }
-
-    write!(f, "}}")
-}
-
-/// Finds the single __name__=value matcher in the filter list.
-/// Returns None if there are zero or multiple __name__ matchers.
-fn find_metric_name_matcher(filters: &[LabelFilter]) -> Option<(usize, &str)> {
-    let mut result: Option<(usize, &str)> = None;
-
-    for (i, matcher) in filters.iter().enumerate() {
-        if matcher.label == METRIC_NAME_LABEL {
-            // Multiple __name__ matchers found - invalid
-            if result.is_some() {
-                return None;
-            }
-
-            // Only Equal operations define a metric name
-            if matcher.matcher.op() == MatchOp::Equal
-                && let Some(name) = matcher.text()
-            {
-                result = Some((i, name));
-            }
-        }
-    }
-
-    result
 }
 
 #[cfg(test)]
@@ -1425,5 +1191,143 @@ mod tests {
         assert!(filter.matches_empty());
         let filter = LabelFilter::create(MatchOp::RegexNotEqual, "l", "foo|").unwrap();
         assert!(!filter.matches_empty());
+    }
+
+    #[test]
+    fn test_metric_name_is_reported_only_when_it_constrains_every_match() {
+        use crate::labels::filters::SeriesSelector;
+        let name = |selector: &str| {
+            let parsed = SeriesSelector::parse(selector).unwrap();
+            (
+                parsed.get_metric_name().map(str::to_string),
+                parsed.is_only_metric_name(),
+            )
+        };
+        let some = |n: &str, only: bool| (Some(n.to_string()), only);
+        let none = (None, false);
+
+        assert_eq!(name("cpu"), some("cpu", true));
+        assert_eq!(name(r#"cpu{job="a"}"#), some("cpu", false));
+        assert_eq!(name(r#"{__name__="cpu"}"#), some("cpu", true));
+        // Every branch pins the same name.
+        assert_eq!(
+            name(r#"{__name__="cpu" or __name__="cpu"}"#),
+            some("cpu", true)
+        );
+        assert_eq!(
+            name(r#"{__name__="cpu" or __name__="cpu",job="a"}"#),
+            some("cpu", false)
+        );
+        // A branch that leaves the name open, or names another, gives no name.
+        assert_eq!(name(r#"{__name__="cpu" or job="api"}"#), none);
+        assert_eq!(name(r#"{__name__="cpu" or __name__="mem"}"#), none);
+        // A list of names is not one name.
+        assert_eq!(name(r#"{__name__=("cpu","mem")}"#), none);
+        // Other `__name__` matchers must accept the name; a contradiction matches nothing.
+        assert_eq!(
+            name(r#"{__name__=~"c.*",__name__="cpu"}"#),
+            some("cpu", false)
+        );
+        assert_eq!(name(r#"{__name__=~"m.*",__name__="cpu"}"#), none);
+        assert_eq!(name(r#"{__name__!="cpu",__name__="cpu"}"#), none);
+        assert_eq!(name(r#"{job="a"}"#), none);
+    }
+
+    #[test]
+    fn test_absent_and_present_operands() {
+        let list = |items: &[&str]| {
+            PredicateValue::from(items.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        // (operand, is_absent, requires_present)
+        let cases = [
+            (PredicateValue::Empty, true, false),
+            (PredicateValue::from(""), true, false),
+            (list(&[]), true, false),
+            (list(&["", ""]), true, false),
+            (PredicateValue::from("a"), false, true),
+            (list(&["a", "b"]), false, true),
+            // A mix is neither: it matches the absent value and some present ones.
+            (list(&["a", ""]), false, false),
+        ];
+        for (operand, absent, present) in cases {
+            assert_eq!(operand.is_absent(), absent, "{operand:?}");
+            assert_eq!(operand.requires_present(), present, "{operand:?}");
+            // An absent operand is exactly one that matches nothing but "".
+            if absent {
+                assert!(operand.matches(""));
+                assert!(!operand.matches("a"));
+            }
+        }
+    }
+
+    /// The negative prefix and substring matchers are the exact complements of the positive
+    /// ones, for any operand. They used to re-check the operand and return false for an empty
+    /// needle or an empty list, so `!*=` and `^~` rejected values `*=` and `^=` also rejected.
+    #[test]
+    fn test_negative_needle_matchers_are_complements() {
+        let operands = [
+            PredicateValue::Empty,
+            PredicateValue::from(""),
+            PredicateValue::from(vec![]),
+            PredicateValue::from(vec![String::new()]),
+            PredicateValue::from(vec!["ser".to_string(), String::new()]),
+            PredicateValue::from("ser"),
+            PredicateValue::from(vec!["ser".to_string(), "cli".to_string()]),
+        ];
+        for operand in operands {
+            for (positive, negative) in [
+                (
+                    PredicateMatch::StartsWith(operand.clone()),
+                    PredicateMatch::NotStartsWith(operand.clone()),
+                ),
+                (
+                    PredicateMatch::Contains(operand.clone()),
+                    PredicateMatch::NotContains(operand.clone()),
+                ),
+            ] {
+                for value in ["", "server", "client", "a-ser", "proxy"] {
+                    assert_ne!(
+                        positive.matches(value),
+                        negative.matches(value),
+                        "{positive:?} / {negative:?} on {value:?}"
+                    );
+                }
+                assert_eq!(positive.validate().is_ok(), operand.requires_present());
+            }
+        }
+    }
+
+    #[test]
+    fn test_selector_groups_and_or_with() {
+        use crate::labels::filters::{FilterList, SeriesSelector};
+        let group =
+            |label: &str| FilterList::from(vec![LabelFilter::equals(label.to_string(), "1")]);
+        let labels = |selector: &SeriesSelector| {
+            selector
+                .groups()
+                .map(|g| g.iter().map(|f| f.label.clone()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+
+        let a = SeriesSelector::And(group("a"));
+        assert_eq!(labels(&a), [["a"]]);
+        let empty_or = SeriesSelector::Or(vec![]);
+        assert_eq!(empty_or.groups().count(), 0);
+
+        // `or_with` keeps every group, in order; two ANDs become an OR of two.
+        let ab = a.clone().or_with(SeriesSelector::And(group("b")));
+        assert!(matches!(ab, SeriesSelector::Or(_)));
+        assert_eq!(labels(&ab), [["a"], ["b"]]);
+        let cd = SeriesSelector::Or(vec![group("c"), group("d")]);
+        assert_eq!(
+            labels(&ab.clone().or_with(cd.clone())),
+            [["a"], ["b"], ["c"], ["d"]]
+        );
+        assert_eq!(labels(&cd.or_with(a)), [["c"], ["d"], ["a"]]);
+
+        // An empty group matches everything and no groups match nothing; neither is bounded.
+        assert!(!SeriesSelector::And(FilterList::default()).is_bounded());
+        assert!(!empty_or.is_bounded());
+        assert!(ab.is_bounded());
     }
 }

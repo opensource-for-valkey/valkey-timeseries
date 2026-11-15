@@ -7,12 +7,10 @@
 
 use super::terms::{Terms, union_cow};
 use super::{EMPTY_BITMAP, Postings, PostingsBitmap};
-use crate::error_consts::MISSING_FILTER;
-use crate::labels::filters::{FilterList, LabelFilter, MatchOp, PredicateMatch, SeriesSelector};
+use crate::labels::filters::{FilterList, LabelFilter, PredicateMatch, SeriesSelector};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::cmp::Ordering;
-use valkey_module::{ValkeyError, ValkeyResult};
+use valkey_module::ValkeyResult;
 
 impl<'a> Terms<'a> {
     /// `postings_for_label_filters` assembles a single postings iterator against the index
@@ -26,10 +24,6 @@ impl<'a> Terms<'a> {
         }
         if filters.len() == 1 {
             let filter = &filters[0];
-            // follow Prometheus here: if we have an empty matcher and label, return all postings.
-            if filter.label.is_empty() && filter.matcher.is_empty() {
-                return Ok(Cow::Borrowed(self.all()));
-            }
             // shortcut the handling of simple equality matchers
             if !filter.is_negative_matcher() && !filter.matches_empty() {
                 let it = self.postings_for_filter(filter)?;
@@ -43,92 +37,35 @@ impl<'a> Terms<'a> {
         let mut its: SmallVec<[_; 4]> = SmallVec::new();
         let mut not_its: SmallVec<[Cow<PostingsBitmap>; 4]> = SmallVec::new();
 
-        let mut sorted_matchers: SmallVec<[(&LabelFilter, bool, bool); 4]> = SmallVec::new();
+        // A filter that accepts "" also selects the series without its label, so it can only
+        // remove series (`not_its`, or nothing for `.*`). One that rejects "" needs the label
+        // present and intersects (`its`), even when negative (`l!=""`, `l!~"a*"`). Intersecting
+        // filters run first, cheapest first, so an empty one returns before any subtracting work.
+        let mut sorted_matchers: SmallVec<[(&LabelFilter, bool); 4]> =
+            filters.iter().map(|f| (f, f.matches_empty())).collect();
+        sorted_matchers.sort_by_key(|&(filter, matches_empty)| (matches_empty, filter.cost()));
 
-        let mut has_subtracting_matchers = false;
-        let mut has_intersecting_matchers = false;
-        for m in filters {
-            let matches_empty = m.matches("");
-
-            // A matcher that rejects "" needs the label present, so it intersects even when
-            // negative (`l!=""`, `l!~"a*"`): the loop below puts every such matcher in `its`.
-            // Counting it as subtracting would seed `its` with all postings for nothing.
-            let is_subtracting = matches_empty;
-
-            if is_subtracting {
-                has_subtracting_matchers = true;
-            } else {
-                has_intersecting_matchers = true;
-            }
-
-            sorted_matchers.push((m, matches_empty, is_subtracting))
-        }
-
-        if has_subtracting_matchers && !has_intersecting_matchers {
-            // If there's nothing to subtract from, add in everything and remove the not_its later.
-            // We prefer to get all_postings so that the base of subtraction (i.e., all_postings)
-            // doesn't include series that may be added to the index reader during this function call.
-            its.push(Cow::Borrowed(self.all()));
-        };
-
-        // Sort matchers to have the intersecting matchers first.
-        // This way the base for subtraction is smaller, and there is no chance that the set we subtract
-        // from contains postings of series that didn't exist when we constructed the set we subtract by.
-        sorted_matchers.sort_by(|i, j| -> Ordering {
-            let is_i_subtracting = i.2;
-            let is_j_subtracting = j.2;
-            if !is_i_subtracting && is_j_subtracting {
-                return Ordering::Less;
-            }
-            // sort by match cost
-            let cost_i = i.0.cost();
-            let cost_j = j.0.cost();
-            cost_i.cmp(&cost_j)
-        });
-
-        for (filter, matches_empty, _is_subtracting) in sorted_matchers {
-            //let value = &m.value;
-            let name = &filter.label;
-
-            if name.is_empty() && matches_empty {
-                // We already handled the case at the top of the function,
-                // and it is unexpected to get all postings again here.
-                return Err(ValkeyError::Str(MISSING_FILTER));
-            }
-
-            if matches!(filter.matcher, PredicateMatch::MatchAll) {
-                continue;
-            }
-
-            if matches!(filter.matcher, PredicateMatch::MatchNone) {
-                return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
-            }
-
-            let typ = filter.op();
-            let regex_value = filter.regex_text().unwrap_or("");
-
-            match (typ, regex_value) {
-                // .* regexp matches any string: do nothing
-                (MatchOp::RegexEqual, ".*") => continue,
-
-                // .* regexp does not match any string: return empty
-                (MatchOp::RegexNotEqual, ".*") => {
+        for (filter, matches_empty) in sorted_matchers {
+            // `.*` and its spellings were turned into MatchAll / MatchNone above, when the
+            // pattern was parsed; `.+` and its spellings are recognized the same way.
+            match &filter.matcher {
+                PredicateMatch::MatchAll => {
+                    continue;
+                }
+                PredicateMatch::MatchNone => {
                     return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
                 }
-
-                // .+ regexp matches any non-empty string
-                (MatchOp::RegexEqual, ".+") => {
-                    // .+ regexp matches any non-empty string: get postings for all label values.
+                // l=~".+": every series carrying the label, without running the regex.
+                PredicateMatch::RegexEqual(re) if re.matches_any_non_empty() => {
                     its.push(self.postings_for_all_label_values(&filter.label));
                 }
-
-                // .+ regexp does not match any non-empty string
-                (MatchOp::RegexNotEqual, ".+") => {
+                // l!~".+": every series without the label.
+                PredicateMatch::RegexNotEqual(re) if re.matches_any_non_empty() => {
                     not_its.push(self.postings_for_all_label_values(&filter.label));
                 }
-                // l!="" (the RTS `l!=` form parses to PredicateValue::Empty): any non-empty value.
-                // Go straight to all label values rather than inverting to l="" first.
-                _ if matches!(&filter.matcher, PredicateMatch::NotEqual(v) if v.is_empty()) => {
+                // l!="" (or the RTS `l!=` form, or `l!=("")`): any non-empty value. Go straight
+                // to all label values rather than inverting to l="" first.
+                PredicateMatch::NotEqual(v) if v.is_absent() => {
                     let it = self.postings_for_all_label_values(&filter.label);
                     if it.is_empty() {
                         return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
@@ -166,6 +103,7 @@ impl<'a> Terms<'a> {
         }
 
         let base = match its.len() {
+            // No intersecting filter: subtract from every series.
             0 => Cow::Borrowed(self.all()),
             // a single intersecting set stays borrowed if nothing is subtracted from it
             1 => its
@@ -173,7 +111,7 @@ impl<'a> Terms<'a> {
                 .expect("index planner: intersecting set must have at least one element"),
             _ => {
                 // sort by cardinality first to reduce the amount of work
-                its.sort_by_key(|a| a.cardinality());
+                its.sort_by_cached_key(|a| a.cardinality());
                 Cow::Owned(intersection(its))
             }
         };
@@ -238,7 +176,9 @@ impl<'a> Terms<'a> {
 
     fn process_or_matchers(self, filters: &[FilterList]) -> ValkeyResult<Cow<'a, PostingsBitmap>> {
         match filters {
-            [] => Ok(Cow::Borrowed(self.all())),
+            // A union of no groups is empty. The parser never builds one; a fan-out payload can,
+            // and it must not widen to every series.
+            [] => Ok(Cow::Borrowed(&*EMPTY_BITMAP)),
             [filters] => self.postings_for_label_filters(filters),
             _ => filters
                 .iter()
@@ -308,7 +248,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::labels::filters::PredicateValue;
+    use crate::labels::filters::{MatchOp, PredicateValue};
 
     fn filter(label: &str, matcher: PredicateMatch) -> LabelFilter {
         LabelFilter {
@@ -635,6 +575,93 @@ mod tests {
                     .collect();
                 assert_eq!(got, expected, "{op:?} with {} filter(s)", filters.len());
             }
+        }
+    }
+
+    /// `l!=""` has several spellings (`PredicateValue::Empty` from the RTS `l!=` form,
+    /// `String("")`, a list holding only `""`). All of them must select the series that carry
+    /// the label, through the same planner arm.
+    #[test]
+    fn not_equal_absent_selects_series_with_the_label_in_every_spelling() {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "env", "prod");
+        postings.add_posting_for_label_value(2, "env", "dev");
+        postings.add_posting_for_label_value(3, "job", "api");
+        for operand in [
+            PredicateValue::Empty,
+            PredicateValue::from(""),
+            PredicateValue::from(vec![String::new()]),
+            PredicateValue::from(vec![String::new(), String::new()]),
+        ] {
+            let filters = [
+                filter("env", PredicateMatch::NotEqual(operand.clone())),
+                filter("env", PredicateMatch::NotEqual(PredicateValue::from("dev"))),
+            ];
+            let result = postings.postings_for_label_filters(&filters).unwrap();
+            assert_eq!(result.iter().collect::<Vec<_>>(), vec![1], "{operand:?}");
+        }
+    }
+
+    /// A union of no groups is empty. It used to return every series, so a fan-out payload
+    /// carrying `Or([])` made a shard answer with its whole keyspace.
+    #[test]
+    fn an_or_of_no_groups_matches_nothing() {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "job", "api");
+        postings.add_posting_for_label_value(2, "job", "web");
+        let result = postings
+            .postings_for_selector(&SeriesSelector::Or(vec![]))
+            .unwrap();
+        assert!(result.is_empty());
+        // An AND of no filters, by contrast, matches every series.
+        let all = postings
+            .postings_for_selector(&SeriesSelector::And(FilterList::default()))
+            .unwrap();
+        assert_eq!(all.iter().collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    /// Every spelling of `.+` takes the label-values path, not only the text `.+`.
+    #[test]
+    fn any_non_empty_regex_selects_by_label_presence_in_any_spelling() {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "env", "prod");
+        postings.add_posting_for_label_value(2, "env", "dev");
+        postings.add_posting_for_label_value(3, "job", "api");
+        let ids = |op, pattern: &str| {
+            let filters = [
+                LabelFilter::create(op, "env", pattern).unwrap(),
+                LabelFilter::create(MatchOp::RegexEqual, "job", ".*").unwrap(),
+            ];
+            let result = postings.postings_for_label_filters(&filters).unwrap();
+            result.iter().collect::<Vec<_>>()
+        };
+        for pattern in [".+", "^.+$", "(.+)", ".+.*"] {
+            assert_eq!(ids(MatchOp::RegexEqual, pattern), vec![1, 2], "{pattern}");
+            assert_eq!(ids(MatchOp::RegexNotEqual, pattern), vec![3], "{pattern}");
+        }
+    }
+
+    /// The parser and the fan-out decoder reject an empty label name, so the planner needs no
+    /// guard for one: built directly, it reads as a label no series has.
+    #[test]
+    fn an_empty_label_name_reads_as_a_label_no_series_has() {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "job", "a");
+        postings.add_posting_for_label_value(2, "job", "b");
+        let job_a = filter("job", PredicateMatch::Equal(PredicateValue::from("a")));
+        let cases = [
+            // Accepts "": removes nothing.
+            (PredicateMatch::Equal(PredicateValue::from("")), vec![1]),
+            (PredicateMatch::NotEqual(PredicateValue::from("x")), vec![1]),
+            (PredicateMatch::MatchAll, vec![1]),
+            // Rejects "": matches nothing.
+            (PredicateMatch::Equal(PredicateValue::from("x")), vec![]),
+            (PredicateMatch::NotEqual(PredicateValue::from("")), vec![]),
+        ];
+        for (matcher, want) in cases {
+            let filters = [job_a.clone(), filter("", matcher.clone())];
+            let got = postings.postings_for_label_filters(&filters).unwrap();
+            assert_eq!(got.iter().collect::<Vec<_>>(), want, "{matcher:?}");
         }
     }
 }

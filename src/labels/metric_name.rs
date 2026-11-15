@@ -4,7 +4,7 @@ use crate::common::rdb::{MAX_RDB_COLLECTION_LEN, rdb_load_len, rdb_load_string, 
 use crate::common::string_interner::InternedString;
 use crate::parser::ParseError;
 use crate::parser::metric_name::parse_metric_name;
-use crate::parser::utils::quote_string;
+use crate::parser::utils::{is_bare_name, quote_string, write_name};
 use get_size2::{GetSize, GetSizeTracker};
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -65,23 +65,30 @@ impl GetSize for MetricName {
     /// the trait default of zero: a series carrying 40 labels and ~1.9KB of interned strings
     /// reported a `memoryUsage` of exactly `size_of::<TimeSeries>()`, labels included for free.
     ///
-    /// The tracker is deliberately not consulted for the strings themselves. It exists to charge
-    /// a shared allocation once per traversal, which here would bill one arbitrary series for a
-    /// label the whole keyspace shares and the rest nothing. [`InternedString::amortized_size`]
-    /// splits it evenly instead, so per-key numbers add up across the keyspace.
+    /// The tracker is deliberately not consulted. It exists to charge a shared allocation once
+    /// per traversal, which here would bill one arbitrary holder for memory others share and
+    /// the rest nothing. Both layers of sharing are split evenly instead, so per-key numbers add
+    /// up across the keyspace:
+    ///
+    /// - each interned string is shared by every slice that holds it, and
+    ///   [`InternedString::amortized_size`] gives this slice its share;
+    /// - the slice is shared by every `MetricName` cloned from it (`COPY` clones the series), so
+    ///   the slice and its string shares are divided again by [`Arc::strong_count`].
+    ///
+    /// The count includes holders that are not keys, such as a query or fan-out holding a
+    /// series' labels; while one lives, each key reports a smaller share. A set that is edited
+    /// gets a slice of its own and returns to the full charge.
     fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
         let string_bytes: usize = self.0.iter().map(InternedString::amortized_size).sum();
-        (self.slice_bytes() + string_bytes, tracker)
+        let holders = Arc::strong_count(&self.0);
+        (
+            (self.slice_bytes() + string_bytes).div_ceil(holders),
+            tracker,
+        )
     }
 }
 
 impl MetricName {
-    /// An empty set. Kept for callers that build incrementally with [`Self::add_label`];
-    /// the capacity is irrelevant to the shared slice.
-    pub fn with_capacity(_capacity: usize) -> Self {
-        Self::default()
-    }
-
     pub fn new(labels: &[Label]) -> Self {
         Self::from_entries(
             labels
@@ -114,33 +121,33 @@ impl MetricName {
             }
             same
         });
-        Self(Arc::from(entries))
+        Self(Self::share(entries))
     }
 
-    /// The pairs as one shared slice, for holders that outlive the borrow (a query's copy of a
-    /// series' labels). A reference-count bump.
-    pub fn shared(&self) -> Arc<[InternedString]> {
-        Arc::clone(&self.0)
+    /// The slice for `entries`. An empty set is the one shared empty slice
+    /// (`Arc::<[_]>::default()`), never an allocation of its own, so every empty set costs
+    /// the same: nothing.
+    fn share(entries: Vec<InternedString>) -> Arc<[InternedString]> {
+        if entries.is_empty() {
+            Arc::default()
+        } else {
+            Arc::from(entries)
+        }
     }
 
-    /// The stored `name=value` strings, in name order. For callers that hash or
-    /// compare whole labels and need neither half on its own.
-    pub fn raw_entries(&self) -> std::slice::Iter<'_, InternedString> {
-        self.0.iter()
-    }
-
-    /// Heap bytes of the slice itself: the `Arc` counts plus one pointer per label.
+    /// Heap bytes of the slice itself, before dividing among its holders: the `Arc` counts plus
+    /// one pointer per label. The empty slice is shared process-wide (see [`Self::share`]), so it
+    /// is charged to no one.
     fn slice_bytes(&self) -> usize {
         if self.0.is_empty() {
-            // `Arc<[T]>::from(Vec::new())` still allocates the counts.
-            2 * size_of::<usize>()
+            0
         } else {
             2 * size_of::<usize>() + self.0.len() * size_of::<InternedString>()
         }
     }
 
     pub fn clear(&mut self) {
-        self.0 = Arc::from(Vec::new());
+        self.0 = Arc::default();
     }
 
     fn key_of(tag: &InternedString) -> &str {
@@ -165,7 +172,7 @@ impl MetricName {
     fn edit(&mut self, f: impl FnOnce(&mut Vec<InternedString>)) {
         let mut entries: Vec<InternedString> = self.0.to_vec();
         f(&mut entries);
-        self.0 = Arc::from(entries);
+        self.0 = Self::share(entries);
     }
 
     /// adds a new label to mn with the given key and value.
@@ -193,10 +200,6 @@ impl MetricName {
         }
     }
 
-    pub fn set_label(&mut self, key: &str, value: &str) {
-        self.add_label(key, value);
-    }
-
     pub fn get_measurement(&self) -> &str {
         self.get_value(METRIC_NAME_LABEL).unwrap_or(EMPTY_LABEL)
     }
@@ -212,16 +215,6 @@ impl MetricName {
         self.iter()
             .map(|label| Label::new(label.name, label.value))
             .collect()
-    }
-
-    /// Restore name order. Every constructor and mutator keeps it, so this is
-    /// only for a set assembled some other way; it orders by label *name*, not
-    /// by the raw `name=value` string (those differ when one name prefixes
-    /// another: `a1=…` sorts before `a=…` as strings).
-    pub fn sort(&mut self) {
-        if !self.0.is_sorted_by_key(Self::key_of) {
-            self.edit(|entries| entries.sort_by(|a, b| a.name().cmp(b.name())));
-        }
     }
 
     pub fn len(&self) -> usize {
@@ -258,9 +251,6 @@ impl MetricName {
         }
         Ok(Self::from_entries(entries))
     }
-
-    /// The shared slice is always exactly sized; kept for API compatibility.
-    pub fn shrink_to_fit(&mut self) {}
 }
 
 impl From<HashMap<String, String>> for MetricName {
@@ -289,24 +279,36 @@ impl FromStr for MetricName {
     }
 }
 
+/// Writes the metric definition [`parse_metric_name`] reads back: `name{label="value",…}`, with
+/// any name that is not an identifier quoted, and a metric name that is not one written inside
+/// the braces as Prometheus 3 does (`{"my metric", a="1"}`). A set without `__name__` renders
+/// as its label set alone (`{a="1"}`); it is a label set, not a metric definition, and does not
+/// parse back.
 impl Display for MetricName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}{{", self.get_measurement())?;
-
+        let name = self.get_measurement();
         let mut first = true;
+        if is_bare_name(name) {
+            write!(f, "{name}{{")?;
+        } else {
+            f.write_str("{")?;
+            if !name.is_empty() {
+                f.write_str(&quote_string(name))?;
+                first = false;
+            }
+        }
         for label in self
             .iter()
             .filter(|l| !l.name.is_empty() && l.name != METRIC_NAME_LABEL)
         {
             if !first {
-                write!(f, ",")?;
+                f.write_str(",")?;
             }
             first = false;
-            write!(f, "{}={}", label.name, quote_string(label.value))?;
+            write_name(f, label.name)?;
+            write!(f, "={}", quote_string(label.value))?;
         }
-
-        write!(f, "}}")?;
-        Ok(())
+        f.write_str("}")
     }
 }
 
@@ -316,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_add_label() {
-        let mut metric_name = MetricName::with_capacity(2);
+        let mut metric_name = MetricName::default();
         metric_name.add_label("key1", "value1");
         metric_name.add_label("key2", "value2");
 
@@ -336,18 +338,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sort() {
-        let mut metric_name = MetricName::default();
-        metric_name.add_label("key2", "value2");
-        metric_name.add_label("key1", "value1");
-        metric_name.sort();
-
-        let sorted_labels: Vec<_> = metric_name.iter().collect();
-        assert_eq!(sorted_labels[0].name, "key1");
-        assert_eq!(sorted_labels[1].name, "key2");
-    }
-
-    #[test]
     fn labels_are_kept_in_name_order_not_raw_order() {
         // "a1=x" < "a=x" as strings ('1' < '='), but `a` < `a1` as names.
         let mn = MetricName::from_pairs([("a1", "x"), ("a", "x"), ("__name__", "m")]);
@@ -355,10 +345,6 @@ mod tests {
         assert_eq!(names, ["__name__", "a", "a1"]);
         assert_eq!(mn.get_value("a"), Some("x"));
         assert_eq!(mn.get_value("a1"), Some("x"));
-
-        let mut sorted = mn.clone();
-        sorted.sort();
-        assert_eq!(sorted, mn);
     }
 
     #[test]
@@ -395,7 +381,7 @@ mod tests {
     #[test]
     fn clone_and_shared_are_the_same_allocation() {
         let mn: MetricName = r#"m{a="1",b="2"}"#.parse().unwrap();
-        let shared = mn.shared();
+        let shared = Arc::clone(&mn.0);
         assert!(Arc::ptr_eq(&shared, &mn.clone().0));
         assert_eq!(shared.len(), 3);
         assert_eq!(shared[1].split_pair(), Some(("a", "1")));
@@ -422,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_display() {
-        let mut metric_name = MetricName::with_capacity(3);
+        let mut metric_name = MetricName::default();
         metric_name.add_label(METRIC_NAME_LABEL, "metric");
         metric_name.add_label("key1", "value1");
         metric_name.add_label("key2", "value2");
@@ -440,7 +426,7 @@ mod tests {
         let _pool = crate::common::string_interner::test_pool::isolated();
         let empty = MetricName::default().get_heap_size();
 
-        let mut metric_name = MetricName::with_capacity(8);
+        let mut metric_name = MetricName::default();
         for i in 0..8 {
             metric_name.add_label(
                 &format!("heap_size_label_{i}"),
@@ -466,13 +452,13 @@ mod tests {
     #[test]
     fn test_shared_labels_are_amortized_across_holders() {
         let _pool = crate::common::string_interner::test_pool::isolated();
-        let mut only = MetricName::with_capacity(1);
+        let mut only = MetricName::default();
         only.add_label("amortize_probe", "shared_value_for_the_amortization_test");
         let sole_holder = only.get_heap_size();
 
         let mut sharers = Vec::new();
         for _ in 0..4 {
-            let mut mn = MetricName::with_capacity(1);
+            let mut mn = MetricName::default();
             mn.add_label("amortize_probe", "shared_value_for_the_amortization_test");
             sharers.push(mn);
         }
@@ -487,6 +473,70 @@ mod tests {
         for mn in &sharers {
             assert_eq!(mn.get_heap_size(), per_holder);
         }
+    }
+
+    /// `COPY` clones a series, which clones its `MetricName`: one slice, two holders. Each must
+    /// report half of what one holder alone reports, so the two keys' `MEMORY USAGE` add up to
+    /// the memory actually held, and an edit gives a holder its own slice and the full charge.
+    #[test]
+    fn test_cloned_labels_split_the_shared_slice() {
+        let _pool = crate::common::string_interner::test_pool::isolated();
+        let original = MetricName::from_pairs([
+            ("clone_probe_a", "value_for_the_clone_accounting_test"),
+            ("clone_probe_b", "another_value_for_the_clone_test"),
+        ]);
+        let alone = original.get_heap_size();
+        assert!(alone > 0);
+
+        let copy = original.clone();
+        assert!(
+            Arc::ptr_eq(&original.0, &copy.0),
+            "a clone shares the slice"
+        );
+        let (a, b) = (original.get_heap_size(), copy.get_heap_size());
+        assert_eq!(a, b);
+        // Each share is rounded up, so the pair can overshoot by a byte.
+        assert!(a + b >= alone && a + b <= alone + 1, "{a} + {b} vs {alone}");
+
+        // Editing the copy gives it a slice of its own; the original is alone again.
+        let mut edited = copy.clone();
+        drop(copy);
+        edited.add_label("clone_probe_c", "x");
+        assert!(!Arc::ptr_eq(&original.0, &edited.0));
+        // The two slices still share the two interned strings, so neither holder is back to
+        // the full charge, but neither is halved any more: the slice is no longer split.
+        assert!(
+            original.get_heap_size() > a,
+            "{} vs {a}",
+            original.get_heap_size()
+        );
+        assert!(original.get_heap_size() < alone);
+        drop(edited);
+        assert_eq!(original.get_heap_size(), alone);
+    }
+
+    /// An empty set is the one shared empty slice however it was made, and costs nothing.
+    #[test]
+    fn test_empty_label_sets_are_shared_and_free() {
+        let default = MetricName::default();
+        let built = MetricName::new(&[]);
+        let mut cleared = MetricName::from_pairs([("empty_probe", "v")]);
+        cleared.clear();
+        let mut emptied = MetricName::from_pairs([("empty_probe", "v")]);
+        emptied.remove_label("empty_probe");
+        for (what, mn) in [
+            ("built", &built),
+            ("cleared", &cleared),
+            ("emptied", &emptied),
+        ] {
+            assert!(mn.is_empty(), "{what}");
+            assert!(
+                Arc::ptr_eq(&mn.0, &default.0),
+                "{what} allocated its own empty slice"
+            );
+            assert_eq!(mn.get_heap_size(), 0, "{what}");
+        }
+        assert_eq!(default.get_heap_size(), 0);
     }
 
     /// Interning on a realistic fleet: every `key=value` pair the fleet repeats is held once,
@@ -520,8 +570,7 @@ mod tests {
         // `stats.total_stats.count` after) instead tied the assertion to unrelated interner
         // traffic and left the `usize` subtraction able to underflow if the pool shrank between
         // the two reads.
-        let retained: HashSet<&InternedString> =
-            names.iter().flat_map(|mn| mn.raw_entries()).collect();
+        let retained: HashSet<&InternedString> = names.iter().flat_map(|mn| mn.0.iter()).collect();
         let retained_count = retained.len();
         assert!(
             retained_count <= unique.len() && retained_count + 64 >= unique.len(),
@@ -570,5 +619,40 @@ mod tests {
             "{amortized} vs {pool_bytes}"
         );
         drop(names);
+    }
+
+    /// `Display` writes a definition `FromStr` reads back as the same label set, whatever the
+    /// names hold (LABELS-02: names were written raw, so `m{"a b"="v"}` rendered as `m{a b="v"}`).
+    #[test]
+    fn test_display_round_trips_through_from_str() {
+        let cases: &[(&[(&str, &str)], &str)] = &[
+            (&[("__name__", "m"), ("a", "v")], r#"m{a="v"}"#),
+            (&[("__name__", "m"), ("a b", "v")], r#"m{"a b"="v"}"#),
+            (&[("__name__", "m"), ("9", "v")], r#"m{"9"="v"}"#),
+            (
+                &[("__name__", "m"), ("or", "1"), ("OR", "2")],
+                r#"m{"OR"="2","or"="1"}"#,
+            ),
+            (&[("__name__", "m"), ("a.b-c:d", "v")], r#"m{a.b-c:d="v"}"#),
+            (&[("__name__", "m"), ("région", "v")], r#"m{"région"="v"}"#),
+            (&[("__name__", "a b")], r#"{"a b"}"#),
+            (&[("__name__", "9cpu"), ("x", "1")], r#"{"9cpu",x="1"}"#),
+            (&[("__name__", "or")], r#"{"or"}"#),
+            (
+                &[("__name__", "m"), ("q", "say \"hi\"\\")],
+                r#"m{q="say \"hi\"\\"}"#,
+            ),
+        ];
+        for (pairs, rendered) in cases {
+            let mn = MetricName::from_pairs(pairs.iter().copied());
+            let text = mn.to_string();
+            assert_eq!(&text, rendered, "{pairs:?}");
+            let back: MetricName = text.parse().unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(back, mn, "{text}");
+        }
+        // Without `__name__` it is a label set, not a metric definition.
+        let unnamed = MetricName::from_pairs([("a b", "v")]);
+        assert_eq!(unnamed.to_string(), r#"{"a b"="v"}"#);
+        assert!(unnamed.to_string().parse::<MetricName>().is_err());
     }
 }

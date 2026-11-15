@@ -55,7 +55,7 @@ impl<'a> Terms<'a> {
             PredicateMatch::StartsWith(prefix) => {
                 let mut state = prefix;
                 self.postings_for_label_matching(&filter.label, &mut state, |value, prefix| {
-                    !starts_with_any(prefix, value)
+                    !prefix.matches_starts_with_any(value)
                 })
             }
             PredicateMatch::NotStartsWith(prefix) => {
@@ -167,7 +167,7 @@ fn handle_regex_equal_match<'a>(
         debug_assert!(false, "unexpected matcher type in handle_regex_equal_match");
         return Err(ValkeyError::Str(INTERNAL_ERROR));
     };
-    let res = if let Some(prefix) = &re.prefix {
+    let res = if let Some(prefix) = re.prefix() {
         postings.postings_by_prefix_and_predicate(&filter.label, prefix, |v| re.is_match(v))
     } else {
         let mut state = ();
@@ -227,15 +227,6 @@ fn postings_by_prefix_value<'a>(
             .fold(Cow::Borrowed(&*EMPTY_BITMAP), |acc, prefix| {
                 union_cow(acc, postings.postings_by_prefix(label, prefix))
             }),
-    }
-}
-
-#[inline]
-fn starts_with_any(prefix: &PredicateValue, value: &str) -> bool {
-    match prefix {
-        PredicateValue::Empty => false,
-        PredicateValue::String(p) => value.starts_with(p.as_str()),
-        PredicateValue::List(prefixes) => prefixes.iter().any(|p| value.starts_with(p.as_str())),
     }
 }
 

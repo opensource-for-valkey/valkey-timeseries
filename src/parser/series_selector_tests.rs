@@ -84,6 +84,14 @@ mod tests {
         }
     }
 
+    /// The number of filters in an AND selector.
+    fn and_len(selector: &SeriesSelector) -> usize {
+        match selector {
+            SeriesSelector::And(filters) => filters.len(),
+            _ => panic!("expected AND matcher"),
+        }
+    }
+
     fn with_or_matchers<F>(matchers: &SeriesSelector, f: F)
     where
         F: Fn(&[FilterList]),
@@ -186,13 +194,13 @@ mod tests {
         let matchers = parse_series_selector(input).unwrap();
 
         assert_eq!(matchers.get_metric_name(), Some("metric_name"));
-        assert_eq!(matchers.len(), 1);
+        assert_eq!(and_len(&matchers), 1);
         assert!(matchers.is_only_metric_name());
 
         let input = "metric_name{}";
         let matchers = parse_series_selector(input).unwrap();
         assert_eq!(matchers.get_metric_name(), Some("metric_name"));
-        assert_eq!(matchers.len(), 1);
+        assert_eq!(and_len(&matchers), 1);
         assert!(matchers.is_only_metric_name());
     }
 
@@ -616,6 +624,32 @@ mod tests {
         }
     }
 
+    /// A quoted name can be empty, but no series has an empty label or metric name, so the
+    /// braces form rejects one as the RTS form does. An empty *value* is still the absent label.
+    #[test]
+    fn test_empty_names_are_rejected() {
+        for selector in [
+            r#"{""="x"}"#,
+            r#"{""=""}"#,
+            r#"{""!="x"}"#,
+            r#"{job="a", ""=""}"#,
+            r#"{job="a", ""=~".*"}"#,
+            r#"{job="a" or ""="x"}"#,
+            r#"{""}"#,
+            r#"{"", job="a"}"#,
+            r#"""{job="a"}"#,
+            r#""""#,
+        ] {
+            let err = parse_series_selector(selector).unwrap_err().to_string();
+            assert!(
+                err.contains("expected a non-empty name"),
+                "{selector}: {err}"
+            );
+        }
+        assert!(parse_series_selector(r#"{job="a", env=""}"#).is_ok());
+        assert!(parse_series_selector(r#"{__name__="", job="a"}"#).is_ok());
+    }
+
     #[test]
     fn test_one_metric_name_per_group_is_judged_as_written() {
         // Two equalities, or an equality and the shorthand, name the metric twice.
@@ -714,12 +748,12 @@ mod tests {
             (r#"label="\n""#, r#"{label="\"\\n\""}"#, None),
             (
                 "size=(small,medium,large)",
-                r#"{size=("small", "medium", "large")}"#,
+                r#"{size=("small","medium","large")}"#,
                 None,
             ),
             (
                 r#"service^=(api,worker,"batch-job")"#,
-                r#"{service^=("api", "worker", "\"batch-job\"")}"#,
+                r#"{service^=("api","worker","\"batch-job\"")}"#,
                 None,
             ),
             // Braces form.
@@ -753,7 +787,7 @@ mod tests {
             ),
             (
                 r#"http_requests_total{method=(GET,SET,"POST"), status=~"2[0-9]{2}"}"#,
-                r#"http_requests_total{method=("GET", "SET", "POST"),status=~"2[0-9]{2}"}"#,
+                r#"http_requests_total{method=("GET","SET","POST"),status=~"2[0-9]{2}"}"#,
                 Some("http_requests_total"),
             ),
             (r#"foo{NaN="inf"}"#, r#"foo{NaN="inf"}"#, Some("foo")),
@@ -764,30 +798,31 @@ mod tests {
                 r#"metric_name{a="b",foo!="bar",test="test",bar!="baz"}"#,
                 Some("metric_name"),
             ),
-            // OR groups; an outer metric name is repeated in every group.
+            // OR groups; an outer metric name is repeated in every group. A name pinned by only
+            // one group is not the selector's: the other group can match any metric.
             (
                 r#"{__name__="metric_name",label1="value1" or label2=~"value.*"}"#,
-                r#"metric_name{label1="value1"} or {label2^="value"}"#,
-                Some("metric_name"),
+                r#"{metric_name,label1="value1" or label2^="value"}"#,
+                None,
             ),
             (
                 r#"{job="prometheus",env="prod" or datacenter=~"us-.*" or instance="localhost",role!="standby"}"#,
-                r#"{job="prometheus",env="prod"} or {datacenter^="us-"} or {instance="localhost",role!="standby"}"#,
+                r#"{job="prometheus",env="prod" or datacenter^="us-" or instance="localhost",role!="standby"}"#,
                 None,
             ),
             (
                 r#"http_requests{status="400" or method="POST"}"#,
-                r#"http_requests{status="400"} or http_requests{method="POST"}"#,
+                r#"http_requests{status="400" or method="POST"}"#,
                 Some("http_requests"),
             ),
             (
                 r#"{a="b", foo!="bar" or size=(small,medium,large) or color="red",flavor!=(original,cajun,"extra spicy")}"#,
-                r#"{a="b",foo!="bar"} or {size=("small", "medium", "large")} or {color="red",flavor!=("original", "cajun", "extra spicy")}"#,
+                r#"{a="b",foo!="bar" or size=("small","medium","large") or color="red",flavor!=("original","cajun","extra spicy")}"#,
                 None,
             ),
             (
                 r#"http_status{status="500"} or api_host{service="auth", env=~"prod|staging"}"#,
-                r#"http_status{status="500"} or api_host{service="auth",env=("prod", "staging")}"#,
+                r#"{http_status,status="500" or api_host,service="auth",env=("prod","staging")}"#,
                 None,
             ),
         ] {

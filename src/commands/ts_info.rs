@@ -2,6 +2,7 @@ use crate::aggregators::AggregationHandler;
 use crate::common::replies::ReplyContext;
 use crate::common::replies::is_resp3_client;
 use crate::common::rounding::RoundingStrategy;
+use crate::labels::label_value_reply;
 use crate::series::{
     TimeSeries, chunks::ChunkOps, get_timeseries, live_source_key, try_get_timeseries,
 };
@@ -257,31 +258,32 @@ fn get_ts_info(ctx: &Context, ts: &TimeSeries, debug: bool, key: &ValkeyString) 
 ///
 /// RESP3: a map of `name -> value`. RESP2: an array of `[name, value]` pairs.
 /// A label-less series yields an empty map / empty array respectively. Both
-/// forms are empty (not nil) — see [`From<Label>`] for the RESP2 pair encoding.
+/// forms are empty (not nil). The stored labels are already in name order, so
+/// they are read as they are; an empty value would be nil ([`label_value_reply`]).
 fn get_labels_info(ts: &TimeSeries, is_resp3: bool) -> ValkeyValue {
-    let mut labels = ts.labels.to_label_vec();
-    labels.sort();
-
     if is_resp3 {
-        let map: HashMap<ValkeyValueKey, ValkeyValue> = labels
-            .into_iter()
+        let map: HashMap<ValkeyValueKey, ValkeyValue> = ts
+            .labels
+            .iter()
             .map(|label| {
-                let value = if label.value.is_empty() {
-                    ValkeyValue::Null
-                } else {
-                    ValkeyValue::from(label.value)
-                };
-                (ValkeyValueKey::String(label.name), value)
+                let name = ValkeyValueKey::String(label.name.to_string());
+                (name, label_value_reply(label.value))
             })
             .collect();
         return ValkeyValue::Map(map);
     }
 
-    let labels_value = labels
-        .into_iter()
-        .map(|label| label.into())
+    let pairs = ts
+        .labels
+        .iter()
+        .map(|label| {
+            ValkeyValue::from(vec![
+                ValkeyValue::from(label.name),
+                label_value_reply(label.value),
+            ])
+        })
         .collect::<Vec<ValkeyValue>>();
-    ValkeyValue::from(labels_value)
+    ValkeyValue::from(pairs)
 }
 
 /// Aggregator name as reported inside a TS.INFO `rules` entry: uppercase

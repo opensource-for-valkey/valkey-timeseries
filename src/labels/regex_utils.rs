@@ -6,17 +6,20 @@ use crate::labels::filters::{
     PredicateMatch, PredicateValue, RegexMatcher, validate_contains_value,
     validate_starts_with_value,
 };
-use crate::labels::regex::{build_cached, try_escape_for_repeat_re};
-use crate::labels::regex_cache::{PatternCache, REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN};
+use crate::labels::regex::{
+    CompiledRegex, RegexError, compile_matcher, compile_rust_syntax, parse_matcher_hir,
+};
+use crate::labels::regex_cache::{
+    MATCHER_CACHE_MAX_BYTES, PatternCache, REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN,
+};
 use crate::parser::{ParseError, ParseResult};
-use regex::Error as RegexError;
-use regex::Regex;
-use regex_syntax::ParserBuilder;
 use regex_syntax::hir::Class::{Bytes, Unicode};
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 use std::sync::LazyLock;
 
-// Beyond this, it's better to use regexp.
+// The most strings decomposition will build out of a character class, a concatenation's
+// product, or one non-literal branch of an alternation; beyond this, the regex is cheaper.
+// Flat lists of literal alternatives are not capped; see `get_or_values`.
 const MAX_OR_VALUES: usize = 16;
 // Prefix extraction is an index optimization, not a reason to materialize an
 // unbounded string from an otherwise compact regex repetition. Larger patterns
@@ -30,22 +33,23 @@ const MAX_REPETITION_PREFIX_BYTES: u64 = 4 * 1024;
 /// stored on the second sighting of its pattern: a miss that only decomposes is cheap enough
 /// that storing and evicting one-off patterns would cost a quarter of it.
 static EQUAL_MATCHERS: LazyLock<PatternCache<PredicateMatch>> = LazyLock::new(|| {
-    PatternCache::admitting_on_second_sighting(REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN)
+    PatternCache::admitting_on_second_sighting(
+        REGEX_CACHE_CAPACITY,
+        REGEX_CACHE_MAX_PATTERN_LEN,
+        MATCHER_CACHE_MAX_BYTES,
+    )
 });
 static NOT_EQUAL_MATCHERS: LazyLock<PatternCache<PredicateMatch>> = LazyLock::new(|| {
-    PatternCache::admitting_on_second_sighting(REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN)
+    PatternCache::admitting_on_second_sighting(
+        REGEX_CACHE_CAPACITY,
+        REGEX_CACHE_MAX_PATTERN_LEN,
+        MATCHER_CACHE_MAX_BYTES,
+    )
 });
 
 /// The matcher for `=~ expr` (or `!~ expr` when `is_equal` is false), decomposed into a
 /// literal, prefix, list or contains match where the regex allows it.
 pub(crate) fn parse_regex_matcher(expr: &str, is_equal: bool) -> ParseResult<PredicateMatch> {
-    if is_match_all_regex_pattern(expr) {
-        return Ok(if is_equal {
-            PredicateMatch::MatchAll
-        } else {
-            PredicateMatch::MatchNone
-        });
-    }
     let cache = if is_equal {
         &EQUAL_MATCHERS
     } else {
@@ -55,10 +59,17 @@ pub(crate) fn parse_regex_matcher(expr: &str, is_equal: bool) -> ParseResult<Pre
 }
 
 fn decompose_matcher(expr: &str, is_equal: bool) -> ParseResult<PredicateMatch> {
-    let invalid = |_| ParseError::InvalidRegex(expr.to_string());
-    // Parse once: the decomposition and the matcher's prefilter hints both
-    // read this tree.
+    let invalid = |err: RegexError| ParseError::InvalidRegex(format!("`{expr}`: {err}"));
+    // Parse once: the degenerate-pattern check, the decomposition and the matcher's prefilter
+    // hints all read this tree.
     let inner = parse_anchored_hir(expr).map_err(invalid)?;
+    if is_match_all(&inner) {
+        return Ok(if is_equal {
+            PredicateMatch::MatchAll
+        } else {
+            PredicateMatch::MatchNone
+        });
+    }
     let decomposed = decompose_parsed(expr, &inner).map_err(invalid)?;
     Ok(decomposed_regex_to_predicate_match(
         expr, &inner, decomposed, is_equal,
@@ -68,7 +79,7 @@ fn decompose_matcher(expr: &str, is_equal: bool) -> ParseResult<PredicateMatch> 
 fn regex_predicate(
     expr: &str,
     inner: &Hir,
-    regex: Regex,
+    regex: CompiledRegex,
     prefix: Option<String>,
     is_equal: bool,
 ) -> PredicateMatch {
@@ -140,129 +151,122 @@ fn decomposed_regex_to_predicate_match(
     }
 }
 
-/// remove_start_end_anchors removes '^' at the start of expr and '$' at the end of the expr.
-fn remove_start_end_anchors(expr: &str) -> &str {
-    let mut cursor = expr;
-    while let Some(t) = cursor.strip_prefix('^') {
-        cursor = t;
-    }
-    while cursor.ends_with('$') && !cursor.ends_with("\\$") {
-        cursor = &cursor[..cursor.len() - 1];
-    }
-    cursor
-}
-
+/// Whether a (Go-syntax) pattern matches every value, judged on its parsed tree: `.*`, but
+/// also `^.*$`, `(.*)`, `.*.*`, `(?s:.*)` or `.*|foo`. A pattern that does not parse is not.
 pub(crate) fn is_match_all_regex_pattern(expr: &str) -> bool {
-    remove_start_end_anchors(expr) == ".*"
+    parse_anchored_hir(expr).is_ok_and(|inner| is_match_all(&inner))
 }
 
-fn get_or_values(sre: &Hir, dest: &mut Vec<String>) -> bool {
+/// `sre` (anchors already stripped) matches every value: a `.*`, or a concatenation of them.
+fn is_match_all(sre: &Hir) -> bool {
+    match sre.kind() {
+        HirKind::Concat(subs) => subs.iter().all(is_dot_star),
+        _ => is_dot_star(sre),
+    }
+}
+
+/// `sre` (anchors already stripped) matches exactly the non-empty values: `.+`, or a
+/// concatenation of one `.+` with any number of `.*` (`(.+)`, `.+.*`, `^.+$`). Two `.+`
+/// would need two characters.
+fn is_any_non_empty(sre: &Hir) -> bool {
+    match sre.kind() {
+        HirKind::Concat(subs) => {
+            subs.iter().all(|s| is_dot_star(s) || is_dot_plus(s))
+                && subs.iter().filter(|s| is_dot_plus(s)).count() == 1
+        }
+        _ => is_dot_plus(sre),
+    }
+}
+
+/// The finite set of strings `sre` matches, when it is small enough to look up value by value
+/// instead of running a regex; `None` otherwise.
+///
+/// [`MAX_OR_VALUES`] bounds every set this function has to *build*: a character class, a
+/// concatenation's product, and each non-literal branch of an alternation. A literal branch
+/// costs one value, and a flat list of literal alternatives (`a|b|c|…`, as dashboards generate
+/// for multi-value variables) is not capped: it is a direct postings lookup per value, and its
+/// size is the size of the pattern.
+///
+/// Work is linear in the size of `sre`. Each node is visited once, without building new trees,
+/// and recursion follows only the nesting the parser allows (`regex_syntax`'s nest limit), not
+/// the length of a concatenation. A concatenation is folded from the left and stops at the
+/// first child that would push the product over the budget, so `[ab]` repeated thousands of
+/// times gives up after five terms.
+fn get_or_values(sre: &Hir) -> Option<Vec<String>> {
     use HirKind::*;
 
-    if dest.len() > MAX_OR_VALUES {
-        return false;
-    }
-
     match sre.kind() {
-        Class(clazz) => {
-            // Expand simple character classes into literal single-character strings when
-            // the total number of alternatives is small. This handles cases like `1|2`
-            // which the parser may represent as a character class `{'1'..='2'}`.
-            match clazz {
-                Unicode(uni) => {
-                    // Count total characters and bail out if too many.
-                    let mut total = 0usize;
-                    for r in uni.ranges() {
-                        let start = r.start() as u32;
-                        let end = r.end() as u32;
-                        total = total.saturating_add((end - start + 1) as usize);
-                        if total > MAX_OR_VALUES {
-                            return false;
-                        }
-                    }
-                    for r in uni.ranges() {
-                        let start = r.start() as u32;
-                        let end = r.end() as u32;
-                        for cp in start..=end {
-                            if let Some(ch) = std::char::from_u32(cp) {
-                                dest.push(ch.to_string());
-                            } else {
-                                return false;
-                            }
-                        }
-                    }
-                    true
+        // Expand a small character class into single-character strings. This handles cases
+        // like `1|2`, which the parser represents as the class `[12]`.
+        Class(Unicode(uni)) => {
+            let mut total = 0usize;
+            for r in uni.ranges() {
+                total = total.saturating_add((r.end() as u32 - r.start() as u32 + 1) as usize);
+                if total > MAX_OR_VALUES {
+                    return None;
                 }
-                Bytes(_) => false, // don't attempt to expand arbitrary byte classes
             }
-        }
-        Empty => {
-            dest.push("".to_string());
-            true
-        }
-        Capture(cap) => get_or_values(cap.sub.as_ref(), dest),
-        Literal(literal) => {
-            if let Ok(s) = String::from_utf8(literal.0.to_vec()) {
-                dest.push(s);
-                true
-            } else {
-                false
+            let mut values = Vec::with_capacity(total);
+            for r in uni.ranges() {
+                for cp in r.start() as u32..=r.end() as u32 {
+                    values.push(std::char::from_u32(cp)?.to_string());
+                }
             }
+            Some(values)
         }
+        // Don't attempt to expand arbitrary byte classes.
+        Class(Bytes(_)) => None,
+        Empty => Some(vec![String::new()]),
+        Capture(cap) => get_or_values(cap.sub.as_ref()),
+        Literal(literal) => String::from_utf8(literal.0.to_vec()).ok().map(|s| vec![s]),
         Alternation(alt) => {
-            dest.reserve(alt.len());
+            let mut values = Vec::with_capacity(alt.len());
             for sub in alt.iter() {
-                let start_count = dest.len();
                 if let Some(literal) = get_literal(sub) {
-                    dest.push(literal);
-                } else if !get_or_values(sub, dest) {
-                    return false;
+                    values.push(literal);
+                    continue;
                 }
-                if dest.len() - start_count > MAX_OR_VALUES {
-                    return false;
+                let branch = get_or_values(sub)?;
+                if branch.len() > MAX_OR_VALUES {
+                    return None;
                 }
+                values.extend(branch);
             }
-            true
+            Some(values)
         }
-        Concat(concat) => {
-            let mut prefixes = Vec::with_capacity(MAX_OR_VALUES);
-            if !get_or_values(&concat[0], &mut prefixes) {
-                return false;
-            }
-            let subs = Vec::from(&concat[1..]);
-            let concat = Hir::concat(subs);
-            let prefix_count = prefixes.len();
-            if !get_or_values(&concat, &mut prefixes) {
-                return false;
-            }
-            let suffix_count = prefixes.len() - prefix_count;
-            let additional_capacity = prefix_count * suffix_count;
-            if additional_capacity > MAX_OR_VALUES {
-                // It is cheaper to use regexp here.
-                return false;
-            }
-            dest.reserve(additional_capacity);
-            let (pre, suffixes) = prefixes.split_at(prefix_count);
-            for prefix in pre.iter() {
-                for suffix in suffixes.iter() {
-                    if dest.len() > MAX_OR_VALUES {
-                        return false;
+        Concat(subs) => {
+            let mut product = vec![String::new()];
+            for sub in subs {
+                let suffixes = get_or_values(sub)?;
+                if product.len().saturating_mul(suffixes.len()) > MAX_OR_VALUES {
+                    // It is cheaper to use the regex here.
+                    return None;
+                }
+                if let [suffix] = suffixes.as_slice() {
+                    // The common step: extend in place rather than copy every prefix.
+                    for prefix in &mut product {
+                        prefix.push_str(suffix);
                     }
-                    dest.push(format!("{prefix}{suffix}"));
+                } else {
+                    product = product
+                        .iter()
+                        .flat_map(|prefix| suffixes.iter().map(move |s| format!("{prefix}{s}")))
+                        .collect();
                 }
             }
-            true
+            Some(product)
         }
-        // Previously we listed simple `?` repetitions here into two literal
-        // alternatives (empty + literal). That caused certain patterns like
-        // `ab?c` to become literal lists. Prefer returning `false` here and let
-        // the main decomposition logic handle `?` by producing a
-        // `PrefixWithRegex` (so `ab?c` becomes prefix `a` with the remainder
-        // `b?c`). This preserves semantics while allowing prefix-based
-        // optimizations elsewhere.
-        // (Fall through to default -> false)
-        _ => false,
+        // Repetitions are not expanded, `?` included: listing `b?` as `""` and `"b"` turned
+        // `ab?c` into a literal list, where the decomposition proper keeps prefix `a` with the
+        // remainder `b?c`.
+        _ => None,
     }
+}
+
+/// [`get_or_values`], treating an empty set (a class that matches nothing) as "not
+/// decomposable" the way every caller wants it.
+fn non_empty_or_values(sre: &Hir) -> Option<Vec<String>> {
+    get_or_values(sre).filter(|values| !values.is_empty())
 }
 
 fn get_literal(sre: &Hir) -> Option<String> {
@@ -333,18 +337,10 @@ fn is_any_char_class(class: &Class) -> bool {
     }
 }
 
-/// Parse `pattern` the way `compile_regex` compiles it, so the decomposition
-/// and the compiled regex agree: the same flags (what `.` matches), and the
-/// same retry with Go-style literal braces (`abc{def}`) escaped.
+/// Parse `pattern` the way `compile_regex` compiles it (Go syntax, `.` matching a newline), so
+/// the decomposition and the compiled regex agree on what it means.
 fn build_hir(pattern: &str) -> Result<Hir, RegexError> {
-    let parse = |p: &str| {
-        ParserBuilder::new()
-            .dot_matches_new_line(true)
-            .build()
-            .parse(p)
-            .map_err(|err| RegexError::Syntax(err.to_string()))
-    };
-    parse(pattern).or_else(|err| parse(&try_escape_for_repeat_re(pattern)).map_err(|_| err))
+    parse_matcher_hir(pattern)
 }
 
 /// Result of decomposing a regex for postings-index optimization.
@@ -357,9 +353,9 @@ pub enum RegexDecomposition {
     /// The regex is exactly `.*literal.*` or `.*(a|b|c).*` after anchor normalization.
     Contains(PredicateValue),
     /// The regex is an anchored literal prefix followed by a (non-.*) remainder.
-    PrefixWithRegex(String, Regex),
+    PrefixWithRegex(String, CompiledRegex),
     /// The regex could not be simplified
-    Regex(Regex),
+    Regex(CompiledRegex),
 }
 
 impl PartialEq for RegexDecomposition {
@@ -446,8 +442,7 @@ fn decompose_parsed(expr: &str, inner: &Hir) -> Result<RegexDecomposition, Regex
         };
         // A remainder that expands into a few literals (e.g. a character
         // class) becomes a flat literal list carrying the prefix.
-        let mut or_values = Vec::new();
-        if get_or_values(&remainder, &mut or_values) && !or_values.is_empty() {
+        if let Some(or_values) = non_empty_or_values(&remainder) {
             let lits = or_values
                 .into_iter()
                 .map(|s| format!("{prefix}{s}"))
@@ -467,18 +462,17 @@ fn decompose_parsed(expr: &str, inner: &Hir) -> Result<RegexDecomposition, Regex
     }
 
     // Flat list of literal alternatives.
-    let mut or_values = Vec::new();
-    if get_or_values(inner, &mut or_values) && !or_values.is_empty() {
+    if let Some(or_values) = non_empty_or_values(inner) {
         return Ok(RegexDecomposition::Literals(or_values));
     }
 
     Ok(RegexDecomposition::Regex(compile_regex(expr)?))
 }
 
-/// The fully anchored regex for `expr`, from the process-wide matcher cache (`regex_cache`).
-pub(crate) fn compile_regex(expr: &str) -> Result<Regex, RegexError> {
-    let anchored = format!("^(?:{})$", expr);
-    build_cached(&anchored)
+/// Compile a user's pattern (Go syntax), anchored at both ends, through the process-wide
+/// cache of compiled matchers (`regex_cache`).
+pub(crate) fn compile_regex(expr: &str) -> Result<CompiledRegex, RegexError> {
+    compile_matcher(expr)
 }
 
 pub(crate) fn compile_prefixed_regex(
@@ -490,7 +484,8 @@ pub(crate) fn compile_prefixed_regex(
     // (including the prefix), prefix the (escaped) literal prefix to the
     // remainder pattern and compile the resulting expression.
     let combined = format!("{}{}", regex::escape(&prefix), pattern);
-    let compiled = compile_regex(&combined)?;
+    // `pattern` is a printed `Hir` or built here, so it is Rust syntax already.
+    let compiled = compile_rust_syntax(&combined)?;
     Ok(RegexDecomposition::PrefixWithRegex(prefix, compiled))
 }
 
@@ -630,10 +625,7 @@ fn extract_anchored_prefix_value(sre: &Hir) -> Option<PredicateValue> {
         return validate_starts_with_value(&value).ok().map(|_| value);
     }
 
-    let mut values = Vec::new();
-    if !get_or_values(&prefix_hir, &mut values) || values.is_empty() {
-        return None;
-    }
+    let mut values = non_empty_or_values(&prefix_hir)?;
 
     let value = if values.len() == 1 {
         PredicateValue::String(values.pop().unwrap())
@@ -650,6 +642,9 @@ pub(crate) struct RegexHints {
     pub(crate) required_literals: Vec<String>,
     /// A literal the value must end with.
     pub(crate) suffix: Option<String>,
+    /// The whole pattern matches exactly the non-empty values (`.+` and its spellings), so a
+    /// match needs no regex and the planner can answer it from the label's value list.
+    pub(crate) matches_any_non_empty: bool,
 }
 
 /// [`regex_hints`] for a pattern that has not been parsed yet. A pattern that
@@ -666,7 +661,10 @@ pub(crate) fn regex_hints_for_pattern(expr: &str, prefix: Option<&str>) -> Regex
 /// `inner` starts with exactly that literal prefix; otherwise there are none.
 fn regex_hints(inner: &Hir, prefix: Option<&str>) -> RegexHints {
     let Some(prefix) = prefix else {
-        return hints_from(inner);
+        return RegexHints {
+            matches_any_non_empty: is_any_non_empty(inner),
+            ..hints_from(inner)
+        };
     };
     match extract_anchored_prefix_or_remainder(inner) {
         Some((actual, PrefixTail::Rest(remainder))) if actual == prefix => hints_from(&remainder),
@@ -678,6 +676,7 @@ fn hints_from(sre: &Hir) -> RegexHints {
     RegexHints {
         required_literals: extract_literal_sequence(sre).unwrap_or_default(),
         suffix: extract_trailing_literal_sequence(sre),
+        matches_any_non_empty: false,
     }
 }
 
@@ -697,10 +696,7 @@ fn extract_contains_value(sre: &Hir) -> Option<PredicateValue> {
         return validate_contains_value(&value).ok().map(|_| value);
     }
 
-    let mut values = Vec::new();
-    if !get_or_values(&middle, &mut values) || values.is_empty() {
-        return None;
-    }
+    let mut values = non_empty_or_values(&middle)?;
 
     let value = if values.len() == 1 {
         PredicateValue::String(values.pop().unwrap())
@@ -773,9 +769,7 @@ fn extract_trailing_literal_sequence(sre: &Hir) -> Option<String> {
 
 #[cfg(test)]
 mod test {
-    use super::{
-        RegexDecomposition, decompose_regex, parse_regex_matcher, remove_start_end_anchors,
-    };
+    use super::{RegexDecomposition, decompose_regex, parse_regex_matcher};
     use crate::labels::filters::{PredicateMatch, PredicateValue};
 
     #[test]
@@ -822,28 +816,6 @@ mod test {
         check("foo.*", false);
         check(".*foo.*bar.*baz.*qux.*quux.*quuz.*corge.*grault", false);
         check(".*foo.*bar.*baz.*qux.*quux.*quuz.*corge.*grault.*", false);
-    }
-
-    #[test]
-    fn test_remove_start_end_anchors() {
-        fn f(s: &str, result_expected: &str) {
-            let result = remove_start_end_anchors(s);
-            assert_eq!(
-                result, result_expected,
-                "unexpected result for remove_start_end_anchors({s}); got {result}; want {}",
-                result_expected
-            );
-        }
-
-        f("", "");
-        f("a", "a");
-        f("^^abc", "abc");
-        f("a^b$c", "a^b$c");
-        f("$$abc^", "$$abc^");
-        f("^abc|de$", "abc|de");
-        f("abc\\$", "abc\\$");
-        f("^abc\\$$$", "abc\\$");
-        f("^a\\$b\\$$", "a\\$b\\$")
     }
 
     #[test]
@@ -1684,13 +1656,19 @@ mod test {
                 };
                 regex_matchers += 1;
                 let rebuilt = RegexMatcher::from_parts(
-                    super::compile_regex(&parsed.value).unwrap(),
-                    parsed.value.clone(),
-                    parsed.prefix.clone(),
+                    super::compile_regex(parsed.value()).unwrap(),
+                    parsed.value().to_string(),
+                    parsed.prefix().map(str::to_string),
                 );
-                assert_eq!(parsed.suffix, rebuilt.suffix, "suffix for {pattern:?}");
+                assert_eq!(parsed.suffix(), rebuilt.suffix(), "suffix for {pattern:?}");
                 assert_eq!(
-                    parsed.required_literals, rebuilt.required_literals,
+                    parsed.matches_any_non_empty(),
+                    rebuilt.matches_any_non_empty(),
+                    "any-non-empty for {pattern:?}"
+                );
+                assert_eq!(
+                    parsed.required_literals(),
+                    rebuilt.required_literals(),
                     "required literals for {pattern:?}"
                 );
             }
@@ -1770,6 +1748,159 @@ mod test {
                         (Err(_), Err(_)) => {}
                         _ => panic!("{pattern} {is_equal}: {fresh:?} vs {cached:?}"),
                     }
+                }
+            }
+        }
+    }
+
+    fn or_values(pattern: &str) -> Option<Vec<String>> {
+        super::get_or_values(&super::build_hir(pattern).unwrap())
+    }
+
+    #[test]
+    fn test_or_values_concat_product_order_and_budget() {
+        assert_eq!(
+            or_values("[ab][cd]").unwrap(),
+            ["ac", "ad", "bc", "bd"].map(String::from)
+        );
+        assert_eq!(
+            or_values("x[ab]y(c|d)z").unwrap(),
+            ["xaycz", "xaydz", "xbycz", "xbydz"].map(String::from)
+        );
+        // 2^4 = 16 is within the budget, 2^5 is not.
+        assert_eq!(or_values(&"[ab]".repeat(4)).unwrap().len(), 16);
+        assert_eq!(or_values(&"[ab]".repeat(5)), None);
+        // A class that matches nothing yields no values to look up, so the pattern is not
+        // turned into a (vacuous) literal list; it stays a regex that matches nothing.
+        let empty_class = r"[ab][^\x00-\x{10FFFF}]";
+        assert!(!matches!(or_values(empty_class), Some(values) if !values.is_empty()));
+        assert!(!matches!(
+            decompose_regex(empty_class).unwrap(),
+            RegexDecomposition::Literals(_)
+        ));
+    }
+
+    #[test]
+    fn test_or_values_alternation_budget_is_per_built_branch() {
+        // Literal branches are not capped: a long list stays a list of lookups.
+        let words: Vec<String> = (0..40).map(|i| format!("host{i}")).collect();
+        assert_eq!(or_values(&words.join("|")).unwrap(), words);
+        // Earlier literal branches no longer count against a later non-literal one.
+        let pattern = format!("{}|x[yz]", words.join("|"));
+        assert_eq!(or_values(&pattern).unwrap().len(), 42);
+        // A branch that has to be built is held to the budget.
+        assert_eq!(or_values(&format!("a|{}", "[ab]".repeat(5))), None);
+    }
+
+    /// LABELS-01: decomposing a long flat concatenation used to recurse once per term and
+    /// clone the remaining terms at every level -- quadratic work, and a stack overflow at a
+    /// few thousand terms (16 KB of pattern). A stack overflow aborts the whole test binary,
+    /// so the patterns run in a child process and the parent checks that it exited normally.
+    #[test]
+    fn test_long_flat_concat_decomposes_without_deep_recursion() {
+        const CHILD: &str = "VALKEY_TS_TEST_LONG_CONCAT_CHILD";
+        const NAME: &str = "test_long_flat_concat_decomposes_without_deep_recursion";
+
+        if std::env::var_os(CHILD).is_some() {
+            let terms = 8192;
+            let classes = "[ab]".repeat(terms);
+            let captures = "(a)".repeat(terms);
+            let mixed = "a[bc]".repeat(terms / 2);
+            for pattern in [
+                // Plain product: gives up after five terms, then the regex compiler's size
+                // limit rejects the pattern.
+                classes.clone(),
+                // Leading literal: reaches decomposition through the prefix remainder.
+                format!("x{classes}"),
+                // Contains: reaches it through the middle of `.*…*.`.
+                format!(".*{classes}.*"),
+                // Prefix: through the part before a trailing `.*`.
+                format!("{classes}.*"),
+                // One value per term: the product never grows, every term is visited.
+                captures,
+                mixed,
+            ] {
+                for is_equal in [true, false] {
+                    // Accepting or rejecting is not the point; returning is.
+                    let _ = parse_regex_matcher(&pattern, is_equal);
+                }
+            }
+            return;
+        }
+
+        let module = module_path!();
+        let test = format!(
+            "{}::{NAME}",
+            module.split_once("::").map_or(module, |(_, m)| m)
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("spawn the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child exited with {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Guard against a filter that matched nothing and "passed" vacuously.
+        assert!(stdout.contains("1 passed"), "child ran no test:\n{stdout}");
+    }
+
+    /// LABELS-13: degenerate patterns are recognized on the parsed tree, so every spelling of
+    /// `.*` becomes MatchAll / MatchNone and every spelling of `.+` is flagged, not only the
+    /// exact texts `.*` and `.+`.
+    #[test]
+    fn test_degenerate_patterns_are_recognized_in_any_spelling() {
+        for pattern in [
+            ".*", "^.*$", "(.*)", "(?:.*)", ".*.*", "(?s:.*)", ".*|foo", "^(.*)$",
+        ] {
+            assert_eq!(
+                parse_regex_matcher(pattern, true).unwrap(),
+                PredicateMatch::MatchAll,
+                "{pattern}"
+            );
+            assert_eq!(
+                parse_regex_matcher(pattern, false).unwrap(),
+                PredicateMatch::MatchNone,
+                "{pattern}"
+            );
+            assert!(super::is_match_all_regex_pattern(pattern), "{pattern}");
+        }
+        for pattern in ["", "a.*", ".*a", ".+", "(?-s:.*)", "[^a]*", "("] {
+            assert!(!super::is_match_all_regex_pattern(pattern), "{pattern}");
+        }
+
+        let values = ["", "a", "abc", "\n", "x\ny"];
+        for (pattern, any_non_empty) in [
+            (".+", true),
+            ("^.+$", true),
+            ("(.+)", true),
+            (".+.*", true),
+            (".*.+", true),
+            (".+.+", false), // needs two characters
+            ("a.+", false),
+            (".+a", false),
+            (".?", false),
+            ("(?-s:.+)", false), // `.` without newlines is not every character
+        ] {
+            for is_equal in [true, false] {
+                let matcher = parse_regex_matcher(pattern, is_equal).unwrap();
+                let (PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re)) = &matcher
+                else {
+                    panic!("{pattern}: {matcher:?}");
+                };
+                assert_eq!(re.matches_any_non_empty(), any_non_empty, "{pattern}");
+                // The shortcut must agree with the compiled regex on every value.
+                let direct = super::compile_regex(pattern).unwrap();
+                for v in values {
+                    assert_eq!(
+                        matcher.matches(v),
+                        direct.is_match(v) == is_equal,
+                        "{pattern} on {v:?}"
+                    );
                 }
             }
         }

@@ -143,7 +143,7 @@ pub(crate) fn invalid_series_key_error() -> ValkeyError {
 /// lazily expire the key, and the `unlink` callback that follows takes the postings write lock on
 /// this thread.
 fn has_series_with_label_set(ctx: &Context, index: &TimeSeriesIndex, labels: &MetricName) -> bool {
-    let candidates = index.postings_by_labels(&labels.to_label_vec());
+    let candidates = index.postings_by_labels(labels.iter());
     candidates.iter().any(|id| {
         let key = index
             .get_postings()
@@ -270,9 +270,9 @@ pub fn create_and_store_series<'a>(
 /// starts from the configured policy).
 ///
 /// A series with a `__name__` label is re-created through `METRIC` when that text parses back to
-/// exactly the same label set, and through `LABELS` otherwise. `LABELS __name__ …` is accepted
-/// too, so a series can hold a name or label names the metric grammar cannot spell
-/// (`cpu total`, `1x`); `METRIC`, in turn, is the only way to spell an empty label value.
+/// exactly the same label set, and through `LABELS` otherwise (a set with more labels than
+/// `METRIC` takes). Names that are not identifiers (`cpu total`, `1x`) are quoted in the
+/// `METRIC` text.
 pub(crate) fn resolved_create_args(ctx: &Context, series: &TimeSeries) -> Vec<ValkeyString> {
     create_option_strings(series)
         .into_iter()
@@ -763,40 +763,49 @@ mod tests {
         }
     }
 
-    /// `LABELS __name__ …` is accepted by `TS.CREATE`/`TS.ALTER`, so a series can hold a name or
-    /// label names the metric grammar cannot spell. Those fall back to `LABELS`, which keeps
-    /// `__name__` as an ordinary pair; rendering them through `METRIC` would make the replica's
-    /// `TS.CREATE` fail and rebuild the series from its own defaults. `LABELS` does not cap the
-    /// label count, so more than `METRIC` takes falls back too.
+    /// `LABELS __name__ …` lets a series hold a metric name or label names that are not
+    /// identifiers. They used to fall back to `LABELS`, because the metric text wrote them raw
+    /// and did not parse back; quoted, they replicate as `METRIC` like any other named series.
     #[test]
-    fn test_labels_the_metric_grammar_cannot_spell_fall_back_to_labels() {
-        let over_limit = std::iter::once(Label::new("__name__", "cpu"))
-            .chain(
-                (0..crate::labels::MAX_LABELS_PER_SERIES)
-                    .map(|i| Label::new(format!("l{i}"), "v".into())),
-            )
-            .collect();
+    fn test_names_that_are_not_identifiers_replicate_as_metric() {
         let cases: Vec<Vec<Label>> = vec![
             vec![Label::new("__name__", "cpu total"), Label::new("1x", "a")],
             vec![Label::new("__name__", "cpu"), Label::new("caf\u{e9}", "a")],
             vec![Label::new("__name__", "9cpu")],
             vec![Label::new("__name__", "cpu"), Label::new("a b", "c")],
-            over_limit,
         ];
         for labels in &cases {
             let (series, args) = render_labels(labels);
             assert!(
-                !args.contains(&"METRIC".to_string()),
+                !args.contains(&"LABELS".to_string()),
                 "{labels:?}: {args:?}"
             );
-            let pos = args.iter().position(|a| a == "LABELS").unwrap();
-            let pairs: Vec<Label> = args[pos + 1..]
-                .chunks(2)
-                .map(|pair| Label::new(&pair[0], &pair[1]))
-                .collect();
-            assert_eq!(MetricName::new(&pairs), series.labels, "{args:?}");
-            assert!(args.contains(&"__name__".to_string()), "{args:?}");
+            let metric = &operands(&args, "METRIC", 1)[0];
+            let parsed = parse_create_metric(metric).expect("TS.CREATE METRIC accepts it");
+            assert_eq!(MetricName::new(&parsed), series.labels, "{metric}");
         }
+    }
+
+    /// `LABELS` does not cap the label count, so a named series with more labels than `METRIC`
+    /// takes falls back to `LABELS`, which keeps `__name__` as an ordinary pair; rendering it
+    /// through `METRIC` would make the replica's `TS.CREATE` fail and rebuild the series from
+    /// its own defaults.
+    #[test]
+    fn test_labels_over_the_metric_limit_fall_back_to_labels() {
+        let over_limit: Vec<Label> = std::iter::once(Label::new("__name__", "cpu"))
+            .chain(
+                (0..crate::labels::MAX_LABELS_PER_SERIES)
+                    .map(|i| Label::new(format!("l{i}"), "v".into())),
+            )
+            .collect();
+        let (series, args) = render_labels(&over_limit);
+        assert!(!args.contains(&"METRIC".to_string()), "{args:?}");
+        let pos = args.iter().position(|a| a == "LABELS").unwrap();
+        let pairs: Vec<Label> = args[pos + 1..]
+            .chunks(2)
+            .map(|pair| Label::new(&pair[0], &pair[1]))
+            .collect();
+        assert_eq!(MetricName::new(&pairs), series.labels, "{args:?}");
     }
 
     #[test]

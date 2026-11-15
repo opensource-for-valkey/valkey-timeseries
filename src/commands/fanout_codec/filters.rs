@@ -8,7 +8,7 @@ use super::generated::{
 use crate::commands::fanout_codec::series_selector::Filters;
 use crate::labels::filters::{
     FilterList, LabelFilter, OrFiltersList, PredicateMatch, PredicateValue, RegexMatcher,
-    SeriesSelector, ValueList, validate_contains_value, validate_starts_with_value,
+    SeriesSelector, ValueList,
 };
 use crate::labels::{compile_regex, is_match_all_regex_pattern};
 use crate::series::DateRange;
@@ -54,16 +54,15 @@ fn regex_matcher_to_fanout(value: &RegexMatcher) -> FanoutRegexFilterValue {
     // `Regex` is not transmitted; the receiver will recompile from the
     // original text which preserves equality checks in tests.
     FanoutRegexFilterValue {
-        regex: value.value.clone(),
-        prefix: value.prefix.clone().unwrap_or_default(),
-        suffix: value.suffix.clone().unwrap_or_default(),
+        regex: value.value().to_string(),
+        prefix: value.prefix().unwrap_or_default().to_string(),
+        suffix: value.suffix().unwrap_or_default().to_string(),
     }
 }
 
 fn regex_matcher_from_fanout(value: &FanoutRegexFilterValue) -> ValkeyResult<RegexMatcher> {
-    // The `regex` field always contains a fully-anchored pattern (^...$) that
-    // matches the entire string.  Re-compile it directly with the same flags
-    // used during construction;
+    // `regex` is the pattern as the user wrote it (`RegexMatcher::value`), unanchored or not;
+    // `compile_regex` anchors and compiles it exactly as the coordinator did.
     let regex = match compile_regex(value.regex.as_str()) {
         Err(_) => {
             return Err(ValkeyError::String(format!(
@@ -291,22 +290,11 @@ impl TryFrom<&FanoutFilter> for LabelFilter {
             }
         };
 
-        if matches!(op, MatcherOpType::Contains | MatcherOpType::NotContains) {
-            let value = match &matcher {
-                PredicateMatch::Contains(value) | PredicateMatch::NotContains(value) => value,
-                _ => unreachable!("contains op must decode to contains matcher"),
-            };
-            validate_contains_value(value).map_err(|err| ValkeyError::String(err.to_string()))?;
-        }
-
-        if matches!(op, MatcherOpType::StartsWith | MatcherOpType::NotStartsWith) {
-            let value = match &matcher {
-                PredicateMatch::StartsWith(value) | PredicateMatch::NotStartsWith(value) => value,
-                _ => unreachable!("starts-with op must decode to starts-with matcher"),
-            };
-            validate_starts_with_value(value)
-                .map_err(|err| ValkeyError::String(err.to_string()))?;
-        }
+        // The same check construction applies, so a hostile or buggy peer can't hand a shard a
+        // matcher no parse would build.
+        matcher
+            .validate()
+            .map_err(|err| ValkeyError::String(err.to_string()))?;
 
         if value.label.is_empty() {
             return Err(ValkeyError::Str("TSDB: matcher label cannot be empty"));
@@ -395,8 +383,8 @@ mod tests {
 
         match (&regex_filter.matcher, &decoded_regex.matcher) {
             (PredicateMatch::RegexEqual(expected), PredicateMatch::RegexEqual(decoded)) => {
-                assert_eq!(decoded.value, expected.value);
-                assert_eq!(decoded.prefix, expected.prefix);
+                assert_eq!(decoded.value(), expected.value());
+                assert_eq!(decoded.prefix(), expected.prefix());
                 for value in ["server123.prod", "server42.staging", "serverabc.prod"] {
                     assert_eq!(decoded.is_match(value), expected.is_match(value));
                 }
@@ -488,6 +476,19 @@ mod tests {
 
         let decoded = LabelFilter::try_from(&fanout).expect("legacy regex payload should decode");
         assert_eq!(decoded.matcher, PredicateMatch::MatchNone);
+
+        // Any spelling of `.*`, not only the text.
+        let fanout = FanoutFilter {
+            label: "instance".into(),
+            op: MatcherOpType::RegexEqual as i32,
+            matcher: Some(Matcher::Regex(FanoutRegexFilterValue {
+                regex: "^(.*)$".into(),
+                prefix: String::new(),
+                suffix: String::new(),
+            })),
+        };
+        let decoded = LabelFilter::try_from(&fanout).expect("legacy regex payload should decode");
+        assert_eq!(decoded.matcher, PredicateMatch::MatchAll);
     }
 
     #[test]
@@ -535,6 +536,43 @@ mod tests {
                 assert!(msg.contains("operation does not match matcher payload"));
             }
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// A shard applies the same operand check construction does, so a peer cannot hand it a
+    /// prefix or substring matcher with an empty needle (which would match every value) or no
+    /// needles (which would make the matcher and its inverse both reject everything).
+    #[test]
+    fn test_label_filter_rejects_empty_needles() {
+        let payloads = [
+            LabelValue::Empty(true),
+            LabelValue::Single(String::new()),
+            LabelValue::List(FilterListValue { values: vec![] }),
+            LabelValue::List(FilterListValue {
+                values: vec!["server".into(), String::new()],
+            }),
+        ];
+        for op in [
+            MatcherOpType::StartsWith,
+            MatcherOpType::NotStartsWith,
+            MatcherOpType::Contains,
+            MatcherOpType::NotContains,
+        ] {
+            for payload in &payloads {
+                let fanout = FanoutFilter {
+                    label: "instance".into(),
+                    op: op as i32,
+                    matcher: Some(Matcher::Value(FanoutPredicateValue {
+                        label_value: Some(payload.clone()),
+                    })),
+                };
+                let err = LabelFilter::try_from(&fanout)
+                    .expect_err(&format!("{op:?} {payload:?} should be rejected"));
+                assert!(
+                    err.to_string().contains("does not allow empty values"),
+                    "{op:?} {payload:?}: {err}"
+                );
+            }
         }
     }
 }

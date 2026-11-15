@@ -3,7 +3,7 @@ use crate::labels::filters::{
     FilterList, LabelFilter, MatchOp, OrFiltersList, PredicateMatch, PredicateValue,
     SeriesSelector, ValueList,
 };
-use crate::parser::lex::{Cursor, Token};
+use crate::parser::lex::{Cursor, Lexeme, Token};
 use crate::parser::{ParseError, ParseResult};
 
 /// Characters an unquoted RTS-form value may not contain. RTS gives them no consistent meaning
@@ -49,7 +49,7 @@ pub fn parse_series_selector(s: &str) -> ParseResult<SeriesSelector> {
     let mut cur = Cursor::new(s);
     let mut selector = parse_one_selector(&mut cur)?;
     while cur.next_if(Token::OpOr)?.is_some() {
-        selector = selector.merge_with(parse_one_selector(&mut cur)?);
+        selector = selector.or_with(parse_one_selector(&mut cur)?);
     }
     cur.expect(&[Token::OpOr, Token::Eof], "series selector")?;
     Ok(selector)
@@ -70,7 +70,7 @@ fn parse_one_selector(cur: &mut Cursor) -> ParseResult<SeriesSelector> {
     if first.token == Token::LeftBrace {
         return parse_braces(cur, None);
     }
-    let name = first.decoded()?.into_owned();
+    let name = decoded_name(cur, &first, "series selector")?;
     if cur.next_if(Token::LeftBrace)?.is_some() {
         return parse_braces(cur, Some(name));
     }
@@ -78,6 +78,18 @@ fn parse_one_selector(cur: &mut Cursor) -> ParseResult<SeriesSelector> {
         METRIC_NAME_LABEL.into(),
         &name,
     )]))
+}
+
+/// The text of a name token (an identifier, `or`, or a quoted string), which must not be
+/// empty. Only a quoted string can be: `{""="x"}`, `{""}`, `""{…}`. No series has an empty
+/// label or metric name (`LABELS` and `METRIC` reject one), and RTS-form predicates and fan-out
+/// payloads reject an empty label too, so the planner never sees one.
+fn decoded_name(cur: &Cursor, lexeme: &Lexeme, context: &str) -> ParseResult<String> {
+    let name = lexeme.decoded()?.into_owned();
+    if name.is_empty() {
+        return Err(cur.unexpected(lexeme, context, "a non-empty name"));
+    }
+    Ok(name)
 }
 
 /// The matchers after `{`, through the closing `}`. Groups separated by `or` are ORed; the
@@ -142,10 +154,8 @@ fn parse_group(cur: &mut Cursor, outer: Option<&str>) -> ParseResult<FilterList>
 /// `LabelFilter::create`, so regex decomposition (which turns `=~"mem"` into `="mem"`) can't
 /// change the outcome.
 fn parse_matcher(cur: &mut Cursor, outer: Option<&str>) -> ParseResult<(LabelFilter, bool)> {
-    let name = cur
-        .expect(NAME_TOKENS, "label matcher")?
-        .decoded()?
-        .into_owned();
+    let lexeme = cur.expect(NAME_TOKENS, "label matcher")?;
+    let name = decoded_name(cur, &lexeme, "label matcher")?;
 
     // A bare name is the metric-name shorthand: `{cpu, job="a"}`.
     if matches!(

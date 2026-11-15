@@ -139,6 +139,31 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
             f"reported when it held them alone"
         )
 
+    def test_copied_series_split_their_shared_labels(self):
+        """`COPY` clones a series, and the clone shares the original's label slice.
+
+        Both keys used to report the whole slice and the whole string share, so a copy doubled
+        the label memory `MEMORY USAGE` claimed. Each now reports half, and the original goes
+        back to the full charge once the copy is deleted.
+        """
+        client = self.server.get_new_client()
+        client.execute_command("TS.CREATE", "mem:orig", "LABELS", *LONG_LABELS, "uniq", "copy")
+        alone = client.execute_command("MEMORY", "USAGE", "mem:orig")
+
+        assert client.execute_command("COPY", "mem:orig", "mem:copy") == 1
+        shared = client.execute_command("MEMORY", "USAGE", "mem:orig")
+        copy = client.execute_command("MEMORY", "USAGE", "mem:copy")
+
+        label_bytes = sum(len(x) for x in LONG_LABELS)
+        assert shared == copy
+        assert shared <= alone - label_bytes // 2, (
+            f"after COPY the original reported {shared} against {alone} alone: the shared "
+            f"labels (~{label_bytes} bytes of text) are still charged to both keys in full"
+        )
+
+        client.execute_command("DEL", "mem:copy")
+        assert client.execute_command("MEMORY", "USAGE", "mem:orig") == alone
+
     # ---- chunks -----------------------------------------------------------------
 
     @pytest.mark.parametrize("encoding", ["COMPRESSED", "UNCOMPRESSED"])

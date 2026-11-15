@@ -288,6 +288,32 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
                 self.client.execute_command("TS.CREATE", f"metric:name:{i}", "METRIC", metric)
             assert self.client.exists(f"metric:name:{i}") == 0
 
+    def test_create_metric_with_quoted_names(self):
+        """Names that are not identifiers are quoted, as Prometheus writes them, and TS.INFO's
+        `metric` writes them back the same way, so the text can be fed to METRIC again."""
+        cases = [
+            ('m{"a b"="v"}', {"__name__": "m", "a b": "v"}),
+            ('{"my metric", "9x"="1"}', {"__name__": "my metric", "9x": "1"}),
+        ]
+        for i, (metric, labels) in enumerate(cases):
+            key = f"metric:quoted:{i}"
+            assert self.client.execute_command("TS.CREATE", key, "METRIC", metric) == b"OK"
+            info = self.ts_info(key)
+            assert info["labels"] == labels, metric
+            rendered = info["metric"].decode() if isinstance(info["metric"], bytes) else info["metric"]
+            # A series with `__name__` is identified by its label set, so the original must go
+            # before the same labels can be created again.
+            self.client.execute_command("DEL", key)
+            again = f"{key}:again"
+            assert self.client.execute_command("TS.CREATE", again, "METRIC", rendered) == b"OK"
+            assert self.ts_info(again)["labels"] == labels, rendered
+
+        # A quoted name may not hold `=` (as with LABELS), and trailing text is an error.
+        for i, metric in enumerate(('m{"a=b"="1"}', 'm{a="1"} junk', '{a="1"}')):
+            with pytest.raises(ResponseError):
+                self.client.execute_command("TS.CREATE", f"metric:bad:{i}", "METRIC", metric)
+            assert self.client.exists(f"metric:bad:{i}") == 0
+
     def test_create_metric_given_twice_rejected(self):
         """A second METRIC used to replace the first silently; it is rejected like a second
         rounding option."""

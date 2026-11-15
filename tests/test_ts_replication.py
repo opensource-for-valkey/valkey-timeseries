@@ -887,7 +887,8 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         self.client.execute_command("TS.ADD", "ts:opt:metric", 1000, 1.234, "METRIC", 'cpu{host="a"}')
         # No rounding over the primary's configured default; the replica has a different default.
         self.client.execute_command("TS.ADD", "ts:opt:norounding", 1000, 1.23456789, "DECIMAL_DIGITS", "none")
-        # `LABELS __name__ …` is accepted, and can spell what the METRIC grammar cannot.
+        # Names that are not identifiers: replicated as the quoted METRIC form,
+        # `{"cpu total","1x"="a"}`, which must round-trip on the replica.
         self.client.execute_command("TS.ADD", "ts:opt:odd", 1000, 1.234, "LABELS", "__name__", "cpu total", "1x", "a")
         self.client.execute_command("TS.INCRBY", "ts:opt:incr", 1.234, "TIMESTAMP", 1000, "LABELS", "k", "v")
         self.client.execute_command("TS.DECRBY", "ts:opt:decr", 1.234, "TIMESTAMP", 1000)
