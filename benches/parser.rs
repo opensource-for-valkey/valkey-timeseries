@@ -109,8 +109,28 @@ fn run<T>(
     g.finish();
 }
 
+/// Regex selectors that are all different, more of them than any regex cache keeps, so every
+/// parse compiles: the cost of a pattern seen for the first time.
+fn bench_distinct_regexes(c: &mut Criterion) {
+    let selectors: Vec<String> = (0..1024)
+        .map(|i| format!(r#"{{job=~"api-{i}-.*"}}"#))
+        .collect();
+    let mut g = c.benchmark_group("selector");
+    g.warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(2));
+    let mut next = 0;
+    g.bench_function("regex_distinct", |b| {
+        b.iter(|| {
+            next = (next + 1) % selectors.len();
+            try_parse_selector(black_box(&selectors[next]))
+        })
+    });
+    g.finish();
+}
+
 fn bench_parsers(c: &mut Criterion) {
     run(c, "selector", SELECTOR_CASES, try_parse_selector);
+    bench_distinct_regexes(c);
     run(c, "metric_name", METRIC_CASES, try_parse_metric_name);
     run(c, "duration", DURATION_CASES, try_parse_duration);
     run(c, "timestamp", TIMESTAMP_CASES, try_parse_timestamp);
