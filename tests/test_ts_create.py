@@ -318,6 +318,13 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
                 self.client.execute_command("TS.CREATE", key, "METRIC", operand)
             assert self.client.exists(key) == 0
 
+    def test_create_metric_named_or(self):
+        """`or` is a keyword only between selectors; a metric can be called that, as a filter
+        on it already allowed."""
+        self.client.execute_command("TS.CREATE", "metric:or", "METRIC", 'or{host="a"}')
+        assert self.ts_info("metric:or")["labels"] == {"__name__": "or", "host": "a"}
+        assert self.client.execute_command("TS.QUERYINDEX", 'or{host="a"}') == [b"metric:or"]
+
     def test_create_metric_trailing_comma_and_quoted_names(self):
         self.client.execute_command("TS.CREATE", "metric:ok", "METRIC", 'cpu{"host.name"="a",}')
         assert self.ts_info("metric:ok")["labels"] == {"__name__": "cpu", "host.name": "a"}

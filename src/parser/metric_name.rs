@@ -17,7 +17,8 @@ use crate::parser::{ParseError, ParseResult};
 pub fn parse_metric_name(s: &str) -> ParseResult<Vec<Label>> {
     let mut cur = Cursor::new(s);
 
-    let measurement = cur.expect(&[Token::Identifier], "metric name")?;
+    // `or` lexes as a keyword but is a name here, as it is in selectors.
+    let measurement = cur.expect(&[Token::Identifier, Token::OpOr], "metric name")?;
     let mut labels = vec![Label::new(METRIC_NAME_LABEL, measurement.text)];
     if cur.next_if(Token::LeftBrace)?.is_some() {
         parse_label_set(&mut cur, &mut labels)?;
@@ -198,6 +199,24 @@ mod tests {
                 "{input}: {:?}",
                 parse_metric_name(input)
             );
+        }
+    }
+
+    #[test]
+    fn test_parse_metric_name_or_is_a_name() {
+        for (input, expected) in [
+            ("or", vec![Label::new("__name__", "or")]),
+            ("OR", vec![Label::new("__name__", "OR")]),
+            (
+                r#"or{host="a"}"#,
+                vec![Label::new("__name__", "or"), Label::new("host", "a")],
+            ),
+            (
+                r#"or{or="b"}"#,
+                vec![Label::new("__name__", "or"), Label::new("or", "b")],
+            ),
+        ] {
+            assert_eq!(parse_metric_name(input), Ok(expected), "{input}");
         }
     }
 
