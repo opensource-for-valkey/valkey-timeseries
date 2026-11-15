@@ -192,7 +192,11 @@ impl TimeSeriesIndex {
     /// Every visible series carrying all of `labels` (it may carry others too). A series whose
     /// label set *is* `labels` is among them; telling it apart needs the candidates' full label
     /// sets, which the index does not keep.
-    pub fn postings_by_labels<T: SeriesLabel>(&self, labels: &[T]) -> PostingsBitmap {
+    pub fn postings_by_labels<I>(&self, labels: I) -> PostingsBitmap
+    where
+        I: IntoIterator,
+        I::Item: SeriesLabel,
+    {
         let inner = read_lock(&self.inner);
         inner.postings_by_labels(labels)
     }

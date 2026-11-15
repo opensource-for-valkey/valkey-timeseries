@@ -56,7 +56,11 @@ impl Postings {
     }
 
     /// Every visible series carrying all of `labels`. See [`Terms::postings_by_labels`].
-    pub fn postings_by_labels<T: SeriesLabel>(&self, labels: &[T]) -> PostingsBitmap {
+    pub fn postings_by_labels<I>(&self, labels: I) -> PostingsBitmap
+    where
+        I: IntoIterator,
+        I::Item: SeriesLabel,
+    {
         self.terms().postings_by_labels(labels)
     }
 }
@@ -200,10 +204,19 @@ impl<'a> Terms<'a> {
     /// Every visible series carrying all of `labels` — a superset of each series whose label set
     /// *is* `labels`, so callers that need an exact match must compare the candidates' full label
     /// sets. Empty when `labels` is empty.
-    pub(super) fn postings_by_labels<T: SeriesLabel>(self, labels: &[T]) -> PostingsBitmap {
+    ///
+    /// Takes any iterator of labels, so a series' stored set can be passed as it is
+    /// (`MetricName::iter`) without materializing owned labels first.
+    pub(super) fn postings_by_labels<I>(self, labels: I) -> PostingsBitmap
+    where
+        I: IntoIterator,
+        I::Item: SeriesLabel,
+    {
         // Look every bitmap up before intersecting any: a new series nearly always carries one
         // unseen value, which this answers with key lookups alone.
-        let mut bitmaps: SmallVec<[&'a PostingsBitmap; 8]> = SmallVec::with_capacity(labels.len());
+        let labels = labels.into_iter();
+        let mut bitmaps: SmallVec<[&'a PostingsBitmap; 8]> =
+            SmallVec::with_capacity(labels.size_hint().0);
         for label in labels {
             let key = KeyBuffer::for_label_value(label.name(), label.value());
             match self.index.get(key.as_bytes()) {
@@ -377,7 +390,7 @@ mod tests {
         assert_eq!(by_prefix.iter().collect::<Vec<_>>(), vec![1]);
     }
 
-    fn ids_with<T: SeriesLabel>(postings: &Postings, labels: &[T]) -> Vec<SeriesRef> {
+    fn ids_with(postings: &Postings, labels: &[Label]) -> Vec<SeriesRef> {
         postings.postings_by_labels(labels).iter().collect()
     }
 
@@ -400,7 +413,7 @@ mod tests {
 
         postings.mark_ids_as_stale(&[42]);
         assert!(ids_with(&postings, &labels).is_empty());
-        assert!(ids_with::<Label>(&postings, &[]).is_empty());
+        assert!(ids_with(&postings, &[]).is_empty());
     }
 
     #[test]

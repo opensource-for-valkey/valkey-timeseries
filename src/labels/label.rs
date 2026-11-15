@@ -10,6 +10,28 @@ pub trait SeriesLabel: Sized {
     fn value(&self) -> &str;
 }
 
+/// So a slice of labels can be passed where an iterator of labels is taken.
+impl<T: SeriesLabel> SeriesLabel for &T {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+
+    fn value(&self) -> &str {
+        (**self).value()
+    }
+}
+
+/// A label value as replies carry it: nil for an empty value, which is how a reply says a
+/// selected label is absent from a series (`SELECTED_LABELS`, `TS.INFO`). Stored values are
+/// never empty, since both write paths reject them.
+pub fn label_value_reply(value: &str) -> ValkeyValue {
+    if value.is_empty() {
+        ValkeyValue::Null
+    } else {
+        ValkeyValue::from(value)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Label {
     pub name: String,
@@ -59,13 +81,8 @@ impl From<InternedLabel<'_>> for Label {
 
 impl From<Label> for ValkeyValue {
     fn from(label: Label) -> Self {
-        let label_value = if label.value.is_empty() {
-            ValkeyValue::Null
-        } else {
-            ValkeyValue::from(label.value)
-        };
-        let res = vec![ValkeyValue::from(label.name), label_value];
-        ValkeyValue::from(res)
+        let label_value = label_value_reply(&label.value);
+        ValkeyValue::from(vec![ValkeyValue::from(label.name), label_value])
     }
 }
 

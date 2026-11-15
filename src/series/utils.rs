@@ -143,7 +143,7 @@ pub(crate) fn invalid_series_key_error() -> ValkeyError {
 /// lazily expire the key, and the `unlink` callback that follows takes the postings write lock on
 /// this thread.
 fn has_series_with_label_set(ctx: &Context, index: &TimeSeriesIndex, labels: &MetricName) -> bool {
-    let candidates = index.postings_by_labels(&labels.to_label_vec());
+    let candidates = index.postings_by_labels(labels.iter());
     candidates.iter().any(|id| {
         let key = index
             .get_postings()
