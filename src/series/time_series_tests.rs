@@ -2490,6 +2490,35 @@ mod tests {
         )
     }
 
+    /// A removal that fails on one chunk has already cleared the chunks before it. They must
+    /// still be dropped, with the metadata counted from what is left: an empty chunk left in
+    /// place reports timestamps of 0 and misdirects the binary chunk search.
+    #[test]
+    fn failed_remove_range_drops_the_chunks_it_cleared() {
+        // 20 chunks of 10 samples, enough for the binary search; the second one undecodable.
+        let chunks = (0..20)
+            .map(|i| {
+                let range = i * 10 + 1..=i * 10 + 10;
+                if i == 1 {
+                    undecodable_gorilla_chunk(range)
+                } else {
+                    gorilla_chunk(range)
+                }
+            })
+            .collect();
+        let mut series = gorilla_series(chunks, 0);
+
+        // Clears the first chunk, then fails on the second.
+        assert!(series.remove_range(1, 15).is_err());
+
+        assert_eq!(series.chunks.len(), 19);
+        assert!(series.chunks.iter().all(|chunk| !chunk.is_empty()));
+        assert_eq!(series.total_samples, 190);
+        assert_eq!(series.first_timestamp, 11);
+        let window: Vec<i64> = series.range_iter(151, 160).map(|s| s.timestamp).collect();
+        assert_eq!(window, (151..=160).collect::<Vec<_>>());
+    }
+
     #[test]
     fn failed_boundary_trim_still_accounts_for_the_dropped_chunks() {
         let mut series = series_with_undecodable_boundary_chunk();
