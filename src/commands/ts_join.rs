@@ -1,4 +1,4 @@
-use crate::commands::analysis_runner::run_on_analysis_lane;
+use crate::commands::analysis_runner::{reserve_analysis_slot, run_reserved_on_analysis_lane};
 use crate::commands::command_parser::{parse_join_args, parse_timestamp_range};
 use crate::common::context::is_blocking_denied;
 use crate::common::replies::{IntoRawCtx, reply_with_array, reply_with_null, reply_with_sample};
@@ -58,9 +58,11 @@ pub fn ts_join_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // decode: the windows are copied out here, while the series are open, and joined there.
     // A client that cannot block (MULTI, a script, a module call) is answered inline.
     if inputs.estimated_samples() > INLINE_JOIN_SAMPLES && !is_blocking_denied(ctx) {
+        // Reserve the queue place first, so a busy lane refuses the join before the copy.
+        let slot = reserve_analysis_slot(ctx, "TS.JOIN")?;
         // Owns copies of both windows: nothing in the job borrows the series.
         let inputs = inputs.into_owned();
-        return run_on_analysis_lane(ctx, "TS.JOIN", move |thread_ctx| {
+        return run_reserved_on_analysis_lane(ctx, slot, move |thread_ctx| {
             reply_with_join_result(thread_ctx, &inputs.join(&options));
         });
     }
