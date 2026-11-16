@@ -938,7 +938,10 @@ impl TimeSeries {
 
     pub fn range_iter(&self, start: Timestamp, end: Timestamp) -> SeriesSampleIterator<'_> {
         let start = start.max(self.get_min_timestamp());
-        SeriesSampleIterator::new(self, start, end, false)
+        // Seek to the first chunk that reaches `start`: the iterator's forward scan would step
+        // through every older chunk to get there. It stops at the first chunk past `end` itself.
+        let first = find_start_chunk_index(&self.chunks, start);
+        SeriesSampleIterator::over_chunks(&self.chunks[first..], start, end, false)
     }
 
     /// Samples in the chunks `[start, end]` touches, without copying or decoding them: what

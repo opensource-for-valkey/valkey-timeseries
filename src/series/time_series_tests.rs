@@ -1458,6 +1458,54 @@ mod tests {
         assert_eq!(time_series.iter().count(), 5);
     }
 
+    /// `range_iter` seeks to its first chunk; over enough chunks to take the binary-search
+    /// path, every window still yields exactly what `get_range` returns.
+    #[test]
+    fn test_range_iter_seeks_and_matches_get_range() {
+        let mut ts = TimeSeries::with_options(TimeSeriesOptions {
+            chunk_encoding: ChunkEncoding::Uncompressed,
+            chunk_size: Some(64),
+            ..Default::default()
+        })
+        .unwrap();
+        let data = DataGenerator::builder()
+            .start(1000)
+            .interval(Duration::from_millis(1000))
+            .algorithm(ValueWorkload::Deriv)
+            .samples(2000)
+            .build()
+            .generate();
+        for sample in data.iter() {
+            ts.add(sample.timestamp, sample.value, None);
+        }
+        assert!(ts.chunks.len() > 16, "needs the binary-search seek");
+
+        let first = ts.first_timestamp;
+        let last = ts.last_timestamp();
+        let windows = [
+            (Timestamp::MIN, Timestamp::MAX),
+            (first, last),
+            (first - 1, first),
+            (last, last + 1),
+            (last + 1, Timestamp::MAX),
+            (Timestamp::MIN, first - 1),
+            (first + 500, first + 500), // between two samples
+            (
+                ts.chunks[7].first_timestamp(),
+                ts.chunks[7].last_timestamp(),
+            ),
+            (
+                ts.chunks[7].last_timestamp(),
+                ts.chunks[8].first_timestamp(),
+            ),
+            (ts.chunks[3].first_timestamp() + 1500, last - 2500),
+        ];
+        for (start, end) in windows {
+            let got: Vec<Sample> = ts.range_iter(start, end).collect();
+            assert_eq!(got, ts.get_range(start, end), "window [{start}, {end}]");
+        }
+    }
+
     #[test]
     fn test_get_range_with_matching_start_and_end_time() {
         let mut time_series = TimeSeries::default();
