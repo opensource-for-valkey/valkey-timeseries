@@ -36,7 +36,7 @@ class TestTimeSeriesCommand(ValkeyTimeSeriesTestCaseBase):
         "TS.DEL":         (4,  1,  1, 1, [b"write", b"denyoom", b"module"]),
         "TS.DECRBY":      (-3, 1,  1, 1, [b"write", b"denyoom", b"module"]),
         "TS.INCRBY":      (-3, 1,  1, 1, [b"write", b"denyoom", b"module"]),
-        "TS.JOIN":        (-4, 1,  2, 1, [b"readonly", b"module"]),
+        "TS.JOIN":        (-5, 1,  2, 1, [b"readonly", b"module"]),
         "TS.MDEL":        (-2, 0,  0, 0, [b"write", b"denyoom", b"module"]),
         "TS.MRANGE":      (-4, 0,  0, 0, [b"readonly", b"module"]),
         "TS.MREVRANGE":   (-4, 0,  0, 0, [b"readonly", b"module"]),

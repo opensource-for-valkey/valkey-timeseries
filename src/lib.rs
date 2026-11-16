@@ -24,7 +24,7 @@ mod error;
 pub mod error_consts;
 mod fanout;
 pub mod iterators;
-mod join;
+pub mod join;
 mod labels;
 mod parser;
 pub mod series;

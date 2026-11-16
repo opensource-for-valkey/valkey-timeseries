@@ -938,7 +938,23 @@ impl TimeSeries {
 
     pub fn range_iter(&self, start: Timestamp, end: Timestamp) -> SeriesSampleIterator<'_> {
         let start = start.max(self.get_min_timestamp());
-        SeriesSampleIterator::new(self, start, end, false)
+        // Seek to the first chunk that reaches `start`: the iterator's forward scan would step
+        // through every older chunk to get there. It stops at the first chunk past `end` itself.
+        let first = find_start_chunk_index(&self.chunks, start);
+        SeriesSampleIterator::over_chunks(&self.chunks[first..], start, end, false)
+    }
+
+    /// Samples in the chunks `[start, end]` touches, without copying or decoding them: what
+    /// [`RangeSnapshot::estimated_samples`] would report for the same window.
+    pub fn estimated_range_samples(&self, start: Timestamp, end: Timestamp) -> usize {
+        let start = start.max(self.get_min_timestamp());
+        if start > end || !self.overlaps(start, end) {
+            return 0;
+        }
+        self.get_chunk_index_bounds(start, end)
+            .map_or(0, |(first, last)| {
+                self.chunks[first..=last].iter().map(|c| c.len()).sum()
+            })
     }
 
     /// Copy the chunks `[start, end]` touches, for decoding after this series
@@ -1120,8 +1136,6 @@ impl TimeSeries {
             return Ok(0);
         }
 
-        let mut deleted_samples = 0;
-
         fn remove_internal(
             chunk: &mut TimeSeriesChunk,
             start_ts: Timestamp,
@@ -1147,37 +1161,44 @@ impl TimeSeries {
         let mut chunks = self.chunks.as_mut_slice();
         chunks = &mut chunks[start_index..=end_index];
 
-        deleted_samples = match (is_compressed, chunks) {
-            (_, []) => 0,
-            (false, many) => {
-                for chunk in many.iter_mut() {
-                    deleted_samples += remove_internal(chunk, start_ts, end_ts)?;
-                }
-                deleted_samples
-            }
-            (true, [one]) => remove_internal(one, start_ts, end_ts)?,
+        let removed = match (is_compressed, chunks) {
+            (_, []) => Ok(0),
+            (false, many) => many.iter_mut().try_fold(0, |deleted, chunk| {
+                Ok(deleted + remove_internal(chunk, start_ts, end_ts)?)
+            }),
+            (true, [one]) => remove_internal(one, start_ts, end_ts),
             (true, many) => {
                 let threads = request_par_threads(many.len(), many.iter().map(|c| c.len()).sum());
                 many.into_par_rayon()
                     .num_threads(threads)
                     .map(|chunk| remove_internal(chunk, start_ts, end_ts))
                     .into_fallible()
-                    .sum()?
+                    .sum()
             }
         };
 
-        // Remove empty chunks
+        // Remove empty chunks, also when a chunk failed: the ones before it may have been
+        // cleared, and an empty chunk left in place misdirects the binary chunk search.
         let saved_len = self.chunks.len();
         self.chunks.retain(|chunk| !chunk.is_empty());
         if self.chunks.len() < saved_len {
             self.chunks.shrink_to_fit();
         }
 
-        // Update metadata
-        self.total_samples = self.total_samples.saturating_sub(deleted_samples);
-        self.update_first_last_timestamps();
-
-        Ok(deleted_samples)
+        // Update metadata. After a failure the chunks that succeeded have still lost their
+        // samples, but how many is unknown, so count what is left.
+        match removed {
+            Ok(deleted) => {
+                self.total_samples = self.total_samples.saturating_sub(deleted);
+                self.update_first_last_timestamps();
+                Ok(deleted)
+            }
+            Err(e) => {
+                self.total_samples = self.chunks.iter().map(|c| c.len()).sum();
+                self.update_first_last_timestamps();
+                Err(e)
+            }
+        }
     }
 
     /// Checks if the time series has at least one sample in the given time range.

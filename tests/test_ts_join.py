@@ -1,8 +1,9 @@
+import math
 import pytest
 from valkey import ResponseError
 from valkeytestframework.util.waiters import *
 from valkeytestframework.conftest import resource_port_tracker
-from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
+from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase, ValkeyTimeSeriesTestCaseDebugMode
 
 
 class TestTSJoin(ValkeyTimeSeriesTestCaseBase):
@@ -415,7 +416,7 @@ class TestTSJoin(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command("TS.CREATE", ts_zero2)
 
         base = 5000
-        # When left = 0, should return 0.0 (per implementation)
+        # A zero base has no percentage change: NaN, not 0.
         self.client.execute_command("TS.ADD", ts_zero1, base, 0.0)
         self.client.execute_command("TS.ADD", ts_zero2, base, 100.0)
 
@@ -427,8 +428,7 @@ class TestTSJoin(ValkeyTimeSeriesTestCaseBase):
 
         assert len(result) == 1
         ts, value = result[0]
-        # Division by zero case should return 0.0
-        assert float(value) == 0.0
+        assert math.isnan(float(value))
 
         # Test 4: Small values with fractional change
         ts_frac1 = "test_pct_frac1"
@@ -765,29 +765,39 @@ class TestTSJoin(ValkeyTimeSeriesTestCaseBase):
             expected_sum = expected_left + expected_right
             assert float(value) == expected_sum
 
-    def smoketest_all_join_reducers(self):
-        """Test different join reducers"""
+    def test_all_join_reducers(self):
+        """Every reducer's value on a matched pair, and on a missing operand (LEFT join)."""
+        self.client.execute_command("TS.ADD", "red:l", 10, 7)
+        self.client.execute_command("TS.ADD", "red:l", 20, 7)
+        self.client.execute_command("TS.ADD", "red:r", 10, 2)
 
-        self.setup_data()
-
-        reducers = [
-            "abs_diff", "avg", "cmp", "div", "eq", "gt", "gte", "lt", "lte", "sum", "max", "min",
-            "ne", "mul", "mod", "pow", "sgn_diff", "pct_change", "coalesce"
-        ]
-
-        for reducer in reducers:
+        nan = float("nan")
+        # reducer -> (value at 10 for (7, 2), value at 20 for (7, missing))
+        expected = {
+            "abs_diff": (5, nan), "avg": (4.5, nan), "cmp": (1, nan), "coalesce": (7, 7),
+            "div": (3.5, nan), "eq": (0, nan), "gt": (1, nan), "gte": (1, nan),
+            "lt": (0, nan), "lte": (0, nan), "max": (7, 7), "min": (2, 7), "mod": (1, nan),
+            "mul": (14, nan), "ne": (1, nan), "pct_change": (-5 / 7, nan), "pow": (49, nan),
+            "sgn_diff": (1, nan), "sub": (5, nan), "sum": (9, nan),
+        }
+        for reducer, (matched, missing) in expected.items():
             result = self.client.execute_command(
-                "TS.JOIN", self.ts1, self.ts2,
-                self.now + 5000, self.now + 6000,  # Test one point for each
-                "INNER", "REDUCE", reducer
-            )
+                "TS.JOIN", "red:l", "red:r", "-", "+", "LEFT", "REDUCE", reducer)
+            assert [row[0] for row in result] == [10, 20], reducer
+            for (_, value), want in zip(result, (matched, missing)):
+                got = float(value)
+                if math.isnan(want):
+                    assert math.isnan(got), f"{reducer}: {got}"
+                else:
+                    assert got == pytest.approx(want), f"{reducer}: {got} != {want}"
 
-            # Should have at least one result
-            assert len(result) > 0
-
-            # Each result should be a [timestamp, value] pair
-            for item in result:
-                assert len(item) == 2
+        # Equal operands: comparisons and signs are exact, -0 equals +0.
+        self.client.execute_command("TS.ADD", "red:l", 30, 7)
+        self.client.execute_command("TS.ADD", "red:r", 30, 7)
+        for reducer, want in {"eq": 1, "ne": 0, "gte": 1, "lte": 1, "cmp": 0, "sgn_diff": 0}.items():
+            result = self.client.execute_command(
+                "TS.JOIN", "red:l", "red:r", 30, 30, "INNER", "REDUCE", reducer)
+            assert float(result[0][1]) == want, reducer
 
     def test_asof_edge_cases(self):
         """Test ASOF join edge cases"""
@@ -897,3 +907,113 @@ class TestTSJoin(ValkeyTimeSeriesTestCaseBase):
                                              'AGGREGATION', 'last', 25, 'EMPTY')
 
         assert result == [[0, b'2'], [25, b'2'], [50, b'2'], [75, b'2'], [100, b'4']]
+
+    def _fill(self, key, timestamps, value):
+        pipe = self.client.pipeline(transaction=False)
+        for ts in timestamps:
+            pipe.execute_command("TS.ADD", key, ts, value(ts))
+        pipe.execute()
+
+    def test_large_join_answers_from_the_analysis_lane(self):
+        """A join over more than the inline budget (65,536 samples) is answered from the
+        analysis lane; inside MULTI, where the client cannot block, it runs inline. Both
+        must give the same answer as a small join would."""
+        n = 40_000
+        self._fill("big:l", range(0, 2 * n, 2), lambda ts: ts)
+        self._fill("big:r", range(0, 3 * n, 3), lambda ts: -ts)
+
+        result = self.client.execute_command("TS.JOIN", "big:l", "big:r", "-", "+", "REDUCE", "sum")
+        # Common timestamps are the multiples of 6 below 2n; every sum is ts + (-ts) = 0.
+        expected = list(range(0, 2 * n, 6))
+        assert [row[0] for row in result] == expected
+        assert all(float(row[1]) == 0 for row in result)
+
+        limited = self.client.execute_command(
+            "TS.JOIN", "big:l", "big:r", "-", "+", "COUNT", 3, "REDUCE", "sum")
+        assert [row[0] for row in limited] == expected[:3]
+
+        pipe = self.client.pipeline(transaction=True)
+        pipe.execute_command("TS.JOIN", "big:l", "big:r", "-", "+", "REDUCE", "sum")
+        (in_multi,) = pipe.execute()
+        assert in_multi == result
+
+    def test_join_on_wrong_type_key(self):
+        self.client.execute_command("TS.ADD", "wt:ts", 10, 1)
+        self.client.execute_command("SET", "wt:str", "hello")
+        for left, right in (("wt:ts", "wt:str"), ("wt:str", "wt:ts")):
+            with pytest.raises(ResponseError, match="WRONGTYPE|not a TSDB key"):
+                self.client.execute_command("TS.JOIN", left, right, "-", "+")
+
+    def test_join_requires_read_access_to_both_keys(self):
+        for key in ("acl:allowed:a", "acl:allowed:b", "acl:denied:b"):
+            self.client.execute_command("TS.ADD", key, 10, 1)
+        self.client.execute_command(
+            "ACL", "SETUSER", "join_reader", "ON", ">pw", "+@all", "resetkeys", "%R~acl:allowed:*")
+        client = self.server.get_new_client()
+        client.execute_command("AUTH", "join_reader", "pw")
+
+        assert len(client.execute_command("TS.JOIN", "acl:allowed:a", "acl:allowed:b", "-", "+")) == 1
+        for left, right in (("acl:allowed:a", "acl:denied:b"), ("acl:denied:b", "acl:allowed:a")):
+            with pytest.raises(ResponseError, match="No permissions to access a key|NOPERM"):
+                client.execute_command("TS.JOIN", left, right, "-", "+")
+
+
+class TestTSJoinPlacement(ValkeyTimeSeriesTestCaseDebugMode):
+    """Where a large TS.JOIN runs. With the next analysis job armed to panic, a join answered
+    from the lane fails with an internal error, and one answered inline does not."""
+
+    def _fill(self, key, timestamps, value):
+        pipe = self.client.pipeline(transaction=False)
+        for ts in timestamps:
+            pipe.execute_command("TS.ADD", key, ts, value(ts))
+        pipe.execute()
+
+    def test_count_join_within_the_inline_budget_runs_inline(self):
+        # 80,000 input samples, past the 65,536 inline budget, but COUNT 3 needs only the first
+        # few of each window.
+        n = 40_000
+        self._fill("place:l", range(0, 2 * n, 2), lambda ts: ts)
+        self._fill("place:r", range(0, 3 * n, 3), lambda ts: -ts)
+
+        self.arm_analysis_job_panic(self.client)
+        limited = self.client.execute_command(
+            "TS.JOIN", "place:l", "place:r", "-", "+", "COUNT", 3, "REDUCE", "sum")
+        assert [row[0] for row in limited] == [0, 6, 12]
+
+        # Still armed: without COUNT the same join goes to the lane.
+        with pytest.raises(ResponseError, match="internal error"):
+            self.client.execute_command("TS.JOIN", "place:l", "place:r", "-", "+", "REDUCE", "sum")
+
+    def test_count_join_past_the_inline_budget_moves_to_the_lane(self):
+        # No common timestamps: COUNT 1 cannot be filled without reading both windows, which
+        # is more than the inline budget, so the join moves to the lane.
+        n = 40_000
+        self._fill("place:even", range(0, 2 * n, 2), lambda ts: 1)
+        self._fill("place:odd", range(1, 2 * n, 2), lambda ts: 2)
+
+        self.arm_analysis_job_panic(self.client)
+        with pytest.raises(ResponseError, match="internal error"):
+            self.client.execute_command("TS.JOIN", "place:even", "place:odd", "-", "+", "COUNT", 1)
+
+        # Disarmed: the lane answers it, with no rows.
+        assert self.client.execute_command(
+            "TS.JOIN", "place:even", "place:odd", "-", "+", "COUNT", 1) == []
+
+    def test_sparse_empty_aggregation_moves_to_the_lane(self):
+        # Four samples, but 1 ms EMPTY buckets across 1,000,000 ms: the buckets, not the
+        # samples, make this join large.
+        for key in ("sparse:l", "sparse:r"):
+            self.client.execute_command("TS.ADD", key, 0, 1)
+            self.client.execute_command("TS.ADD", key, 1_000_000, 2)
+        join = ("TS.JOIN", "sparse:l", "sparse:r", "-", "+", "REDUCE", "sum")
+        aggregation = ("AGGREGATION", "avg", 1, "EMPTY")
+
+        self.arm_analysis_job_panic(self.client)
+        # A small COUNT fills a few buckets, so it is answered inline.
+        limited = self.client.execute_command(*join, "COUNT", 5, *aggregation)
+        assert [row[0] for row in limited] == [0, 1, 2, 3, 4]
+
+        # Still armed: without COUNT the join would fill a million buckets, so it goes to the lane.
+        with pytest.raises(ResponseError, match="internal error"):
+            self.client.execute_command(*join, *aggregation)
+

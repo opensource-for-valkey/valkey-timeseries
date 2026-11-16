@@ -1458,6 +1458,54 @@ mod tests {
         assert_eq!(time_series.iter().count(), 5);
     }
 
+    /// `range_iter` seeks to its first chunk; over enough chunks to take the binary-search
+    /// path, every window still yields exactly what `get_range` returns.
+    #[test]
+    fn test_range_iter_seeks_and_matches_get_range() {
+        let mut ts = TimeSeries::with_options(TimeSeriesOptions {
+            chunk_encoding: ChunkEncoding::Uncompressed,
+            chunk_size: Some(64),
+            ..Default::default()
+        })
+        .unwrap();
+        let data = DataGenerator::builder()
+            .start(1000)
+            .interval(Duration::from_millis(1000))
+            .algorithm(ValueWorkload::Deriv)
+            .samples(2000)
+            .build()
+            .generate();
+        for sample in data.iter() {
+            ts.add(sample.timestamp, sample.value, None);
+        }
+        assert!(ts.chunks.len() > 16, "needs the binary-search seek");
+
+        let first = ts.first_timestamp;
+        let last = ts.last_timestamp();
+        let windows = [
+            (Timestamp::MIN, Timestamp::MAX),
+            (first, last),
+            (first - 1, first),
+            (last, last + 1),
+            (last + 1, Timestamp::MAX),
+            (Timestamp::MIN, first - 1),
+            (first + 500, first + 500), // between two samples
+            (
+                ts.chunks[7].first_timestamp(),
+                ts.chunks[7].last_timestamp(),
+            ),
+            (
+                ts.chunks[7].last_timestamp(),
+                ts.chunks[8].first_timestamp(),
+            ),
+            (ts.chunks[3].first_timestamp() + 1500, last - 2500),
+        ];
+        for (start, end) in windows {
+            let got: Vec<Sample> = ts.range_iter(start, end).collect();
+            assert_eq!(got, ts.get_range(start, end), "window [{start}, {end}]");
+        }
+    }
+
     #[test]
     fn test_get_range_with_matching_start_and_end_time() {
         let mut time_series = TimeSeries::default();
@@ -2440,6 +2488,35 @@ mod tests {
             vec![gorilla_chunk(1..=50), undecodable_gorilla_chunk(51..=150)],
             50,
         )
+    }
+
+    /// A removal that fails on one chunk has already cleared the chunks before it. They must
+    /// still be dropped, with the metadata counted from what is left: an empty chunk left in
+    /// place reports timestamps of 0 and misdirects the binary chunk search.
+    #[test]
+    fn failed_remove_range_drops_the_chunks_it_cleared() {
+        // 20 chunks of 10 samples, enough for the binary search; the second one undecodable.
+        let chunks = (0..20)
+            .map(|i| {
+                let range = i * 10 + 1..=i * 10 + 10;
+                if i == 1 {
+                    undecodable_gorilla_chunk(range)
+                } else {
+                    gorilla_chunk(range)
+                }
+            })
+            .collect();
+        let mut series = gorilla_series(chunks, 0);
+
+        // Clears the first chunk, then fails on the second.
+        assert!(series.remove_range(1, 15).is_err());
+
+        assert_eq!(series.chunks.len(), 19);
+        assert!(series.chunks.iter().all(|chunk| !chunk.is_empty()));
+        assert_eq!(series.total_samples, 190);
+        assert_eq!(series.first_timestamp, 11);
+        let window: Vec<i64> = series.range_iter(151, 160).map(|s| s.timestamp).collect();
+        assert_eq!(window, (151..=160).collect::<Vec<_>>());
     }
 
     #[test]

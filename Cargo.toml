@@ -115,6 +115,10 @@ harness = false
 name = "outliers"
 harness = false
 
+[[bench]]
+name = "join"
+harness = false
+
 [[bin]]
 name = "compression_report"
 path = "tools/compression_report.rs"
