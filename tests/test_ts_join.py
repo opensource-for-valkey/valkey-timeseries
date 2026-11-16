@@ -998,3 +998,22 @@ class TestTSJoinPlacement(ValkeyTimeSeriesTestCaseDebugMode):
         # Disarmed: the lane answers it, with no rows.
         assert self.client.execute_command(
             "TS.JOIN", "place:even", "place:odd", "-", "+", "COUNT", 1) == []
+
+    def test_sparse_empty_aggregation_moves_to_the_lane(self):
+        # Four samples, but 1 ms EMPTY buckets across 1,000,000 ms: the buckets, not the
+        # samples, make this join large.
+        for key in ("sparse:l", "sparse:r"):
+            self.client.execute_command("TS.ADD", key, 0, 1)
+            self.client.execute_command("TS.ADD", key, 1_000_000, 2)
+        join = ("TS.JOIN", "sparse:l", "sparse:r", "-", "+", "REDUCE", "sum")
+        aggregation = ("AGGREGATION", "avg", 1, "EMPTY")
+
+        self.arm_analysis_job_panic(self.client)
+        # A small COUNT fills a few buckets, so it is answered inline.
+        limited = self.client.execute_command(*join, "COUNT", 5, *aggregation)
+        assert [row[0] for row in limited] == [0, 1, 2, 3, 4]
+
+        # Still armed: without COUNT the join would fill a million buckets, so it goes to the lane.
+        with pytest.raises(ResponseError, match="internal error"):
+            self.client.execute_command(*join, *aggregation)
+

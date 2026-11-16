@@ -197,15 +197,17 @@ stream has no data outside the window to extend towards.
 @error-reply on invalid arguments, when either key does not exist or is not a time series,
 when `leftKey` and `rightKey` are the same, or when the user may not read either key.
 
-A join that reads more than 65,536 samples runs in the background: the client is blocked
+A join that reads more than 65,536 samples runs in the background, and so does an `EMPTY`
+aggregation that could fill more than 65,536 buckets: the client is blocked
 until the result is ready, and the server keeps serving other clients meanwhile. If too many
 background jobs are already queued, the command fails with
 `TSDB: TS.JOIN: too many queued jobs`. Inside `MULTI`, a script or a module call, a join
 always runs inline.
 
-With `COUNT`, a join over larger inputs is first tried inline, since it usually needs only
-the start of each window. It moves to the background only if filling `COUNT` would read more
-than 65,536 samples: for example, an `INNER` join whose inputs share few timestamps.
+With `COUNT`, a larger join is first tried inline, since it usually needs only the start of
+each window. It moves to the background only if filling `COUNT` would read more than 65,536
+samples and buckets together: for example, an `INNER` join whose inputs share few
+timestamps, or a large `COUNT` of `EMPTY` buckets.
 
 ## Examples
 

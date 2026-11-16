@@ -1322,4 +1322,58 @@ mod tests {
         assert_eq!(values(inputs.join_within(&options, 100)), Some(full));
         assert_eq!(values(inputs.join_within(&options, 99)), None);
     }
+    fn empty_avg_aggregation(bucket_duration: u64) -> AggregationOptions {
+        AggregationOptions {
+            aggregations: smallvec::smallvec![AggregationType::Avg.into()],
+            bucket_duration,
+            timestamp_output: BucketTimestamp::Start,
+            alignment: BucketAlignment::Start,
+            report_empty: true,
+        }
+    }
+
+    /// Two samples 10,000,000 ms apart, on both sides, joined with 1 ms `EMPTY` buckets: four
+    /// input samples, ten million buckets.
+    fn sparse_series() -> TimeSeries {
+        series([(0, 1.0), (10_000_000, 2.0)])
+    }
+
+    #[test]
+    fn estimated_work_counts_the_buckets_empty_can_fill() {
+        let (left, right) = (sparse_series(), sparse_series());
+        let mut options = create_basic_options();
+        options.reducer = Some(JoinReducer::Sum);
+        let inputs = JoinInputs::read(&left, &right, &options).unwrap();
+        assert_eq!(inputs.estimated_work(&options), 4);
+
+        options.aggregation = Some(empty_avg_aggregation(1));
+        assert!(inputs.estimated_work(&options) >= 10_000_000);
+        // Without EMPTY, a bucket needs a sample, so the samples bound the work.
+        options.aggregation.as_mut().unwrap().report_empty = false;
+        assert_eq!(inputs.estimated_work(&options), 4);
+        // COUNT bounds the buckets.
+        options.aggregation.as_mut().unwrap().report_empty = true;
+        options.count = Some(10);
+        assert_eq!(inputs.estimated_work(&options), 4 + 10);
+    }
+
+    #[test]
+    fn join_within_charges_empty_buckets_to_its_budget() {
+        let (left, right) = (sparse_series(), sparse_series());
+        let mut options = create_basic_options();
+        options.reducer = Some(JoinReducer::Sum);
+        options.aggregation = Some(empty_avg_aggregation(1));
+        let inputs = JoinInputs::read(&left, &right, &options).unwrap();
+
+        // A small COUNT fits: four samples read, ten buckets returned.
+        options.count = Some(10);
+        let JoinResultType::Samples(buckets) = inputs.join_within(&options, 1_000).unwrap() else {
+            panic!("Expected Samples result type");
+        };
+        assert_eq!(buckets.len(), 10);
+
+        // A large one reads the same four samples but would fill a million buckets.
+        options.count = Some(1_000_000);
+        assert!(inputs.join_within(&options, 1_000).is_none());
+    }
 }

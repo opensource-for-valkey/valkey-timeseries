@@ -56,14 +56,15 @@ pub fn ts_join_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     // A large join answers from the analysis lane, so it does not hold the main thread for the
     // decode: the windows are copied out here, while the series are open, and joined there.
+    // Large counts the buckets an EMPTY aggregation can fill as well as the samples read.
     // A client that cannot block (MULTI, a script, a module call) is answered inline.
-    if inputs.estimated_samples() > INLINE_JOIN_SAMPLES && !is_blocking_denied(ctx) {
+    if inputs.estimated_work(&options) > INLINE_JOIN_WORK && !is_blocking_denied(ctx) {
         // Under COUNT the join usually reads only a prefix of each window, so try it here
         // first, within the inline budget. COUNT does not bound what the join reads (an INNER
         // join with few common timestamps reads both windows to fill it), so a join that
         // needs more falls back to the lane, having spent at most the budget.
         if options.count.is_some()
-            && let Some(result) = inputs.join_within(&options, INLINE_JOIN_SAMPLES)
+            && let Some(result) = inputs.join_within(&options, INLINE_JOIN_WORK)
         {
             reply_with_join_result(ctx, &result);
             return Ok(ValkeyValue::NoReply);
@@ -80,10 +81,10 @@ pub fn ts_join_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     Ok(ValkeyValue::NoReply)
 }
 
-/// Samples a join reads before it moves to the analysis lane. Inline, a join of that size
-/// takes about 0.6 ms (`benches/join.rs`, `join/end_to_end`: ~9 ns per input sample); the
-/// lane hand-off costs tens of microseconds.
-const INLINE_JOIN_SAMPLES: usize = 65_536;
+/// Work, in samples read plus `EMPTY` buckets filled, past which a join moves to the analysis
+/// lane. Inline, a join that reads that many samples takes about 0.6 ms (`benches/join.rs`,
+/// `join/end_to_end`: ~9 ns per input sample); the lane hand-off costs tens of microseconds.
+const INLINE_JOIN_WORK: usize = 65_536;
 
 fn reply_with_join_result<C: IntoRawCtx + Copy>(ctx: C, result: &JoinResultType) {
     match result {

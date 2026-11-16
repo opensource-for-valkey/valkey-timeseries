@@ -83,6 +83,34 @@ impl<'a> JoinInputs<'a> {
         self.left.estimated_samples() + self.right.estimated_samples()
     }
 
+    /// An upper bound on the join's work: the samples it reads, plus the buckets an `EMPTY`
+    /// aggregation can fill between them. The input does not bound those: two samples far
+    /// apart, with a small bucket, fill every bucket in between.
+    pub fn estimated_work(&self, options: &JoinOptions) -> usize {
+        self.estimated_samples()
+            .saturating_add(self.max_empty_buckets(options))
+    }
+
+    /// The most buckets an `EMPTY` aggregation can fill: every bucket between the earliest and
+    /// latest sample either input can yield, as no joined row lies outside them, and no more
+    /// than `COUNT`.
+    fn max_empty_buckets(&self, options: &JoinOptions) -> usize {
+        let Some(aggregation) = options.aggregation.as_ref().filter(|a| a.report_empty) else {
+            return 0;
+        };
+        let Some((first, last)) = [self.left.extent(), self.right.extent()]
+            .into_iter()
+            .flatten()
+            .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
+        else {
+            return 0;
+        };
+        // +2: alignment can split the span's edges into buckets of their own.
+        let buckets = (last.abs_diff(first) / aggregation.bucket_duration.max(1)).saturating_add(2);
+        let buckets = usize::try_from(buckets).unwrap_or(usize::MAX);
+        options.count.map_or(buckets, |count| buckets.min(count))
+    }
+
     pub fn join(&self, options: &JoinOptions) -> JoinResultType {
         let filter = options.value_filter;
         // Under COUNT the join usually needs only a prefix of each input, so decode lazily, as
@@ -105,25 +133,28 @@ impl<'a> JoinInputs<'a> {
         }
     }
 
-    /// [`Self::join`], unless it would read more than `budget` input samples, both sides
-    /// together: then it stops there and returns `None`. Lets a `COUNT` join, which usually
+    /// [`Self::join`], unless it would do more than `budget` units of work, counted as in
+    /// [`Self::estimated_work`]: input samples read on both sides, plus aggregation buckets
+    /// returned. Then it stops there and returns `None`. Lets a `COUNT` join, which usually
     /// needs only a prefix of each window, try the calling thread before paying for a copy of
-    /// both windows; a join that runs out wastes at most `budget` samples of work.
+    /// both windows; a join that runs out wastes at most `budget` units of work.
     pub fn join_within(&self, options: &JoinOptions, budget: usize) -> Option<JoinResultType> {
         let filter = options.value_filter;
         let budget = Budget::new(budget);
-        let result = join_samples(
+        let result = join_samples_within(
             self.left.samples(filter, Some(&budget)),
             self.right.samples(filter, Some(&budget)),
             options,
             self.now,
+            Some(&budget),
         );
         // An input cut short by the budget can change the answer, not just shorten it.
         (!budget.exceeded.get()).then_some(result)
     }
 }
 
-/// Input samples a [`JoinInputs::join_within`] may still read, shared by both inputs.
+/// Work a [`JoinInputs::join_within`] may still do: input samples read by either side and
+/// aggregation buckets returned, from one pool.
 struct Budget {
     remaining: Cell<usize>,
     exceeded: Cell<bool>,
@@ -189,6 +220,27 @@ impl<'a> JoinInput<'a> {
         }
     }
 
+    /// Bounds on the timestamps the input can yield; `None` when it can yield none.
+    fn extent(&self) -> Option<(Timestamp, Timestamp)> {
+        let (first, last) = match self {
+            JoinInput::Samples(samples) => (samples.first()?.timestamp, samples.last()?.timestamp),
+            JoinInput::Live { series, start, end } => {
+                if series.is_empty() {
+                    return None;
+                }
+                (
+                    series.first_timestamp.max(*start),
+                    series.last_timestamp().min(*end),
+                )
+            }
+            JoinInput::Snapshot(snapshot) => {
+                let (first, last) = snapshot.series_extent()?;
+                (first.max(snapshot.start()), last)
+            }
+        };
+        (first <= last).then_some((first, last))
+    }
+
     /// The input's samples, value-filtered. With a `budget`, every sample read counts against
     /// it, including those the filter drops, and the input ends when the budget runs out.
     fn samples<'s>(
@@ -225,6 +277,23 @@ where
     L: Iterator<Item = Sample>,
     R: Iterator<Item = Sample>,
 {
+    join_samples_within(left, right, options, now, None)
+}
+
+/// [`join_samples`], charging every aggregation bucket it returns to `budget`: an `EMPTY`
+/// aggregation can fill many more buckets than it reads samples. Rows are not charged; each
+/// one consumes an input sample, which the inputs charge already.
+fn join_samples_within<L, R>(
+    left: impl IntoIterator<Item = Sample, IntoIter = L>,
+    right: impl IntoIterator<Item = Sample, IntoIter = R>,
+    options: &JoinOptions,
+    now: Timestamp,
+    budget: Option<&Budget>,
+) -> JoinResultType
+where
+    L: Iterator<Item = Sample>,
+    R: Iterator<Item = Sample>,
+{
     let rows = create_join_iter(left, right, options.join_type);
 
     // COUNT limits the rows (or, with AGGREGATION, the buckets) the join returns. It is applied
@@ -252,6 +321,7 @@ where
     JoinResultType::Samples(
         AggregateIterator::new(samples, aggregation, aligned_timestamp)
             .take(count)
+            .take_while(|_| budget.is_none_or(Budget::spend))
             .collect(),
     )
 }
