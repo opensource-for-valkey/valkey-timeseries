@@ -723,6 +723,75 @@ impl TimeSeries {
         samples
     }
 
+    /// Bounds on how many samples [`Self::get_range`] returns for this range, without decoding
+    /// anything: the chunks inside the range count towards both, and a chunk the range only
+    /// partly covers counts towards the upper bound alone.
+    pub fn sample_count_bounds(&self, start: Timestamp, end: Timestamp) -> (usize, usize) {
+        let start = start.max(self.get_min_timestamp());
+        if start > end || !self.overlaps(start, end) {
+            return (0, 0);
+        }
+        let Some((start_index, end_index)) = self.get_chunk_index_bounds(start, end) else {
+            return (0, 0);
+        };
+        self.chunks[start_index..=end_index]
+            .iter()
+            .fold((0, 0), |(lower, upper), chunk| {
+                let inside = chunk.first_timestamp() >= start && chunk.last_timestamp() <= end;
+                (
+                    lower + if inside { chunk.len() } else { 0 },
+                    upper + chunk.len(),
+                )
+            })
+    }
+
+    /// How many samples [`Self::get_range`] returns for this range, stopping at `stop_at`.
+    ///
+    /// Only a chunk the range partly covers is decoded, so this reads at most the two chunks at
+    /// the ends of the range. Compressed chunks decode from their start, so a narrow range can
+    /// read a whole chunk to count one sample: `None` if that takes more than `max_scanned`
+    /// decoded samples.
+    pub fn count_samples_in_range(
+        &self,
+        start: Timestamp,
+        end: Timestamp,
+        stop_at: usize,
+        max_scanned: usize,
+    ) -> Option<usize> {
+        let start = start.max(self.get_min_timestamp());
+        if start > end || !self.overlaps(start, end) {
+            return Some(0);
+        }
+        let Some((start_index, end_index)) = self.get_chunk_index_bounds(start, end) else {
+            return Some(0);
+        };
+        let mut count = 0;
+        let mut scanned = 0;
+        for chunk in &self.chunks[start_index..=end_index] {
+            if chunk.first_timestamp() >= start && chunk.last_timestamp() <= end {
+                count += chunk.len();
+            } else if chunk.first_timestamp() <= end && chunk.last_timestamp() >= start {
+                for sample in chunk.iter() {
+                    if sample.timestamp > end {
+                        break;
+                    }
+                    if scanned == max_scanned {
+                        return None;
+                    }
+                    scanned += 1;
+                    count += usize::from(sample.timestamp >= start);
+                    if count >= stop_at {
+                        return Some(stop_at);
+                    }
+                }
+            }
+            if count >= stop_at {
+                return Some(stop_at);
+            }
+        }
+        Some(count)
+    }
+
     pub fn get_range_filtered(
         &self,
         start_timestamp: Timestamp,
@@ -1329,7 +1398,7 @@ impl TimeSeries {
     }
 
     #[cfg(test)]
-    pub(super) fn update_state_from_chunks(&mut self) {
+    pub(crate) fn update_state_from_chunks(&mut self) {
         self.update_first_last_timestamps();
         self.total_samples = self.chunks.iter().map(|x| x.len()).sum();
     }

@@ -1,9 +1,11 @@
-use super::utils::{normalize_evidence, normalize_value};
-use crate::analysis::TimeSeriesAnalysisResult;
-use crate::analysis::math::{calculate_mean, calculate_std_dev};
+use super::utils::{
+    detect_own_departures, fit_head_baseline, normalize_evidence, snap_dust_if_collapsed,
+    usable_fence_distance,
+};
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo,
 };
+use crate::analysis::{TimeSeriesAnalysisError, TimeSeriesAnalysisResult};
 
 /// Default alpha for Ewma SPC
 pub const EWMA_DEFAULT_ALPHA: f64 = 0.3;
@@ -22,61 +24,123 @@ pub struct EwmaOutlierDetector {
 }
 
 impl EwmaOutlierDetector {
-    pub fn from_series(ts: &[f64], alpha: f64) -> Self {
-        let training_size = (ts.len() as f64 * 0.5).min(100.0) as usize;
-        let training_data = &ts[0..training_size];
+    /// Fits the control chart to the head of `ts`.
+    ///
+    /// `alpha` is a smoothing weight and must lie in `(0, 1]`: at `0` the average
+    /// never moves, and above `1` the update overshoots the sample it is pulled
+    /// toward (at `2` the variance factor `alpha / (2 - alpha)` is not finite).
+    pub fn from_series(ts: &[f64], alpha: f64) -> TimeSeriesAnalysisResult<Self> {
+        if !(alpha > 0.0 && alpha <= 1.0) {
+            return Err(TimeSeriesAnalysisError::InvalidParameter {
+                name: "alpha".to_string(),
+                message: format!("alpha must be in the range (0, 1], got {alpha}"),
+            });
+        }
 
-        let target = calculate_mean(training_data);
-        let sigma = calculate_std_dev(training_data);
+        let (target, sigma) = fit_head_baseline(ts);
         let multiplier = 3.0;
 
-        EwmaOutlierDetector {
+        Ok(EwmaOutlierDetector {
             alpha,
             target,
             sigma,
             multiplier,
-        }
+        })
     }
 
     pub fn detect(&self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
-        let n = ts.len();
-        let mut scores = Vec::with_capacity(n);
+        let (scores, anomalies) = if self.is_collapsed() {
+            detect_own_departures(ts, self.target)
+        } else {
+            self.detect_smoothed(ts)
+        };
+
+        Ok(AnomalyResult {
+            scores,
+            anomalies,
+            threshold: self.multiplier,
+            method: AnomalyMethod::Ewma,
+            method_info: self.model_info(),
+        })
+    }
+
+    /// Half-width of the control limits once the smoothed average has been running
+    /// long enough for its variance to settle: `multiplier * sigma * sqrt(alpha / (2 - alpha))`.
+    ///
+    /// The limits applied at each position are narrower than this and converge to it
+    /// (see `detect_smoothed`), so this is the width the chart tests against in the
+    /// long run, and the one `model_info` reports.
+    fn steady_state_half_width(&self) -> f64 {
+        self.multiplier * (self.sigma * (self.alpha / (2.0 - self.alpha)).sqrt())
+    }
+
+    /// The standard deviation of the average after `observed` samples, given
+    /// `log_keep = ln(1 - alpha)`: `sigma * sqrt(alpha / (2 - alpha) * (1 - (1 - alpha)^(2n)))`.
+    ///
+    /// `ln_1p` and `exp_m1` because `1 - alpha` rounds to 1 below about 1e-16, which would
+    /// zero the limit whatever the sigma. Each factor has its own root so their product does
+    /// not underflow: sigma would otherwise be squared below ~1e-154 and overflow above
+    /// ~1e154, and a small alpha enters both of the other two.
+    fn transient_std(&self, log_keep: f64, observed: i32) -> f64 {
+        let settling = -(2.0 * f64::from(observed) * log_keep).exp_m1();
+        self.sigma * (self.alpha / (2.0 - self.alpha)).sqrt() * settling.sqrt()
+    }
+
+    /// True when the fitted sigma itself is lost in the target. Measured before alpha narrows
+    /// it: a small alpha shrinks the limits and the average's reach alike, so that chart
+    /// still has a scale and only the samples that move the average are departures.
+    fn is_collapsed(&self) -> bool {
+        self.target.is_finite()
+            && usable_fence_distance(self.target, self.multiplier * self.sigma) == 0.0
+    }
+
+    fn detect_smoothed(&self, ts: &[f64]) -> (Vec<f64>, Vec<Anomaly>) {
+        let mut scores = Vec::with_capacity(ts.len());
         let mut anomalies: Vec<Anomaly> = Vec::with_capacity(4);
 
         let mut ewma = self.target;
+        // Observations folded into `ewma` so far. A missing reading is not one: it
+        // leaves the average alone and the control limits where they were, rather
+        // than widening them for a sample that never informed the average.
+        let mut observed: i32 = 0;
+        let log_keep = (-self.alpha).ln_1p();
 
         for (i, &v) in ts.iter().enumerate() {
-            let value = normalize_value(v);
-            ewma = self.alpha * value + (1.0 - self.alpha) * ewma;
+            if v.is_nan() {
+                scores.push(0.0);
+                continue;
+            }
+            observed += 1;
+            // The update form, not `alpha * value + (1 - alpha) * ewma`: at a small
+            // alpha that form's rounding bias accumulates to hundreds of ULPs on a
+            // constant series, whereas here a sample equal to the average moves it
+            // by exactly nothing. Finite readings can still overflow the difference, and
+            // an infinite average would turn NaN on the next step and never recover.
+            let step = v - ewma;
+            ewma = if step.is_finite() {
+                ewma + self.alpha * step
+            } else {
+                self.alpha * v + (1.0 - self.alpha) * ewma
+            };
 
-            let ewma_variance = self.sigma * self.sigma * self.alpha / (2.0 - self.alpha)
-                * (1.0 - (1.0 - self.alpha).powi(2 * (i as i32 + 1)));
-            let ewma_std = ewma_variance.sqrt();
+            let ewma_std = self.transient_std(log_keep, observed);
 
             // The smoothed average's departure from target is the evidence; the
             // control limit that departure is tested against is the boundary.
             // Both grow with the observation index, which is why the limits are
             // recomputed each step rather than fixed at `multiplier * sigma`.
-            let deviation = ewma - self.target;
-            let boundary = self.multiplier * ewma_std;
-
-            // A control limit at or below rounding noise is not a limit. The
-            // EWMA recurrence carries its own error — `0.3*3.0 + 0.7*3.0` is not
-            // exactly `3.0` — so a zero-width limit would flag every point of a
-            // constant series on floating-point dust. NaN is the module's
-            // "no boundary to be past" sentinel: it scores 0.0 and fails the
-            // comparison below, so both agree that nothing is testable here.
-            let boundary = if boundary <= f64::EPSILON {
-                f64::NAN
-            } else {
-                boundary
-            };
+            //
+            // Even with a real sigma, the limit can be lost to rounding in the
+            // target while it is still narrow. Rounding error in the average must
+            // not read as a departure then.
+            let boundary = usable_fence_distance(self.target, self.multiplier * ewma_std);
+            let deviation = snap_dust_if_collapsed(ewma - self.target, boundary, self.target);
 
             let score = normalize_evidence(deviation.abs(), boundary);
             scores.push(score);
 
-            // A NaN limit — the degenerate case above — fails this comparison,
-            // which is how it stays unflagged.
+            // A NaN limit — no usable sigma — fails this comparison, which is how
+            // it stays unflagged.
             let signal = if deviation.abs() > boundary {
                 if deviation > 0.0 {
                     AnomalySignal::Positive
@@ -91,23 +155,13 @@ impl EwmaOutlierDetector {
                 anomalies.push(Anomaly {
                     index: i,
                     signal,
-                    value,
+                    value: v,
                     score,
                 });
             }
         }
 
-        let distance = self.multiplier * self.sigma;
-        Ok(AnomalyResult {
-            scores,
-            anomalies,
-            threshold: self.multiplier,
-            method: AnomalyMethod::Ewma,
-            method_info: Some(MethodInfo::Spc {
-                control_limits: (self.target - distance, self.target + distance),
-                center_line: self.target,
-            }),
-        })
+        (scores, anomalies)
     }
 }
 
@@ -120,9 +174,9 @@ impl AnomalyDetector for EwmaOutlierDetector {
     }
 
     fn model_info(&self) -> Option<MethodInfo> {
-        let distance = self.multiplier * self.sigma;
+        let half_width = self.steady_state_half_width();
         Some(MethodInfo::Spc {
-            control_limits: (self.target - distance, self.target + distance),
+            control_limits: (self.target - half_width, self.target + half_width),
             center_line: self.target,
         })
     }
@@ -143,7 +197,7 @@ mod tests {
     ) -> TimeSeriesAnalysisResult<AnomalyResult> {
         // Ewma control chart implementation
         let alpha = alpha.unwrap_or(EWMA_DEFAULT_ALPHA);
-        let detector = EwmaOutlierDetector::from_series(ts, alpha);
+        let detector = EwmaOutlierDetector::from_series(ts, alpha)?;
         detector.detect(ts)
     }
 
@@ -402,13 +456,64 @@ mod tests {
 
     #[test]
     fn test_ewma_nan_handling() {
-        // Test with NaN values (should be normalized to 0.0)
         let ts = vec![1.0, 1.1, f64::NAN, 1.2, 1.0, f64::NAN, 1.1];
 
         let result = detect_anomalies_spc_ewma(&ts, Some(0.3));
 
         // Should not panic and should complete successfully
         assert!(result.is_ok(), "Should handle NaN values gracefully");
+    }
+
+    /// A missing reading is not an observation: the average keeps its value and the
+    /// control limits do not widen for it. Scores and flags after the gap are those
+    /// of the series with the gap removed.
+    #[test]
+    fn test_ewma_nan_leaves_the_state_untouched() {
+        let baseline: Vec<f64> = (0..40)
+            .map(|i| 1.0 + 0.1 * (i as f64 * 0.7).sin())
+            .collect();
+        let detector = EwmaOutlierDetector::from_series(&baseline, 0.3).unwrap();
+
+        // A sustained shift, so the average is mid-move when the gap arrives.
+        let shifted = vec![1.6; 12];
+        let mut with_gap = shifted.clone();
+        with_gap.insert(4, f64::NAN);
+
+        let clean = detector.detect(&shifted).unwrap();
+        let gapped = detector.detect(&with_gap).unwrap();
+
+        assert!(
+            !clean.anomalies.is_empty(),
+            "the shift must leave the limits"
+        );
+        let mut expected_scores = clean.scores.clone();
+        expected_scores.insert(4, 0.0);
+        assert_eq!(gapped.scores, expected_scores);
+
+        let place = |index: usize| if index < 4 { index } else { index + 1 };
+        let expected_flags: Vec<_> = clean
+            .anomalies
+            .iter()
+            .map(|a| (place(a.index), a.signal, a.score))
+            .collect();
+        let flags: Vec<_> = gapped
+            .anomalies
+            .iter()
+            .map(|a| (a.index, a.signal, a.score))
+            .collect();
+        assert_eq!(flags, expected_flags);
+        assert!(gapped.anomalies.iter().all(|a| a.index != 4));
+    }
+
+    /// Zero-width limits take the same view of a gap: nothing to score, nothing to flag.
+    #[test]
+    fn test_ewma_nan_is_not_a_departure_when_the_scale_has_collapsed() {
+        let detector = EwmaOutlierDetector::from_series(&[5.0; 10], 0.3).unwrap();
+
+        let result = detector.detect(&[5.0, f64::NAN, 5.0]).unwrap();
+
+        assert_eq!(result.scores, vec![0.0; 3]);
+        assert!(result.anomalies.is_empty());
     }
 
     #[test]
@@ -422,5 +527,237 @@ mod tests {
         // Very high alpha (0.99) - minimal smoothing
         let high_result = detect_anomalies_spc_ewma(&ts, Some(0.99));
         assert!(high_result.is_ok(), "Should handle very high alpha");
+    }
+
+    fn spc_limits(info: Option<MethodInfo>) -> ((f64, f64), f64) {
+        let Some(MethodInfo::Spc {
+            control_limits,
+            center_line,
+        }) = info
+        else {
+            panic!("EWMA must report SPC method info, got {info:?}");
+        };
+        (control_limits, center_line)
+    }
+
+    #[test]
+    fn reported_limits_equal_the_steady_state_detection_limit() {
+        let ts: Vec<f64> = (0..400)
+            .map(|i| 1.0 + 0.1 * (i as f64 * 0.1).sin())
+            .collect();
+        let d = EwmaOutlierDetector::from_series(&ts, 0.3).unwrap();
+        let Some(MethodInfo::Spc {
+            control_limits,
+            center_line,
+        }) = d.model_info()
+        else {
+            panic!()
+        };
+        let w = d.multiplier * d.sigma * (0.3f64 / 1.7).sqrt();
+        assert!((control_limits.1 - (center_line + w)).abs() < 1e-12);
+        assert!((control_limits.0 - (center_line - w)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn detect_reports_the_limits_model_info_reports() {
+        let smooth: Vec<f64> = (0..100)
+            .map(|i| 1.0 + 0.1 * (i as f64 * 0.1).sin())
+            .collect();
+        let constant = vec![3.0; 20];
+        for ts in [&smooth, &constant] {
+            let d = EwmaOutlierDetector::from_series(ts, 0.3).unwrap();
+            let from_detect = spc_limits(d.detect(ts).unwrap().method_info);
+            let from_info = spc_limits(d.model_info());
+            assert_eq!(from_detect, from_info);
+        }
+    }
+
+    #[test]
+    fn collapsed_chart_reports_zero_width_limits_and_flags_any_departure() {
+        let mut ts = vec![3.0; 20];
+        ts[12] = 3.5;
+        let d = EwmaOutlierDetector::from_series(&ts[..10], 0.3).unwrap();
+        assert!(d.is_collapsed());
+
+        let result = d.detect(&ts).unwrap();
+        let ((lo, hi), center) = spc_limits(result.method_info);
+        assert_eq!((lo, hi, center), (3.0, 3.0, 3.0));
+        let flagged: Vec<usize> = result.anomalies.iter().map(|a| a.index).collect();
+        assert_eq!(flagged, vec![12]);
+    }
+
+    /// The per-step limit takes no square of sigma, so a spike is found at a
+    /// scale where `sigma * sigma` underflows to zero (flagging every wobble) or
+    /// overflows to infinity (flagging nothing).
+    #[test]
+    fn spike_is_found_at_extreme_scales() {
+        fn flagged_at(scale: f64) -> Vec<usize> {
+            let mut ts: Vec<f64> = (0..100)
+                .map(|i| scale * (1.0 + 0.02 * (i as f64 * 0.1).sin()))
+                .collect();
+            ts[60] = scale * 5.0;
+            // The fitted sigma is built directly: `calculate_variance` squares its
+            // deviations, which is out of range at these scales on its own.
+            let d = EwmaOutlierDetector {
+                alpha: 0.3,
+                target: scale,
+                sigma: scale * 0.035,
+                multiplier: 3.0,
+            };
+            assert!(!d.is_collapsed(), "scale {scale}");
+            d.detect(&ts)
+                .unwrap()
+                .anomalies
+                .iter()
+                .map(|a| a.index)
+                .collect()
+        }
+
+        let reference = flagged_at(1.0);
+        assert!(reference.contains(&60), "reference: {reference:?}");
+        assert!(
+            reference.iter().all(|&i| i >= 60),
+            "reference: {reference:?}"
+        );
+        for scale in [1e-200, 1e200] {
+            assert_eq!(flagged_at(scale), reference, "scale {scale:e}");
+        }
+    }
+
+    /// A constant head has an exact answer: its own value, with no scale. The computed
+    /// mean of such a head is a few ULPs off, which the dust floor would hide in the
+    /// sigma but not in the target.
+    #[test]
+    fn from_series_fits_a_constant_head_exactly() {
+        for value in [0.1, 1.0 / 3.0, 1e-3, 123_456.789, -7.7] {
+            let mut ts = vec![value; 100];
+            ts.extend((0..100).map(|i| value + (i as f64 * 0.1).sin()));
+            let d = EwmaOutlierDetector::from_series(&ts, EWMA_DEFAULT_ALPHA).unwrap();
+            assert_eq!((d.target, d.sigma), (value, 0.0), "value {value}");
+        }
+    }
+
+    /// A head without two finite observations has no baseline to depart from, so later
+    /// readings are not judged against the 0.0 an empty mean falls back to.
+    #[test]
+    fn head_without_two_finite_observations_is_unusable() {
+        let heads: [&[f64]; 5] = [
+            &[],
+            &[f64::NAN, f64::NAN],
+            &[f64::INFINITY, f64::INFINITY],
+            &[f64::NEG_INFINITY, f64::INFINITY],
+            &[5.0, f64::NAN],
+        ];
+        for head in heads {
+            let d = EwmaOutlierDetector::from_series(head, 0.3).unwrap();
+            let result = d.detect(&[5.0, 50.0, -500.0]).unwrap();
+            assert!(result.anomalies.is_empty(), "{head:?}");
+            assert_eq!(result.scores, vec![0.0; 3], "{head:?}");
+        }
+    }
+
+    /// Half the series alternating around `center`, the rest shifted by `shift`.
+    fn shifted_after_alternating(center: f64, deviation: f64, shift: f64) -> Vec<f64> {
+        let mut ts: Vec<f64> = (0..100)
+            .map(|i| center + if i % 2 == 0 { deviation } else { -deviation })
+            .collect();
+        ts.extend(std::iter::repeat_n(center + shift, 100));
+        ts
+    }
+
+    /// A deviation of a few dozen ULPs of the target is still representable variance, so it
+    /// is a scale to test against rather than rounding error to discard.
+    #[test]
+    fn small_variance_on_a_large_target_is_kept() {
+        let ts = shifted_after_alternating(1e15, 0.5, 3.0);
+        let d = EwmaOutlierDetector::from_series(&ts, 0.3).unwrap();
+        assert!(d.sigma > 0.4, "sigma {}", d.sigma);
+        assert_eq!(
+            d.detect(&ts).unwrap().anomalies.first().map(|a| a.index),
+            Some(100)
+        );
+        // Inside the same limits, the same baseline flags nothing.
+        let quiet = shifted_after_alternating(1e15, 0.5, 0.0);
+        let d = EwmaOutlierDetector::from_series(&quiet, 0.3).unwrap();
+        assert!(d.detect(&quiet).unwrap().anomalies.is_empty());
+    }
+
+    /// `v - ewma` can overflow on finite readings. The average must survive it, or every
+    /// later outlier goes unseen.
+    #[test]
+    fn an_overflowing_difference_does_not_poison_the_average() {
+        let alternating = |i: usize| if i.is_multiple_of(2) { 1.0 } else { -1.0 };
+        let mut ts: Vec<f64> = (0..200).map(alternating).collect();
+        ts.extend([1e308, -1e308, 100.0]);
+        ts.extend(std::iter::repeat_n(0.0, 50));
+        ts.push(1e6);
+        ts.extend(std::iter::repeat_n(0.0, 50));
+
+        let d = EwmaOutlierDetector::from_series(&ts, 1.0).unwrap();
+        let result = d.detect(&ts).unwrap();
+        let flagged: Vec<usize> = result.anomalies.iter().map(|a| a.index).collect();
+        // The 100 at 202 is absorbed: next to -1e308 it is below the rounding of the update.
+        // What matters is that the average recovers and finds the outlier at 253.
+        assert_eq!(flagged, vec![200, 201, 253]);
+        assert!(result.scores.iter().all(|s| s.is_finite()));
+    }
+
+    /// Below about 1e-16 `1 - alpha` rounds to 1, which used to zero the control limits and
+    /// flag half of an unremarkable series. A real sigma keeps a chart from collapsing, and
+    /// an average that small an alpha cannot move stays inside its limits.
+    #[test]
+    fn a_tiny_alpha_does_not_collapse_the_limits() {
+        for alpha in [1e-16, 1e-17, 1e-20, 1e-40, 1e-100, 1e-160, 1e-200, 1e-300] {
+            for center in [0.0, 5.0, 1e-3, -1e6] {
+                let ts = shifted_after_alternating(center, 1.0, 0.0);
+                let d = EwmaOutlierDetector::from_series(&ts, alpha).unwrap();
+                let result = d.detect(&ts).unwrap();
+                assert!(
+                    result.anomalies.is_empty(),
+                    "alpha {alpha:e} center {center}: {} flagged",
+                    result.anomalies.len()
+                );
+            }
+        }
+    }
+
+    /// The closed form of the limit at each step, against the recurrence it solves.
+    #[test]
+    fn the_transient_limit_matches_its_recurrence() {
+        for alpha in [1.0, 0.9, 0.3, 1e-3, 1e-8] {
+            let (mut variance, sigma, multiplier) = (0.0, 2.0, 3.0);
+            let d = EwmaOutlierDetector {
+                alpha,
+                target: 0.0,
+                sigma,
+                multiplier,
+            };
+            let log_keep = (-alpha).ln_1p();
+            for observed in 1..=200 {
+                variance = (1.0 - alpha) * (1.0 - alpha) * variance + alpha * alpha;
+                let want = sigma * f64::sqrt(variance);
+                let got = d.transient_std(log_keep, observed);
+                assert!(
+                    ((got - want) / want).abs() < 1e-9,
+                    "{alpha} {observed}: {got} vs {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn from_series_rejects_alpha_outside_the_half_open_unit_interval() {
+        for alpha in [0.0, -1.0, 1.5, f64::NAN, f64::INFINITY] {
+            let err = EwmaOutlierDetector::from_series(&[1.0, 2.0, 3.0, 4.0], alpha)
+                .expect_err(&format!("alpha {alpha} must be rejected"));
+            assert!(
+                matches!(
+                    err,
+                    TimeSeriesAnalysisError::InvalidParameter { ref name, .. } if name == "alpha"
+                ),
+                "{alpha}: {err:?}"
+            );
+        }
+        assert!(EwmaOutlierDetector::from_series(&[1.0, 2.0, 3.0, 4.0], 1.0).is_ok());
     }
 }

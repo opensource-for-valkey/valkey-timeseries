@@ -8,7 +8,7 @@
 use crate::common::acl::caller_user_name;
 use crate::common::context::{get_current_db, is_blocking_denied};
 use crate::common::replies::{ReplyContext, ThreadSafeReplyContext, block_client};
-use crate::common::threads::{BoundedExecutor, Capacity, ExecutorStats, lane_workers};
+use crate::common::threads::{BoundedExecutor, Capacity, ExecutorStats, Reservation, lane_workers};
 use crate::fanout::FanoutContext;
 use crate::series::index::{
     SeriesCursor, SeriesSelection, get_db_index, plan_if_cheap, series_read_exceeds_inline_budget,
@@ -54,14 +54,33 @@ pub(crate) fn run_on_analysis_lane<F>(ctx: &Context, what: &str, job: F) -> Valk
 where
     F: FnOnce(&ThreadSafeReplyContext) + Send + 'static,
 {
+    let slot = reserve_analysis_slot(ctx, what)?;
+    run_reserved_on_analysis_lane(ctx, slot, job)
+}
+
+/// Reserves a queue place on the analysis lane without blocking the client, for a caller with
+/// expensive work to do first: a busy lane refuses the request before that work is spent.
+/// Dropping the reservation gives the place back. Fails as [`run_on_analysis_lane`] does.
+pub(crate) fn reserve_analysis_slot(ctx: &Context, what: &str) -> ValkeyResult<Reservation> {
     if is_blocking_denied(ctx) {
         return Err(ValkeyError::String(format!(
             "TSDB: {what} cannot run in the background inside MULTI, a script or a module call"
         )));
     }
-    let slot = ANALYSIS_EXECUTOR
+    ANALYSIS_EXECUTOR
         .try_reserve()
-        .map_err(|rejected| ValkeyError::String(format!("TSDB: {what}: {rejected}")))?;
+        .map_err(|rejected| ValkeyError::String(format!("TSDB: {what}: {rejected}")))
+}
+
+/// Blocks the client of `ctx` and runs `job` in a place from [`reserve_analysis_slot`].
+pub(crate) fn run_reserved_on_analysis_lane<F>(
+    ctx: &Context,
+    slot: Reservation,
+    job: F,
+) -> ValkeyResult
+where
+    F: FnOnce(&ThreadSafeReplyContext) + Send + 'static,
+{
     let blocked_client = block_client(ctx);
     slot.spawn(move || {
         let thread_ctx = ThreadSafeReplyContext::with_blocked_client(blocked_client);

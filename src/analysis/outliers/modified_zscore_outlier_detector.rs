@@ -1,4 +1,6 @@
-use super::utils::{deviation_and_fence_distance, normalize_evidence, normalize_value};
+use super::utils::{
+    deviation_and_fence_distance, normalize_evidence, snap_dust_if_collapsed, usable_fence_distance,
+};
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::math::{calculate_median_sorted, robust_scale_from_sorted_abs_devs};
 use crate::analysis::outliers::{
@@ -46,23 +48,20 @@ impl ModifiedZScoreOutlierDetector {
     /// rounding step about a value sitting exactly on the fence.
     #[inline]
     fn deviation_and_boundary(&self, value: f64) -> (f64, f64) {
-        if self.mad_scaled <= 1e-10 {
-            // No usable scale: nothing to be past.
-            return (value - self.median, f64::NAN);
-        }
         let (lower_fence, upper_fence) = self.fences();
-        deviation_and_fence_distance(value, self.median, lower_fence, upper_fence)
+        let (deviation, boundary) =
+            deviation_and_fence_distance(value, self.median, lower_fence, upper_fence);
+        (
+            snap_dust_if_collapsed(deviation, boundary, self.median),
+            boundary,
+        )
     }
 
     /// The fences `model_info` reports, and the ones `deviation_and_boundary`
     /// measures against. One definition, so they cannot drift apart.
     #[inline]
     fn fences(&self) -> (f64, f64) {
-        let delta = if self.mad_scaled > 1e-10 {
-            self.threshold * self.mad_scaled
-        } else {
-            0.0
-        };
+        let delta = usable_fence_distance(self.median, self.threshold * self.mad_scaled);
         (self.median - delta, self.median + delta)
     }
 
@@ -89,16 +88,15 @@ impl AnomalyDetector for ModifiedZScoreOutlierDetector {
     }
 
     fn train(&mut self, data: &[f64]) -> TimeSeriesAnalysisResult<()> {
-        // Calculate median
-        let mut sorted_values: Vec<f64> = data.iter().map(|&x| normalize_value(x)).collect();
+        // Calculate median. A missing reading is left out of the fit rather than
+        // counted as a zero.
+        let mut sorted_values: Vec<f64> = data.iter().copied().filter(|x| !x.is_nan()).collect();
         sorted_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = calculate_median_sorted(&sorted_values);
 
         // Calculate Mad (Median Absolute Deviation)
-        let mut abs_deviations: Vec<f64> = data
-            .iter()
-            .map(|&x| (normalize_value(x) - median).abs())
-            .collect();
+        let mut abs_deviations: Vec<f64> =
+            sorted_values.iter().map(|&x| (x - median).abs()).collect();
         abs_deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let mad = calculate_median_sorted(&abs_deviations);
@@ -160,6 +158,26 @@ mod tests {
     use super::detect_anomalies_modified_zscore;
     use super::*;
     use crate::analysis::outliers::{AnomalyDetector, AnomalySignal, PointDetector};
+
+    /// A missing reading is left out of the median and the MAD, not counted as a
+    /// zero: the fit over a series with gaps is the fit over the series without them.
+    #[test]
+    fn nan_samples_are_left_out_of_the_fit() {
+        let values = vec![40.0, 41.0, 42.0, 43.0, 44.0, 45.0, 41.5, 42.5, 43.5];
+        let mut with_gaps = values.clone();
+        with_gaps.insert(2, f64::NAN);
+        with_gaps.insert(6, f64::NAN);
+        with_gaps.push(f64::NAN);
+
+        let mut clean = ModifiedZScoreOutlierDetector::new(MODIFIED_ZSCORE_DEFAULT_THRESHOLD);
+        clean.train(&values).unwrap();
+        let mut gapped = ModifiedZScoreOutlierDetector::new(MODIFIED_ZSCORE_DEFAULT_THRESHOLD);
+        gapped.train(&with_gaps).unwrap();
+
+        assert_eq!(gapped.median, clean.median);
+        assert_eq!(gapped.mad, clean.mad);
+        assert_eq!(gapped.mad_scaled, clean.mad_scaled);
+    }
 
     /// A negative threshold inverts the fences. Before `deviation_and_boundary`
     /// mapped a negative fence distance to NaN, this flagged essentially every

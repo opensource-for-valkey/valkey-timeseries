@@ -1481,6 +1481,101 @@ mod tests {
         assert_eq!(result[0].value, sample.value);
     }
 
+    /// Four chunks of five samples: 1000..=5000, 6000..=10000, ...
+    fn four_chunks_of_five(new_chunk: fn() -> TimeSeriesChunk) -> TimeSeries {
+        let mut series = TimeSeries::default();
+        for chunk_index in 0..4 {
+            let mut chunk = new_chunk();
+            for i in 1..=5 {
+                let sample = Sample {
+                    timestamp: (chunk_index * 5 + i) * 1000,
+                    value: 1.0,
+                };
+                chunk.add_sample(&sample).unwrap();
+            }
+            series.chunks.push(chunk);
+        }
+        series.update_state_from_chunks();
+        series
+    }
+
+    #[test]
+    fn sample_count_bounds_hold_what_the_range_reads() {
+        let series = four_chunks_of_five(|| create_chunk(None));
+        let bounds = |start, end| series.sample_count_bounds(start, end);
+        assert_eq!(bounds(1000, 20000), (20, 20));
+        // One sample inside a chunk counts its whole chunk towards the upper bound alone.
+        assert_eq!(bounds(7000, 7000), (0, 5));
+        // Two partly covered chunks around a whole one.
+        assert_eq!(bounds(3000, 12000), (5, 15));
+        // Outside the series, or reversed.
+        assert_eq!(bounds(21000, 30000), (0, 0));
+        assert_eq!(bounds(0, 500), (0, 0));
+        assert_eq!(bounds(8000, 7000), (0, 0));
+        for start in (0..=21000).step_by(500) {
+            for end in (start..=21000).step_by(500) {
+                let (lower, upper) = bounds(start, end);
+                let read = series.get_range(start, end).len();
+                assert!(lower <= read && read <= upper, "{start}..={end}");
+            }
+        }
+    }
+
+    #[test]
+    fn counted_samples_match_what_get_range_returns() {
+        let chunks: [fn() -> TimeSeriesChunk; 3] = [
+            || TimeSeriesChunk::Gorilla(GorillaChunk::with_max_size(1024)),
+            || TimeSeriesChunk::Chimp(Default::default()),
+            || TimeSeriesChunk::Uncompressed(Default::default()),
+        ];
+        for new_chunk in chunks {
+            let mut series = four_chunks_of_five(new_chunk);
+            let count = |s: &TimeSeries, start, end| {
+                s.count_samples_in_range(start, end, usize::MAX, usize::MAX)
+            };
+            // One sample inside a chunk is one sample, however long the chunk.
+            assert_eq!(count(&series, 7000, 7000), Some(1));
+            assert_eq!(count(&series, 1000, 20000), Some(20));
+            // Between samples, between chunks, outside the series, and reversed.
+            assert_eq!(count(&series, 7001, 7999), Some(0));
+            assert_eq!(count(&series, 5001, 5999), Some(0));
+            assert_eq!(count(&series, 21000, 30000), Some(0));
+            assert_eq!(count(&series, 8000, 7000), Some(0));
+            for start in (0..=21000).step_by(500) {
+                for end in (start..=21000).step_by(500) {
+                    assert_eq!(
+                        count(&series, start, end),
+                        Some(series.get_range(start, end).len()),
+                        "{start}..={end}"
+                    );
+                }
+            }
+
+            // A retention window hides the older samples from both.
+            series.retention = Duration::from_millis(4500);
+            assert_eq!(
+                count(&series, 0, 20000),
+                Some(series.get_range(0, 20000).len())
+            );
+            assert_eq!(count(&series, 0, 20000), Some(5));
+        }
+    }
+
+    #[test]
+    fn counting_stops_at_its_limit_and_its_scan_budget() {
+        let series = four_chunks_of_five(|| create_chunk(None));
+        // Stops once the answer is known, here from whole chunks that take no decoding.
+        assert_eq!(series.count_samples_in_range(1000, 20000, 3, 0), Some(3));
+        assert_eq!(series.count_samples_in_range(3000, 12000, 2, 4), Some(2));
+        // Whole chunks need no decoding at all.
+        assert_eq!(series.count_samples_in_range(1000, 20000, 100, 0), Some(20));
+        // 3000 is the third sample of its chunk: three decoded find it, two run out.
+        assert_eq!(series.count_samples_in_range(3000, 3000, 100, 3), Some(1));
+        assert_eq!(series.count_samples_in_range(3000, 3000, 100, 2), None);
+        // Ranges past the chunk stop decoding at the first sample beyond them.
+        assert_eq!(series.count_samples_in_range(1000, 2500, 100, 3), Some(2));
+    }
+
     #[test]
     fn test_get_range_across_multiple_chunks() {
         let mut time_series = TimeSeries::default();

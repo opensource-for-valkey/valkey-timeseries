@@ -139,7 +139,7 @@ impl Mstl {
 
         // Check minimum length
         let max_period = *self.seasonal_periods.last()?;
-        if n < 2 * max_period {
+        if n < max_period.saturating_mul(2) {
             return None;
         }
 
@@ -397,5 +397,14 @@ mod tests {
         let result = mstl.decompose(&series).unwrap();
 
         assert!(result.seasonal_strength(5).is_none());
+    }
+
+    #[test]
+    fn mstl_oversized_period_returns_none_instead_of_overflowing() {
+        assert!(
+            Mstl::new(vec![4, 1usize << 63])
+                .decompose(&[1.0; 10])
+                .is_none()
+        );
     }
 }
