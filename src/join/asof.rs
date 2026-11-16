@@ -1,18 +1,21 @@
 //! `TS.JOIN ... ASOF`: match each left sample with one right sample near it in time.
 //!
 //! Both inputs come from a series, so their timestamps strictly increase. The matcher keeps a
-//! single cursor into the right input: `cursor` is the first right sample at or after the
-//! current left timestamp. Because left timestamps also increase, the cursor only moves
-//! forward, and every candidate a strategy can choose sits next to it:
+//! single cursor into the right input: the first right sample at or after the current left
+//! timestamp. Because left timestamps also increase, the cursor only moves forward, and every
+//! candidate a strategy can choose sits next to it:
 //!
-//! - `before`: the sample just ahead of the cursor (strictly earlier than `left`),
+//! - `before`: the last sample consumed before the cursor (strictly earlier than `left`),
 //! - `exact`:  the sample at the cursor, when its timestamp equals `left`,
-//! - `after`:  the first sample strictly later than `left`.
+//! - `after`:  the first sample strictly later than `left`: the cursor itself, or the one after
+//!   it when the cursor is an exact match.
 //!
+//! So both inputs stream: the right input is read at most two samples past the cursor.
 //! Exact-match eligibility is decided per left sample from those three, so no earlier left
 //! sample can leave behind a candidate that a later one is not allowed to use.
 use crate::common::Sample;
 use crate::join::JoinValue;
+use itertools::{PeekNth, peek_nth};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -26,90 +29,79 @@ pub enum AsOfJoinStrategy {
     Nearest,
 }
 
-/// Picks the right sample `left` joins with, if any. `cursor` must be the first index whose
-/// timestamp is not before the previous left sample's; it is advanced for `left`.
-fn asof_match(
-    right: &[Sample],
-    cursor: &mut usize,
-    left: &Sample,
-    strategy: AsOfJoinStrategy,
-    allow_exact_match: bool,
-) -> Option<Sample> {
-    let ts = left.timestamp;
-    while right.get(*cursor).is_some_and(|r| r.timestamp < ts) {
-        *cursor += 1;
-    }
-    let before = cursor.checked_sub(1).map(|i| right[i]);
-    let exact = right.get(*cursor).filter(|r| r.timestamp == ts).copied();
-    let after = right[*cursor..].iter().find(|r| r.timestamp > ts).copied();
-
-    if allow_exact_match && exact.is_some() {
-        return exact;
-    }
-    match strategy {
-        AsOfJoinStrategy::Backward => before,
-        AsOfJoinStrategy::Forward => after,
-        AsOfJoinStrategy::Nearest => match (before, after) {
-            (Some(b), Some(a)) => {
-                // Ties go to the later sample.
-                if ts.abs_diff(a.timestamp) <= ts.abs_diff(b.timestamp) {
-                    Some(a)
-                } else {
-                    Some(b)
-                }
-            }
-            (b, a) => b.or(a),
-        },
-    }
-}
-
-/// Streams ASOF rows: lazy over the left input, with the right input held in memory.
-pub struct JoinAsOfIter<L> {
+/// Streams ASOF rows, reading each input only as far as the rows produced so far need.
+pub struct JoinAsOfIter<L, R: Iterator> {
     left: L,
-    right: Vec<Sample>,
-    cursor: usize,
+    right: PeekNth<R>,
+    /// The last right sample strictly earlier than the current left sample.
+    before: Option<Sample>,
     strategy: AsOfJoinStrategy,
     /// Maximum distance in milliseconds; `None` for no limit.
     tolerance: Option<u64>,
     allow_exact_match: bool,
 }
 
-impl<L: Iterator<Item = Sample>> JoinAsOfIter<L> {
+impl<L: Iterator<Item = Sample>, R: Iterator<Item = Sample>> JoinAsOfIter<L, R> {
     pub fn new(
         left: impl IntoIterator<Item = Sample, IntoIter = L>,
-        right: impl IntoIterator<Item = Sample>,
+        right: impl IntoIterator<Item = Sample, IntoIter = R>,
         strategy: AsOfJoinStrategy,
         tolerance: Option<Duration>,
         allow_exact_match: bool,
     ) -> Self {
-        let right: Vec<Sample> = right.into_iter().collect();
-        debug_assert!(
-            right.is_sorted_by(|a, b| a.timestamp < b.timestamp),
-            "ASOF right input must have strictly increasing timestamps"
-        );
         Self {
             left: left.into_iter(),
-            right,
-            cursor: 0,
+            right: peek_nth(right),
+            before: None,
             strategy,
             tolerance: tolerance.map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX)),
             allow_exact_match,
         }
     }
+
+    /// Picks the right sample `left` joins with, if any, advancing the cursor to `left`.
+    fn matching(&mut self, left: &Sample) -> Option<Sample> {
+        let ts = left.timestamp;
+        while let Some(r) = self.right.next_if(|r| r.timestamp < ts) {
+            debug_assert!(
+                self.before.is_none_or(|b| b.timestamp < r.timestamp),
+                "ASOF right input must have strictly increasing timestamps"
+            );
+            self.before = Some(r);
+        }
+        let exact = self.right.peek().filter(|r| r.timestamp == ts).copied();
+        if self.allow_exact_match && exact.is_some() {
+            return exact;
+        }
+        let before = self.before;
+        let mut after = || {
+            let next = if exact.is_some() { 1 } else { 0 };
+            self.right.peek_nth(next).copied()
+        };
+        match self.strategy {
+            AsOfJoinStrategy::Backward => before,
+            AsOfJoinStrategy::Forward => after(),
+            AsOfJoinStrategy::Nearest => match (before, after()) {
+                (Some(b), Some(a)) => {
+                    // Ties go to the later sample.
+                    if ts.abs_diff(a.timestamp) <= ts.abs_diff(b.timestamp) {
+                        Some(a)
+                    } else {
+                        Some(b)
+                    }
+                }
+                (b, a) => b.or(a),
+            },
+        }
+    }
 }
 
-impl<L: Iterator<Item = Sample>> Iterator for JoinAsOfIter<L> {
+impl<L: Iterator<Item = Sample>, R: Iterator<Item = Sample>> Iterator for JoinAsOfIter<L, R> {
     type Item = JoinValue;
 
     fn next(&mut self) -> Option<Self::Item> {
-        for left in self.left.by_ref() {
-            let Some(right) = asof_match(
-                &self.right,
-                &mut self.cursor,
-                &left,
-                self.strategy,
-                self.allow_exact_match,
-            ) else {
+        while let Some(left) = self.left.next() {
+            let Some(right) = self.matching(&left) else {
                 continue;
             };
             // The chosen candidate is the nearest one the strategy allows, so if it is out of
@@ -259,6 +251,37 @@ mod test {
             .collect();
         assert_eq!(first.len(), 1);
         assert_eq!(pulled, 1);
+    }
+
+    /// The right input is read only up to two samples past the cursor, so an unbounded right
+    /// input still yields the first rows, under every strategy and exact-match setting.
+    #[test]
+    fn consumes_right_lazily() {
+        use std::cell::Cell;
+        for strategy in [
+            AsOfJoinStrategy::Backward,
+            AsOfJoinStrategy::Forward,
+            AsOfJoinStrategy::Nearest,
+        ] {
+            for allow_eq in [true, false] {
+                let pulled = Cell::new(0usize);
+                let left = (0..3).map(|i| Sample::new(i * 10 + 5, 1.0));
+                let right = (0i64..).map(|i| {
+                    pulled.set(pulled.get() + 1);
+                    Sample::new(i * 10, 0.0)
+                });
+                let rows: Vec<_> = JoinAsOfIter::new(left, right, strategy, None, allow_eq)
+                    .take(2)
+                    .collect();
+                assert_eq!(rows.len(), 2, "{strategy:?} allow_eq={allow_eq}");
+                // Two left samples, at 5 and 15, reach right samples 0..=20 at most.
+                assert!(
+                    pulled.get() <= 4,
+                    "{strategy:?} allow_eq={allow_eq}: pulled {}",
+                    pulled.get()
+                );
+            }
+        }
     }
 
     #[test]
