@@ -2,7 +2,7 @@
 mod tests {
     use crate::aggregators::{AggregationType, BucketAlignment, BucketTimestamp};
     use crate::common::Sample;
-    use crate::join::join_handler::{join_samples, process_join};
+    use crate::join::join_handler::{JoinInputs, join_samples, process_join};
     use crate::join::{
         AsOfJoinOptions, AsOfJoinStrategy, JoinOptions, JoinReducer, JoinResultType, JoinType,
         JoinValue,
@@ -1265,5 +1265,61 @@ mod tests {
             assert!(!parallel.is_empty(), "{join_type:?}");
             assert_eq!(parallel, lazy, "{join_type:?}");
         }
+    }
+    fn values(result: Option<JoinResultType>) -> Option<Vec<JoinValue>> {
+        result.map(|result| match result {
+            JoinResultType::Values(values) => values,
+            JoinResultType::Samples(_) => panic!("Expected Values result type"),
+        })
+    }
+
+    #[test]
+    fn join_within_answers_a_count_join_that_fits_its_budget() {
+        // INNER over two windows that share every timestamp: COUNT 10 reads ten samples a side.
+        let left = series((0..100_000).map(|ts| (ts, 1.0)));
+        let right = series((0..100_000).map(|ts| (ts, 2.0)));
+        let mut options = create_basic_options();
+        options.count = Some(10);
+        let inputs = JoinInputs::read(&left, &right, &options).unwrap();
+
+        let full = values(Some(inputs.join(&options))).unwrap();
+        assert_eq!(full.len(), 10);
+        assert_eq!(values(inputs.join_within(&options, 1_000)), Some(full));
+    }
+
+    #[test]
+    fn join_within_gives_up_when_the_join_reads_past_its_budget() {
+        // The only common timestamp lies past the budget: an input cut there would answer
+        // "no rows", which is wrong, so the join must give up instead.
+        let left = series((0..10_000).map(|i| (i * 2, 1.0)).chain([(1_000_001, 1.0)]));
+        let right = series(
+            (0..10_000)
+                .map(|i| (i * 2 + 1, 2.0))
+                .chain([(1_000_001, 2.0)]),
+        );
+        let mut options = create_basic_options();
+        options.count = Some(1);
+        let inputs = JoinInputs::read(&left, &right, &options).unwrap();
+
+        assert_eq!(values(Some(inputs.join(&options))).unwrap().len(), 1);
+        assert_eq!(values(inputs.join_within(&options, 1_000)), None);
+        // Filtered-out samples count too: they were read.
+        options.value_filter = Some(ValueFilter::new(5.0, 6.0).unwrap());
+        assert_eq!(values(inputs.join_within(&options, 1_000)), None);
+    }
+
+    #[test]
+    fn join_within_accepts_a_budget_spent_exactly() {
+        // Both inputs end with the budget: every sample was read, none was cut, so the answer
+        // stands.
+        let left = series((0..50).map(|ts| (ts, 1.0)));
+        let right = series((0..50).map(|ts| (ts, 2.0)));
+        let mut options = create_basic_options();
+        options.count = Some(usize::MAX);
+        let inputs = JoinInputs::read(&left, &right, &options).unwrap();
+
+        let full = values(Some(inputs.join(&options))).unwrap();
+        assert_eq!(values(inputs.join_within(&options, 100)), Some(full));
+        assert_eq!(values(inputs.join_within(&options, 99)), None);
     }
 }

@@ -3,7 +3,7 @@ import pytest
 from valkey import ResponseError
 from valkeytestframework.util.waiters import *
 from valkeytestframework.conftest import resource_port_tracker
-from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
+from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase, ValkeyTimeSeriesTestCaseDebugMode
 
 
 class TestTSJoin(ValkeyTimeSeriesTestCaseBase):
@@ -956,3 +956,45 @@ class TestTSJoin(ValkeyTimeSeriesTestCaseBase):
         for left, right in (("acl:allowed:a", "acl:denied:b"), ("acl:denied:b", "acl:allowed:a")):
             with pytest.raises(ResponseError, match="No permissions to access a key|NOPERM"):
                 client.execute_command("TS.JOIN", left, right, "-", "+")
+
+
+class TestTSJoinPlacement(ValkeyTimeSeriesTestCaseDebugMode):
+    """Where a large TS.JOIN runs. With the next analysis job armed to panic, a join answered
+    from the lane fails with an internal error, and one answered inline does not."""
+
+    def _fill(self, key, timestamps, value):
+        pipe = self.client.pipeline(transaction=False)
+        for ts in timestamps:
+            pipe.execute_command("TS.ADD", key, ts, value(ts))
+        pipe.execute()
+
+    def test_count_join_within_the_inline_budget_runs_inline(self):
+        # 80,000 input samples, past the 65,536 inline budget, but COUNT 3 needs only the first
+        # few of each window.
+        n = 40_000
+        self._fill("place:l", range(0, 2 * n, 2), lambda ts: ts)
+        self._fill("place:r", range(0, 3 * n, 3), lambda ts: -ts)
+
+        self.arm_analysis_job_panic(self.client)
+        limited = self.client.execute_command(
+            "TS.JOIN", "place:l", "place:r", "-", "+", "COUNT", 3, "REDUCE", "sum")
+        assert [row[0] for row in limited] == [0, 6, 12]
+
+        # Still armed: without COUNT the same join goes to the lane.
+        with pytest.raises(ResponseError, match="internal error"):
+            self.client.execute_command("TS.JOIN", "place:l", "place:r", "-", "+", "REDUCE", "sum")
+
+    def test_count_join_past_the_inline_budget_moves_to_the_lane(self):
+        # No common timestamps: COUNT 1 cannot be filled without reading both windows, which
+        # is more than the inline budget, so the join moves to the lane.
+        n = 40_000
+        self._fill("place:even", range(0, 2 * n, 2), lambda ts: 1)
+        self._fill("place:odd", range(1, 2 * n, 2), lambda ts: 2)
+
+        self.arm_analysis_job_panic(self.client)
+        with pytest.raises(ResponseError, match="internal error"):
+            self.client.execute_command("TS.JOIN", "place:even", "place:odd", "-", "+", "COUNT", 1)
+
+        # Disarmed: the lane answers it, with no rows.
+        assert self.client.execute_command(
+            "TS.JOIN", "place:even", "place:odd", "-", "+", "COUNT", 1) == []

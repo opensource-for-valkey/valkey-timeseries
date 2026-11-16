@@ -203,6 +203,10 @@ background jobs are already queued, the command fails with
 `TSDB: TS.JOIN: too many queued jobs`. Inside `MULTI`, a script or a module call, a join
 always runs inline.
 
+With `COUNT`, a join over larger inputs is first tried inline, since it usually needs only
+the start of each window. It moves to the background only if filling `COUNT` would read more
+than 65,536 samples: for example, an `INNER` join whose inputs share few timestamps.
+
 ## Examples
 
 <details open>

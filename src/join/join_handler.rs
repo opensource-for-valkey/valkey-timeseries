@@ -8,6 +8,7 @@ use crate::series::chunks::utils::filter_timestamp_slice;
 use crate::series::types::ValueFilter;
 use crate::series::{RangeSnapshot, TimeSeries};
 use itertools::{Either, EitherOrBoth};
+use std::cell::Cell;
 use valkey_module::{ValkeyError, ValkeyResult};
 
 /// The result of a join: scalar samples (reduced, or aggregated) or raw joined rows.
@@ -90,17 +91,63 @@ impl<'a> JoinInputs<'a> {
         // (break-even at about 4,096 samples, `benches/join.rs`, `join/decode`).
         if options.count.is_none() && request_par_threads(2, self.estimated_samples()) != 1 {
             let (left, right) = join(
-                || self.left.samples(filter).collect::<Vec<_>>(),
-                || self.right.samples(filter).collect::<Vec<_>>(),
+                || self.left.samples(filter, None).collect::<Vec<_>>(),
+                || self.right.samples(filter, None).collect::<Vec<_>>(),
             );
             join_samples(left, right, options, self.now)
         } else {
             join_samples(
-                self.left.samples(filter),
-                self.right.samples(filter),
+                self.left.samples(filter, None),
+                self.right.samples(filter, None),
                 options,
                 self.now,
             )
+        }
+    }
+
+    /// [`Self::join`], unless it would read more than `budget` input samples, both sides
+    /// together: then it stops there and returns `None`. Lets a `COUNT` join, which usually
+    /// needs only a prefix of each window, try the calling thread before paying for a copy of
+    /// both windows; a join that runs out wastes at most `budget` samples of work.
+    pub fn join_within(&self, options: &JoinOptions, budget: usize) -> Option<JoinResultType> {
+        let filter = options.value_filter;
+        let budget = Budget::new(budget);
+        let result = join_samples(
+            self.left.samples(filter, Some(&budget)),
+            self.right.samples(filter, Some(&budget)),
+            options,
+            self.now,
+        );
+        // An input cut short by the budget can change the answer, not just shorten it.
+        (!budget.exceeded.get()).then_some(result)
+    }
+}
+
+/// Input samples a [`JoinInputs::join_within`] may still read, shared by both inputs.
+struct Budget {
+    remaining: Cell<usize>,
+    exceeded: Cell<bool>,
+}
+
+impl Budget {
+    fn new(samples: usize) -> Self {
+        Self {
+            remaining: Cell::new(samples),
+            exceeded: Cell::new(false),
+        }
+    }
+
+    /// Spends one sample; `false`, and marks the budget exceeded, when none is left.
+    fn spend(&self) -> bool {
+        match self.remaining.get().checked_sub(1) {
+            Some(left) => {
+                self.remaining.set(left);
+                true
+            }
+            None => {
+                self.exceeded.set(true);
+                false
+            }
         }
     }
 }
@@ -142,14 +189,28 @@ impl<'a> JoinInput<'a> {
         }
     }
 
-    fn samples(&self, filter: Option<ValueFilter>) -> impl Iterator<Item = Sample> + '_ {
-        let range = match self {
+    /// The input's samples, value-filtered. With a `budget`, every sample read counts against
+    /// it, including those the filter drops, and the input ends when the budget runs out.
+    fn samples<'s>(
+        &'s self,
+        filter: Option<ValueFilter>,
+        budget: Option<&'s Budget>,
+    ) -> impl Iterator<Item = Sample> + 's {
+        let (range, filter) = match self {
             // Already value-filtered by `read`.
-            JoinInput::Samples(samples) => return Either::Left(samples.iter().copied()),
-            JoinInput::Live { series, start, end } => series.range_iter(*start, *end),
-            JoinInput::Snapshot(snapshot) => snapshot.sample_iter(false),
+            JoinInput::Samples(samples) => (Either::Left(samples.iter().copied()), None),
+            JoinInput::Live { series, start, end } => (
+                Either::Right(Either::Left(series.range_iter(*start, *end))),
+                filter,
+            ),
+            JoinInput::Snapshot(snapshot) => (
+                Either::Right(Either::Right(snapshot.sample_iter(false))),
+                filter,
+            ),
         };
-        Either::Right(range.filter(move |s| filter.is_none_or(|f| f.is_match(s.value))))
+        range
+            .take_while(move |_| budget.is_none_or(Budget::spend))
+            .filter(move |s| filter.is_none_or(|f| f.is_match(s.value)))
     }
 }
 
