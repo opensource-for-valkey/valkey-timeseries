@@ -196,3 +196,41 @@ class TestRdbLoadRepair(ValkeyTimeSeriesTestCaseBase):
         assert self.ts_info("empties")["chunkCount"] == len(spans)
         for i in range(1, 61):
             assert self.client.execute_command("TS.DEL", "empties", i * 1000, i * 1000) == 1
+
+    @pytest.mark.parametrize("kind,digits,expected", [
+        ("SIGNIFICANT_DIGITS", 0, None),
+        ("SIGNIFICANT_DIGITS", 200, [b"significantDigits", 16]),
+        ("DECIMAL_DIGITS", 17, [b"decimalDigits", 16]),
+    ])
+    def test_rounding_digits_out_of_range(self, kind, digits, expected):
+        """Rounding digits no TS.CREATE accepts. RESTORE refuses them; the server's own copy
+        loads with what the stored value already did: no rounding for zero significant digits,
+        16 digits for more."""
+        client = self.client
+        client.config_set("rdbcompression", "no")
+        client.execute_command("TS.CREATE", "round", kind, 3)
+        client.execute_command("TS.ADD", "round", 1000, 1.23456)
+        payload = Payload(client.dump("round"))
+        digits_at = Series(payload).fields["retention"] + 3
+        assert payload.tokens[digits_at][1] == 3, "the field map must point at the digits"
+        edited = set_token(payload, {digits_at: digits})
+        with pytest.raises(ResponseError, match="Bad data format"):
+            client.restore("round:refused", 0, edited)
+            raise AssertionError("RESTORE accepted out-of-range rounding")
+        assert client.exists("round:refused") == 0
+
+        def rounding():
+            raw = client.execute_command("TS.INFO", "round")
+            return dict(zip(raw[::2], raw[1::2])).get(b"rounding")
+
+        repairs, tolerated = self.counters()
+        self.reload_with("round", edited)
+        assert self.counters() == (repairs + 1, tolerated)
+        assert rounding() == expected
+        stored = b"1.23" if kind == "SIGNIFICANT_DIGITS" else b"1.235"
+        assert client.execute_command("TS.RANGE", "round", "-", "+") == [[1000, stored]]
+
+        # The repair was saved: the next reload has nothing left to fix, and RESTORE accepts it.
+        client.execute_command("DEBUG", "RELOAD")
+        assert self.counters() == (repairs + 1, tolerated)
+        assert client.restore("round:copy", 0, client.dump("round")) == b"OK"

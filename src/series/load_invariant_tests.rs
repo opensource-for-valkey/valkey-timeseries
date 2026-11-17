@@ -5,6 +5,7 @@
 //! another node, or rewrites it on every restart. Random command sequences pin that; the forged
 //! cases pin what the checks are for.
 
+use crate::common::rounding::RoundingStrategy;
 use crate::common::{Sample, Timestamp};
 use crate::series::chunks::{
     Chunk, ChunkEncoding, ChunkOps, MAX_CHUNK_SIZE, MAX_LOADED_CHUNK_BYTES, SampleCodec,
@@ -13,8 +14,8 @@ use crate::series::chunks::{
 use crate::series::serialization::{
     BUDGET_CLAMPED, CHUNK_SIZE_CLAMPED, CHUNKS_OUT_OF_ORDER, ENCODING_ADOPTED, LoadTrust,
     NEGATIVE_TIMESTAMPS, OFF_GRID_BUCKET_REBUILT, OVERSIZED_SPLIT, RETENTION_CLAMPED,
-    STALE_RULE_STATE_CLEARED, STRAYS_REENCODED, UNDECODABLE_STRAYS_KEPT, check_series_invariants,
-    drop_empty_chunks, normalize_series,
+    ROUNDING_CLAMPED, ROUNDING_DROPPED, STALE_RULE_STATE_CLEARED, STRAYS_REENCODED,
+    UNDECODABLE_STRAYS_KEPT, check_series_invariants, drop_empty_chunks, normalize_series,
 };
 use crate::series::{
     DuplicatePolicy, SPLIT_SLACK_DIVISOR, TimeSeries, bulk_insert_samples, defrag_series,
@@ -492,6 +493,20 @@ fn forged_series_are_refused_when_foreign_and_kept_when_own() {
         cases.push(("retention past i64", ts, Repaired(&[RETENTION_CLAMPED])));
 
         let mut ts = base.clone();
+        ts.rounding = Some(RoundingStrategy::SignificantDigits(0));
+        cases.push(("zero significant digits", ts, Repaired(&[ROUNDING_DROPPED])));
+        for rounding in [
+            RoundingStrategy::SignificantDigits(17),
+            RoundingStrategy::SignificantDigits(u8::MAX),
+            RoundingStrategy::DecimalDigits(17),
+            RoundingStrategy::DecimalDigits(200),
+        ] {
+            let mut ts = base.clone();
+            ts.rounding = Some(rounding);
+            cases.push(("rounding digits past 16", ts, Repaired(&[ROUNDING_CLAMPED])));
+        }
+
+        let mut ts = base.clone();
         let mut stray = TimeSeriesChunk::new(other_encoding(encoding), 128);
         stray.add_sample(&Sample::new(last + 1000, 1.0)).unwrap();
         ts.chunks.push(stray);
@@ -553,6 +568,56 @@ fn forged_series_are_refused_when_foreign_and_kept_when_own() {
                     assert!(loaded == ts, "{encoding}: {what} was changed");
                 }
             }
+        }
+    }
+}
+
+/// Rounding digits the write path accepts load unchanged on any load. Past them, an own load
+/// repairs to what the stored value already did: no rounding for zero significant digits, and
+/// 16 digits for more, which is where both helpers capped a count anyway.
+#[test]
+fn rounding_digits_are_held_to_the_write_path_range() {
+    use RoundingStrategy::*;
+    for trust in [LoadTrust::Foreign, LoadTrust::Own] {
+        for rounding in [
+            None,
+            Some(SignificantDigits(1)),
+            Some(SignificantDigits(16)),
+            Some(DecimalDigits(0)),
+            Some(DecimalDigits(16)),
+        ] {
+            let mut ts = loaded_base(ChunkEncoding::Chimp);
+            ts.rounding = rounding;
+            let repairs = normalize_series(&mut ts, trust).unwrap();
+            assert!(repairs.is_empty(), "{trust:?} {rounding:?}");
+            assert_eq!(ts.rounding, rounding);
+        }
+    }
+    for (forged, repaired) in [
+        (SignificantDigits(0), None),
+        (SignificantDigits(17), Some(SignificantDigits(16))),
+        (SignificantDigits(u8::MAX), Some(SignificantDigits(16))),
+        (DecimalDigits(17), Some(DecimalDigits(16))),
+        (DecimalDigits(u8::MAX), Some(DecimalDigits(16))),
+    ] {
+        let mut ts = loaded_base(ChunkEncoding::Chimp);
+        ts.rounding = Some(forged);
+        let err = normalize_series(&mut ts.clone(), LoadTrust::Foreign).unwrap_err();
+        assert!(err.contains("rounding"), "{forged:?}: {err}");
+
+        normalize_series(&mut ts, LoadTrust::Own).unwrap();
+        assert_eq!(ts.rounding, repaired, "{forged:?}");
+        // The repair rounds new samples exactly as the forged value did.
+        for value in [
+            123.456_789_012_345_67,
+            -0.000_123_456_789,
+            9.999_999_999e300,
+        ] {
+            assert_eq!(
+                ts.adjust_value(value).to_bits(),
+                forged.round(value).to_bits(),
+                "{forged:?} {value}"
+            );
         }
     }
 }
