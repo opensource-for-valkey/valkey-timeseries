@@ -114,7 +114,8 @@ pub trait FanoutClientCommand: Default + Send + 'static {
             };
             if gone {
                 if let Ok(slot) = REPLY_EXECUTOR.try_reserve() {
-                    slot.spawn(move || {
+                    // Refused, the job is dropped here: what it held is freed in place.
+                    let _ = slot.spawn(move || {
                         drop(op);
                         drop(bc_for_closure);
                     });
@@ -125,7 +126,9 @@ pub trait FanoutClientCommand: Default + Send + 'static {
                 && op.should_reply_off_main_thread()
                 && let Ok(slot) = REPLY_EXECUTOR.try_reserve()
             {
-                slot.spawn(move || {
+                // Refused, the job is dropped unrun, and the last handle to the client answers
+                // it with an error as it drops.
+                let _ = slot.spawn(move || {
                     let replied = lock(&bc_for_closure).reply_off_main_thread(op);
                     // The merged results are freed here rather than on the main thread;
                     // dropping the last handle then unblocks the client.

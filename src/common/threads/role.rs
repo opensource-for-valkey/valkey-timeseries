@@ -21,7 +21,9 @@ pub enum ThreadRole {
     /// depends on a pool that may be parked. Never takes the GIL; its nested parallel work
     /// stays on its own pool.
     IsolatedPool,
-    /// A worker of a rayon pool the module did not build (tests).
+    /// A worker of a rayon pool that declared no role: rayon's global pool, which third-party
+    /// crates enter on their own (`krcf` under `TS.OUTLIERS METHOD rcf`) and which is not
+    /// orx's shared pool, or a pool built in a test. Never blocks, never takes the GIL.
     ForeignPool,
     /// Any other thread: a server I/O thread, a test harness thread.
     Other,

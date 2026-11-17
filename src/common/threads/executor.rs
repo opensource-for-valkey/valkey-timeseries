@@ -124,8 +124,7 @@ impl BoundedExecutor {
 
     /// Queues `job` for a worker. Never blocks: a full queue rejects the job.
     pub fn try_spawn<F: FnOnce() + Send + 'static>(&'static self, job: F) -> Result<(), Rejected> {
-        self.try_reserve()?.spawn(job);
-        Ok(())
+        self.try_reserve()?.spawn(job)
     }
 
     pub fn stats(&self) -> ExecutorStats {
@@ -193,18 +192,23 @@ pub struct Reservation {
 
 impl Reservation {
     /// Queues `job` in the reserved place.
-    pub fn spawn<F: FnOnce() + Send + 'static>(mut self, job: F) {
-        self.spent = true;
+    ///
+    /// A reservation exists only once the workers started, and they never exit while the
+    /// `static` sender lives, so the send cannot fail today. If it does, `job` is dropped
+    /// unrun, the place is given back, and the refusal is [`Rejected::NotRunning`]: whatever
+    /// the job captured to answer for (a blocked client) answers from its own drop.
+    pub fn spawn<F: FnOnce() + Send + 'static>(mut self, job: F) -> Result<(), Rejected> {
         let executor = self.executor;
-        // A reservation exists only once the workers started, and they never exit while the
-        // `static` sender lives, so the channel is always open.
         let sent = executor
             .sender()
             .is_some_and(|sender| sender.send(Box::new(job)).is_ok());
         if !sent {
-            executor.queued.fetch_sub(1, Ordering::AcqRel);
+            // Unspent, so dropping `self` gives the place back.
             log_warning(format!("{}: workers are gone; job dropped", executor.name));
+            return Err(Rejected::NotRunning);
         }
+        self.spent = true;
+        Ok(())
     }
 }
 
@@ -326,9 +330,35 @@ mod tests {
         EXECUTOR
             .try_reserve()
             .unwrap()
-            .spawn(move || tx.send(()).unwrap());
+            .spawn(move || tx.send(()).unwrap())
+            .unwrap();
         release.wait();
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn a_job_that_cannot_be_sent_is_refused_and_gives_its_place_back() {
+        static EXECUTOR: BoundedExecutor =
+            BoundedExecutor::new("test-exec-gone", one, Capacity::Fixed(4));
+        // Workers that are gone: a sender whose receiving end has been dropped.
+        let (sender, receiver) = channel::<Job>();
+        drop(receiver);
+        assert!(EXECUTOR.queue.set(Some(sender)).is_ok());
+
+        let (tx, rx) = channel::<()>();
+        assert_eq!(
+            EXECUTOR.try_spawn(move || tx.send(()).unwrap()),
+            Err(Rejected::NotRunning)
+        );
+        // The job was dropped unrun, and its place released.
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_err());
+        assert_eq!(EXECUTOR.stats().queued, 0);
+        assert_eq!(EXECUTOR.stats().rejected, 0);
+
+        let reservation = EXECUTOR.try_reserve().unwrap();
+        assert_eq!(EXECUTOR.stats().queued, 1);
+        assert_eq!(reservation.spawn(|| {}), Err(Rejected::NotRunning));
+        assert_eq!(EXECUTOR.stats().queued, 0);
     }
 
     #[test]

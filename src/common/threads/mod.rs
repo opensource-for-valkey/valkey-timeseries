@@ -17,8 +17,10 @@
 //! their own (`krcf`, behind `TS.OUTLIERS METHOD rcf`, when its parallel heuristic fires). The
 //! module never submits work to it, and the jobs it runs there neither block nor take the GIL,
 //! so it obeys R1 without exception and any thread, a GIL holder included, may wait on it. It
-//! is sized by rayon, not by `ts-num-threads`. Keep it that way: a crate that could block or
-//! take the GIL inside its parallel iterators must not be called with the GIL held.
+//! is sized by rayon, not by `ts-num-threads`. Its workers declare no role, so they report
+//! `ForeignPool`, which the checks refuse both the GIL and blocking waits. Keep it that way: a
+//! crate that could block or take the GIL inside its parallel iterators must not be called with
+//! the GIL held.
 //!
 //! # Rules
 //!
@@ -179,7 +181,7 @@ pub fn spawn_background<F: FnOnce() + Send + 'static>(name: &str, job: F) -> boo
     use std::panic::{AssertUnwindSafe, catch_unwind};
     let thread_name = name.to_string();
     if let Err(err) = std::thread::Builder::new()
-        .name(name.to_string())
+        .name(thread_name.clone())
         .spawn(move || {
             set_thread_role(ThreadRole::Blocking);
             if let Err(payload) = catch_unwind(AssertUnwindSafe(job)) {
