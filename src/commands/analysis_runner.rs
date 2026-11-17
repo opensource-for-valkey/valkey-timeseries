@@ -149,7 +149,7 @@ where
     P: FnOnce(&ReplyContext, T) + Send + 'static,
 {
     // Read here, on the main thread, where the GIL is held.
-    let src = FanoutContext::new(caller_user_name(ctx), get_current_db(ctx));
+    let src = FanoutContext::new(caller_user_name(ctx)?, get_current_db(ctx));
     run_on_analysis_lane(ctx, what, move |thread_ctx| match read(&src) {
         Ok(value) => reply(&thread_ctx.get_reply_context(), value),
         Err(err) => {

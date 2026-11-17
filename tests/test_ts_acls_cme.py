@@ -179,6 +179,19 @@ class TestTimeSeriesAclCluster(ValkeyTimeSeriesClusterTestCase):
         with pytest.raises(ResponseError):
             dave.execute_command("TS.MGET", "FILTER", "name=cpu")
 
+    def test_non_utf8_user_name_is_refused_not_mangled(self):
+        """A user name is carried to the shards as text. One that is not UTF-8 is refused
+        with its own error instead of reaching the shards as a different (lossy) name."""
+        cluster = self.new_cluster_client()
+        self._setup_per_shard_data(cluster)
+        name = b"al\xffce"
+        self._create_user_on_all_primaries(name, "pw", "+@timeseries", "+@read", "~*")
+
+        for coordinator in range(self.CLUSTER_SIZE):
+            client = self._get_primary_user_client(coordinator, name, "pw")
+            with pytest.raises(ResponseError, match="not valid UTF-8"):
+                client.execute_command("TS.MGET", "FILTER", "name=cpu")
+
     # ==================================================== per-command ACL ====
 
     def test_default_admin_user_sees_all_keys(self):

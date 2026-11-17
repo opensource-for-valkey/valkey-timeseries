@@ -436,7 +436,7 @@ pub(super) fn send_cluster_request(
 
     let id = generate_id();
     let db = get_current_db(ctx);
-    let user = caller_user_name(ctx);
+    let user = caller_user_name(ctx)?;
 
     let timeout = timeout.unwrap_or_else(get_cluster_command_timeout);
 

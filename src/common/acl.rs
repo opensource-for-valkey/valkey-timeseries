@@ -17,7 +17,7 @@ use std::ops::Deref;
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use valkey_module::{
     AclPermissions, CallOptionsBuilder, CallReply, CallResult, Context, ValkeyError, ValkeyResult,
     ValkeyString, raw,
@@ -224,9 +224,26 @@ fn thread_acl_scope_active() -> bool {
 /// `RM_Call` without the `C` flag runs on and which no ACL rule applies to. The wire has no way
 /// to say "root", so the receiving side then checks as its own context's user (the `default`
 /// user on a fan-out shard), which may be stricter: such a call fails closed rather than open.
-pub(crate) fn caller_user_name(ctx: &Context) -> Option<String> {
-    let user = current_user_name(ctx)?.to_string();
-    (!user.is_empty()).then_some(user)
+///
+/// Fails for a user name that is not UTF-8. The server accepts any bytes but whitespace and
+/// NUL in a name, while the name travels as text (a fan-out header field, a `String` on the
+/// background job), so a lossy rendering would be re-resolved on the other side as a
+/// different user. Refusing keeps such a caller from ever running as someone else.
+pub(crate) fn caller_user_name(ctx: &Context) -> ValkeyResult<Option<String>> {
+    match current_user_name(ctx) {
+        Some(name) => user_name_text(name.as_slice()),
+        None => Ok(None),
+    }
+}
+
+/// [`caller_user_name`]'s rule for one name's bytes: an empty name is no user, a non-UTF-8
+/// one an error.
+fn user_name_text(name: &[u8]) -> ValkeyResult<Option<String>> {
+    match std::str::from_utf8(name) {
+        Ok("") => Ok(None),
+        Ok(name) => Ok(Some(name.to_owned())),
+        Err(_) => Err(ValkeyError::Str(error_consts::ACL_USER_NAME_NOT_UTF8)),
+    }
 }
 
 /// Whether key checks apply to `ctx` at all.
@@ -442,34 +459,78 @@ impl AllKeysGrants {
 
 /// Answers for recently seen rule sets, keyed by [`AclDescription`] address.
 /// Holding the description keeps the key valid (see its docs), so a hit is
-/// exact and a rule change is always a miss. Only users with a `~*` token
-/// reach it, so it stays small; the oldest entry goes first when full.
-static ALL_KEYS_GRANTS: LazyLock<Mutex<Vec<(AclDescription, AllKeysGrants)>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+/// exact and a rule change is always a miss.
+static ALL_KEYS_GRANTS: Mutex<GrantsCache<AclDescription>> = Mutex::new(GrantsCache::new());
 
 const ALL_KEYS_GRANTS_CAPACITY: usize = 32;
+
+/// `ACL GETUSER` answers by rule set. A failed call is an answer too (`None`):
+/// the command renamed or disabled, or a reply this parser does not expect,
+/// neither of which a retry fixes, so it is not repeated for the same rule set
+/// on every request. Only users with a `~*` token reach it, so it stays small;
+/// the oldest entry goes first when full.
+struct GrantsCache<K> {
+    entries: Vec<(K, Option<AllKeysGrants>)>,
+}
+
+impl<K> GrantsCache<K> {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// The cached answer for `key`, `same` telling whether two keys are one rule set; on a
+    /// miss, `query`'s, cached. `query` runs with the cache unlocked: it runs a server command.
+    fn answer(
+        cache: &Mutex<Self>,
+        key: K,
+        same: impl Fn(&K, &K) -> bool,
+        query: impl FnOnce() -> Option<AllKeysGrants>,
+    ) -> Option<AllKeysGrants> {
+        let lock = || {
+            cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+        if let Some((_, answer)) = lock().entries.iter().find(|(k, _)| same(k, &key)) {
+            return *answer;
+        }
+        let answer = query();
+        let mut cache = lock();
+        if cache.entries.len() >= ALL_KEYS_GRANTS_CAPACITY {
+            cache.entries.remove(0);
+        }
+        cache.entries.push((key, answer));
+        answer
+    }
+}
 
 fn cached_all_keys_grants(
     ctx: &Context,
     description: AclDescription,
     user_name: impl FnOnce() -> ValkeyString,
 ) -> Option<AllKeysGrants> {
-    let lock = || {
-        ALL_KEYS_GRANTS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    };
-    if let Some((_, grants)) = lock().iter().find(|(d, _)| d.0 == description.0) {
-        return Some(*grants);
-    }
-    // Not under the cache lock: this runs a server command.
-    let grants = query_all_keys_grants(ctx, &user_name())?;
-    let mut cache = lock();
-    if cache.len() >= ALL_KEYS_GRANTS_CAPACITY {
-        cache.remove(0);
-    }
-    cache.push((description, grants));
-    Some(grants)
+    GrantsCache::answer(
+        &ALL_KEYS_GRANTS,
+        description,
+        |a, b| a.0 == b.0,
+        || {
+            let answer = query_all_keys_grants(ctx, &user_name());
+            if answer.is_none() {
+                static REPORTED: AtomicBool = AtomicBool::new(false);
+                if !REPORTED.swap(true, Ordering::Relaxed) {
+                    log_warning(
+                        "ACL GETUSER failed or gave an unexpected reply: users granted `~*` get \
+                         per-key checks, and commands that need read access to every key \
+                         (label names, values and statistics) refuse them until their rules \
+                         change. Those commands need the ACL command callable from modules.",
+                    );
+                }
+            }
+            answer
+        },
+    )
 }
 
 /// Reads the user's selectors from `ACL GETUSER`, whose reply keeps each
@@ -534,9 +595,15 @@ enum Identity {
 
 /// The caller's ACL identity for one set of permissions, resolved once so a
 /// loop over many keys costs one `RM_ACLCheckKeyPermissions` call per key —
-/// or nothing per key when the user may reach every key anyway (the `default`
-/// user, and any deployment without key-scoped rules), which two probes
-/// establish up front.
+/// or nothing per key when the user's rules grant the permissions on every key
+/// (the `default` user, and any deployment without key-scoped rules).
+///
+/// That is decided up front by `ModuleUser::allows_all_keys`: the user's
+/// rendered rules are scanned for a `~*` token, whose absence answers *no*
+/// without a server call; a *yes* is confirmed from `ACL GETUSER`'s
+/// per-selector key fields, cached per rule set. When that call fails the user
+/// gets per-key checks (see [`check_metadata_permissions`] for what it costs
+/// there).
 ///
 /// Resolving by name — the only entry point valkey-module-rs offers — builds
 /// a `ValkeyString` for the user name, looks the user up and allocates a
@@ -597,13 +664,7 @@ impl KeyAccess {
         if self.allows(key) {
             return Ok(());
         }
-        if self.permissions.contains(AclPermissions::DELETE) {
-            return Err(ValkeyError::Str(error_consts::KEY_DELETE_PERMISSION_ERROR));
-        }
-        if self.permissions.contains(AclPermissions::UPDATE) {
-            return Err(ValkeyError::Str(error_consts::KEY_WRITE_PERMISSION_ERROR));
-        }
-        Err(ValkeyError::Str(error_consts::PERMISSION_DENIED))
+        Err(ValkeyError::Str(denial_message(&self.permissions)))
     }
 
     pub fn is_unrestricted(&self) -> bool {
@@ -620,21 +681,16 @@ impl Default for KeyAccess {
     }
 }
 
-pub fn clone_permissions(permissions: &AclPermissions) -> AclPermissions {
-    let mut cloned = AclPermissions::empty();
-    if permissions.contains(AclPermissions::ACCESS) {
-        cloned |= AclPermissions::ACCESS;
-    }
-    if permissions.contains(AclPermissions::INSERT) {
-        cloned |= AclPermissions::INSERT;
-    }
-    if permissions.contains(AclPermissions::UPDATE) {
-        cloned |= AclPermissions::UPDATE;
-    }
+/// The error a refused key check answers with: the delete text when deleting, the write text
+/// for any other change (inserting into or updating a key), the read text otherwise.
+fn denial_message(permissions: &AclPermissions) -> &'static str {
     if permissions.contains(AclPermissions::DELETE) {
-        cloned |= AclPermissions::DELETE;
+        error_consts::KEY_DELETE_PERMISSION_ERROR
+    } else if permissions.intersects(AclPermissions::INSERT | AclPermissions::UPDATE) {
+        error_consts::KEY_WRITE_PERMISSION_ERROR
+    } else {
+        error_consts::PERMISSION_DENIED
     }
-    cloned
 }
 
 /// One key's check. A loop should build a [`KeyAccess`] once instead.
@@ -644,7 +700,9 @@ pub fn check_key_permissions(
     key: &ValkeyString,
     permissions: &AclPermissions,
 ) -> ValkeyResult<()> {
-    KeyAccess::new(ctx, clone_permissions(permissions)).check(key)
+    // `AclPermissions` is neither `Clone` nor `Copy`.
+    let permissions = AclPermissions::from_bits_truncate(permissions.bits());
+    KeyAccess::new(ctx, permissions).check(key)
 }
 
 /// Gate for commands that report on the whole keyspace's metadata (label names and
@@ -654,6 +712,11 @@ pub fn check_key_permissions(
 /// "Every key" means the rules say so (`ModuleUser::allows_all_keys`), not that some
 /// sample keys pass: probing the literal key `*` admitted `~?`, `~[*]` and `~\*`, and a
 /// later two-key probe admitted any pattern built to match both probes.
+///
+/// Confirming such a grant runs `ACL GETUSER` through `RM_Call`, so the `ACL` command must
+/// be callable from modules. With it renamed or disabled (`rename-command ACL ""`) the call
+/// fails and this refuses every enforced user, `default` included. The failure is logged
+/// once and cached per rule set, so it is not retried on every request.
 pub fn check_metadata_permissions(ctx: &Context) -> ValkeyResult<()> {
     if KeyAccess::new(ctx, AclPermissions::ACCESS).is_unrestricted() {
         Ok(())
@@ -986,5 +1049,97 @@ mod tests {
 
         let joined = grants(&[b"~abc*", b"%R~* %W~foo", b"~*"]);
         assert!(joined.cover(&(READ | WRITE)));
+    }
+
+    #[test]
+    fn a_user_name_is_carried_only_as_exact_text() {
+        assert!(matches!(user_name_text(b""), Ok(None)));
+        assert_eq!(user_name_text(b"alice").unwrap().as_deref(), Some("alice"));
+        assert_eq!(
+            user_name_text("j\u{f6}rg".as_bytes()).unwrap().as_deref(),
+            Some("j\u{f6}rg")
+        );
+        // A lossy rendering would name a different user ("al\u{fffd}ce").
+        let Err(err) = user_name_text(b"al\xffce") else {
+            panic!("a non-UTF-8 name was accepted");
+        };
+        assert!(
+            matches!(err, ValkeyError::Str(msg) if msg == error_consts::ACL_USER_NAME_NOT_UTF8),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_names_the_permission_that_was_refused() {
+        let cases = [
+            (AclPermissions::ACCESS, error_consts::PERMISSION_DENIED),
+            (AclPermissions::empty(), error_consts::PERMISSION_DENIED),
+            (
+                AclPermissions::INSERT,
+                error_consts::KEY_WRITE_PERMISSION_ERROR,
+            ),
+            (
+                AclPermissions::UPDATE,
+                error_consts::KEY_WRITE_PERMISSION_ERROR,
+            ),
+            (
+                AclPermissions::ACCESS | AclPermissions::UPDATE,
+                error_consts::KEY_WRITE_PERMISSION_ERROR,
+            ),
+            (
+                AclPermissions::ACCESS | AclPermissions::INSERT,
+                error_consts::KEY_WRITE_PERMISSION_ERROR,
+            ),
+            (
+                AclPermissions::DELETE,
+                error_consts::KEY_DELETE_PERMISSION_ERROR,
+            ),
+            (
+                AclPermissions::INSERT | AclPermissions::UPDATE | AclPermissions::DELETE,
+                error_consts::KEY_DELETE_PERMISSION_ERROR,
+            ),
+        ];
+        for (permissions, expected) in cases {
+            assert_eq!(denial_message(&permissions), expected, "{permissions:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_grants_query_is_cached_per_rule_set() {
+        let cache = Mutex::new(GrantsCache::<u32>::new());
+        let queries = std::cell::Cell::new(0);
+        let answer = |key: u32, result: Option<AllKeysGrants>| {
+            GrantsCache::answer(
+                &cache,
+                key,
+                |a, b| a == b,
+                || {
+                    queries.set(queries.get() + 1);
+                    result
+                },
+            )
+        };
+
+        // A failure is asked once, then answered from the cache.
+        assert!(answer(1, None).is_none());
+        assert!(answer(1, Some(grants(&[b"~*"]))).is_none());
+        assert_eq!(queries.get(), 1);
+
+        // Another rule set (a rule change) is a miss, and is asked.
+        assert!(answer(2, Some(grants(&[b"~*"]))).is_some_and(|g| g.cover(&READ)));
+        assert!(answer(2, None).is_some());
+        assert_eq!(queries.get(), 2);
+
+        // A full cache drops its oldest entry, so that rule set is asked again.
+        for key in 3..3 + ALL_KEYS_GRANTS_CAPACITY as u32 {
+            answer(key, None);
+        }
+        assert_eq!(
+            cache.lock().unwrap().entries.len(),
+            ALL_KEYS_GRANTS_CAPACITY
+        );
+        let before = queries.get();
+        answer(1, None);
+        assert_eq!(queries.get(), before + 1);
     }
 }

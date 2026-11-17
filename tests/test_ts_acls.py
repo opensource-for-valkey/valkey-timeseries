@@ -6,6 +6,7 @@ import time
 
 from valkey import ResponseError, Valkey
 
+from common import VALKEY_SERVER_PATH
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
 from valkeytestframework.conftest import resource_port_tracker
 
@@ -518,3 +519,41 @@ class TestTimeSeriesACL(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command("ACL", "SETUSER", "read_all", "clearselectors", "resetkeys", "~abc*")
         with pytest.raises(ResponseError):
             client.execute_command("TS.LABELNAMES")
+
+
+class TestTimeSeriesACLCommandRenamed(ValkeyTimeSeriesTestCaseBase):
+    """With `ACL` renamed, the module cannot confirm a `~*` grant through `ACL GETUSER`."""
+
+    ACL = "acl-renamed-by-test"
+
+    @pytest.fixture(autouse=True)
+    def setup_test(self, request):
+        args = {
+            "enable-debug-command": "yes",
+            "loadmodule": self.resolve_module_path(),
+            "rename-command": f"ACL {self.ACL}",
+        }
+        self.server, self.client = self.create_server(
+            testdir=self.testdir, server_path=VALKEY_SERVER_PATH, args=args
+        )
+
+    def warnings_logged(self) -> int:
+        logfile = os.path.join(self.server.cwd, self.server.args["logfile"])
+        with open(logfile, encoding="latin-1") as f:
+            return sum("ACL GETUSER failed" in line for line in f)
+
+    def test_failed_getuser_refuses_metadata_and_is_logged_once(self):
+        """A failed `ACL GETUSER` refuses the all-keys gate for everyone, `default` included
+        (a failed call is cached, not repeated per request: see the unit tests), while
+        per-key commands fall back to per-key checks. The failure is logged once."""
+        self.client.execute_command("TS.CREATE", "meta:1", "LABELS", "secret", "yes")
+        for _ in range(5):
+            with pytest.raises(ResponseError, match="permissions to query labels"):
+                self.client.execute_command("TS.LABELNAMES")
+        assert len(self.client.execute_command("TS.MGET", "FILTER", "secret=yes")) == 1
+
+        # A rule change is a new rule set, asked again, and refused the same way.
+        self.client.execute_command(self.ACL, "SETUSER", "default", "+@all")
+        with pytest.raises(ResponseError, match="permissions to query labels"):
+            self.client.execute_command("TS.LABELNAMES")
+        assert self.warnings_logged() == 1
