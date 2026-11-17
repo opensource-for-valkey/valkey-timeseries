@@ -1,4 +1,4 @@
-from valkey import ResponseError, ValkeyCluster
+from valkey import ResponseError, Valkey, ValkeyCluster
 from valkeytestframework.conftest import resource_port_tracker
 from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCase
 import pytest
@@ -790,3 +790,27 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         # Without GROUPBY every series still answers.
         result = client.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'kind=grp')
         assert len(result) == len(series)
+
+    def test_mrange_cme_large_resp3_reply_keeps_its_shape(self):
+        """A merged reply large enough to be written off the main thread still uses the
+        client's protocol: RESP3 gets a map keyed by series, with the samples RESP2 gets."""
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        for key in ('big:{slot1}:a', 'big:{slot1}:b', 'big:{slot2}:a', 'big:{slot2}:b'):
+            cluster_client.execute_command('TS.CREATE', key, 'LABELS', 'kind', 'big')
+            args = []
+            for i in range(500):
+                args += [key, 1000 + i, i % 13]
+            cluster_client.execute_command('TS.MADD', *args)
+
+        query = ('TS.MRANGE', '-', '+', 'WITHLABELS', 'FILTER', 'kind=big')
+        primary = self.get_primary(0)
+        resp2 = self.new_client_for_primary(0).execute_command(*query)
+        resp3 = Valkey(host=primary.bind_ip, port=primary.port, protocol=3).execute_command(*query)
+
+        assert isinstance(resp3, dict)
+        assert sorted(resp3) == sorted(series[0] for series in resp2)
+        for key, labels, samples in resp2:
+            labels3, metadata, samples3 = resp3[key]
+            assert labels3 == {name: value for name, value in labels}
+            assert metadata == {b'aggregators': []}
+            assert samples3 == [[ts, float(value)] for ts, value in samples]

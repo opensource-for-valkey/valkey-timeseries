@@ -2,7 +2,7 @@ use super::fanout_codec::filters::{deserialize_matchers_list, serialize_matchers
 use super::fanout_codec::{QueryLabelsRequest, QueryLabelsSubtype, StringListResponse};
 use super::utils::get_multi_command_targets;
 use crate::commands::command_parser::QueryLabelsOptions;
-use crate::common::replies::ReplyContext;
+use crate::common::replies::{ReplyContext, reply_with_string_set};
 use crate::fanout::{
     FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
 };
@@ -93,12 +93,7 @@ impl FanoutClientCommand for QueryLabelsFanoutCommand {
     }
 
     fn reply(&mut self, ctx: &ReplyContext) -> Status {
-        let values: Vec<String> = std::mem::take(&mut self.values).into_iter().collect();
-        ctx.reply_with_set(values.len());
-        for value in values.iter() {
-            ctx.reply_with_string(value);
-        }
-        Status::Ok
+        reply_with_string_set(ctx, std::mem::take(&mut self.values))
     }
 }
 

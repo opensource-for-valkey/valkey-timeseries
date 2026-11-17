@@ -77,7 +77,13 @@ pub trait FanoutClientCommand: Default + Send + 'static {
         // One budget for the whole operation, counted from now (see `exec_command`).
         let started = Instant::now();
         let timeout = get_cluster_command_timeout();
-        let blocked_client = Arc::new(Mutex::new(FanoutBlockedClient::<Self>::new(ctx, timeout)));
+        // A client the server will not block (one already blocked, or not a normal one) is
+        // refused the same way, before anything runs.
+        let Some(blocked_client) = FanoutBlockedClient::<Self>::new(ctx, timeout) else {
+            metrics::FANOUT_BLOCKING_DENIED.incr();
+            return Err(ValkeyError::Str(FANOUT_BLOCKING_DENIED));
+        };
+        let blocked_client = Arc::new(Mutex::new(blocked_client));
         let bc_for_closure = Arc::clone(&blocked_client);
 
         let handle_response = move |op: Self, result: FanoutResult| {

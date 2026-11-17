@@ -2,7 +2,7 @@ use crate::commands::parse_mrange_options;
 use crate::commands::ts_mrange_fanout_command::MRangeFanoutCommand;
 use crate::commands::utils::{MRangeReplyShape, reply_with_mrange_series_results};
 use crate::common::context::is_blocking_denied;
-use crate::common::replies::{IntoRawCtx, ThreadSafeReplyContext, block_client};
+use crate::common::replies::{ReplyContext, ThreadSafeReplyContext, block_client};
 use crate::common::threads::{BoundedExecutor, Capacity, ExecutorStats, lane_workers};
 use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, is_clustered};
@@ -121,7 +121,7 @@ fn mrange_internal(ctx: &Context, args: Vec<ValkeyString>, reverse: bool) -> Val
 
     let shape = MRangeReplyShape::from_options(&options);
     let result_rows = process_mrange_query(ctx, options, MRangeScope::Client, None, &|| false)?;
-    reply_with_mrange_series_results(ctx, &result_rows, &shape)
+    reply_with_mrange_series_results(&ReplyContext::new(ctx.ctx), &result_rows, &shape)
 }
 
 /// A non-clustered TS.MRANGE answered off the main thread: the chunks are copied under the
@@ -136,7 +136,8 @@ fn mrange_internal(ctx: &Context, args: Vec<ValkeyString>, reverse: bool) -> Val
 ///
 /// The lane slot is reserved before the client is blocked; when the lane is full the
 /// request is answered inline instead, since deferring is only an optimization. There is
-/// no timeout, as there is none inline; a client that disconnects stops the decode.
+/// no timeout, as there is none inline; a client that disconnects stops the decode. A client
+/// the server will not block is answered inline from the snapshot.
 fn mrange_deferred(
     ctx: &Context,
     options: crate::series::request_types::MRangeOptions,
@@ -147,11 +148,16 @@ fn mrange_deferred(
         MRANGE_EXECUTOR.try_reserve().ok()
     })? {
         LocalMRange::Answered(rows) => {
-            return reply_with_mrange_series_results(ctx, &rows, &shape);
+            return reply_with_mrange_series_results(&ReplyContext::new(ctx.ctx), &rows, &shape);
         }
         LocalMRange::Deferred(slot, series) => (slot, series),
     };
-    let blocked_client = block_client(ctx);
+    let Some(blocked_client) = block_client(ctx) else {
+        // The server would not block this client: answer it here, from the snapshot.
+        drop(slot);
+        let rows = decode_snapshot_series(series, &options, &|| false)?;
+        return reply_with_mrange_series_results(&ReplyContext::new(ctx.ctx), &rows, &shape);
+    };
     slot.spawn(move || {
         let thread_ctx = ThreadSafeReplyContext::with_blocked_client(blocked_client);
         // A client that disconnects stops the decode: nobody would read the reply.
@@ -164,9 +170,9 @@ fn mrange_deferred(
                 return;
             }
         };
-        // Through `into_raw`, which marks the client answered: otherwise dropping
-        // `thread_ctx` would append an error after the complete reply.
-        let reply_ctx = Context::new((&thread_ctx).into_raw());
+        // Taking the writer marks the client answered: otherwise dropping `thread_ctx` would
+        // append an error after the complete reply.
+        let reply_ctx = thread_ctx.get_reply_context();
         let _ = reply_with_mrange_series_results(&reply_ctx, &rows, &shape);
     });
     Ok(ValkeyValue::NoReply)

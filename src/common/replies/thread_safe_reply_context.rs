@@ -1,11 +1,13 @@
-use crate::common::replies::{IntoRawCtx, ReplyContext};
+use crate::common::logging::log_warning;
+use crate::common::replies::{IntoRawCtx, ReplyContext, is_resp3_client, reply};
 use crate::common::sync::lock;
 use crate::error_consts;
 use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use valkey_module::{Context, ValkeyError, ValkeyResult, raw};
+use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyValue, raw};
 
 /// The disconnect flag of every watched blocked client ([`DisconnectWatch`]), by its handle.
 /// The server reports a disconnect with the handle alone, so this is how the callback finds
@@ -40,8 +42,12 @@ unsafe extern "C" fn on_disconnect(
             watched.hook.take()
         });
     // Outside the registry lock: a hook that unblocks the client forgets it, which takes it.
-    if let Some(hook) = hook {
-        hook(&Context::new(ctx));
+    // A panic must not unwind into the server, which would abort it. The flag is already set,
+    // so the work answering the client still stops; the hook's captures drop as it unwinds.
+    if let Some(hook) = hook
+        && catch_unwind(AssertUnwindSafe(|| hook(&Context::new(ctx)))).is_err()
+    {
+        log_warning("blocked client disconnect hook panicked");
     }
 }
 
@@ -125,9 +131,13 @@ impl Drop for DisconnectWatch {
 /// So a handle dropped before anyone took responsibility for the reply (a job that panicked, or
 /// one the executor dropped without running) answers with an error itself.
 pub struct BlockedClient {
+    /// Never null: [`block_client`] hands out no handle the server refused.
     pub(crate) inner: *mut raw::RedisModuleBlockedClient,
     /// Whether a reply has been written or handed to a writer.
     answered: bool,
+    /// Whether the client negotiated RESP3, read on the main thread when it was blocked: the
+    /// reply is written from another thread, where the server cannot be asked.
+    resp3: bool,
     /// Reports the client's disconnect: nobody will read the reply, so the work answering it
     /// can stop.
     disconnect: DisconnectWatch,
@@ -138,9 +148,6 @@ unsafe impl Send for BlockedClient {}
 
 impl Drop for BlockedClient {
     fn drop(&mut self) {
-        if self.inner.is_null() {
-            return;
-        }
         // Before the unblock, after which the server may free the handle and reuse its address.
         self.disconnect.forget();
         unsafe {
@@ -162,7 +169,11 @@ fn reply_no_reply_written(ctx: *mut raw::RedisModuleCtx) {
 /// Blocks the client of `ctx` until the returned handle is dropped, with no timeout: the work
 /// answering it runs to the end unless the client disconnects first, which
 /// [`ThreadSafeReplyContext::disconnected`] reports. Main thread only.
-pub(crate) fn block_client(ctx: &Context) -> BlockedClient {
+///
+/// `None` when the server refuses to block the client (one already blocked, a client that is
+/// not a normal one, a temporary module context). Nothing has been written to it then, so the
+/// caller must answer it inline: returning no reply would leave it waiting forever.
+pub(crate) fn block_client(ctx: &Context) -> Option<BlockedClient> {
     let inner = unsafe {
         raw::RedisModule_BlockClient.unwrap()(
             ctx.ctx, // ctx
@@ -171,11 +182,15 @@ pub(crate) fn block_client(ctx: &Context) -> BlockedClient {
             None, 0,
         )
     };
-    BlockedClient {
+    if inner.is_null() {
+        return None;
+    }
+    Some(BlockedClient {
         inner,
         answered: false,
+        resp3: is_resp3_client(ctx),
         disconnect: DisconnectWatch::new(inner),
-    }
+    })
 }
 
 pub struct ThreadSafeReplyContext {
@@ -203,6 +218,8 @@ impl ThreadSafeReplyContext {
     /// spent queued does not count, as a blocking command's wait never does.
     #[must_use]
     pub fn with_blocked_client(blocked_client: BlockedClient) -> Self {
+        // SAFETY: `inner` is a live, non-null handle (see `block_client`) until the
+        // `BlockedClient` drops, which `self` owns.
         let ctx = unsafe {
             raw::RedisModule_BlockedClientMeasureTimeStart.unwrap()(blocked_client.inner);
             raw::RedisModule_GetThreadSafeContext.unwrap()(blocked_client.inner)
@@ -221,18 +238,22 @@ impl ThreadSafeReplyContext {
     }
 
     /// The Valkey modules API does not require locking for `Reply` functions,
-    /// so we pass through its functionality directly.
+    /// so we pass through its functionality directly. `Ok(NoReply)` writes nothing, so it
+    /// leaves the client unanswered.
     #[allow(clippy::must_use_candidate)]
     pub fn reply(&self, r: ValkeyResult) -> raw::Status {
-        self.answered.store(true, Ordering::Relaxed);
-        let ctx = Context::new(self.ctx);
-        ctx.reply(r)
+        if !matches!(r, Ok(ValkeyValue::NoReply)) {
+            self.answered.store(true, Ordering::Relaxed);
+        }
+        reply(self.ctx, r)
     }
 
-    /// A context to write the reply through. The caller takes responsibility for writing it.
-    pub fn get_reply_context(&self) -> ReplyContext {
+    /// A context to write the reply through, usable only while `self` lives (dropping `self`
+    /// frees the server context it writes to). The caller takes responsibility for writing
+    /// the reply: the client counts as answered from here.
+    pub fn get_reply_context(&self) -> ReplyContext<'_> {
         self.answered.store(true, Ordering::Relaxed);
-        ReplyContext::new(self.ctx)
+        ReplyContext::with_protocol(self.ctx, self.blocked_client.resp3)
     }
 }
 

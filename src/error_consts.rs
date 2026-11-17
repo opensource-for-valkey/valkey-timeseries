@@ -45,6 +45,9 @@ pub const MISSING_DUPLICATE_POLICY: &str = "TSDB: Couldn't parse DUPLICATE_POLIC
 /// ran); the server log has the cause.
 pub const NO_REPLY_WRITTEN: &str =
     "TSDB: internal error: the command failed before replying; see the server log";
+/// The server refused to block the client a background command would have answered later.
+pub const CANNOT_BLOCK_CLIENT: &str =
+    "TSDB: this client cannot be blocked to run the command in the background";
 pub const DEBUG_MODE_DISABLED: &str = "TSDB: TS._DEBUG is disabled. Set the 'ts.debug-mode' configuration parameter to yes to enable it";
 pub const DEBUG_DUPLICATE_TARGET: &str = "TSDB: only one node target may be given";
 pub const INVALID_DURATION: &str = "TSDB: invalid duration";

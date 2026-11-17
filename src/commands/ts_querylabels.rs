@@ -3,7 +3,7 @@ use crate::commands::analysis_runner::{
 };
 use crate::commands::command_parser::{QueryLabelsOptions, parse_query_labels_command_args};
 use crate::commands::ts_querylabels_fanout_command::QueryLabelsFanoutCommand;
-use crate::common::replies::reply_with_string_set;
+use crate::common::replies::{ReplyContext, reply_with_string_set};
 use crate::common::threads::GilSource;
 use crate::fanout::{FanoutClientCommand, is_clustered};
 use crate::series::index::{SeriesCursor, query_labels_distinct_planned, query_labels_selection};
@@ -56,7 +56,7 @@ pub fn ts_querylabels_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResul
         ),
         SeriesReadPlacement::Inline(plan) => {
             let values = read_labels(ctx, plan, &options)?;
-            reply_with_string_set(ctx, &values);
+            reply_with_string_set(&ReplyContext::new(ctx.ctx), &values);
             Ok(ValkeyValue::NoReply)
         }
     }

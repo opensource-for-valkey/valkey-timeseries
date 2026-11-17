@@ -6,6 +6,7 @@ from valkeytestframework.conftest import resource_port_tracker
 from valkeytestframework.util.waiters import wait_for_equal, wait_for_true
 from valkey import ResponseError
 import threading
+import valkey
 import time
 import pytest
 
@@ -689,6 +690,29 @@ class TestTimeSeriesMRangeDeferred(ValkeyTimeSeriesTestCaseDebugMode):
         inline_usec = self.usec_per_call(inline)
         # Counting only the main thread's share (taking the snapshot) reports a few percent.
         assert deferred_usec >= inline_usec / 2, (deferred_usec, inline_usec)
+
+    @pytest.mark.parametrize("protocol", [2, 3])
+    def test_deferred_reply_has_the_inline_shape(self, protocol):
+        """The lane writes the reply in the client's own protocol: RESP3 gets the map form a
+        read kept on the main thread gets, RESP2 the array form."""
+        self.load()
+        client = valkey.Valkey(host=self.server.bind_ip, port=self.server.port, protocol=protocol)
+        queries = (
+            ('TS.MRANGE', '-', '+', 'WITHLABELS', 'AGGREGATION', 'avg', 100, 'FILTER', 'group=d'),
+            ('TS.MREVRANGE', '-', '+', 'AGGREGATION', 'max', 100, 'FILTER', 'group=d',
+             'GROUPBY', 'group', 'REDUCE', 'sum'),
+        )
+        for query in queries:
+            deferred = client.execute_command(*query)
+            # MULTI keeps the read on the main thread.
+            pipe = client.pipeline(transaction=True)
+            pipe.execute_command(*query)
+            [inline] = pipe.execute()
+            assert deferred == inline, query
+            if protocol == 3:
+                assert isinstance(deferred, dict), query
+            else:
+                assert isinstance(deferred, list), query
 
     def test_killed_clients_leave_nothing_blocked(self):
         """Clients killed while their deferred reads queue or run are let go: nothing stays
