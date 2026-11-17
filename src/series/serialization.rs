@@ -1,4 +1,5 @@
 use crate::common::rdb::*;
+use crate::common::rounding::{MAX_DECIMAL_DIGITS, MAX_SIGNIFICANT_DIGITS, RoundingStrategy};
 use crate::common::{Sample, Timestamp};
 use crate::labels::MetricName;
 use crate::series::chunks::{
@@ -282,6 +283,8 @@ pub(crate) const STRAYS_REENCODED: &str = "chunks of another encoding re-encoded
 pub(crate) const OVERSIZED_SPLIT: &str = "oversized chunks split";
 pub(crate) const CHUNK_SIZE_CLAMPED: &str = "chunk size clamped";
 pub(crate) const RETENTION_CLAMPED: &str = "retention clamped";
+pub(crate) const ROUNDING_CLAMPED: &str = "rounding digits clamped";
+pub(crate) const ROUNDING_DROPPED: &str = "rounding to zero significant digits dropped";
 pub(crate) const NEGATIVE_TIMESTAMPS: &str = "negative timestamps";
 pub(crate) const CHUNKS_OUT_OF_ORDER: &str = "chunks out of order";
 pub(crate) const UNDECODABLE_STRAYS_KEPT: &str = "undecodable chunks of another encoding kept";
@@ -307,6 +310,7 @@ pub(crate) const OFF_GRID_BUCKET_REBUILT: &str =
 /// | Chunk data over `MAX_LOADED_CHUNK_BYTES` | refused | split, as the merge path splits |
 /// | `chunk_size_bytes` outside `validate_chunk_size` | refused | clamped into range |
 /// | Retention past `i64::MAX` ms | refused | clamped to `i64::MAX` ms |
+/// | Rounding digits outside what `DECIMAL_DIGITS`/`SIGNIFICANT_DIGITS` accept | refused | clamped to 16; zero significant digits dropped |
 /// | Negative timestamps | refused | loaded as they are |
 /// | Chunks out of order or overlapping | refused | loaded as they are |
 /// | A rule's aggregator state with no open bucket | cleared | cleared |
@@ -400,6 +404,28 @@ pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<
         // ten-year maximum instead would expire older data on reload.
         ts.retention = Duration::from_millis(i64::MAX as u64);
         repairs.repair(RETENTION_CLAMPED);
+    }
+
+    if let Some(rounding) = ts.rounding
+        && !rounding.is_valid()
+    {
+        refuse(format!("rounding {rounding} out of range"))?;
+        // Both keep what the stored value already did: the rounding helpers treat zero
+        // significant digits as no rounding, and cap a larger count at 16.
+        ts.rounding = match rounding {
+            RoundingStrategy::SignificantDigits(0) => {
+                repairs.repair(ROUNDING_DROPPED);
+                None
+            }
+            RoundingStrategy::SignificantDigits(_) => {
+                repairs.repair(ROUNDING_CLAMPED);
+                Some(RoundingStrategy::SignificantDigits(MAX_SIGNIFICANT_DIGITS))
+            }
+            RoundingStrategy::DecimalDigits(_) => {
+                repairs.repair(ROUNDING_CLAMPED);
+                Some(RoundingStrategy::DecimalDigits(MAX_DECIMAL_DIGITS))
+            }
+        };
     }
 
     let mut prev_last: Option<Timestamp> = None;
