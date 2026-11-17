@@ -135,6 +135,8 @@ pub fn exec_command<OP: FanoutCommand, F>(
 where
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
+    // First: a caller whose name cannot be carried to the shards fails before any work.
+    let fanout_user = caller_user_name(ctx)?;
     let op = command;
     let deadline = started + timeout;
     let (targets, cluster_fingerprint) = get_fanout_targets(ctx, targets);
@@ -143,7 +145,6 @@ where
 
     let req = op.generate_request();
     let outstanding = targets.len();
-    let fanout_user = caller_user_name(ctx);
     let db = get_current_db(ctx);
     // At least 1 ms: a zero-length timer would fire before any peer could answer.
     let remaining = deadline

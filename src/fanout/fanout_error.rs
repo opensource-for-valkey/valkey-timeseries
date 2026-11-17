@@ -385,7 +385,9 @@ fn convert_from_string(err: &str) -> FanoutError {
         // message so the client sees *why* the multi-shard command failed closed
         // instead of a generic aggregate error.
         error_consts::PERMISSION_DENIED => FanoutError::key_permissions(err.to_string()),
-        error_consts::ACL_USER_UNAVAILABLE | error_consts::DB_PERMISSION_ERROR => FanoutError {
+        error_consts::ACL_USER_UNAVAILABLE
+        | error_consts::ACL_USER_NAME_NOT_UTF8
+        | error_consts::DB_PERMISSION_ERROR => FanoutError {
             kind: ErrorKind::Permissions,
             message: err.to_string(),
         },

@@ -157,6 +157,10 @@ pub const NO_CLUSTER_NODES_AVAILABLE: &str = "TSDB: no cluster nodes available";
 /// text, so the fanout can classify it as a permission failure on the shard that raised it.
 pub const ACL_USER_UNAVAILABLE: &str =
     "TSDB: the ACL user this request runs as does not exist or is disabled";
+/// The caller's ACL user name is not UTF-8, so it cannot be carried to another node or thread
+/// without turning into a different name. Refused rather than run as someone else.
+pub const ACL_USER_NAME_NOT_UTF8: &str =
+    "TSDB: this command cannot run as an ACL user whose name is not valid UTF-8";
 pub const WITH_LABELS_AND_SELECTED_LABELS_SPECIFIED: &str =
     "TSDB: cannot accept WITHLABELS and SELECT_LABELS together";
 pub const EMPTY_SELECTED_LABELS: &str = "TSDB: SELECT_LABELS should have at least 1 parameter";
