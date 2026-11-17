@@ -1,7 +1,7 @@
 use crate::aggregators::{
     AggregateIterator, AggregationType, EmptyFillBounds, MultiAggregateIterator, bucket_start_for,
 };
-use crate::common::hash::IntSet;
+use crate::common::hash::TimestampSet;
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::iterators::TimestampFilterIterator;
 use crate::series::request_types::{AggregationOptions, RangeOptions};
@@ -1174,14 +1174,14 @@ const TIMESTAMP_FILTER_INLINE_THRESHOLD: usize = 16;
 // this may be overkill, but we'll try optimizing memory for a
 // very common case of a very small number of timestamps
 enum TimestampFilter {
-    Set(IntSet<Timestamp>),
+    Set(TimestampSet),
     List(SmallVec<[Timestamp; TIMESTAMP_FILTER_INLINE_THRESHOLD]>),
 }
 
 impl TimestampFilter {
     pub fn new(timestamps: &[Timestamp]) -> Self {
         if timestamps.len() > TIMESTAMP_FILTER_INLINE_THRESHOLD {
-            Self::Set(IntSet::from_iter(timestamps.iter().copied()))
+            Self::Set(timestamps.iter().copied().collect())
         } else {
             Self::List(SmallVec::from_slice(timestamps))
         }

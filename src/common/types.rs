@@ -69,7 +69,11 @@ impl PartialOrd for Sample {
 impl Hash for Sample {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.timestamp.hash(state);
-        hash_f64(self.value, state);
+        // Must agree with `eq`: `-0.0 == 0.0`, so both hash as `0.0`. Normalized here rather
+        // than in `hash_f64`, whose digest callers keep the two apart. `hash_f64` already maps
+        // every NaN payload to one value, matching `eq`'s NaN == NaN.
+        let value = if self.value == 0.0 { 0.0 } else { self.value };
+        hash_f64(value, state);
     }
 }
 
@@ -166,5 +170,35 @@ impl TryFrom<&str> for SortDir {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         Self::try_from(value.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+
+    fn hash_of(sample: Sample) -> u64 {
+        BuildHasherDefault::<DefaultHasher>::default().hash_one(sample)
+    }
+
+    #[test]
+    fn equal_samples_hash_alike() {
+        let pos = Sample::new(10, 0.0);
+        let neg = Sample::new(10, -0.0);
+        assert_eq!(pos, neg);
+        assert_eq!(hash_of(pos), hash_of(neg));
+
+        let quiet = Sample::new(10, f64::NAN);
+        let payload = Sample::new(10, f64::from_bits(0x7ff0_0000_0000_0001));
+        let negative = Sample::new(10, f64::from_bits(0xfff8_0000_0000_dead));
+        assert!(payload.value.is_nan() && negative.value.is_nan());
+        assert_eq!(quiet, payload);
+        assert_eq!(quiet, negative);
+        assert_eq!(hash_of(quiet), hash_of(payload));
+        assert_eq!(hash_of(quiet), hash_of(negative));
+
+        assert_ne!(hash_of(pos), hash_of(Sample::new(11, 0.0)));
+        assert_ne!(hash_of(pos), hash_of(Sample::new(10, 1.0)));
     }
 }

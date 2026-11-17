@@ -1,4 +1,4 @@
-use crate::common::hash::IntSet;
+use crate::common::hash::TimestampSet;
 use crate::common::logging::log_warning;
 use crate::common::{Sample, Timestamp};
 use crate::error::{TsdbError, TsdbResult};
@@ -30,8 +30,8 @@ where
 
     // Track the input timestamps so we produce exactly one result per unique input
     // timestamp, and none for pre-existing samples that are only being rewritten.
-    let mut sample_set: IntSet<Timestamp> =
-        IntSet::with_capacity_and_hasher(samples.len(), Default::default());
+    let mut sample_set: TimestampSet =
+        TimestampSet::with_capacity_and_hasher(samples.len(), Default::default());
     for sample in samples {
         sample_set.insert(sample.timestamp);
     }

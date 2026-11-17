@@ -8,6 +8,10 @@ use core::hash::{BuildHasher, Hasher};
 /// collection starts with the same fixed seeds. The second field is the state
 /// used when this type is passed directly to `Hash::hash` (for example when a
 /// fingerprint is calculated).
+///
+/// In-process only: ahash's output is not specified, and changes across ahash versions and
+/// between AES and non-AES builds. Anything compared between processes or nodes, or persisted,
+/// uses [`StableHasher`](super::StableHasher).
 pub struct DeterministicHasher(RandomState, AHasher);
 
 impl Default for DeterministicHasher {

@@ -2,7 +2,7 @@
 //! from `CLUSTER NODES` ([`parse`]) over the node model in [`node`], and the
 //! fanout target selection that reads it.
 
-use crate::common::hash::DeterministicHasher;
+use crate::common::hash::StableHasher;
 use crate::common::logging::{log_debug, log_warning};
 use crate::common::threads::LockGil;
 use crate::common::time::current_time_millis;
@@ -600,8 +600,11 @@ impl ClusterMap {
     /// Hash of the slot -> owner assignment alone. Two nodes agree on it exactly
     /// when they would route every slot to the same shard; membership that owns
     /// no slots (replicas, empty or forgotten masters) leaves it unchanged.
+    ///
+    /// Compared between nodes, which may run different builds during a rolling upgrade, so it
+    /// uses the fully specified [`StableHasher`] (integers as little-endian bytes).
     fn compute_cluster_fingerprint(&self) -> u64 {
-        let mut hasher = DeterministicHasher::default();
+        let mut hasher = StableHasher::new();
         for (range, shard_id) in self.slot_to_shard_map.range_values() {
             hasher.write_u16(*range.start());
             hasher.write_u16(*range.end());
@@ -701,6 +704,15 @@ mod tests {
 
         assert_eq!(a.cluster_slots_fingerprint(), b.cluster_slots_fingerprint());
         assert!(a.cluster_slots_fingerprint() != 0);
+    }
+
+    /// Nodes compare fingerprints with each other, so the value must not change with a
+    /// dependency bump or a different build. If this fails, every node of a mixed-version
+    /// cluster would reject every fan-out.
+    #[test]
+    fn test_fingerprint_is_pinned() {
+        let map = ClusterMap::from_cluster_nodes(&three_shard_nodes(), &id(M1));
+        assert_eq!(map.cluster_slots_fingerprint(), 0x969a_0451_edbe_99a3);
     }
 
     #[test]

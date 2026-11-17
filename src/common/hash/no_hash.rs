@@ -16,6 +16,12 @@ use core::{
 
 /// A `HashMap` with an integer domain, using `NoHashHasher` to perform no hashing at all.
 ///
+/// **Dense ids only** (series ids, chunk or outlier indexes, request ids, db ids). The key is
+/// the hash, and `hashbrown` takes the bucket from its low bits and the probe tag from its top
+/// 7 bits, so sparse keys that share low bits and have zero top bits (millisecond timestamps,
+/// especially aligned ones) collide on both and degrade to quadratic probing. Key timestamps
+/// and other sparse values with a mixing hash instead, e.g. [`TimestampSet`](super::TimestampSet).
+///
 /// # Examples
 ///
 /// See [`IsEnabled`] for use with custom types.
@@ -34,6 +40,9 @@ use core::{
 pub type IntMap<K, V> = std::collections::HashMap<K, V, BuildNoHashHasher<K>>;
 
 /// A `HashSet` of integers, using `NoHashHasher` to perform no hashing at all.
+///
+/// **Dense ids only** — see [`IntMap`] for why, and use [`TimestampSet`](super::TimestampSet)
+/// for timestamps or other sparse keys.
 ///
 /// # Examples
 ///
@@ -78,7 +87,8 @@ pub type BuildNoHashHasher<T> = BuildHasherDefault<NoHashHasher<T>>;
 /// i64, isize}` methods as its hash output.
 ///
 /// `NoHashHasher` does not implement any hashing algorithm and can only be used
-/// with types which can be mapped directly to a numeric value. Out of the box
+/// with types which can be mapped directly to a numeric value. Use it for dense ids
+/// only (see [`IntMap`]). Out of the box
 /// `NoHashHasher` is enabled for `u8`, `u16`, `u32`, `u64`, `usize`, `i8`, `i16`,
 /// `i32`, `i64`, and `isize`. Types that should be used with `NoHashHasher` need
 /// to implement [`IsEnabled`] and by doing so assert that their `Hash` impl invokes
@@ -108,6 +118,7 @@ pub type BuildNoHashHasher<T> = BuildHasherDefault<NoHashHasher<T>>;
 pub struct NoHashHasher<T>(u64, bool, PhantomData<T>);
 
 #[cfg(not(debug_assertions))]
+#[derive(Clone, Copy)]
 pub struct NoHashHasher<T>(u64, PhantomData<T>);
 
 impl<T> fmt::Debug for NoHashHasher<T> {
@@ -136,20 +147,6 @@ impl<T> Default for NoHashHasher<T> {
         NoHashHasher(0, PhantomData)
     }
 }
-
-// impl<T> Clone for NoHashHasher<T> {
-//     #[cfg(debug_assertions)]
-//     fn clone(&self) -> Self {
-//         *self
-//     }
-//
-//     #[cfg(not(debug_assertions))]
-//     fn clone(&self) -> Self {
-//         NoHashHasher(self.0, self.1)
-//     }
-// }
-
-// impl<T> Copy for NoHashHasher<T> {}
 
 /// Types which are safe to use with `NoHashHasher`.
 ///
@@ -360,6 +357,20 @@ mod tests {
         let mut h10 = NoHashHasher::<isize>::default();
         h10.write_isize(42);
         assert_eq!(42, h10.finish())
+    }
+
+    /// Debug and release builds define the hasher separately; both must be `Clone + Copy`.
+    #[test]
+    fn hasher_is_copy_in_every_build() {
+        fn assert_copy<T: Clone + Copy>(_: &T) {}
+        let mut h = NoHashHasher::<u64>::default();
+        h.write_u64(7);
+        assert_copy(&h);
+        let copied = h;
+        #[allow(clippy::clone_on_copy)]
+        let cloned = h.clone();
+        assert_eq!(copied.finish(), 7);
+        assert_eq!(cloned.finish(), 7);
     }
 
     #[cfg(debug_assertions)]
