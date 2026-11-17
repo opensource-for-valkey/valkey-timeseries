@@ -43,20 +43,11 @@ impl SubsequenceMatcher {
             let _ = pattern_chars.set(pattern.chars().collect());
         }
 
-        if pattern_ascii {
-            Self {
-                pattern: pattern.to_owned(),
-                pattern_len: pattern.len(),
-                pattern_ascii: true,
-                pattern_chars,
-            }
-        } else {
-            Self {
-                pattern: pattern.to_owned(),
-                pattern_len: pattern.len(),
-                pattern_ascii: false,
-                pattern_chars,
-            }
+        Self {
+            pattern: pattern.to_owned(),
+            pattern_len: pattern.len(),
+            pattern_ascii,
+            pattern_chars,
         }
     }
 
