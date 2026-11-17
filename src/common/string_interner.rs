@@ -37,7 +37,6 @@ use ahash::RandomState;
 use get_size2::GetSize;
 use min_max_heap::MinMaxHeap;
 use papaya::{Equivalent, Guard, HashMap};
-use smallvec::SmallVec;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BTreeMap;
@@ -186,10 +185,14 @@ const HEADER_SIZE: usize = size_of::<Header>();
 ///   is 1" a sound test inside `remove_if`.
 /// - **Whoever removes an entry releases the pool's reference** — the last
 ///   holder in [`InternedString::drop`], or an interner that stumbled on a dead
-///   entry — and does so through [`Guard::defer_retire`], so the release runs
-///   only once every thread that could have found the entry has unpinned. A
-///   thread that reached a node through the map can therefore keep reading it
-///   for as long as it stays pinned.
+///   entry. It does so only indirectly: it takes the entry out with
+///   `remove_if`, and the reference goes when papaya drops the removed entry,
+///   in [`PoolEntry::drop`]. Papaya retires a removed entry through its
+///   deferred reclamation — straight away, or, during an incremental resize
+///   while an older table may still reach it, once that table is reclaimed —
+///   so the release runs only once every thread that could have found the
+///   entry has unpinned. A thread that reached a node through the map can
+///   therefore keep reading it for as long as it stays pinned.
 /// - A holder pins the map **before** giving up its own reference in the slow
 ///   path, so the node it is about to remove cannot be reclaimed under it.
 #[repr(C)]
@@ -234,9 +237,16 @@ struct Node(NonNull<Header>);
 impl Node {
     /// Allocate a node for `key` holding `strong` references, all owned by the caller.
     fn allocate(key: PoolKey<'_>, strong: usize) -> Node {
-        let PoolKey { name_len, bytes } = key;
-        let len = bytes.len();
-        debug_assert!(len < NO_SEPARATOR as usize, "checked by PoolKey::new");
+        let PoolKey {
+            name_len,
+            head,
+            tail,
+        } = key;
+        let len = key.len();
+        debug_assert!(
+            len < NO_SEPARATOR as usize,
+            "checked by the PoolKey constructors"
+        );
         let layout = Header::layout(len);
         // SAFETY: the layout is non-zero-sized (it holds at least the header).
         let ptr = unsafe { alloc(layout) } as *mut Header;
@@ -245,18 +255,24 @@ impl Node {
         };
         // SAFETY: `ptr` is a fresh, properly aligned allocation of `layout`
         // bytes; the header is written in full before anything reads it and
-        // the payload region starts `HEADER_SIZE` bytes in and holds `len` bytes.
+        // the payload region starts `HEADER_SIZE` bytes in and holds `len`
+        // bytes, which is exactly `head`, plus `=` and `tail` for a label.
         unsafe {
             ptr.write(Header {
                 strong: AtomicUsize::new(strong),
                 len: len as u32,
                 name_len,
             });
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                ptr.as_ptr().cast::<u8>().add(HEADER_SIZE),
-                len,
-            );
+            let payload = ptr.as_ptr().cast::<u8>().add(HEADER_SIZE);
+            std::ptr::copy_nonoverlapping(head.as_ptr(), payload, head.len());
+            if key.is_pair() {
+                payload.add(head.len()).write(b'=');
+                std::ptr::copy_nonoverlapping(
+                    tail.as_ptr(),
+                    payload.add(head.len() + 1),
+                    tail.len(),
+                );
+            }
         }
         Node(ptr)
     }
@@ -287,12 +303,26 @@ impl Node {
         self.header().name_len
     }
 
-    /// What the pool keys this node by.
+    /// What the pool keys this node by: split where the name ends, exactly as
+    /// [`PoolKey::pair`] holds a probe, so the two hash and compare alike.
     #[inline]
     fn key(&self) -> PoolKey<'_> {
-        PoolKey {
-            name_len: self.name_len(),
-            bytes: self.bytes(),
+        let bytes = self.bytes();
+        match self.name_len() {
+            NO_SEPARATOR => PoolKey {
+                name_len: NO_SEPARATOR,
+                head: bytes,
+                tail: &[],
+            },
+            name_len => {
+                let (head, rest) = bytes.split_at(name_len as usize);
+                debug_assert_eq!(rest.first(), Some(&b'='), "a label's name ends at its `=`");
+                PoolKey {
+                    name_len,
+                    head,
+                    tail: &rest[1..],
+                }
+            }
         }
     }
 
@@ -377,10 +407,10 @@ impl Node {
 /// `remove_if` makes exactly one of them succeed, and the pointer check keeps
 /// a lookalike entry (same key, different allocation) untouched.
 ///
-/// Resolves the calling thread's pool, which is the owning one in production;
-/// under [`test_pool`] the caller must have the owning pool installed.
-fn retire_if_dead(node: Node, guard: &impl Guard) -> bool {
-    let interner = interner();
+/// `interner` must be the pool that owns `node` (and `guard` one of its guards):
+/// the process-wide pool in production; under [`test_pool`], the one the caller
+/// resolved with the owning pool installed.
+fn retire_if_dead(interner: &Interner, node: Node, guard: &impl Guard) -> bool {
     let removed = interner.pool.remove_if(
         &node.key(),
         |entry, _| entry.0.0 == node.0 && node.strong().load(Ordering::Acquire) == 1,
@@ -405,47 +435,94 @@ unsafe impl Sync for Node {}
 /// What identifies a string in the pool: its bytes and, for a label, where the
 /// name ends. Probes the map without allocating; a [`PoolEntry`] hashes and
 /// compares as its node's key.
-#[derive(Clone, Copy)]
+///
+/// A label is held in two pieces, the name and the value either side of its
+/// `=`, so a probe borrows the caller's strings and never assembles
+/// `name=value` (a miss writes the pieces straight into the new node). A
+/// stored node is split the same way ([`Node::key`]), and hashing and equality
+/// read only the three fields, so a probe and the entry it should find feed a
+/// hasher identical calls. For two labels, equal fields are equal assembled
+/// bytes and vice versa: the `=` sits at `name_len` in both.
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct PoolKey<'a> {
+    /// The name's byte length for a label; [`NO_SEPARATOR`] for a plain string.
     name_len: u32,
-    bytes: &'a [u8],
+    /// A label's name; a plain string's whole text.
+    head: &'a [u8],
+    /// A label's value (after the `=`); empty for a plain string.
+    tail: &'a [u8],
 }
 
 impl<'a> PoolKey<'a> {
-    /// Panics on a string of `u32::MAX` bytes or more, which the header cannot describe.
+    /// The key of a plain string. Panics on a string of `u32::MAX` bytes or more,
+    /// which the header cannot describe. Test-only, like [`InternedString::new`].
+    #[cfg(test)]
     #[inline]
-    fn new(bytes: &'a [u8], name_len: u32) -> Self {
-        assert!(
-            bytes.len() < NO_SEPARATOR as usize,
-            "interned string of {} bytes reaches the {NO_SEPARATOR}-byte limit",
-            bytes.len()
-        );
-        debug_assert!(
-            name_len == NO_SEPARATOR || bytes.get(name_len as usize) == Some(&b'='),
-            "a label's name must be followed by its separator"
-        );
-        Self { name_len, bytes }
+    fn plain(bytes: &'a [u8]) -> Self {
+        check_interned_len(bytes.len());
+        Self {
+            name_len: NO_SEPARATOR,
+            head: bytes,
+            tail: &[],
+        }
+    }
+
+    /// The key of the label `name=value`. Panics if the label is `u32::MAX` bytes
+    /// or longer, as [`Self::plain`] does.
+    #[inline]
+    fn pair(name: &'a [u8], value: &'a [u8]) -> Self {
+        // Cannot overflow: each slice is at most `isize::MAX` bytes.
+        check_interned_len(name.len() + 1 + value.len());
+        Self {
+            // Fits: the name is shorter than the whole label, which was just checked.
+            name_len: name.len() as u32,
+            head: name,
+            tail: value,
+        }
+    }
+
+    #[inline]
+    fn is_pair(&self) -> bool {
+        self.name_len != NO_SEPARATOR
+    }
+
+    /// Bytes of the string this key identifies, the `=` of a label included.
+    #[inline]
+    fn len(&self) -> usize {
+        if self.is_pair() {
+            self.head.len() + 1 + self.tail.len()
+        } else {
+            self.head.len()
+        }
     }
 }
 
+#[inline]
+fn check_interned_len(len: usize) {
+    assert!(
+        len < NO_SEPARATOR as usize,
+        "interned string of {len} bytes reaches the {NO_SEPARATOR}-byte limit"
+    );
+}
+
+/// The one hash of a pool key, used by probes, by [`PoolEntry`] and by
+/// [`InternedString`]. It reads only the key's fields, so any two keys with the
+/// same fields — a borrowed probe and the stored node it matches — make the
+/// same hasher calls. The length prefix keeps the hash prefix-free when keys
+/// are hashed in sequence (a `MetricName`'s labels, say).
 impl Hash for PoolKey<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        hash_key(self.name_len, self.bytes, state);
+        state.write_u32(self.name_len);
+        state.write_usize(self.len());
+        state.write(self.head);
+        state.write(self.tail);
     }
 }
 
 impl Equivalent<PoolEntry> for PoolKey<'_> {
     fn equivalent(&self, entry: &PoolEntry) -> bool {
-        let key = entry.0.key();
-        self.name_len == key.name_len && self.bytes == key.bytes
+        *self == entry.0.key()
     }
-}
-
-/// The one hash of a pool key, shared by [`PoolKey`] and [`PoolEntry`] so probes land.
-#[inline]
-fn hash_key<H: Hasher>(name_len: u32, bytes: &[u8], state: &mut H) {
-    name_len.hash(state);
-    bytes.hash(state);
 }
 
 /// A pool entry. Hashes and compares as its node's [`PoolKey`].
@@ -705,10 +782,6 @@ pub fn saved_pct(saved: usize, held: usize) -> f64 {
 /// ```
 pub struct InternedString(Node);
 
-/// Buffer for assembling a `name=value` candidate before the pool is probed;
-/// sized so ordinary labels never touch the heap for it.
-type PairBuf = SmallVec<[u8; 128]>;
-
 impl InternedString {
     /// Intern a plain string: one that is not a label and never splits, even if it
     /// contains `=` (`name()` is the whole string, `value()` empty). Distinct from
@@ -719,20 +792,15 @@ impl InternedString {
     /// display text and `TS._DEBUG STRINGPOOLSTATS` can merge rows by text.
     #[cfg(test)]
     pub fn new(val: &str) -> Self {
-        Self::intern(PoolKey::new(val.as_bytes(), NO_SEPARATOR))
+        Self::intern(PoolKey::plain(val.as_bytes()))
     }
 
     /// Intern the label `name=value` without building a `String` first. The
-    /// pool is probed with bytes assembled in a stack buffer (on the heap only
-    /// for labels over 128 bytes), and only a miss allocates a node.
+    /// pool is probed with `name` and `value` as they are, so a hit copies and
+    /// allocates nothing however long the label; only a miss allocates, writing
+    /// `name=value` straight into the new node.
     pub fn new_pair(name: &str, value: &str) -> Self {
-        let mut buf = PairBuf::with_capacity(name.len() + 1 + value.len());
-        buf.extend_from_slice(name.as_bytes());
-        buf.push(b'=');
-        buf.extend_from_slice(value.as_bytes());
-        // A name too long for `u32` makes the whole string too long, which `PoolKey::new` rejects.
-        let name_len = u32::try_from(name.len()).unwrap_or(NO_SEPARATOR);
-        Self::intern(PoolKey::new(&buf, name_len))
+        Self::intern(PoolKey::pair(name.as_bytes(), value.as_bytes()))
     }
 
     fn intern(key: PoolKey<'_>) -> InternedString {
@@ -745,7 +813,7 @@ impl InternedString {
                     return InternedString(node);
                 }
                 // Dead entry: its last holder is retiring it. Help, then look again.
-                retire_if_dead(node, &guard);
+                retire_if_dead(interner, node, &guard);
                 continue;
             }
 
@@ -759,7 +827,7 @@ impl InternedString {
                     // Before the holder is returned, so before anything can retire it.
                     interner
                         .memory_used
-                        .fetch_add(allocated_size(key.bytes.len()), Ordering::Relaxed);
+                        .fetch_add(allocated_size(key.len()), Ordering::Relaxed);
                     return InternedString(node);
                 }
                 Err(_) => {
@@ -1026,10 +1094,11 @@ impl Drop for InternedString {
                 // races (see `Header`), then give up our reference — the entry
                 // is dead from that moment — and retire it.
                 2 => {
-                    let guard = interner().pool.guard();
+                    let interner = interner();
+                    let guard = interner.pool.guard();
                     match strong.compare_exchange(2, 1, Ordering::AcqRel, Ordering::Acquire) {
                         Ok(_) => {
-                            retire_if_dead(node, &guard);
+                            retire_if_dead(interner, node, &guard);
                             return;
                         }
                         Err(seen) => current = seen,
@@ -1065,12 +1134,18 @@ impl GetSize for InternedString {
     }
 }
 
-/// Hashes the pool key (content and separator), not the pointer, so a hash doesn't depend on
-/// allocation addresses. There is deliberately no `Borrow<str>`: a `&str` can't hash the same
-/// way, so borrowed lookups in a hashed collection would silently miss.
+/// Hashes the node's address, the identity [`PartialEq`] compares: one hasher write at any
+/// length, where hashing the content re-read a payload that cannot change. The pool itself
+/// still probes by content (`PoolKey`).
+///
+/// The address differs from run to run and between nodes, so this hash is meaningful only
+/// within one process: it must never feed a digest, a fingerprint, or anything persisted or sent
+/// to another node — hash the content (`as_bytes`) for those. It also stays valid only while
+/// equality is by address: there is deliberately no `Borrow<str>`, since a `&str` cannot hash to
+/// an address and borrowed lookups in a hashed collection would silently miss.
 impl Hash for InternedString {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.key().hash(state);
+        std::ptr::hash(self.0.0.as_ptr(), state);
     }
 }
 
@@ -1106,8 +1181,7 @@ impl Eq for InternedString {}
 #[cfg(test)]
 mod tests {
     use super::{
-        InternedString, MAX_REFCOUNT, NO_SEPARATOR, Node, PoolEntry, PoolKey, increment_refcount,
-        test_pool,
+        InternedString, MAX_REFCOUNT, Node, PoolEntry, PoolKey, increment_refcount, test_pool,
     };
     use ahash::{HashSet, HashSetExt};
     use std::collections::HashMap;
@@ -1126,7 +1200,7 @@ mod tests {
 
     #[test]
     fn pool_entry_owns_one_reference() {
-        let node = Node::allocate(PoolKey::new(b"pool-entry", NO_SEPARATOR), 2);
+        let node = Node::allocate(PoolKey::plain(b"pool-entry"), 2);
         drop(PoolEntry(node));
         assert_eq!(node.strong().load(Ordering::Acquire), 1);
         node.release();
@@ -1994,6 +2068,96 @@ mod tests {
         assert_eq!(l.allocated_size(), 16 + 3 + 1000);
     }
 
+    /// A probe holds a label in two borrowed pieces, a stored node holds it assembled; the
+    /// two must hash and compare alike at every length, or a hit would be missed and the
+    /// label interned twice.
+    #[test]
+    fn split_probe_matches_the_stored_label() {
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        let fixed = ahash::RandomState::with_seeds(1, 2, 3, 4);
+        let sip = BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+
+        for (name_len, value_len) in [
+            (0, 0),
+            (3, 4),
+            (60, 66),   // 127 bytes in all
+            (60, 67),   // 128
+            (127, 0),   // 128, all name
+            (0, 127),   // 128, all value
+            (100, 199), // 300
+            (17, 4078), // 4096
+            (4000, 95), // 4096, long name
+        ] {
+            let name = "n".repeat(name_len);
+            let value = "v".repeat(value_len);
+            let probe = PoolKey::pair(name.as_bytes(), value.as_bytes());
+            let node = Node::allocate(probe, 1);
+            let assembled = format!("{name}={value}");
+            assert_eq!(node.bytes(), assembled.as_bytes(), "{name_len}/{value_len}");
+            assert_eq!(node.len(), probe.len());
+            assert!(probe == node.key(), "{name_len}/{value_len}");
+            assert_eq!(fixed.hash_one(probe), fixed.hash_one(node.key()));
+            assert_eq!(sip.hash_one(probe), sip.hash_one(node.key()));
+            node.release();
+        }
+    }
+
+    /// Short and long labels alike: the first `new_pair` allocates, every later one finds the
+    /// same node, including one made from freshly built strings at other addresses.
+    #[test]
+    fn long_labels_hit_the_entry_they_made() {
+        let _pool = test_pool::isolated();
+        for total in [8, 127, 128, 300, 4096] {
+            let name = "lbl".to_string();
+            let value = "x".repeat(total - name.len() - 1);
+            let first = InternedString::new_pair(&name, &value);
+            assert_eq!(first.len(), total);
+            let memory = InternedString::memory_used();
+            let count = InternedString::interned_count();
+
+            let (name2, value2) = (name.clone(), value.clone());
+            let again = InternedString::new_pair(&name2, &value2);
+            assert_eq!(first, again, "{total}");
+            assert!(std::ptr::eq(
+                first.as_bytes().as_ptr(),
+                again.as_bytes().as_ptr()
+            ));
+            assert_eq!(first.ref_count(), 2);
+            assert_eq!(InternedString::interned_count(), count);
+            assert_eq!(InternedString::memory_used(), memory);
+        }
+    }
+
+    /// Where the name ends stays part of a label's identity for labels of hundreds of bytes,
+    /// and a plain string with the same text stays apart from both.
+    #[test]
+    fn long_labels_with_the_same_bytes_stay_distinct() {
+        let _pool = test_pool::isolated();
+        let stem = "s".repeat(300);
+        let name_with_eq = format!("{stem}=b");
+        let value_with_eq = format!("b={stem}");
+        let a = InternedString::new_pair(&name_with_eq, &stem);
+        let b = InternedString::new_pair(&stem, &value_with_eq);
+        let c = InternedString::new_pair(&stem, &format!("b={stem}"));
+        assert_eq!(a.split_pair(), Some((name_with_eq.as_str(), stem.as_str())));
+        assert_eq!(
+            b.split_pair(),
+            Some((stem.as_str(), value_with_eq.as_str()))
+        );
+        assert_eq!(b, c);
+        assert_ne!(a, b);
+
+        // Same bytes, different split.
+        let x = InternedString::new_pair(&format!("{stem}=b"), "c");
+        let y = InternedString::new_pair(&stem, "b=c");
+        let plain = InternedString::new(&format!("{stem}=b=c"));
+        assert_eq!((&*x, &*y), (&*plain, &*plain));
+        assert_ne!(x, y);
+        assert_ne!(x, plain);
+        assert_ne!(y, plain);
+        assert_eq!(InternedString::interned_count(), 5);
+    }
+
     /// Two last holders dropping at once must not both take the fast path and
     /// leave a holder-less entry in the pool.
     #[test]
@@ -2024,6 +2188,40 @@ mod tests {
 
     /// Interning a string while its last holder is dropping it must yield a
     /// live value either way.
+    /// The hash follows identity: every holder of one entry hashes alike whatever its label's
+    /// length, and distinct live entries hash apart.
+    #[test]
+    fn equal_strings_hash_alike_and_distinct_ones_apart() {
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        let _pool = test_pool::isolated();
+        let sip = BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+        let seeded = ahash::RandomState::with_seeds(1, 2, 3, 4);
+
+        for len in [1, 24, 127, 128, 300, 4096] {
+            let value = "v".repeat(len);
+            let first = InternedString::new_pair("name", &value);
+            let clone = first.clone();
+            let hit = InternedString::new_pair("name", &value);
+            let other = InternedString::new_pair("name", &format!("{value}x"));
+            for h in [&first, &clone, &hit] {
+                assert_eq!(*h, first, "{len}");
+                assert_eq!(sip.hash_one(h), sip.hash_one(&first), "{len}");
+                assert_eq!(seeded.hash_one(h), seeded.hash_one(&first), "{len}");
+            }
+            assert_ne!(other, first, "{len}");
+            assert_ne!(sip.hash_one(&other), sip.hash_one(&first), "{len}");
+            assert_ne!(seeded.hash_one(&other), seeded.hash_one(&first), "{len}");
+        }
+
+        // A hashed collection keyed by holders finds each entry through any holder.
+        let a = InternedString::new_pair("a", "1");
+        let b = InternedString::new_pair("b", "2");
+        let set: std::collections::HashSet<_> = [a.clone(), b.clone(), a.clone()].into();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&InternedString::new_pair("a", "1")));
+        assert!(set.contains(&b));
+    }
+
     #[test]
     fn intern_races_drop_of_last_holder() {
         let _pool = test_pool::isolated();

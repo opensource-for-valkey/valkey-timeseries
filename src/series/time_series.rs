@@ -23,7 +23,6 @@ use get_size2::GetSize;
 use orx_parallel::Par;
 use orx_parallel::ParResult;
 use smallvec::SmallVec;
-use std::hash::Hash;
 use std::mem::size_of;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -61,7 +60,7 @@ pub(crate) fn seal_chunk(chunk: &mut TimeSeriesChunk) {
 pub(crate) const SPLIT_SLACK_DIVISOR: usize = 4;
 
 /// Represents a time series consisting of chunks of samples, each with a timestamp and value.
-#[derive(Clone, Debug, Hash, PartialEq, GetSize)]
+#[derive(Clone, Debug, PartialEq, GetSize)]
 pub struct TimeSeries {
     /// fixed, opaque internal id used in indexing
     pub id: SeriesRef,

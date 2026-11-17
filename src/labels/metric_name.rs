@@ -56,6 +56,9 @@ impl SeriesLabel for InternedLabel<'_> {
 ///
 /// The labels are kept in name order so that lookups are binary searches and two sets with the
 /// same pairs compare equal.
+///
+/// `Hash` follows each label's interned address (see [`InternedString`]'s `Hash`), so it is for
+/// in-process collections only, never for a digest or anything another node compares.
 #[derive(Debug, Clone, Default, Hash, PartialEq, Eq)]
 pub struct MetricName(Arc<[InternedString]>);
 
