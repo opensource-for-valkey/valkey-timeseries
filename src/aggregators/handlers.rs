@@ -1303,3 +1303,73 @@ impl Aggregator {
         }
     }
 }
+
+#[cfg(test)]
+mod rdb_tests {
+    use super::*;
+    use crate::common::rdb::mem_io::MemIo;
+
+    const STALE_NAN: f64 = f64::from_bits(0x7ff0000000000002);
+
+    fn round_trip(agg: &Aggregator) -> Aggregator {
+        let mut mem = MemIo::new();
+        agg.rdb_save(mem.io());
+        mem.rewind();
+        let loaded = Aggregator::rdb_load(mem.io()).expect("load");
+        assert!(mem.is_drained(), "{agg:?} left items unread");
+        loaded
+    }
+
+    #[test]
+    fn irate_state_keeps_a_stale_nan_last_value() {
+        let state = IRateAggregatorState {
+            dt: 15,
+            dv: 2.5,
+            last_sample: Some(Sample {
+                timestamp: 1_000,
+                value: STALE_NAN,
+            }),
+        };
+        let Aggregator::IRate(loaded) =
+            round_trip(&Aggregator::IRate(IRateAggregator(Box::new(state))))
+        else {
+            panic!("aggregation type changed");
+        };
+        let sample = loaded.0.last_sample.expect("last sample survives");
+        assert_eq!(sample.value.to_bits(), STALE_NAN.to_bits());
+        assert_eq!(sample.timestamp, 1_000);
+        assert_eq!((loaded.0.dt, loaded.0.dv), (15, 2.5));
+    }
+
+    #[test]
+    fn irate_state_without_a_sample_round_trips() {
+        let agg = Aggregator::IRate(IRateAggregator::default());
+        assert_eq!(round_trip(&agg), agg);
+    }
+
+    #[test]
+    fn optional_value_states_keep_a_stale_nan() {
+        let aggs = [
+            Aggregator::First(FirstAggregator(Some(STALE_NAN))),
+            Aggregator::Last(LastAggregator {
+                current: Some(STALE_NAN),
+            }),
+            Aggregator::Min(MinAggregator(Some(STALE_NAN))),
+            Aggregator::Max(MaxAggregator(Some(STALE_NAN))),
+        ];
+        for agg in aggs {
+            let loaded = round_trip(&agg);
+            assert_eq!(
+                loaded.current().map(f64::to_bits),
+                Some(STALE_NAN.to_bits()),
+                "{agg:?}"
+            );
+        }
+        for agg in [
+            Aggregator::First(FirstAggregator(None)),
+            Aggregator::Max(MaxAggregator(None)),
+        ] {
+            assert_eq!(round_trip(&agg).current(), None);
+        }
+    }
+}
