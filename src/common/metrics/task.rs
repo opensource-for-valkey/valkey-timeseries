@@ -107,9 +107,10 @@ pub static TOMBSTONE_PASSES_COMPLETED: AtomicU64 = AtomicU64::new(0);
 pub static OPTIMIZE_INDEX_PASSES_COMPLETED: AtomicU64 = AtomicU64::new(0);
 pub static OPTIMIZE_INDEX_LAST_PASS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 /// Empty-db cleanup is not a [`TaskMetrics`] task: it is a short inline pass on the main thread,
-/// so it reports only what it removed and whether it is running now.
+/// so it reports only how many passes ran and what they removed. A running gauge would be no use:
+/// every reader (`INFO`, `TS._DEBUG METRICS`) runs on the main thread too, never during a pass.
 pub static TRIM_UNUSED_DBS_REMOVED: AtomicU64 = AtomicU64::new(0);
-pub static TRIM_UNUSED_DBS_RUNNING: AtomicU64 = AtomicU64::new(0);
+pub static TRIM_UNUSED_DBS_PASSES: AtomicU64 = AtomicU64::new(0);
 
 /// Records a complete traversal of one database, rather than one bounded task invocation.
 pub fn complete_pass(count: &AtomicU64, last_completed: &AtomicU64) {
@@ -212,6 +213,11 @@ pub(super) fn register(registry: &mut Registry<'static>) {
             "Periodic optimizer traversals completed for one existing database",
         ),
         (
+            "trim_unused_dbs_passes",
+            &TRIM_UNUSED_DBS_PASSES,
+            "Empty database index cleanup passes run by cron (inline on the main thread)",
+        ),
+        (
             "trim_unused_dbs_removed",
             &TRIM_UNUSED_DBS_REMOVED,
             "Empty database indexes removed by cron",
@@ -219,20 +225,12 @@ pub(super) fn register(registry: &mut Registry<'static>) {
     ] {
         registry.register(counter(name).source(source).help(help));
     }
-    registry
-        .register(
-            gauge("optimize_index_last_pass_completed_timestamp_seconds")
-                .source(&OPTIMIZE_INDEX_LAST_PASS_COMPLETED)
-                .unit("seconds")
-                .help(
-                    "Unix timestamp of the last completed database pass, or zero before any pass",
-                ),
-        )
-        .register(
-            gauge("trim_unused_dbs_running")
-                .source(&TRIM_UNUSED_DBS_RUNNING)
-                .help("Empty database index cleanups running now (inline on the main thread)"),
-        );
+    registry.register(
+        gauge("optimize_index_last_pass_completed_timestamp_seconds")
+            .source(&OPTIMIZE_INDEX_LAST_PASS_COMPLETED)
+            .unit("seconds")
+            .help("Unix timestamp of the last completed database pass, or zero before any pass"),
+    );
 }
 
 #[cfg(test)]

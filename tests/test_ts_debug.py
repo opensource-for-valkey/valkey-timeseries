@@ -1200,18 +1200,19 @@ class TestDebugMetrics(ValkeyTimeSeriesTestCaseDebugMode):
         # Tick zero schedules all four periodic tasks, so no long cron interval is needed.
         def completed():
             values = self.debug_metrics('task')
-            return all(values[f'task_{task}_completed_total'] > 0
-                       and values[f'task_{task}_last_completed_timestamp_seconds'] > 0
-                       for task in ('retention_trim', 'tombstone_sweep', 'optimize_index'))
+            return values['task_trim_unused_dbs_passes_total'] > 0 and all(
+                values[f'task_{task}_completed_total'] > 0
+                and values[f'task_{task}_last_completed_timestamp_seconds'] > 0
+                for task in ('retention_trim', 'tombstone_sweep', 'optimize_index'))
         wait_for_true(completed)
         stats = self.debug_metrics('task')
         for task in ('retention_trim', 'tombstone_sweep', 'optimize_index'):
             assert stats[f'task_{task}_last_completed_timestamp_seconds'] > 0
             assert self.histogram(stats[f'task_{task}_duration_seconds'])['count'] > 0
-        # Empty-db cleanup is not a lifecycle task: only its removal count and running gauge.
+        # Empty-db cleanup is not a lifecycle task: only its pass and removal counts. It runs
+        # inline on the main thread, where every reader runs too, so it has no running gauge.
         trim_dbs = sorted(n for n in stats if n.startswith('task_trim_unused_dbs_'))
-        assert trim_dbs == ['task_trim_unused_dbs_removed_total', 'task_trim_unused_dbs_running']
-        assert stats['task_trim_unused_dbs_running'] == 0
+        assert trim_dbs == ['task_trim_unused_dbs_passes_total', 'task_trim_unused_dbs_removed_total']
         assert 'task_retention_trim_samples_deleted_total' in stats
         assert 'task_tombstones_retired_total' in stats
         # Counts passes of every cleanup path, so it carries no task identity.

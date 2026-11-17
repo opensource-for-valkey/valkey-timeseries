@@ -118,6 +118,10 @@ The cluster view counts itself: the fan-out that collects it is an operation on 
 like any other. A reply is not an atomic snapshot, on one node or across nodes: two values may
 straddle an update.
 
+The `INFO ts_<section>` mirrors described under each section below also go into the server's crash
+report, with `ts_compaction`. `ts_index` does not: it walks the label index under locks the
+crashing thread may hold, so the crash report leaves it out rather than risk hanging.
+
 ### Syntax
 
 ```bash
@@ -462,11 +466,13 @@ work and pass counters show its progress. Timestamps and running gauges survive 
 | `task_tombstones_retired_total` | Tombstoned IDs retired at the end of a complete postings pass, across all cleanup paths; excludes IDs revoked or marked again during the pass |
 | `task_tombstone_passes_completed_total` | Completed postings passes that retired a stale-ID snapshot for one database, across all cleanup paths |
 | `task_optimize_index_passes_completed_total` | Periodic optimizer passes completed for one existing database; excludes full optimizations requested by migration |
+| `task_trim_unused_dbs_passes_total` | Empty database index cleanup passes run by cron |
 | `task_trim_unused_dbs_removed_total` | Empty database indexes removed by cron |
 
 Empty database index cleanup (every 300 s, inline on the main thread) is not one of the tasks
-above. It is a short pass, so it reports only `task_trim_unused_dbs_removed_total` and the gauge
-`task_trim_unused_dbs_running` (1 while a pass runs, else 0).
+above. It is a short pass, so it reports only `task_trim_unused_dbs_passes_total` and
+`task_trim_unused_dbs_removed_total`. It has no running gauge: `METRICS` and `INFO` run on the
+main thread too, so neither could ever see a pass in progress.
 
 `task_optimize_index_last_pass_completed_timestamp_seconds` is a gauge holding the Unix timestamp of
 the last completed database pass, or zero before any pass. A task invocation can process only

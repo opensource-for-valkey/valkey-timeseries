@@ -117,7 +117,6 @@ fn resume_task_schedule() {
 }
 
 fn trim_unused_dbs() {
-    task::TRIM_UNUSED_DBS_RUNNING.fetch_add(1, Ordering::Relaxed);
     let index = TIMESERIES_INDEX.pin();
     index.retain(|db, ts_index| {
         if ts_index.is_empty() {
@@ -128,7 +127,7 @@ fn trim_unused_dbs() {
             true
         }
     });
-    task::TRIM_UNUSED_DBS_RUNNING.fetch_sub(1, Ordering::Relaxed);
+    task::TRIM_UNUSED_DBS_PASSES.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cron_event_handler]
