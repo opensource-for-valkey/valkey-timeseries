@@ -1,6 +1,6 @@
 use crate::common::logging::log_error;
 use crate::common::metrics::fanout as metrics;
-use crate::common::replies::{DisconnectHook, DisconnectWatch, ReplyContext};
+use crate::common::replies::{DisconnectHook, DisconnectWatch, ReplyContext, is_resp3_client};
 use crate::fanout::fanout_error::TIMEOUT_ERROR;
 use crate::fanout::{FanoutClientCommand, FanoutResult};
 use metered::Counter;
@@ -62,6 +62,9 @@ pub(super) struct FanoutBlockedClient<T: FanoutClientCommand> {
     is_blocked: bool,
     /// When the server times the client out ([`timeout_callback`]).
     deadline: Instant,
+    /// Whether the client negotiated RESP3, read on the main thread when it was blocked, for a
+    /// reply written off it.
+    resp3: bool,
     /// Reports the client's disconnect, after which no reply is read.
     disconnect: DisconnectWatch,
 }
@@ -92,8 +95,13 @@ where
     /// for a client that disconnects: the server runs only [`free_callback`] for it, and
     /// [`Self::reply_off_main_thread`] skips building its reply.
     ///
-    /// Main thread only (the disconnect callback is installed here).
-    pub fn new(ctx: &Context, timeout: Duration) -> Self {
+    /// Main thread only (the disconnect callback is installed here, and the client's protocol
+    /// is read here for [`Self::reply_off_main_thread`]).
+    ///
+    /// `None` when the server refuses to block the client (one already blocked, a client that
+    /// is not a normal one, a temporary module context): nothing has been written to it, so
+    /// the caller must answer it.
+    pub fn new(ctx: &Context, timeout: Duration) -> Option<Self> {
         // 0 means "never" to the server.
         let timeout_ms = i64::try_from(timeout.as_millis())
             .unwrap_or(i64::MAX)
@@ -107,6 +115,9 @@ where
                 timeout_ms,
             )
         };
+        if bc_ptr.is_null() {
+            return None;
+        }
 
         let mut res = Self {
             inner: bc_ptr,
@@ -114,11 +125,12 @@ where
             data: None,
             is_blocked: true,
             deadline: Instant::now() + Duration::from_millis(timeout_ms as u64),
+            resp3: is_resp3_client(ctx),
             disconnect: DisconnectWatch::new(bc_ptr.cast()),
         };
 
         res.measure_time_start();
-        res
+        Some(res)
     }
 
     /// Runs `hook` on the main thread should the client disconnect while blocked. Main thread
@@ -166,11 +178,11 @@ where
         }
         // SAFETY: `inner` is this client's live handle until `unblock`, which cannot run
         // while the caller holds `&mut self`. A thread-safe context bound to a blocked client
-        // may be used from any thread and needs no GIL for replies; it inherits the client's
-        // protocol, so RESP3 detection works through it.
+        // may be used from any thread and needs no GIL for replies. Asking the server for the
+        // client's protocol would need it, so the reply uses the one read when it was blocked.
         unsafe {
             let ctx = raw::RedisModule_GetThreadSafeContext.unwrap()(self.inner.cast());
-            let reply_ctx = ReplyContext::new(ctx);
+            let reply_ctx = ReplyContext::with_protocol(ctx, self.resp3);
             // As in [`reply_callback`]: `reply` is the command's own code, so a panic in it
             // becomes this client's error reply rather than a lost one.
             if panic::catch_unwind(AssertUnwindSafe(|| op.reply(&reply_ctx))).is_err() {

@@ -1,15 +1,21 @@
+use super::reply_context::ReplyContext;
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::labels::Label;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_long};
 use valkey_module::{
     Context, ContextFlags, Status, VALKEYMODULE_POSTPONED_ARRAY_LEN,
-    ValkeyModule_ReplySetArrayLength, ValkeyModuleCtx, ValkeyResult, raw,
+    ValkeyModule_ReplySetArrayLength, ValkeyModuleCtx, ValkeyResult, ValkeyValue, raw,
 };
 
 /// True when the client this reply targets negotiated RESP3 (HELLO 3).
 /// Commands whose RESP3 reply is structurally different from the RESP2 one
 /// (e.g. TS.MRANGE's map-of-series form) branch on this.
+///
+/// Main thread only, with the GIL held: `RM_GetContextFlags` reads server state besides the
+/// client's protocol. Reply code that may run on another thread asks its [`ReplyContext`]
+/// instead ([`ReplyContext::is_resp3`]), which carries the flag read when the client was
+/// blocked.
 pub fn is_resp3_client<C: IntoRawCtx>(ctx: C) -> bool {
     Context::new(ctx.into_raw())
         .get_flags()
@@ -190,7 +196,7 @@ pub fn reply_with_bool<C: IntoRawCtx>(ctx: C, value: bool) -> Status {
 fn str_as_legal_resp_string(s: &str) -> CString {
     let mut bytes = s.as_bytes().to_owned();
     for b in &mut bytes {
-        if *b == b'\r' || *b == b'\n' || *b == b'\0' {
+        if breaks_resp_line(*b) {
             *b = b' ';
         }
     }
@@ -229,22 +235,19 @@ pub fn reply_with_array<C: IntoRawCtx>(ctx: C, len: usize) -> Status {
 /// The length is written as the reply header before any element, so this relies on
 /// `ExactSizeIterator::len` being exact, which the standard collections guarantee. A
 /// wrong length from a custom iterator would corrupt the reply stream, not just this reply.
-pub fn reply_with_string_set<C, I>(ctx: C, values: I) -> Status
+///
+/// The protocol is the one `ctx` carries ([`ReplyContext::reply_with_set`]), so this is safe
+/// off the main thread.
+pub fn reply_with_string_set<I>(ctx: &ReplyContext<'_>, values: I) -> Status
 where
-    C: IntoRawCtx,
     I: IntoIterator,
     I::IntoIter: ExactSizeIterator,
     I::Item: AsRef<str>,
 {
-    let raw_ctx = ctx.into_raw();
     let values = values.into_iter();
-    if is_resp3_client(raw_ctx) {
-        raw::reply_with_set(raw_ctx, values.len() as c_long);
-    } else {
-        reply_with_array(raw_ctx, values.len());
-    }
+    ctx.reply_with_set(values.len());
     for value in values {
-        reply_with_bulk_string(raw_ctx, value.as_ref());
+        ctx.reply_with_string(value.as_ref());
     }
     Status::Ok
 }
@@ -268,13 +271,34 @@ pub fn reply_with_counted_array<C: IntoRawCtx, T>(
     let raw_ctx = ctx.into_raw();
     reply_with_postponed_array(raw_ctx);
 
-    let mut len = 0;
+    // Sets the length on every exit, a panic in `emit` or the iterator included: an unset
+    // postponed length is a malformed reply, which some servers crash on when copying it to
+    // the client.
+    let mut array = CountedArray::new(|len| {
+        reply_with_array_len(raw_ctx, len);
+    });
     for item in items {
         emit(item);
-        len += 1;
+        array.count += 1;
     }
+}
 
-    reply_with_array_len(raw_ctx, len);
+/// Calls `close` with the number of elements counted, when dropped.
+struct CountedArray<F: FnMut(usize)> {
+    count: usize,
+    close: F,
+}
+
+impl<F: FnMut(usize)> CountedArray<F> {
+    fn new(close: F) -> Self {
+        Self { count: 0, close }
+    }
+}
+
+impl<F: FnMut(usize)> Drop for CountedArray<F> {
+    fn drop(&mut self) {
+        (self.close)(self.count);
+    }
 }
 
 fn reply_with_array_len<C: IntoRawCtx>(ctx: C, len: usize) -> Status {
@@ -296,6 +320,103 @@ fn reply_with_postponed_array<C: IntoRawCtx>(ctx: C) -> Status {
 
 #[allow(clippy::must_use_candidate)]
 pub fn reply<C: IntoRawCtx>(ctx: C, result: ValkeyResult) -> Status {
-    let ctx = Context::new(ctx.into_raw());
-    ctx.reply(result)
+    let raw_ctx = ctx.into_raw();
+    match result {
+        // `Context::reply` copies a simple string into a new `CString` (and panics on a NUL);
+        // a short, clean one needs no allocation.
+        Ok(ValkeyValue::SimpleStringStatic(s)) => reply_with_simple_str(raw_ctx, s),
+        Ok(ValkeyValue::SimpleString(s)) => reply_with_simple_str(raw_ctx, &s),
+        other => Context::new(raw_ctx).reply(other),
+    }
+}
+
+/// Longest simple string written from a stack buffer rather than an allocation.
+const INLINE_SIMPLE_STRING: usize = 63;
+
+/// A simple-string reply. A byte that would break the RESP line (CR, LF, NUL) is written as a
+/// space, as in error replies; only such a string, or a long one, is copied to the heap.
+fn reply_with_simple_str(raw_ctx: *mut raw::RedisModuleCtx, s: &str) -> Status {
+    let mut buf = [0u8; INLINE_SIMPLE_STRING + 1];
+    match inline_c_str(s, &mut buf) {
+        Some(msg) => raw::reply_with_simple_string(raw_ctx, msg.as_ptr()),
+        None => {
+            let msg = str_as_legal_resp_string(s);
+            raw::reply_with_simple_string(raw_ctx, msg.as_ptr())
+        }
+    }
+}
+
+/// `s` as a C string in `buf`, if it fits with its terminator and has no byte to replace.
+fn inline_c_str<'b>(s: &str, buf: &'b mut [u8]) -> Option<&'b CStr> {
+    let bytes = s.as_bytes();
+    if bytes.len() >= buf.len() || bytes.iter().any(|&b| breaks_resp_line(b)) {
+        return None;
+    }
+    buf[..bytes.len()].copy_from_slice(bytes);
+    buf[bytes.len()] = 0;
+    CStr::from_bytes_until_nul(buf).ok()
+}
+
+/// A byte a simple-string or error line cannot carry.
+#[inline]
+fn breaks_resp_line(b: u8) -> bool {
+    b == b'\r' || b == b'\n' || b == b'\0'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn counted_array_closes_with_the_count_on_unwind() {
+        let mut closed = None;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut array = CountedArray::new(|len| closed = Some(len));
+            for i in 0..5 {
+                if i == 3 {
+                    panic!("emit failed");
+                }
+                array.count += 1;
+            }
+        }));
+        assert!(result.is_err());
+        assert_eq!(closed, Some(3));
+    }
+
+    #[test]
+    fn counted_array_closes_once_with_the_full_count() {
+        let mut calls = Vec::new();
+        {
+            let mut array = CountedArray::new(|len| calls.push(len));
+            array.count += 2;
+        }
+        assert_eq!(calls, [2]);
+    }
+
+    #[test]
+    fn short_clean_simple_string_is_written_from_the_stack() {
+        let mut buf = [0u8; INLINE_SIMPLE_STRING + 1];
+        assert_eq!(inline_c_str("OK", &mut buf).unwrap().to_bytes(), b"OK");
+        let mut buf = [0u8; INLINE_SIMPLE_STRING + 1];
+        assert_eq!(inline_c_str("", &mut buf).unwrap().to_bytes(), b"");
+        let longest = "x".repeat(INLINE_SIMPLE_STRING);
+        let mut buf = [0u8; INLINE_SIMPLE_STRING + 1];
+        assert_eq!(
+            inline_c_str(&longest, &mut buf).unwrap().to_bytes(),
+            longest.as_bytes()
+        );
+    }
+
+    #[test]
+    fn long_or_unsafe_simple_string_takes_the_sanitizing_path() {
+        let too_long = "x".repeat(INLINE_SIMPLE_STRING + 1);
+        let mut buf = [0u8; INLINE_SIMPLE_STRING + 1];
+        assert!(inline_c_str(&too_long, &mut buf).is_none());
+        for s in ["a\rb", "a\nb", "a\0b"] {
+            let mut buf = [0u8; INLINE_SIMPLE_STRING + 1];
+            assert!(inline_c_str(s, &mut buf).is_none(), "{s:?}");
+            assert_eq!(str_as_legal_resp_string(s).as_bytes(), b"a b");
+        }
+    }
 }

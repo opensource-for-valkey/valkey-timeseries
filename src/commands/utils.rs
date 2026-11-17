@@ -2,9 +2,9 @@ use super::fanout_codec::generated::{Label as FanoutLabel, Sample as FanoutSampl
 use crate::commands::fanout_codec::MGetValue;
 use crate::common::constants::{REDUCER_KEY, SOURCE_KEY};
 use crate::common::replies::{
-    IntoRawCtx, is_resp3_client, reply_label_ex, reply_with_array, reply_with_bulk_string,
-    reply_with_labels, reply_with_labels_map, reply_with_map, reply_with_multi_samples,
-    reply_with_sample_ex, reply_with_samples, reply_with_slice,
+    IntoRawCtx, ReplyContext, is_resp3_client, reply_label_ex, reply_with_array,
+    reply_with_bulk_string, reply_with_labels, reply_with_labels_map, reply_with_map,
+    reply_with_multi_samples, reply_with_sample_ex, reply_with_samples, reply_with_slice,
 };
 use crate::fanout::{FanoutTarget, client_allows_replica_fanout, compute_query_fanout_mode};
 use crate::labels::Label;
@@ -105,12 +105,14 @@ fn is_synthetic_group_label(label: &Label) -> bool {
     label.name == REDUCER_KEY || label.name == SOURCE_KEY
 }
 
+/// Runs on the main thread or, for a deferred or fan-out reply, on a lane through a thread-safe
+/// context: the protocol is the one `ctx` carries.
 pub(super) fn reply_with_mrange_series_results(
-    ctx: &Context,
+    ctx: &ReplyContext<'_>,
     series_results: &[MRangeSeriesResult],
     shape: &MRangeReplyShape,
 ) -> ValkeyResult {
-    if !is_resp3_client(ctx) {
+    if !ctx.is_resp3() {
         reply_with_array(ctx, series_results.len());
         for series in series_results {
             reply_with_mrange_series_result(ctx, series);

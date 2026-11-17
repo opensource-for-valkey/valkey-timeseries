@@ -9,6 +9,7 @@ use crate::common::acl::caller_user_name;
 use crate::common::context::{get_current_db, is_blocking_denied};
 use crate::common::replies::{ReplyContext, ThreadSafeReplyContext, block_client};
 use crate::common::threads::{BoundedExecutor, Capacity, ExecutorStats, Reservation, lane_workers};
+use crate::error_consts;
 use crate::fanout::FanoutContext;
 use crate::series::index::{
     SeriesCursor, SeriesSelection, get_db_index, plan_if_cheap, series_read_exceeds_inline_budget,
@@ -81,7 +82,11 @@ pub(crate) fn run_reserved_on_analysis_lane<F>(
 where
     F: FnOnce(&ThreadSafeReplyContext) + Send + 'static,
 {
-    let blocked_client = block_client(ctx);
+    // Refused by the server (a client already blocked, or not a normal one): nothing has been
+    // written to it, so it gets an error now. The reservation is given back as it drops.
+    let Some(blocked_client) = block_client(ctx) else {
+        return Err(ValkeyError::Str(error_consts::CANNOT_BLOCK_CLIENT));
+    };
     slot.spawn(move || {
         let thread_ctx = ThreadSafeReplyContext::with_blocked_client(blocked_client);
         if PANIC_NEXT_ANALYSIS_JOB.swap(false, Ordering::Relaxed) {
