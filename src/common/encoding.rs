@@ -3,7 +3,7 @@ use std::fmt;
 use valkey_module::ValkeyError;
 
 /// Decoding varint error.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DecodeError {
     /// The buffer does not contain a valid LEB128 encoding.
@@ -91,7 +91,7 @@ pub(crate) fn write_byte_slice(buf: &mut Vec<u8>, slice: &[u8]) {
 }
 
 pub(crate) fn try_read_byte_slice<'a>(buf: &mut &'a [u8]) -> DecodeResult<&'a [u8]> {
-    let len = try_read_uvarint(buf)? as usize;
+    let len = usize::try_from(try_read_uvarint(buf)?).map_err(|_| DecodeError::Overflow)?;
 
     if len > buf.len() {
         return Err(DecodeError::insufficient_data(buf.len(), len)); // Not enough data
@@ -102,35 +102,31 @@ pub(crate) fn try_read_byte_slice<'a>(buf: &mut &'a [u8]) -> DecodeResult<&'a [u
     Ok(slice)
 }
 
-/// Reads an unsigned varint from the buffer
-/// Returns the value and the number of bytes consumed, or None if invalid
+/// Most bytes a `u64` LEB128 encoding can take: nine 7-bit groups and a tenth holding bit 63.
+const MAX_UVARINT_LEN: usize = 10;
+
+/// Reads an unsigned LEB128 varint from the buffer, advancing it past the encoding on success.
+///
+/// Fails with [`DecodeError::InsufficientData`] when the buffer ends before the terminal byte,
+/// and with [`DecodeError::Overflow`] when the encoding cannot be a `u64`: more than ten bytes,
+/// or a tenth byte carrying payload bits above bit 63. On failure the buffer is left unchanged.
 pub(crate) fn try_read_uvarint(buf: &mut &[u8]) -> DecodeResult<u64> {
     let mut value: u64 = 0;
-    let mut shift = 0;
-    let mut current_offset = 0;
 
-    loop {
-        if current_offset >= buf.len() {
-            return Err(DecodeError::Overflow); // Unexpected end of buffer
-        }
-
-        let byte = buf[current_offset];
-        current_offset += 1;
-
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-
-        shift += 7;
-        if shift > 63 {
-            // Protect against malicious inputs
+    for (i, &byte) in buf.iter().enumerate() {
+        if i == MAX_UVARINT_LEN - 1 && byte > 0x01 {
+            // The tenth byte has room for bit 63 only: anything else (a continuation bit or
+            // more payload) would be silently shifted out and alias a smaller value.
             return Err(DecodeError::Overflow);
         }
+        value |= ((byte & 0x7F) as u64) << (7 * i);
+        if byte & 0x80 == 0 {
+            *buf = &buf[i + 1..];
+            return Ok(value);
+        }
     }
-    *buf = &buf[current_offset..];
 
-    Ok(value)
+    Err(DecodeError::insufficient_data(buf.len(), buf.len() + 1))
 }
 
 /// Reads a single u8 byte from the buffer.
@@ -203,4 +199,139 @@ pub(crate) fn sign_extend(val: u64, bits: u32) -> i64 {
     #[allow(clippy::cast_possible_wrap)]
     let val = val as i64;
     (val ^ m) - m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn encode(value: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_uvarint(&mut buf, value);
+        buf
+    }
+
+    #[test]
+    fn uvarint_max_round_trips_in_ten_bytes() {
+        let bytes = encode(u64::MAX);
+        assert_eq!(bytes.len(), MAX_UVARINT_LEN);
+        assert_eq!(bytes[MAX_UVARINT_LEN - 1], 0x01);
+        let mut buf = bytes.as_slice();
+        assert_eq!(try_read_uvarint(&mut buf), Ok(u64::MAX));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn uvarint_rejects_tenth_byte_payload_beyond_u64() {
+        // Nine continuation bytes leave room for bit 63 only. 0x02 used to decode as 0, and
+        // 0x7f as the same value as 0x01.
+        for last in [0x02u8, 0x7f] {
+            let mut bytes = vec![0x80u8; 9];
+            bytes.push(last);
+            let mut buf = bytes.as_slice();
+            assert_eq!(
+                try_read_uvarint(&mut buf),
+                Err(DecodeError::Overflow),
+                "{last:#x}"
+            );
+            assert_eq!(
+                buf.len(),
+                bytes.len(),
+                "a failed read must not consume input"
+            );
+        }
+
+        let mut bytes = vec![0x80u8; 9];
+        bytes.push(0x01);
+        assert_eq!(try_read_uvarint(&mut bytes.as_slice()), Ok(1 << 63));
+    }
+
+    #[test]
+    fn uvarint_rejects_more_than_ten_bytes() {
+        for len in [11, 12, 20] {
+            let mut bytes = vec![0xffu8; len - 1];
+            bytes.push(0x00);
+            assert_eq!(
+                try_read_uvarint(&mut bytes.as_slice()),
+                Err(DecodeError::Overflow),
+                "{len} bytes"
+            );
+        }
+        // A tenth byte that is still a continuation fails even with nothing after it.
+        let bytes = [0x80u8; 10];
+        assert_eq!(
+            try_read_uvarint(&mut bytes.as_slice()),
+            Err(DecodeError::Overflow)
+        );
+    }
+
+    #[test]
+    fn uvarint_truncation_is_insufficient_data() {
+        let mut empty: &[u8] = &[];
+        assert!(matches!(
+            try_read_uvarint(&mut empty),
+            Err(DecodeError::InsufficientData { available: 0, .. })
+        ));
+
+        let full = encode(u64::MAX);
+        for cut in 1..full.len() {
+            let mut buf = &full[..cut];
+            assert!(
+                matches!(
+                    try_read_uvarint(&mut buf),
+                    Err(DecodeError::InsufficientData { available, .. }) if available == cut
+                ),
+                "cut at {cut}"
+            );
+            assert_eq!(buf.len(), cut, "a failed read must not consume input");
+        }
+    }
+
+    #[test]
+    fn byte_slice_length_past_buffer_fails() {
+        let mut bytes = encode(u64::MAX);
+        bytes.extend_from_slice(b"abc");
+        let result = try_read_byte_slice(&mut bytes.as_slice());
+        if usize::BITS < u64::BITS {
+            assert_eq!(result, Err(DecodeError::Overflow));
+        } else {
+            assert!(matches!(
+                result,
+                Err(DecodeError::InsufficientData { available: 3, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn byte_slice_round_trips() {
+        let mut bytes = Vec::new();
+        write_byte_slice(&mut bytes, b"hello");
+        write_byte_slice(&mut bytes, b"");
+        let mut buf = bytes.as_slice();
+        assert_eq!(try_read_byte_slice(&mut buf), Ok(&b"hello"[..]));
+        assert_eq!(try_read_byte_slice(&mut buf), Ok(&b""[..]));
+        assert!(buf.is_empty());
+    }
+
+    proptest! {
+        #[test]
+        fn uvarint_round_trips(value: u64, tail in proptest::collection::vec(any::<u8>(), 0..4)) {
+            let mut bytes = encode(value);
+            prop_assert!(bytes.len() <= MAX_UVARINT_LEN);
+            bytes.extend_from_slice(&tail);
+            let mut buf = bytes.as_slice();
+            prop_assert_eq!(try_read_uvarint(&mut buf), Ok(value));
+            prop_assert_eq!(buf, &tail[..]);
+        }
+
+        #[test]
+        fn signed_varint_round_trips(value: i64) {
+            let mut bytes = Vec::new();
+            write_signed_varint(&mut bytes, value);
+            let mut buf = bytes.as_slice();
+            prop_assert_eq!(try_read_signed_varint(&mut buf), Ok(value));
+            prop_assert!(buf.is_empty());
+        }
+    }
 }

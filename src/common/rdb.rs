@@ -5,17 +5,6 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use valkey_module::{RedisModuleIO, ValkeyError, ValkeyResult, raw};
 
-// STALE_NAN is a sentinel NaN used to encode `None` for `Option<f64>` in the RDB format.
-// The bit pattern 0x7ff0000000000002 is:
-//   - An IEEE-754 double with exponent = 0x7ff (all 1s) and a non-zero mantissa,
-//     which makes it a NaN rather than ±∞ or a normal finite value.
-//   - Deliberately not the canonical quiet-NaN used by `f64::NAN` (often 0x7ff8000000000000),
-//     and instead a rarely used NaN payload that is unlikely to be produced by normal
-//     floating-point operations.
-// We construct and compare it via `from_bits` / `to_bits` so that we can reliably distinguish
-// this exact sentinel from any "real" NaN that may appear in user data.
-const STALE_NAN: f64 = f64::from_bits(0x7ff0000000000002);
-
 const OPTIONAL_MARKER_PRESENT: u64 = 0xfe;
 const OPTIONAL_MARKER_ABSENT: u64 = 0xff;
 
@@ -64,17 +53,22 @@ pub(crate) fn rdb_load_f64(rdb: *mut RedisModuleIO) -> ValkeyResult<f64> {
     Ok(value)
 }
 
+/// Writes a presence marker, then the double when there is one. Presence is never encoded
+/// in-band as a NaN payload: every bit pattern, Prometheus's StaleNaN included, is a value.
 pub(crate) fn rdb_save_optional_f64(rdb: *mut RedisModuleIO, value: Option<f64>) {
-    let val = value.unwrap_or(STALE_NAN);
-    raw::save_double(rdb, val);
+    rdb_save_optional_marker(rdb, value.is_some());
+    if let Some(value) = value {
+        raw::save_double(rdb, value);
+    }
 }
 
+/// Reads what [`rdb_save_optional_f64`] wrote; a marker other than present/absent fails the load.
 pub(crate) fn rdb_load_optional_f64(rdb: *mut RedisModuleIO) -> ValkeyResult<Option<f64>> {
-    let val = raw::load_double(rdb)?;
-    if val.to_bits() == STALE_NAN.to_bits() {
-        return Ok(None);
+    if load_optional_marker(rdb)? {
+        Ok(Some(raw::load_double(rdb)?))
+    } else {
+        Ok(None)
     }
-    Ok(Some(val))
 }
 
 pub fn rdb_save_duration(rdb: *mut RedisModuleIO, duration: &Duration) {
@@ -299,9 +293,175 @@ pub(crate) fn rdb_load_optional_rounding(
     }
 }
 
+/// An in-memory stand-in for the server's RDB stream, so unit tests can round-trip
+/// `rdb_save`/`rdb_load` without a server.
+///
+/// The `RedisModuleIO` pointer handed to the codecs is a [`MemIo`], and the server's save/load
+/// entry points are replaced (once, process-wide) by functions that push to and pop from it.
+/// Each item keeps its kind, so a load reading a different kind than was saved there (a
+/// desynchronized stream) reports an IO error, as a short or garbled read would on the server.
+/// Only the integer and double entry points are installed.
+#[cfg(test)]
+pub(crate) mod mem_io {
+    use std::os::raw::c_int;
+    use std::sync::Once;
+    use valkey_module::{RedisModuleIO, raw};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Item {
+        Unsigned(u64),
+        Signed(i64),
+        /// The double's bits, so NaN payloads compare exactly.
+        Double(u64),
+    }
+
+    #[derive(Default)]
+    pub(crate) struct MemIo {
+        pub(crate) items: Vec<Item>,
+        pos: usize,
+        error: bool,
+    }
+
+    impl MemIo {
+        pub(crate) fn new() -> Self {
+            install();
+            Self::default()
+        }
+
+        pub(crate) fn io(&mut self) -> *mut RedisModuleIO {
+            (self as *mut Self).cast()
+        }
+
+        /// Starts reading from the beginning again.
+        pub(crate) fn rewind(&mut self) {
+            self.pos = 0;
+            self.error = false;
+        }
+
+        pub(crate) fn is_drained(&self) -> bool {
+            self.pos == self.items.len()
+        }
+    }
+
+    /// # Safety
+    /// `io` must come from [`MemIo::io`] on a live `MemIo`.
+    unsafe fn mem<'a>(io: *mut RedisModuleIO) -> &'a mut MemIo {
+        unsafe { &mut *io.cast::<MemIo>() }
+    }
+
+    fn next(io: &mut MemIo) -> Option<Item> {
+        let item = io.items.get(io.pos).copied();
+        io.pos += 1;
+        if item.is_none() {
+            io.error = true;
+        }
+        item
+    }
+
+    unsafe extern "C" fn save_unsigned(io: *mut RedisModuleIO, value: u64) {
+        unsafe { mem(io) }.items.push(Item::Unsigned(value));
+    }
+
+    unsafe extern "C" fn save_signed(io: *mut RedisModuleIO, value: i64) {
+        unsafe { mem(io) }.items.push(Item::Signed(value));
+    }
+
+    unsafe extern "C" fn save_double(io: *mut RedisModuleIO, value: f64) {
+        unsafe { mem(io) }.items.push(Item::Double(value.to_bits()));
+    }
+
+    unsafe extern "C" fn load_unsigned(io: *mut RedisModuleIO) -> u64 {
+        let io = unsafe { mem(io) };
+        match next(io) {
+            Some(Item::Unsigned(value)) => value,
+            _ => {
+                io.error = true;
+                0
+            }
+        }
+    }
+
+    unsafe extern "C" fn load_signed(io: *mut RedisModuleIO) -> i64 {
+        let io = unsafe { mem(io) };
+        match next(io) {
+            Some(Item::Signed(value)) => value,
+            _ => {
+                io.error = true;
+                0
+            }
+        }
+    }
+
+    unsafe extern "C" fn load_double(io: *mut RedisModuleIO) -> f64 {
+        let io = unsafe { mem(io) };
+        match next(io) {
+            Some(Item::Double(bits)) => f64::from_bits(bits),
+            _ => {
+                io.error = true;
+                0.0
+            }
+        }
+    }
+
+    unsafe extern "C" fn is_io_error(io: *mut RedisModuleIO) -> c_int {
+        c_int::from(unsafe { mem(io) }.error)
+    }
+
+    fn install() {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| unsafe {
+            raw::RedisModule_SaveUnsigned = Some(save_unsigned);
+            raw::RedisModule_SaveSigned = Some(save_signed);
+            raw::RedisModule_SaveDouble = Some(save_double);
+            raw::RedisModule_LoadUnsigned = Some(load_unsigned);
+            raw::RedisModule_LoadSigned = Some(load_signed);
+            raw::RedisModule_LoadDouble = Some(load_double);
+            raw::RedisModule_IsIOError = Some(is_io_error);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::narrow;
+    use super::mem_io::{Item, MemIo};
+    use super::{narrow, rdb_load_optional_f64, rdb_save_optional_f64};
+
+    /// Prometheus's stale marker, once the in-band encoding of `None`.
+    const STALE_NAN_BITS: u64 = 0x7ff0000000000002;
+
+    #[test]
+    fn optional_f64_round_trips_every_bit_pattern() {
+        let values = [
+            None,
+            Some(1.5),
+            Some(-0.0),
+            Some(f64::INFINITY),
+            Some(f64::NAN),
+            Some(f64::from_bits(STALE_NAN_BITS)),
+        ];
+        let mut mem = MemIo::new();
+        for value in values {
+            rdb_save_optional_f64(mem.io(), value);
+        }
+        mem.rewind();
+        for value in values {
+            let loaded = rdb_load_optional_f64(mem.io()).expect("load");
+            assert_eq!(
+                loaded.map(f64::to_bits),
+                value.map(f64::to_bits),
+                "{value:?}"
+            );
+        }
+        assert!(mem.is_drained());
+    }
+
+    #[test]
+    fn optional_f64_refuses_an_unknown_marker() {
+        let mut mem = MemIo::new();
+        mem.items.push(Item::Unsigned(0));
+        mem.items.push(Item::Double(1.0f64.to_bits()));
+        assert!(rdb_load_optional_f64(mem.io()).is_err());
+    }
 
     #[test]
     fn narrowing_refuses_what_the_type_cannot_hold() {
