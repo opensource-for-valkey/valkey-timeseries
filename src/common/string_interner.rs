@@ -5,9 +5,11 @@
 //! License: MIT
 //!
 //! Interning stores one copy of each distinct label, so every series that
-//! carries it shares a single allocation. Equality compares pointers;
-//! hashing reads the bytes (so a hash depends on the content alone, not on
-//! an allocation address). Creating a value costs a lookup in the pool.
+//! carries it shares a single allocation. Equality and hashing both use the
+//! allocation's address, so a hash is cheap at any length but means nothing
+//! outside this process: never feed one to a digest, a fingerprint or another
+//! node (hash [`InternedString::as_bytes`] for those). The pool itself is
+//! still probed by content. Creating a value costs a lookup in the pool.
 //!
 //! Design choices:
 //!
@@ -187,11 +189,11 @@ const HEADER_SIZE: usize = size_of::<Header>();
 ///   holder in [`InternedString::drop`], or an interner that stumbled on a dead
 ///   entry. It does so only indirectly: it takes the entry out with
 ///   `remove_if`, and the reference goes when papaya drops the removed entry,
-///   in [`PoolEntry::drop`]. Papaya retires a removed entry through its
-///   deferred reclamation — straight away, or, during an incremental resize
-///   while an older table may still reach it, once that table is reclaimed —
-///   so the release runs only once every thread that could have found the
-///   entry has unpinned. A thread that reached a node through the map can
+///   in [`PoolEntry::drop`]. Papaya never drops a removed entry in place: it
+///   hands it to deferred reclamation, either at removal or, during an
+///   incremental resize while an older table may still reach it, when that
+///   table is reclaimed. Either way the drop, and so the release, runs only
+///   after every thread that could have found the entry has unpinned. A thread that reached a node through the map can
 ///   therefore keep reading it for as long as it stays pinned.
 /// - A holder pins the map **before** giving up its own reference in the slow
 ///   path, so the node it is about to remove cannot be reclaimed under it.
@@ -505,11 +507,11 @@ fn check_interned_len(len: usize) {
     );
 }
 
-/// The one hash of a pool key, used by probes, by [`PoolEntry`] and by
-/// [`InternedString`]. It reads only the key's fields, so any two keys with the
-/// same fields — a borrowed probe and the stored node it matches — make the
-/// same hasher calls. The length prefix keeps the hash prefix-free when keys
-/// are hashed in sequence (a `MetricName`'s labels, say).
+/// The one hash of a pool key, used by probes and by [`PoolEntry`]
+/// ([`InternedString`] hashes its address instead). It reads only the key's
+/// fields, so any two keys with the same fields — a borrowed probe and the
+/// stored node it matches — make the same hasher calls, and `name_len` keeps
+/// labels whose bytes coincide across the `=` (`a=b`/`c` and `a`/`b=c`) apart.
 impl Hash for PoolKey<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_u32(self.name_len);
@@ -1968,11 +1970,14 @@ mod tests {
         assert_eq!(b, InternedString::new_pair("a", "b=c"));
         assert_eq!(plain, InternedString::new("a=b=c"));
 
-        // And hashes apart, so hashed collections don't pile them into one bucket.
+        // And their pool keys hash apart, so the pool does not pile them into one bucket:
+        // the bytes are the same, so only `name_len` can tell them apart. (Their
+        // `InternedString` hashes differ by address whatever the key does.)
         use std::hash::{BuildHasher, BuildHasherDefault};
         let hasher = BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
-        assert_ne!(hasher.hash_one(&a), hasher.hash_one(&b));
-        assert_ne!(hasher.hash_one(&a), hasher.hash_one(&plain));
+        assert_ne!(hasher.hash_one(a.0.key()), hasher.hash_one(b.0.key()));
+        assert_ne!(hasher.hash_one(a.0.key()), hasher.hash_one(plain.0.key()));
+        assert_ne!(hasher.hash_one(b.0.key()), hasher.hash_one(plain.0.key()));
 
         drop((a, b, plain));
         assert_eq!(InternedString::interned_count(), 0);
@@ -2186,8 +2191,6 @@ mod tests {
         assert_eq!(InternedString::memory_used(), 0);
     }
 
-    /// Interning a string while its last holder is dropping it must yield a
-    /// live value either way.
     /// The hash follows identity: every holder of one entry hashes alike whatever its label's
     /// length, and distinct live entries hash apart.
     #[test]
@@ -2222,6 +2225,8 @@ mod tests {
         assert!(set.contains(&b));
     }
 
+    /// Interning a string while its last holder is dropping it must yield a
+    /// live value either way.
     #[test]
     fn intern_races_drop_of_last_holder() {
         let _pool = test_pool::isolated();

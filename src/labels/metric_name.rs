@@ -57,9 +57,10 @@ impl SeriesLabel for InternedLabel<'_> {
 /// The labels are kept in name order so that lookups are binary searches and two sets with the
 /// same pairs compare equal.
 ///
-/// `Hash` follows each label's interned address (see [`InternedString`]'s `Hash`), so it is for
-/// in-process collections only, never for a digest or anything another node compares.
-#[derive(Debug, Clone, Default, Hash, PartialEq, Eq)]
+/// Deliberately not `Hash`: [`InternedString`] hashes its address, so a derived hash would differ
+/// between runs and nodes. Where a label set needs a hash, hash its content (each label's
+/// `as_bytes`) explicitly, so a digest cannot pick up an address by accident.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetricName(Arc<[InternedString]>);
 
 impl GetSize for MetricName {
