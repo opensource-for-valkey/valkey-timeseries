@@ -6,7 +6,9 @@
 
 use crate::commands::parse_nonnegative_duration_ms;
 use crate::common::binop::ComparisonOperator;
-use crate::common::block_on_keys::{BlockedKeyHandler, ReadyStatus, block_client_on_key};
+use crate::common::block_on_keys::{
+    BlockOutcome, BlockedKeyHandler, ReadyStatus, block_client_on_key,
+};
 use crate::common::context::is_blocking_denied;
 use crate::common::metrics::read::{
     BLOCK_REFUSED, SERVED_WITHOUT_BLOCK, SPURIOUS_WAKEUPS, UNBLOCKED_BY_DELETE,
@@ -466,14 +468,21 @@ pub fn ts_read_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                 cursor,
                 options,
             };
-            if block_client_on_key(ctx, &key, block.timeout_ms, pending) {
-                Ok(ValkeyValue::NoReply)
-            } else {
-                // The server refused to block; we still owe a reply.
-                BLOCK_REFUSED.fetch_add(1, Ordering::Relaxed);
-                ctx.log_warning("TS.READ: failed to block client; replying with current data");
-                reply_with_samples(ctx, std::iter::empty());
-                Ok(ValkeyValue::NoReply)
+            // The wait limit is range-checked here, at block time, rather than by the parser: a
+            // read that is satisfiable at once never consults it, and still succeeds.
+            match block_client_on_key(ctx, &key, block.timeout_ms, pending) {
+                BlockOutcome::Blocked => Ok(ValkeyValue::NoReply),
+                BlockOutcome::TimeoutOutOfRange => {
+                    BLOCK_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    Err(ValkeyError::Str(error_consts::BLOCK_TIMEOUT_OUT_OF_RANGE))
+                }
+                BlockOutcome::Refused => {
+                    // The server refused to block; we still owe a reply.
+                    BLOCK_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    ctx.log_warning("TS.READ: failed to block client; replying with current data");
+                    reply_with_samples(ctx, std::iter::empty());
+                    Ok(ValkeyValue::NoReply)
+                }
             }
         }
     }

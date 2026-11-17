@@ -189,6 +189,10 @@ pub const READ_BLOCK_MS_MUST_BE_NON_NEGATIVE: &str =
     "TSDB: BLOCK milliseconds must be a non-negative integer";
 pub const READ_MIN_COUNT_EXCEEDS_MAX_COUNT: &str = "TSDB: BLOCK min_count must be <= MAX_COUNT";
 pub const READ_BLOCKING_NOT_ALLOWED: &str = "TSDB: blocking TS.READ (with BLOCK) is not allowed inside MULTI, EVAL, or a deny-blocking context";
+// A wait limit too large to schedule (see `block_on_keys::MAX_BLOCK_TIMEOUT_MS`). Deliberately the
+// server's own text for an overflowing block deadline, which is what clients received before the
+// module started checking the limit itself.
+pub const BLOCK_TIMEOUT_OUT_OF_RANGE: &str = "ERR timeout is out of range";
 // CONDITION is an additive extension with no reference text to match; the wording follows the
 // clause-named style of the probed constants above. A bad operator reuses
 // INVALID_COMPARISON_OPERATOR, which `ComparisonOperator::try_from` already returns.

@@ -17,6 +17,7 @@
 
 use crate::common::metrics::read::{BLOCK_TIMEOUTS, BLOCKED, BLOCKED_CLIENTS};
 use crate::common::replies::ReplyContext;
+use crate::common::time::valkey_current_time_millis;
 use std::os::raw::{c_int, c_longlong, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::Ordering;
@@ -92,14 +93,51 @@ pub(crate) fn signal_timeseries_ready(ctx: &Context, key: &ValkeyString) {
     unsafe { signal(ctx.ctx, key.inner) };
 }
 
+/// Largest wait limit [`block_client_on_key`] hands the server: half the `i64` range, about 146
+/// million years.
+///
+/// The server refuses a timeout whose deadline (`now + timeout_ms`) would overflow, but it does so
+/// *without blocking* while still returning a live handle, which orphans everything the block
+/// owns. Checking `timeout_ms <= i64::MAX - now` ourselves alone leaves a race, because the server
+/// reads its clock again after we do. A fixed cap this far below the overflow point closes that
+/// race for any clock reading before the year ~146 million, and no caller needs a finite wait
+/// longer than "forever" (`0`).
+pub(crate) const MAX_BLOCK_TIMEOUT_MS: i64 = i64::MAX / 2;
+
+/// What [`block_client_on_key`] did with the client.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockOutcome {
+    /// The client is blocked. The server owns the handler and replies through it.
+    Blocked,
+    /// `timeout_ms` was negative, above [`MAX_BLOCK_TIMEOUT_MS`], or would overflow the server's
+    /// deadline. The server was never called; the caller should answer with
+    /// [`crate::error_consts::BLOCK_TIMEOUT_OUT_OF_RANGE`].
+    TimeoutOutOfRange,
+    /// The server declined to block the client.
+    Refused,
+}
+
+/// Whether the server would accept `timeout_ms` as a block deadline at `now_ms`, with the
+/// headroom described on [`MAX_BLOCK_TIMEOUT_MS`]. `0` (no timeout) is always in range.
+///
+/// `now_ms` must come from the server's own clock (`RM_Milliseconds`), the one it checks against.
+fn block_timeout_in_range(timeout_ms: i64, now_ms: i64) -> bool {
+    if timeout_ms == 0 {
+        return true;
+    }
+    // The server computes `now + timeout_ms` and refuses when that overflows.
+    timeout_ms > 0 && timeout_ms <= MAX_BLOCK_TIMEOUT_MS && now_ms.checked_add(timeout_ms).is_some()
+}
+
 /// Block the current client on `key` until its handler reports readiness, `timeout_ms` elapses, or
 /// the key is deleted.
 ///
 /// `timeout_ms` of 0 means "no timeout"; the client then leaves only via a readiness signal, a
 /// deletion, `CLIENT UNBLOCK`, or disconnect.
 ///
-/// Returns `false` if the server refused to block the client, in which case `handler` has been
-/// dropped and the caller still owes the client a reply.
+/// For anything but [`BlockOutcome::Blocked`], `handler` has been dropped, nothing has been
+/// replied, and the caller still owes the client exactly one reply.
 ///
 /// # Panics
 ///
@@ -111,9 +149,16 @@ pub(crate) fn block_client_on_key<H: BlockedKeyHandler>(
     key: &ValkeyString,
     timeout_ms: i64,
     handler: H,
-) -> bool {
+) -> BlockOutcome {
+    // Decided before the call, never after: for an out-of-range timeout the server replies with
+    // an error and returns a non-NULL handle without blocking. The free callback then never runs,
+    // so the handle, the boxed handler, and the gauges below would all leak.
+    if !block_timeout_in_range(timeout_ms, valkey_current_time_millis()) {
+        return BlockOutcome::TimeoutOutOfRange;
+    }
+
     let Some(block_fn) = (unsafe { raw::RedisModule_BlockClientOnKeysWithFlags }) else {
-        return false;
+        return BlockOutcome::Refused;
     };
 
     // Ownership moves to the server here and returns only through `free_privdata_callback`.
@@ -137,11 +182,11 @@ pub(crate) fn block_client_on_key<H: BlockedKeyHandler>(
     if blocked.is_null() {
         // The server did not take the private data, so we still own it.
         drop(unsafe { Box::from_raw(privdata.cast::<H>()) });
-        return false;
+        return BlockOutcome::Refused;
     }
     BLOCKED.fetch_add(1, Ordering::Relaxed);
     BLOCKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
-    true
+    BlockOutcome::Blocked
 }
 
 /// Borrow the handler the server is holding for this blocked client.
@@ -241,5 +286,45 @@ mod tests {
             ReadyStatus::Replied.as_c_int(),
             ReadyStatus::NotReady.as_c_int()
         );
+    }
+
+    /// An arbitrary wall-clock reading in ms (2027).
+    const NOW: i64 = 1_800_000_000_000;
+
+    #[test]
+    fn zero_timeout_is_always_in_range() {
+        assert!(block_timeout_in_range(0, NOW));
+        assert!(block_timeout_in_range(0, i64::MAX));
+    }
+
+    #[test]
+    fn ordinary_timeouts_are_in_range() {
+        assert!(block_timeout_in_range(1, NOW));
+        assert!(block_timeout_in_range(60_000, NOW));
+        assert!(block_timeout_in_range(MAX_BLOCK_TIMEOUT_MS, NOW));
+    }
+
+    #[test]
+    fn timeouts_the_server_would_refuse_are_out_of_range() {
+        // The server's own overflow condition: `timeout_ms > i64::MAX - now`.
+        assert!(!block_timeout_in_range(i64::MAX, NOW));
+        assert!(!block_timeout_in_range(i64::MAX - NOW + 1, NOW));
+        // Above the cap, even though the server would still accept it at this clock reading.
+        assert!(!block_timeout_in_range(MAX_BLOCK_TIMEOUT_MS + 1, NOW));
+        assert!(!block_timeout_in_range(-1, NOW));
+        assert!(!block_timeout_in_range(i64::MIN, NOW));
+    }
+
+    #[test]
+    fn cap_leaves_headroom_for_a_later_server_clock_read() {
+        // Within the cap, the deadline cannot overflow for any clock up to i64::MAX / 2 + 1, so
+        // the server reading its clock after we do cannot turn an accepted timeout into a refused
+        // one.
+        assert_eq!(
+            (i64::MAX / 2 + 1).checked_add(MAX_BLOCK_TIMEOUT_MS),
+            Some(i64::MAX)
+        );
+        // A clock past that point is still caught by the overflow check.
+        assert!(!block_timeout_in_range(MAX_BLOCK_TIMEOUT_MS, i64::MAX - 1));
     }
 }
