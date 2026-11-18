@@ -450,6 +450,13 @@ pub fn current_if_built(sections: &[Section]) -> Option<Vec<MetricReading>> {
     LazyLock::get(&REGISTRIES).map(|registries| read_sections(registries, sections))
 }
 
+/// Whether the registries exist yet, without building them or reading anything: the crash
+/// report's check before it opens a metrics section (see [`current_if_built`]). Once built
+/// they stay built, so a `true` holds for the read that follows.
+pub fn registries_built() -> bool {
+    LazyLock::get(&REGISTRIES).is_some()
+}
+
 fn read_sections(
     registries: &'static [SectionRegistry],
     sections: &[Section],
@@ -759,6 +766,7 @@ mod tests {
             readings.into_iter().map(|reading| reading.name).collect()
         };
         let forced = names(current(&[Section::Fanout]));
+        assert!(registries_built(), "current built the registries");
         let built = current_if_built(&[Section::Fanout]).expect("current built the registries");
         assert_eq!(names(built), forced);
     }

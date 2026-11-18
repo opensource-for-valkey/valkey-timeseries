@@ -155,7 +155,7 @@ impl InfoSection {
     fn readable_in_crash_report(self) -> bool {
         match self {
             InfoSection::Index | InfoSection::Compaction => true,
-            InfoSection::Metrics(_) => metrics::current_if_built(&[]).is_some(),
+            InfoSection::Metrics(_) => metrics::registries_built(),
         }
     }
 
