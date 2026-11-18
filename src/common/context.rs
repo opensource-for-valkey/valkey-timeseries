@@ -15,8 +15,10 @@ use valkey_module::{
 /// inside a keyspace-notification or data-type callback, which is `extern "C"` and cannot unwind
 /// — the panic becomes an `abort`, taking the whole server down with it.
 ///
-/// Every conversion of keyspace-derived bytes into a `ValkeyString` must go through here.
-/// `create_string` stays fine for module-authored literals and formatted numbers.
+/// Every conversion of keyspace-derived or client-supplied bytes into a `ValkeyString` must go
+/// through here: key names, and label names and values (a label name may hold a NUL; the
+/// replicated `TS.CREATE` carries both). `create_string` stays fine for module-authored literals
+/// and formatted numbers.
 pub fn create_key_string(ctx: &Context, key: &[u8]) -> ValkeyString {
     ValkeyString::create_from_slice(ctx.ctx, key)
 }

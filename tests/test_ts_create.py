@@ -249,6 +249,18 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command("TS.CREATE", "eq:value", "LABELS", "a", "b=c")
         assert self.ts_info("eq:value")["labels"] == {"a": "b=c"}
 
+    def test_label_names_containing_nul_are_stored(self):
+        """A NUL in a label *name* cannot make one index key a prefix of another (the key's `=`
+        would have to sit inside a name), so names keep it, as RTS does. Creating the series
+        used to abort the server: its replicated TS.CREATE was built through a C string."""
+        self.client.execute_command("TS.CREATE", "nul:name", "LABELS", b"a\x00b", "v", "c", "d")
+        self.client.execute_command("TS.ADD", "nul:name:add", 1, 1, "LABELS", b"a\x00b", "v")
+        assert self.client.ping()
+        info = self.client.execute_command("TS.INFO", "nul:name")
+        labels = dict(info[info.index(b"labels") + 1])
+        assert labels == {b"a\x00b": b"v", b"c": b"d"}
+        assert sorted(self.client.execute_command("TS.QUERYINDEX", "c=d")) == [b"nul:name"]
+
     def test_option_operand_named_labels_is_not_the_keyword(self):
         """An option's operand spelled `labels` is that option's value, not the LABELS
         keyword: `METRIC labels` used to split there and leave METRIC with no operand."""

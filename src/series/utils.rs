@@ -276,7 +276,8 @@ pub fn create_and_store_series<'a>(
 pub(crate) fn resolved_create_args(ctx: &Context, series: &TimeSeries) -> Vec<ValkeyString> {
     create_option_strings(series)
         .into_iter()
-        .map(|arg| ctx.create_string(arg.as_bytes()))
+        // Label names and values are client bytes and may hold a NUL.
+        .map(|arg| create_key_string(ctx, arg.as_bytes()))
         .collect()
 }
 
