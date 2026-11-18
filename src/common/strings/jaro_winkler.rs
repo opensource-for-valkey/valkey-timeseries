@@ -46,7 +46,7 @@ const SHORT_MAX_LEN: usize = 128;
 /// ```
 /// use valkey_timeseries::common::strings::jaro_winkler;
 ///
-/// assert_eq!(jaro_winkler("martha", "marhta"), 0.96111107);
+/// assert_eq!(jaro_winkler("martha", "marhta"), 0.9611111);
 /// assert_eq!(jaro_winkler("", "words"), 0.0);
 /// assert_eq!(jaro_winkler("same", "same"), 1.0);
 /// ```
@@ -120,7 +120,7 @@ fn jaro_winkler_short<T: PartialEq>(left: &[T], right: &[T], range: usize) -> f3
     let s1_len = left.len();
     let mut s1m: u128 = 0;
     let mut s2m: u128 = 0;
-    let mut matching: f32 = 0.0;
+    let mut matching: usize = 0;
 
     for (i, r) in right.iter().enumerate() {
         let window_start = i.saturating_sub(range);
@@ -129,13 +129,13 @@ fn jaro_winkler_short<T: PartialEq>(left: &[T], right: &[T], range: usize) -> f3
             if (s1m >> j) & 1 == 0 && r == l {
                 s1m |= 1 << j;
                 s2m |= 1 << i;
-                matching += 1.0;
+                matching += 1;
                 break;
             }
         }
     }
 
-    if matching == 0.0 {
+    if matching == 0 {
         return 0.0;
     }
 
@@ -148,54 +148,95 @@ fn jaro_winkler_short<T: PartialEq>(left: &[T], right: &[T], range: usize) -> f3
 /// Matching pass for Unicode inputs where `left` (the longer one) exceeds
 /// [`SHORT_MAX_LEN`] chars.
 ///
-/// The positions of each distinct char of `left` are kept as an ascending
-/// occurrence list (all lists share one `positions` buffer), so memory is
-/// O(len) however many distinct chars there are. Each list has a cursor, and
-/// every position before it is either matched or lies before the current match
-/// window. The window start never decreases as `i` advances, so a skipped
-/// position can never become eligible again, and the first position at or
-/// after the cursor is the leftmost unmatched occurrence inside the window —
-/// the choice the short path's linear scan makes. Cursors only move forward, so
-/// the whole pass is O(len) amortized.
+/// Positions are stored as `u32` whenever `left` is short enough for them to
+/// fit, which covers every input a Valkey argument can hold.
 fn jaro_winkler_long(left: &[char], right: &[char], range: usize) -> f32 {
+    if u32::try_from(left.len()).is_ok() {
+        jaro_winkler_long_with::<u32>(left, right, range)
+    } else {
+        jaro_winkler_long_with::<usize>(left, right, range)
+    }
+}
+
+/// An index into `left`, stored as compactly as the input length allows.
+trait Position: Copy {
+    fn from_index(index: usize) -> Self;
+    fn index(self) -> usize;
+}
+
+impl Position for u32 {
+    fn from_index(index: usize) -> Self {
+        debug_assert!(u32::try_from(index).is_ok());
+        index as u32
+    }
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+impl Position for usize {
+    fn from_index(index: usize) -> Self {
+        index
+    }
+    fn index(self) -> usize {
+        self
+    }
+}
+
+/// [`jaro_winkler_long`] with positions stored as `P`.
+///
+/// Each distinct char of `right` gets an ascending occurrence list of its
+/// positions in `left` (all lists share one `positions` buffer). Chars of
+/// `left` that never occur in `right` can't match and aren't indexed, so the
+/// scratch memory is one `P` per matchable char of `left`, however many
+/// distinct chars there are. Each list has a cursor, and every position before
+/// it is either matched or lies before the current match window. The window
+/// start never decreases as `i` advances, so a skipped position can never
+/// become eligible again, and the first position at or after the cursor is the
+/// leftmost unmatched occurrence inside the window — the choice the short
+/// path's linear scan makes. Cursors only move forward, so the whole pass is
+/// O(len) amortized.
+fn jaro_winkler_long_with<P: Position>(left: &[char], right: &[char], range: usize) -> f32 {
     let s1_len = left.len();
 
-    // Assign each distinct char a group id and count its occurrences.
+    // One group per distinct char of `right`.
     let mut group_of: HashMap<char, usize> = HashMap::new();
-    let mut group_ids: Vec<usize> = Vec::with_capacity(s1_len);
-    let mut counts: Vec<usize> = Vec::new();
-    for &c in left {
-        let next_id = counts.len();
-        let group = *group_of.entry(c).or_insert(next_id);
-        if group == next_id {
-            counts.push(0);
-        }
-        counts[group] += 1;
-        group_ids.push(group);
+    for &c in right {
+        let next_id = group_of.len();
+        group_of.entry(c).or_insert(next_id);
     }
 
-    // Group `g` owns `positions[starts[g]..starts[g + 1]]`.
-    let mut starts: Vec<usize> = Vec::with_capacity(counts.len() + 1);
-    starts.push(0);
+    // Group `g` owns `positions[starts[g]..starts[g + 1]]`: count each group's
+    // occurrences in `left` into `starts[g + 1]`, then take prefix sums.
+    let mut starts = vec![0usize; group_of.len() + 1];
+    for c in left {
+        if let Some(&group) = group_of.get(c) {
+            starts[group + 1] += 1;
+        }
+    }
     let mut total = 0;
-    for count in counts {
-        total += count;
-        starts.push(total);
+    for start in &mut starts {
+        total += *start;
+        *start = total;
+    }
+    if total == 0 {
+        return 0.0;
     }
 
     // Fill each list from its end while walking `left` backwards; afterwards
     // every cursor sits at the start of its list.
     let mut cursor: Vec<usize> = starts[1..].to_vec();
-    let mut positions = vec![0usize; s1_len];
-    for (j, &group) in group_ids.iter().enumerate().rev() {
-        cursor[group] -= 1;
-        positions[cursor[group]] = j;
+    let mut positions: Vec<P> = vec![P::from_index(0); total];
+    for (j, c) in left.iter().enumerate().rev() {
+        if let Some(&group) = group_of.get(c) {
+            cursor[group] -= 1;
+            positions[cursor[group]] = P::from_index(j);
+        }
     }
-    drop(group_ids);
 
     let mut s1m = vec![0u64; s1_len.div_ceil(64)];
     let mut s2m = vec![0u64; right.len().div_ceil(64)];
-    let mut matching: f32 = 0.0;
+    let mut matching: usize = 0;
 
     for (i, c) in right.iter().enumerate() {
         let Some(&group) = group_of.get(c) else {
@@ -205,20 +246,20 @@ fn jaro_winkler_long(left: &[char], right: &[char], range: usize) -> f32 {
         let window_end = (i + range + 1).min(s1_len);
         let list_end = starts[group + 1];
         let mut k = cursor[group];
-        while k < list_end && positions[k] < window_start {
+        while k < list_end && positions[k].index() < window_start {
             k += 1;
         }
-        if k < list_end && positions[k] < window_end {
-            let j = positions[k];
+        if k < list_end && positions[k].index() < window_end {
+            let j = positions[k].index();
             s1m[j >> 6] |= 1u64 << (j & 63);
             s2m[i >> 6] |= 1u64 << (i & 63);
-            matching += 1.0;
+            matching += 1;
             k += 1;
         }
         cursor[group] = k;
     }
 
-    if matching == 0.0 {
+    if matching == 0 {
         return 0.0;
     }
 
@@ -243,7 +284,7 @@ fn jaro_winkler_long_bytes(left: &[u8], right: &[u8], range: usize) -> f32 {
 
     let mut s1m = vec![0u64; s1_words];
     let mut s2m = vec![0u64; right.len().div_ceil(64)];
-    let mut matching: f32 = 0.0;
+    let mut matching: usize = 0;
 
     for (i, &r) in right.iter().enumerate() {
         let target = r as usize;
@@ -276,13 +317,13 @@ fn jaro_winkler_long_bytes(left: &[u8], right: &[u8], range: usize) -> f32 {
                 let bit = candidates.trailing_zeros();
                 s1m[w] |= 1u64 << bit;
                 s2m[i >> 6] |= 1u64 << (i & 63);
-                matching += 1.0;
+                matching += 1;
                 break;
             }
         }
     }
 
-    if matching == 0.0 {
+    if matching == 0 {
         return 0.0;
     }
 
@@ -309,28 +350,37 @@ fn set_bits(words: &[u64]) -> impl Iterator<Item = usize> + '_ {
 /// (both sides hold the same number of matches, so every match is paired) and
 /// returns the transposition count under this module's convention: half the
 /// differing pairs, rounded up (see [`jaro_winkler`]).
-fn count_transpositions<T: PartialEq>(left: &[T], right: &[T], s1m: &[u64], s2m: &[u64]) -> f32 {
+fn count_transpositions<T: PartialEq>(left: &[T], right: &[T], s1m: &[u64], s2m: &[u64]) -> usize {
     let out_of_order = set_bits(s2m)
         .zip(set_bits(s1m))
         .filter(|&(i, j)| right[i] != left[j])
         .count();
-    out_of_order.div_ceil(2) as f32
+    out_of_order.div_ceil(2)
 }
 
-fn winkler<T: PartialEq>(matching: f32, transpositions: f32, left: &[T], right: &[T]) -> f32 {
-    let jaro = (matching / (left.len() as f32)
-        + matching / (right.len() as f32)
-        + (matching - transpositions) / matching)
-        / 3.0;
+fn winkler<T: PartialEq>(matching: usize, transpositions: usize, left: &[T], right: &[T]) -> f32 {
+    let jaro = jaro(matching, transpositions, left.len(), right.len());
 
     let prefix_length = left
         .iter()
         .zip(right)
         .take(4)
         .take_while(|(l, r)| l == r)
-        .count() as f32;
+        .count() as f64;
 
-    jaro + prefix_length * 0.1 * (1.0 - jaro)
+    (jaro + prefix_length * 0.1 * (1.0 - jaro)) as f32
+}
+
+/// The Jaro similarity from the match and transposition counts.
+///
+/// The counts stay integers until here: an `f32` counter stops growing at
+/// 2^24, which on longer inputs would let the transpositions outgrow the
+/// matches and push the score below zero. The arithmetic is done in `f64` so
+/// lengths beyond 2^24 are still represented exactly.
+fn jaro(matching: usize, transpositions: usize, s1_len: usize, s2_len: usize) -> f64 {
+    debug_assert!(0 < matching && transpositions <= matching);
+    let m = matching as f64;
+    (m / s1_len as f64 + m / s2_len as f64 + (matching - transpositions) as f64 / m) / 3.0
 }
 
 fn matching_distance(s1_len: usize, s2_len: usize) -> usize {
@@ -544,6 +594,10 @@ mod tests {
             ("public", jaro_winkler(a, b)),
             ("chars", jaro_winkler_chars(&a_chars, &b_chars)),
             ("long_chars", forced(&a_chars, &b_chars, jaro_winkler_long)),
+            (
+                "long_chars_usize",
+                forced(&a_chars, &b_chars, jaro_winkler_long_with::<usize>),
+            ),
         ];
         if short {
             scores.push((
@@ -618,9 +672,9 @@ mod tests {
         let mut swapped = left.clone();
         swapped.swap(100, 101);
         let swapped_str: String = swapped.iter().collect();
-        let m = N as f32;
+        let m = N as f64;
         let jaro = (m / m + m / m + (m - 1.0) / m) / 3.0;
-        let expected = jaro + 4.0 * 0.1 * (1.0 - jaro);
+        let expected = (jaro + 4.0 * 0.1 * (1.0 - jaro)) as f32;
         assert_eq!(jaro_winkler(&left_str, &swapped_str), expected);
         assert_eq!(jaro_winkler(&swapped_str, &left_str), expected);
 
@@ -647,6 +701,38 @@ mod tests {
             "scrambled",
         );
         assert_paths_agree(&head, &scrambled_str);
+    }
+
+    /// The long Unicode path indexes only chars of `left` that occur in
+    /// `right`: a long low-cardinality string against a pattern sharing none
+    /// of its chars scores zero without indexing anything, and partial overlap
+    /// still matches the reference.
+    #[test]
+    fn long_unicode_indexes_only_matchable_chars() {
+        let long = "é".repeat(10_000);
+        assert_eq!(jaro_winkler(&long, "a"), 0.0);
+        assert_eq!(jaro_winkler("a", &long), 0.0);
+
+        let mixed: String = "éaø日".repeat(100);
+        for pattern in ["aé", "日", "xø", "zzz日é"] {
+            assert_close(
+                jaro_winkler(&mixed, pattern),
+                jaro_winkler_reference(&mixed, pattern),
+                pattern,
+            );
+            assert_paths_agree(&mixed, pattern);
+        }
+    }
+
+    /// Counts beyond 2^24, where an `f32` counter stops growing. With half
+    /// the matches transposed the Jaro score is (1 + 1 + 0.5) / 3; a counter
+    /// stuck at 2^24 against an integer transposition count went negative.
+    #[test]
+    fn jaro_is_exact_beyond_f32_counter_range() {
+        let n = 1usize << 26;
+        let score = jaro(n, n / 2, n, n);
+        assert!((score - 2.5 / 3.0).abs() < 1e-12, "got {score}");
+        assert!(jaro(n, n, n, n) > 0.0);
     }
 
     /// Two strings of the same length drawn from `alphabet`, so the input
