@@ -87,6 +87,20 @@ fn interner() -> &'static Interner {
     test_pool::installed().unwrap_or(&GLOBAL_INTERNER)
 }
 
+/// [`interner`] if it exists yet, without creating it: for the counts `INFO` reads, which must
+/// never run the pool's initializer (see [`InternedString::interned_count`]).
+#[cfg(not(test))]
+fn interner_if_created() -> Option<&'static Interner> {
+    LazyLock::get(&GLOBAL_INTERNER)
+}
+
+/// [`interner`] if it exists yet, without creating it: the thread's private pool if it installed
+/// one, else the process-wide one once created.
+#[cfg(test)]
+fn interner_if_created() -> Option<&'static Interner> {
+    test_pool::installed().or_else(|| LazyLock::get(&GLOBAL_INTERNER))
+}
+
 /// Per-test string pools.
 ///
 /// The pool is process-wide, and ~1400 other tests intern concurrently with any one test, so
@@ -930,15 +944,19 @@ impl InternedString {
 
     /// Entries in the pool. Includes an entry whose last holder has dropped it while its
     /// removal is in flight, which [`Self::get_stats`] skips, so the two can briefly disagree.
+    ///
+    /// Zero before the first string is interned: it never creates the pool, so `INFO` can read
+    /// it into a crash report even if the faulting thread was creating the pool at the time.
     pub fn interned_count() -> usize {
-        interner().pool.len()
+        interner_if_created().map_or(0, |interner| interner.pool.len())
     }
 
     /// Header-plus-payload bytes of the entries in the pool, counted as
     /// [`Self::interned_count`] counts them. Excludes the map's own tables, allocator
-    /// rounding, and removed entries whose memory papaya has not reclaimed yet.
+    /// rounding, and removed entries whose memory papaya has not reclaimed yet. Like
+    /// [`Self::interned_count`], it never creates the pool.
     pub fn memory_used() -> usize {
-        interner().memory_used.load(Ordering::Relaxed)
+        interner_if_created().map_or(0, |interner| interner.memory_used.load(Ordering::Relaxed))
     }
 
     /// Collect statistics about the interned string pool, including the top `k`

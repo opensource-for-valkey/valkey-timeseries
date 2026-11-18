@@ -5,15 +5,16 @@
 //! `register` function that registers each with its help text and unit. Where the code
 //! already keeps the value, the registry reads that state directly: a std atomic is a metered
 //! counter or gauge as it stands, and an executor's own counts are read through a closure.
-//! `TS._DEBUG METRICS` reports from the registries, and so does `INFO ts_blocked_read` (one section's
-//! mirror, see `common::module_info`); so will the `INFO ts_stats` mirror and any OpenMetrics
-//! export. The design and the roster of planned metrics are in
-//! `docs/plans/observability-metrics-plan.md`.
+//! `TS._DEBUG METRICS` reports from the registries, and so does `INFO`: every section but
+//! `clustermap` and `exec` is mirrored as an `INFO ts_<section>` of its own (`ts_rdb`,
+//! `ts_blocked_read`, `ts_string_interning`, `ts_task`, `ts_asm`, `ts_index_reconciliation`,
+//! `ts_fanout`, `ts_chunk`), counters and gauges only, without the `METRICS RESET` baseline (see
+//! `common::module_info`).
 //!
 //! Collection is always on: a counter is one relaxed atomic add, a histogram observation a
-//! bucket search, an atomic add and a compare-and-swap on the sum. Only the read surface is
-//! gated (by `debug-mode`, like the rest of `TS._DEBUG`), so the history is there when an
-//! operator turns it on.
+//! bucket search, an atomic add and a compare-and-swap on the sum. `TS._DEBUG METRICS` is gated
+//! by `debug-mode`, like the rest of `TS._DEBUG`, so the history is there when an operator turns
+//! it on; the `INFO` mirrors are not gated.
 //!
 //! Naming follows OpenMetrics, as metered renders it: a counter is registered without its
 //! `_total` suffix, which its sample name gains, and a duration is a histogram in seconds.
@@ -27,8 +28,13 @@
 //!
 //! Metrics are node-local. Two rules keep them honest:
 //!
-//! - Reading a metric must not walk the keyspace or the index. A gauge is a load, or a call
-//!   that is itself O(1).
+//! - Reading a metric must not walk the keyspace or the index, take a lock, or initialize
+//!   anything lazily. A gauge is a load, or a lock-free call that is itself O(1): `INFO` reads
+//!   the mirrored sections into the server's crash report, on a thread that may hold any of the
+//!   module's locks, or may have faulted inside a `LazyLock`'s initializer, which waits forever
+//!   if the same thread forces it again. A gauge over a lazily created structure reads it with
+//!   `LazyLock::get`, reporting what an empty one would; the crash report reads the registries
+//!   themselves only once built, which module init does ([`init`], [`current_if_built`]).
 //! - Nothing may be counted in a forked child (`rdb_save`, the index aux save, `aof_rewrite`)
 //!   through an ordinary static: the parent never sees it. Count on the receiving side instead,
 //!   or in memory shared with the child, as the `rdb` save counters are (see [`rdb`]).
@@ -47,7 +53,7 @@ pub mod task;
 use crate::common::sync::lock;
 use metered::{
     Bucket, BucketHistogram, Buckets, HistogramData, HistogramSnapshot, MetricSampleValue,
-    MetricType, MetricValues, Registry, Scalar, Unit,
+    MetricSchema, MetricType, Registry, Scalar, Unit,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -205,11 +211,27 @@ fn build_registry(section: Section) -> Registry<'static> {
     registry
 }
 
+/// A section's registry and its schema. Nothing registers after the registry is built, so the
+/// schema is built once with it rather than on every read.
+struct SectionRegistry {
+    section: Section,
+    registry: Registry<'static>,
+    schema: MetricSchema,
+}
+
 /// Every section's registry, in [`Section::ALL`] order.
-static REGISTRIES: LazyLock<Vec<(Section, Registry<'static>)>> = LazyLock::new(|| {
+static REGISTRIES: LazyLock<Vec<SectionRegistry>> = LazyLock::new(|| {
     Section::ALL
         .iter()
-        .map(|&section| (section, build_registry(section)))
+        .map(|&section| {
+            let registry = build_registry(section);
+            let schema = registry.schema();
+            SectionRegistry {
+                section,
+                registry,
+                schema,
+            }
+        })
         .collect()
 });
 
@@ -254,7 +276,8 @@ pub struct MetricReading {
     pub name: String,
     pub section: Section,
     pub kind: MetricKind,
-    pub help: String,
+    /// Borrowed from the section's schema, so a read (`INFO` discards it) copies nothing.
+    pub help: &'static str,
     /// Whether the family's declared unit is bytes.
     pub is_bytes: bool,
     pub value: MetricValue,
@@ -277,14 +300,6 @@ impl MetricReading {
     }
 }
 
-fn sample_value(values: &MetricValues, name: &str) -> Option<MetricSampleValue> {
-    values
-        .samples()
-        .iter()
-        .find(|sample| sample.name == name)
-        .map(|sample| sample.value)
-}
-
 fn to_scalar(value: MetricSampleValue) -> Scalar {
     match value {
         MetricSampleValue::Int(v) => Scalar::Int(v),
@@ -303,10 +318,17 @@ fn to_u64(value: MetricSampleValue) -> u64 {
 
 /// Reads one registry's metrics as metered reports them, before any baseline, sorted by family
 /// name (the order of metered's schema, and of its OpenMetrics output).
-fn read_registry(section: Section, registry: &Registry<'static>) -> Vec<MetricReading> {
-    let schema = registry.schema();
-    let values = registry.values();
-    schema
+fn read_registry(entry: &'static SectionRegistry) -> Vec<MetricReading> {
+    let values = entry.registry.values();
+    // Samples come in registration order, families by name: index the samples once rather than
+    // scan them per family. The first sample of a name wins, as a scan would find it.
+    let mut samples = HashMap::with_capacity(values.samples().len());
+    for sample in values.samples() {
+        samples.entry(sample.name.as_str()).or_insert(sample.value);
+    }
+    let sample_value = |name: &str| samples.get(name).copied();
+    entry
+        .schema
         .families()
         .iter()
         .filter_map(|family| {
@@ -314,11 +336,11 @@ fn read_registry(section: Section, registry: &Registry<'static>) -> Vec<MetricRe
             let (name, value) = match kind {
                 MetricKind::Counter => {
                     let name = format!("{}_total", family.name);
-                    let value = to_u64(sample_value(&values, &name)?);
+                    let value = to_u64(sample_value(&name)?);
                     (name, MetricValue::Counter(value))
                 }
                 MetricKind::Gauge => {
-                    let value = to_scalar(sample_value(&values, &family.name)?);
+                    let value = to_scalar(sample_value(&family.name)?);
                     (family.name.clone(), MetricValue::Gauge(value))
                 }
                 MetricKind::Histogram => {
@@ -337,13 +359,9 @@ fn read_registry(section: Section, registry: &Registry<'static>) -> Vec<MetricRe
             };
             Some(MetricReading {
                 name,
-                section,
+                section: entry.section,
                 kind,
-                help: family
-                    .help
-                    .as_ref()
-                    .map(|help| help.as_str().to_owned())
-                    .unwrap_or_default(),
+                help: family.help.as_ref().map_or("", |help| help.as_str()),
                 is_bytes: family.unit == Some(Unit::Bytes),
                 value,
             })
@@ -419,10 +437,43 @@ fn subtract_histogram(current: &HistogramSnapshot, base: &HistogramSnapshot) -> 
 /// `INFO` reports, since a scraper expects counters that never go backwards. Ordered as
 /// [`snapshot`].
 pub fn current(sections: &[Section]) -> Vec<MetricReading> {
-    REGISTRIES
+    read_sections(&REGISTRIES, sections)
+}
+
+/// Builds the registries now. Called from module init, so that a crash report — which must not
+/// build them itself (see [`current_if_built`]) — finds them built and carries the mirrored
+/// sections from the first command on, not only after the first `INFO`. Building them forces the
+/// duration histograms and registers the gauges' read closures; it runs no read and starts
+/// nothing, so it needs nothing initialized first but the save counters ([`rdb::init`]).
+pub fn init() {
+    LazyLock::force(&REGISTRIES);
+}
+
+/// [`current`] without building the registries: `None` until they are built, which module
+/// init does ([`init`]), so only a crash during that build or before it sees `None`.
+///
+/// For the crash report, which runs on the faulting thread: if that thread faulted while
+/// building the registries, forcing them again from the crash report would wait on its own
+/// initialization forever, and the report would never finish.
+pub fn current_if_built(sections: &[Section]) -> Option<Vec<MetricReading>> {
+    LazyLock::get(&REGISTRIES).map(|registries| read_sections(registries, sections))
+}
+
+/// Whether the registries exist yet, without building them or reading anything: the crash
+/// report's check before it opens a metrics section (see [`current_if_built`]). Once built
+/// they stay built, so a `true` holds for the read that follows.
+pub fn registries_built() -> bool {
+    LazyLock::get(&REGISTRIES).is_some()
+}
+
+fn read_sections(
+    registries: &'static [SectionRegistry],
+    sections: &[Section],
+) -> Vec<MetricReading> {
+    registries
         .iter()
-        .filter(|(section, _)| sections.is_empty() || sections.contains(section))
-        .flat_map(|(section, registry)| read_registry(*section, registry))
+        .filter(|entry| sections.is_empty() || sections.contains(&entry.section))
+        .flat_map(read_registry)
         .collect()
 }
 
@@ -442,8 +493,8 @@ pub fn snapshot(sections: &[Section]) -> Vec<MetricReading> {
 /// values underneath are left alone, and so are gauges.
 pub fn reset() {
     let mut baseline = Baseline::default();
-    for (section, registry) in REGISTRIES.iter() {
-        for reading in read_registry(*section, registry) {
+    for entry in REGISTRIES.iter() {
+        for reading in read_registry(entry) {
             baseline.record(reading);
         }
     }
@@ -453,13 +504,28 @@ pub fn reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use metered::MetricSchema;
     use std::sync::atomic::Ordering;
 
     fn schemas() -> impl Iterator<Item = (Section, MetricSchema)> {
         REGISTRIES
             .iter()
-            .map(|(section, registry)| (*section, registry.schema()))
+            .map(|entry| (entry.section, entry.registry.schema()))
+    }
+
+    /// Reads use the schema built with the registry; it must still describe the registry.
+    #[test]
+    fn cached_schemas_match_their_registries() {
+        let names = |schema: &MetricSchema| -> Vec<String> {
+            schema.families().iter().map(|f| f.name.clone()).collect()
+        };
+        for entry in REGISTRIES.iter() {
+            assert_eq!(
+                names(&entry.schema),
+                names(&entry.registry.schema()),
+                "{}",
+                entry.section.as_str()
+            );
+        }
     }
 
     fn reading(sections: &[Section], name: &str) -> MetricReading {
@@ -696,8 +762,23 @@ mod tests {
 
     #[test]
     fn registries_follow_section_order() {
-        let order: Vec<_> = REGISTRIES.iter().map(|(section, _)| *section).collect();
+        let order: Vec<_> = REGISTRIES.iter().map(|entry| entry.section).collect();
         assert_eq!(order, Section::ALL);
+    }
+
+    /// Once the registries exist, the non-forcing read sees the same families as [`current`].
+    /// (Whether they exist before that depends on which tests ran first, so only the built
+    /// case is pinned.)
+    #[test]
+    fn current_if_built_reads_the_built_registries() {
+        let names = |readings: Vec<MetricReading>| -> Vec<String> {
+            readings.into_iter().map(|reading| reading.name).collect()
+        };
+        init();
+        assert!(registries_built(), "init built the registries");
+        let forced = names(current(&[Section::Fanout]));
+        let built = current_if_built(&[Section::Fanout]).expect("current built the registries");
+        assert_eq!(names(built), forced);
     }
 
     /// Metered's own check: a declared unit must suffix the name, label names must be legal,

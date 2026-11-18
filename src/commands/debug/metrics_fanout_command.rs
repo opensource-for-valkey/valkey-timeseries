@@ -198,7 +198,7 @@ impl ClusterMetrics {
                 let section = Section::of_metric(&name);
                 let known = local.get(name.as_str());
                 ClusterReading {
-                    help: known.map(|r| r.help.clone()).unwrap_or_default(),
+                    help: known.map(|r| r.help.to_owned()).unwrap_or_default(),
                     is_bytes: known.is_some_and(|r| r.is_bytes),
                     section,
                     kind: value.kind(),
@@ -346,7 +346,7 @@ mod tests {
             name: name.to_owned(),
             section: Section::Fanout,
             kind,
-            help: format!("help for {name}"),
+            help: format!("help for {name}").leak(),
             is_bytes: false,
             value,
         }

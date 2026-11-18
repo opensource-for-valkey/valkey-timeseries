@@ -193,9 +193,11 @@ type InFlightRequestMap = HashMap<u64, InFlightRequest, BuildNoHashHasher<u64>>;
 
 static INFLIGHT_REQUESTS: LazyLock<InFlightRequestMap> = LazyLock::new(InFlightRequestMap::default);
 
-/// How many fanout RPCs have remote shares outstanding (`fanout_inflight`).
+/// How many fanout RPCs have remote shares outstanding (`fanout_inflight`). A sum of the map's
+/// striped counters, with no guard and without creating the map (zero before the first RPC):
+/// `INFO` reads it into a crash report, possibly on a thread that faulted while creating it.
 pub(crate) fn inflight_request_count() -> usize {
-    INFLIGHT_REQUESTS.pin().len()
+    LazyLock::get(&INFLIGHT_REQUESTS).map_or(0, |requests| requests.len())
 }
 
 /// One in-flight fanout RPC, as `TS._DEBUG INFLIGHT` reports it.
@@ -907,9 +909,12 @@ struct PeerRequestEntry {
     cancelled: Arc<AtomicBool>,
 }
 
-/// How many peer requests this node is serving, queued or running, writes included.
+/// How many peer requests this node is serving, queued or running, writes included. A sum of
+/// the map's striped counters, with no guard and without creating the map (zero before the
+/// first request): `INFO` reads it into a crash report, possibly on a thread that faulted while
+/// creating it.
 pub(crate) fn peer_request_count() -> usize {
-    PEER_REQUESTS.pin().len()
+    LazyLock::get(&PEER_REQUESTS).map_or(0, |requests| requests.len())
 }
 
 /// One peer request being served, as `TS._DEBUG PEER_REQUESTS VERBOSE` reports it.

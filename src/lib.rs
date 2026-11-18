@@ -193,6 +193,12 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
 
     init_thread_pool();
 
+    // Build the metric registries here, on the loading thread, so a crash report finds them
+    // built: it must never build them itself (it runs on the faulting thread, which may be the
+    // one building them), and would otherwise leave every mirrored section out until the first
+    // `INFO`. Needs only the save counters mapped above.
+    common::metrics::init();
+
     ctx.log_notice("valkey-timeseries module initialized");
     IS_MODULE_INITIALIZED.store(true, Ordering::Relaxed);
     Status::Ok

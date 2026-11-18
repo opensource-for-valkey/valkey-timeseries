@@ -4,13 +4,16 @@
 //!
 //! Module sections are emitted only for an explicit `INFO modules`, `INFO everything`, or
 //! `INFO <section>`; bare `INFO` and `INFO all` omit them. Section selection is checked before
-//! collecting data, so an index walk is needed only when the index section is requested.
+//! collecting data, so an index walk is needed only when the index section is requested. A crash
+//! report carries only the sections that are safe to read on a faulting thread (see
+//! [`InfoSection::crash_safe`]).
 
 use crate::common::humanize::bytes_to_human;
 use crate::common::metrics::{self, MetricValue, Section};
 use crate::series::index::index_memory_usage;
 use crate::series::{COMPACTION_FAILURES, COMPACTION_STATE_REBUILDS};
 use metered::Scalar;
+use std::sync::atomic::Ordering;
 use valkey_module::{
     InfoContext, InfoContextBuilderFieldBottomLevelValue as InfoValue, Status, ValkeyResult, raw,
 };
@@ -26,53 +29,25 @@ use valkey_module_macros::info_command_handler;
 ///
 /// Each `*_bytes` field, mirrored ones included, is followed by a `*_bytes_human` rendering of it
 /// (`1.21M`), formatted as the server formats `used_memory_human`.
+///
+/// On a crash the server calls this from its crash report, on the faulting thread, with every
+/// section selected. That thread may hold any lock the module has (an index's write lock, say),
+/// and a `std` lock taken again by its holder deadlocks: the report never finishes and the
+/// process hangs instead of exiting. So a crash report carries only the sections
+/// [`InfoSection::crash_safe`] admits, and of those only the ones it can read without
+/// initializing anything ([`InfoSection::readable_in_crash_report`]). A new section must be
+/// classified in both.
 #[info_command_handler]
-fn module_info(ctx: &InfoContext, _for_crash_report: bool) -> ValkeyResult<()> {
-    write_section(ctx, "index", || {
-        let index = index_memory_usage();
-        let mut fields = Vec::new();
-        // `index_bytes` is the sum of the four parts. It is a gauge, so `total` stays out of
-        // its name: OpenMetrics reserves that for counters.
-        for (name, bytes) in [
-            ("index_bytes", index.total_bytes()),
-            ("index_terms_bytes", index.terms_bytes),
-            ("index_postings_bytes", index.postings_bytes),
-            ("index_id_to_key_bytes", index.id_to_key_bytes),
-            ("index_bookkeeping_bytes", index.bookkeeping_bytes),
-        ] {
-            fields.push((name.to_owned(), (bytes as u64).into()));
-            fields.push((format!("{name}_human"), bytes_to_human(bytes as u64).into()));
+fn module_info(ctx: &InfoContext, for_crash_report: bool) -> ValkeyResult<()> {
+    for &section in SECTIONS {
+        if !section.emitted(for_crash_report) {
+            continue;
         }
-        for (name, count) in [
-            ("index_terms", index.term_count),
-            ("index_series", index.series_count),
-            ("index_databases", index.db_count),
-        ] {
-            fields.push((name.to_owned(), (count as u64).into()));
+        if for_crash_report && !section.readable_in_crash_report() {
+            continue;
         }
-        fields
-    })?;
-    write_section(ctx, "compaction", || {
-        vec![
-            (
-                "compaction_failures_total".to_owned(),
-                COMPACTION_FAILURES
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .into(),
-            ),
-            (
-                "compaction_state_rebuilds_total".to_owned(),
-                COMPACTION_STATE_REBUILDS
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .into(),
-            ),
-        ]
-    })?;
-
-    for &section in MIRRORED {
-        write_section(ctx, section.as_str(), || info_fields(section))?;
+        write_section(ctx, section.name(), || section.fields(for_crash_report))?;
     }
-
     Ok(())
 }
 
@@ -97,17 +72,144 @@ fn write_section(
     })
 }
 
-/// The `TS._DEBUG METRICS` sections `INFO` mirrors, each as a section of its own.
-const MIRRORED: &[Section] = &[
-    Section::Rdb,
-    Section::Read,
-    Section::StringInterning,
-    Section::Task,
-    Section::Asm,
-    Section::IndexReconciliation,
-    Section::Fanout,
-    Section::Chunk,
+/// One of the module's `INFO` sections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InfoSection {
+    /// `ts_index`: the postings index's memory, from a walk of every database's index.
+    Index,
+    /// `ts_compaction`: compaction failures and state rebuilds.
+    Compaction,
+    /// A `TS._DEBUG METRICS` section, mirrored under its own name.
+    Metrics(Section),
+}
+
+/// Every section, in emission order.
+const SECTIONS: &[InfoSection] = &[
+    InfoSection::Index,
+    InfoSection::Compaction,
+    InfoSection::Metrics(Section::Rdb),
+    InfoSection::Metrics(Section::Read),
+    InfoSection::Metrics(Section::StringInterning),
+    InfoSection::Metrics(Section::Task),
+    InfoSection::Metrics(Section::Asm),
+    InfoSection::Metrics(Section::IndexReconciliation),
+    InfoSection::Metrics(Section::Fanout),
+    InfoSection::Metrics(Section::Chunk),
 ];
+
+impl InfoSection {
+    const fn name(self) -> &'static str {
+        match self {
+            InfoSection::Index => "index",
+            InfoSection::Compaction => "compaction",
+            InfoSection::Metrics(section) => section.as_str(),
+        }
+    }
+
+    /// Whether the section may go into a crash report: every value it reads is an atomic load,
+    /// or a sum over a fixed set of them, so it takes no lock, walks no structure, and
+    /// initializes nothing lazily — a `LazyLock` is a lock too, and the faulting thread may be
+    /// the one running its initializer. Allocating is allowed: the server's own crash report
+    /// allocates too.
+    ///
+    /// - `index` walks every database's postings under each index's read lock: not safe.
+    /// - `compaction`, `rdb`, `blocked_read`, `chunk`: plain counters and gauges.
+    /// - `task`, `asm`, `index_reconciliation`: counters and gauges, and duration histograms
+    ///   that metered snapshots with atomic loads (INFO leaves them out, but reads them). The
+    ///   histograms are forced when the registries are built, so reading them initializes nothing.
+    /// - `string_interning`: the pool's entry count (a sum of papaya's striped counters) and an
+    ///   atomic byte count, both read without creating the pool (zero before its first string).
+    /// - `fanout`: counters, and two map sizes read the same way, without a guard and without
+    ///   creating the maps.
+    /// - `clustermap`, `exec`: not mirrored, so not audited; not safe until they are.
+    ///
+    /// The mirrored metrics are read through metered's registry, which takes no lock either, and
+    /// only once it exists ([`Self::readable_in_crash_report`]).
+    const fn crash_safe(self) -> bool {
+        match self {
+            InfoSection::Index => false,
+            InfoSection::Compaction => true,
+            InfoSection::Metrics(section) => match section {
+                Section::Rdb
+                | Section::Read
+                | Section::Chunk
+                | Section::Task
+                | Section::Asm
+                | Section::IndexReconciliation
+                | Section::StringInterning
+                | Section::Fanout => true,
+                Section::Clustermap | Section::Exec => false,
+            },
+        }
+    }
+
+    /// Whether the section is emitted: always, except a crash report skips the unsafe ones.
+    const fn emitted(self, for_crash_report: bool) -> bool {
+        !for_crash_report || self.crash_safe()
+    }
+
+    /// Whether a crash report can read the section right now without initializing anything.
+    /// The metrics sections need the registries, which a crash report must not build. Module
+    /// init builds them ([`metrics::init`]), so this is `false` only for a crash during or before
+    /// that build, and the section is then left out. Once built they stay built, so a `true`
+    /// holds for [`Self::fields`].
+    fn readable_in_crash_report(self) -> bool {
+        match self {
+            InfoSection::Index | InfoSection::Compaction => true,
+            InfoSection::Metrics(_) => metrics::registries_built(),
+        }
+    }
+
+    fn fields(self, for_crash_report: bool) -> Vec<(String, InfoValue)> {
+        match self {
+            InfoSection::Index => index_fields(),
+            InfoSection::Compaction => compaction_fields(),
+            InfoSection::Metrics(section) if for_crash_report => {
+                // Never builds the registries; checked built before the section was opened.
+                info_fields_from(metrics::current_if_built(&[section]).unwrap_or_default())
+            }
+            InfoSection::Metrics(section) => info_fields(section),
+        }
+    }
+}
+
+fn index_fields() -> Vec<(String, InfoValue)> {
+    let index = index_memory_usage();
+    let mut fields = Vec::new();
+    // `index_bytes` is the sum of the four parts. It is a gauge, so `total` stays out of its
+    // name: OpenMetrics reserves that for counters.
+    for (name, bytes) in [
+        ("index_bytes", index.total_bytes()),
+        ("index_terms_bytes", index.terms_bytes),
+        ("index_postings_bytes", index.postings_bytes),
+        ("index_id_to_key_bytes", index.id_to_key_bytes),
+        ("index_bookkeeping_bytes", index.bookkeeping_bytes),
+    ] {
+        fields.push((name.to_owned(), (bytes as u64).into()));
+        fields.push((format!("{name}_human"), bytes_to_human(bytes as u64).into()));
+    }
+    for (name, count) in [
+        ("index_terms", index.term_count),
+        ("index_series", index.series_count),
+        ("index_databases", index.db_count),
+    ] {
+        fields.push((name.to_owned(), (count as u64).into()));
+    }
+    fields
+}
+
+fn compaction_fields() -> Vec<(String, InfoValue)> {
+    vec![
+        (
+            "compaction_failures_total".to_owned(),
+            COMPACTION_FAILURES.load(Ordering::Relaxed).into(),
+        ),
+        (
+            "compaction_state_rebuilds_total".to_owned(),
+            COMPACTION_STATE_REBUILDS.load(Ordering::Relaxed).into(),
+        ),
+    ]
+}
 
 /// A metrics section's `INFO` fields: each counter and gauge under its
 /// `TS._DEBUG METRICS` name, a byte metric followed by its `_human` rendering. Histograms are left
@@ -116,8 +218,13 @@ const MIRRORED: &[Section] = &[
 ///
 /// Returning plain data keeps the conversion testable without a server.
 fn info_fields(section: Section) -> Vec<(String, InfoValue)> {
+    info_fields_from(metrics::current(&[section]))
+}
+
+/// [`info_fields`] for readings already taken.
+fn info_fields_from(readings: Vec<metrics::MetricReading>) -> Vec<(String, InfoValue)> {
     let mut fields = Vec::new();
-    for reading in metrics::current(&[section]) {
+    for reading in readings {
         if let Some(value) = info_value(&reading.value) {
             fields.push((reading.name.clone(), value));
         }
@@ -148,6 +255,13 @@ mod tests {
     use super::*;
     use crate::common::metrics::MetricKind;
 
+    fn mirrored() -> impl Iterator<Item = Section> {
+        SECTIONS.iter().filter_map(|section| match *section {
+            InfoSection::Metrics(section) => Some(section),
+            _ => None,
+        })
+    }
+
     fn field_names(section: Section) -> Vec<String> {
         info_fields(section)
             .into_iter()
@@ -159,7 +273,7 @@ mod tests {
     /// byte metric; no histogram.
     #[test]
     fn info_section_mirrors_the_metrics_section() {
-        for &section in MIRRORED {
+        for section in mirrored() {
             let mut expected = Vec::new();
             for reading in metrics::current(&[section]) {
                 if reading.kind == MetricKind::Histogram {
@@ -194,5 +308,31 @@ mod tests {
                 "string_interning_strings"
             ]
         );
+    }
+
+    /// A plain `INFO` emits every section; a crash report leaves out the index walk, which takes
+    /// locks the faulting thread may hold.
+    #[test]
+    fn crash_report_skips_only_the_index_section() {
+        let emitted = |for_crash_report| -> Vec<_> {
+            SECTIONS
+                .iter()
+                .filter(|section| section.emitted(for_crash_report))
+                .map(|section| section.name())
+                .collect()
+        };
+        let all: Vec<_> = SECTIONS.iter().map(|section| section.name()).collect();
+        assert_eq!(emitted(false), all);
+        let crash = emitted(true);
+        assert_eq!(crash, all[1..]);
+        assert!(!crash.contains(&"index"));
+    }
+
+    #[test]
+    fn section_names_are_unique() {
+        let names: Vec<_> = SECTIONS.iter().map(|section| section.name()).collect();
+        for (i, name) in names.iter().enumerate() {
+            assert!(!names[..i].contains(name), "{name} listed twice");
+        }
     }
 }

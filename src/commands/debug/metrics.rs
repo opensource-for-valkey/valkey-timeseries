@@ -145,7 +145,7 @@ fn reply_metric_verbose(ctx: &Context, reading: &MetricReading) {
         reply_human_value(ctx, &reading.value);
     }
     reply_with_str(ctx, "description");
-    reply_with_bulk_string(ctx, &reading.help);
+    reply_with_bulk_string(ctx, reading.help);
 }
 
 /// Writes the cluster view in the same layout as a single node's reply (see [`metrics_cmd`]).
