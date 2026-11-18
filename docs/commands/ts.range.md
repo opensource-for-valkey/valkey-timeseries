@@ -304,6 +304,19 @@ TS.RANGE cpu:utilization 1609459200000 1609545600000 AGGREGATION countif>90,sumi
 - **invalid ALIGN** — Invalid alignment parameter
 - **invalid bucketDuration** — Bucket duration must be a positive integer
 
+## Complexity
+
+O(n/m + k) where:
+
+- n = number of samples in the series
+- m = number of samples per chunk
+- k = number of samples read
+
+Without `twa`, k is the number of samples in the range. With `twa`, k also counts the
+samples read outside the range to find the nearest real samples that pass the filters (see
+[Time-weighted average](#time-weighted-average)). That read stops at the second such sample on
+each side, or at the end of the series, so it is not limited by the range.
+
 ---
 
 ## See Also
