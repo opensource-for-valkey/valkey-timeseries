@@ -1,8 +1,6 @@
-mod deterministic_hasher;
 mod no_hash;
 mod stable_hasher;
 
-pub use deterministic_hasher::*;
 pub use no_hash::*;
 pub use stable_hasher::*;
 

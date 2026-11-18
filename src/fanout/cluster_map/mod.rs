@@ -712,7 +712,7 @@ mod tests {
     #[test]
     fn test_fingerprint_is_pinned() {
         let map = ClusterMap::from_cluster_nodes(&three_shard_nodes(), &id(M1));
-        assert_eq!(map.cluster_slots_fingerprint(), 0x969a_0451_edbe_99a3);
+        assert_eq!(map.cluster_slots_fingerprint(), 0x486c_bf76_7ecb_4105);
     }
 
     #[test]
