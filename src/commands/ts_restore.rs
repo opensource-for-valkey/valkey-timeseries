@@ -82,7 +82,7 @@ pub fn ts_restore_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     series._db = Some(db);
     series.key = key.as_slice().into();
 
-    let writable_key = ctx.open_key_writable(key);
+    let writable_key = ctx.open_key_writable(key)?;
     if !writable_key.is_empty() {
         // A value already exists for this key; treat the restore as authoritative and replace it.
         writable_key.delete()?;

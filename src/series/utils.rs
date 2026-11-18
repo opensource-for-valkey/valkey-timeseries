@@ -191,7 +191,7 @@ pub fn create_and_store_internal(
     options: TimeSeriesOptions,
     notify: bool,
 ) -> ValkeyResult<()> {
-    let _key = ValkeyKeyWritable::open(ctx.ctx, key);
+    let _key = ValkeyKeyWritable::open(ctx.ctx, key)?;
     // check if this refers to an existing series
     if !_key.is_empty() {
         return Err(ValkeyError::Str(error_consts::DUPLICATE_KEY));
@@ -384,7 +384,7 @@ fn add_default_compactions(
             ..base_config
         };
 
-        let value_key = ValkeyKeyWritable::open(ctx.ctx, &child_key);
+        let value_key = ValkeyKeyWritable::open(ctx.ctx, &child_key)?;
         if !value_key.is_empty() {
             // Not ours to write into (adopting it would accept input RTS rejects). Skipped on
             // every node alike — a replica applies no policy and receives no rule for it — so

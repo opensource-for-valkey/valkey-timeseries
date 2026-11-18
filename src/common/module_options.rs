@@ -8,7 +8,7 @@
 
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicI32, Ordering};
-use valkey_module::{Context, raw};
+use valkey_module::{Context, raw, raw::ModuleOptions};
 
 /// `VALKEYMODULE_OPTIONS_HANDLE_IO_ERRORS`.
 ///
@@ -17,21 +17,16 @@ use valkey_module::{Context, raw};
 /// module's bounds checks or error handling can run. With it, the failed read is recorded on
 /// the `RedisModuleIO` instead; `valkey_module::raw`'s load helpers check `is_io_error` after
 /// every read and surface a short-read `Err`, which the loaders propagate.
-pub const HANDLE_IO_ERRORS: c_int = 1 << 0;
+pub const HANDLE_IO_ERRORS: ModuleOptions = ModuleOptions::HANDLE_IO_ERRORS;
 
 /// `VALKEYMODULE_OPTIONS_HANDLE_ATOMIC_SLOT_MIGRATION`.
-pub const HANDLE_ATOMIC_SLOT_MIGRATION: c_int = 1 << 5;
-
-/// `VALKEYMODULE_OPTIONS_HANDLE_REPL_ASYNC_LOAD`, deliberately never declared.
 ///
-/// Without it, a replica configured for `repl-diskless-load swapdb` loads a full sync
-/// synchronously instead ("Skipping diskless-load because there are modules that are not aware
-/// of async replication"), and a synchronous load refuses every client command with `-LOADING`.
-/// So no client `RESTORE` can reach the series loader while the server loads its own data, which
-/// is what lets `LoadTrust::current` (`series::serialization`) tell an own payload from a foreign
-/// one by the load window alone. Declaring it would let a forged `RESTORE` on a writable replica
-/// load as the server's own data; the loader would first need to tell the two apart per call.
-pub const HANDLE_REPL_ASYNC_LOAD: c_int = 1 << 2;
+/// `valkey-module` names this flag only under its `min-valkey-compatibility-version-9-0`
+/// feature, which would raise the module's minimum server to 9.0; an 8.x server ignores the
+/// bit, so it is built from the header constant instead.
+pub const HANDLE_ATOMIC_SLOT_MIGRATION: ModuleOptions = ModuleOptions::from_bits_retain(
+    raw::VALKEYMODULE_OPTIONS_HANDLE_ATOMIC_SLOT_MIGRATION as c_int,
+);
 
 static DECLARED_OPTIONS: AtomicI32 = AtomicI32::new(0);
 
@@ -42,14 +37,22 @@ static DECLARED_OPTIONS: AtomicI32 = AtomicI32::new(0);
 /// concurrent callers could apply their masks in either order, and the server would keep
 /// whichever landed last.
 ///
+/// `HANDLE_REPL_ASYNC_LOAD` is deliberately never declared. Without it, a replica configured
+/// for `repl-diskless-load swapdb` loads a full sync synchronously instead ("Skipping
+/// diskless-load because there are modules that are not aware of async replication"), and a
+/// synchronous load refuses every client command with `-LOADING`. So no client `RESTORE` can
+/// reach the series loader while the server loads its own data, which is what lets
+/// `LoadTrust::current` (`series::serialization`) tell an own payload from a foreign one by the
+/// load window alone. Declaring it would let a forged `RESTORE` on a writable replica load as
+/// the server's own data; the loader would first need to tell the two apart per call.
+///
 /// # Panics
 ///
-/// On [`HANDLE_REPL_ASYNC_LOAD`]; see there. Every module load runs this, so any test catches it.
+/// On `HANDLE_REPL_ASYNC_LOAD`. Every module load runs this, so any test catches it.
 /// A debug build also panics if the module has finished loading.
-pub fn declare_module_options(ctx: &Context, flags: c_int) {
-    assert_eq!(
-        flags & HANDLE_REPL_ASYNC_LOAD,
-        0,
+pub fn declare_module_options(ctx: &Context, flags: ModuleOptions) {
+    assert!(
+        !flags.contains(ModuleOptions::HANDLE_REPL_ASYNC_LOAD),
         "HANDLE_REPL_ASYNC_LOAD would let client commands reach the series loader during a load"
     );
     debug_assert!(
@@ -57,17 +60,8 @@ pub fn declare_module_options(ctx: &Context, flags: c_int) {
         "module options are declared during module load only"
     );
     // Relaxed: every declaration runs on the one thread loading the module.
-    let previous = DECLARED_OPTIONS.fetch_or(flags, Ordering::Relaxed);
-    let combined = previous | flags;
-
-    // SAFETY: `ctx` is a live module context; the API pointer is checked before use because
-    // older servers may not export it.
-    unsafe {
-        let Some(set_opts) = raw::ValkeyModule_SetModuleOptions else {
-            ctx.log_notice("ValkeyModule_SetModuleOptions not available in raw bindings");
-            return;
-        };
-        set_opts(ctx.ctx as *mut raw::ValkeyModuleCtx, combined);
-    }
+    let previous = DECLARED_OPTIONS.fetch_or(flags.bits(), Ordering::Relaxed);
+    let combined = previous | flags.bits();
+    ctx.set_module_options(ModuleOptions::from_bits_retain(combined));
     ctx.log_notice(&format!("Declared module options: 0x{combined:x}"));
 }
