@@ -108,6 +108,14 @@ fn test_every_aggregation_type_round_trips() {
 }
 
 #[test]
+fn test_a_twa_aggregator_config_does_not_decode() {
+    let wire: FanoutAggregatorConfig = AggregatorConfig::new(AggregationType::Twa, None)
+        .unwrap()
+        .into();
+    assert!(AggregatorConfig::try_from(wire).is_err());
+}
+
+#[test]
 fn test_every_comparison_operator_round_trips() {
     for local in ALL_COMPARISON_OPERATORS {
         let wire: FanoutComparisonOperator = local.into();
@@ -280,22 +288,27 @@ fn any_value_comparison_filter() -> impl Strategy<Value = ValueComparisonFilter>
 /// condition it cannot use, so the filter is generated to match the aggregation
 /// type rather than independently of it.
 fn any_aggregator_config() -> impl Strategy<Value = AggregatorConfig> {
-    prop::sample::select(ALL_AGGREGATION_TYPES.as_slice()).prop_flat_map(|aggregation| {
-        let filter = any_value_comparison_filter();
-        if aggregation.is_filtered() {
-            // Condition required.
-            filter.prop_map(Some).boxed()
-        } else if aggregation.has_filtered_variant() {
-            // Condition optional.
-            prop::option::of(filter).boxed()
-        } else {
-            // Condition forbidden.
-            Just(None).boxed()
-        }
-        .prop_map(move |value_filter| {
-            AggregatorConfig::new(aggregation, value_filter).expect("strategy builds valid configs")
+    prop::sample::select(ALL_AGGREGATION_TYPES.as_slice())
+        .prop_filter("shards reject twa", |aggregation| {
+            *aggregation != AggregationType::Twa
         })
-    })
+        .prop_flat_map(|aggregation| {
+            let filter = any_value_comparison_filter();
+            if aggregation.is_filtered() {
+                // Condition required.
+                filter.prop_map(Some).boxed()
+            } else if aggregation.has_filtered_variant() {
+                // Condition optional.
+                prop::option::of(filter).boxed()
+            } else {
+                // Condition forbidden.
+                Just(None).boxed()
+            }
+            .prop_map(move |value_filter| {
+                AggregatorConfig::new(aggregation, value_filter)
+                    .expect("strategy builds valid configs")
+            })
+        })
 }
 
 /// A valid `AggregationOptions`. Aggregation types must be distinct — the
