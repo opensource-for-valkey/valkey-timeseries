@@ -2,8 +2,9 @@
 //!
 //! The server API takes the *complete* option bitmask on every call, so two independent
 //! call sites each passing their own flag leaves only whichever ran last. Declarations here
-//! are OR-ed into a process-wide mask and the full mask is re-applied, so the order in which
-//! subsystems declare their options does not matter.
+//! are OR-ed into a process-wide mask and the full mask is re-applied, so a later declaration
+//! keeps the earlier ones. That holds for declarations made one after another, which is what
+//! module load is; see [`declare_module_options`].
 
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -36,16 +37,27 @@ static DECLARED_OPTIONS: AtomicI32 = AtomicI32::new(0);
 
 /// Adds `flags` to the module's declared options and re-applies the accumulated mask.
 ///
+/// Module load only: the server runs the module's init on its main thread, so declarations
+/// never overlap. Accumulating and applying are two steps, not one atomic update; two
+/// concurrent callers could apply their masks in either order, and the server would keep
+/// whichever landed last.
+///
 /// # Panics
 ///
 /// On [`HANDLE_REPL_ASYNC_LOAD`]; see there. Every module load runs this, so any test catches it.
+/// A debug build also panics if the module has finished loading.
 pub fn declare_module_options(ctx: &Context, flags: c_int) {
     assert_eq!(
         flags & HANDLE_REPL_ASYNC_LOAD,
         0,
         "HANDLE_REPL_ASYNC_LOAD would let client commands reach the series loader during a load"
     );
-    let previous = DECLARED_OPTIONS.fetch_or(flags, Ordering::SeqCst);
+    debug_assert!(
+        !crate::is_module_initialized(),
+        "module options are declared during module load only"
+    );
+    // Relaxed: every declaration runs on the one thread loading the module.
+    let previous = DECLARED_OPTIONS.fetch_or(flags, Ordering::Relaxed);
     let combined = previous | flags;
 
     // SAFETY: `ctx` is a live module context; the API pointer is checked before use because

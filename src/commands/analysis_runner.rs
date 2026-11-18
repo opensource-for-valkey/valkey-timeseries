@@ -87,7 +87,7 @@ where
     let Some(blocked_client) = block_client(ctx) else {
         return Err(ValkeyError::Str(error_consts::CANNOT_BLOCK_CLIENT));
     };
-    slot.spawn(move || {
+    let queued = slot.spawn(move || {
         let thread_ctx = ThreadSafeReplyContext::with_blocked_client(blocked_client);
         if PANIC_NEXT_ANALYSIS_JOB.swap(false, Ordering::Relaxed) {
             panic!("TS._DEBUG PANIC_NEXT_ANALYSIS_JOB");
@@ -95,7 +95,10 @@ where
         job(&thread_ctx);
     });
 
-    // Answered later, from the analysis lane.
+    // Answered later, from the analysis lane. A job the lane refused was dropped unrun, and
+    // its blocked client answered with an error as it dropped; the client is blocked, so it
+    // must not be answered here as well.
+    let _ = queued;
     Ok(ValkeyValue::NoReply)
 }
 

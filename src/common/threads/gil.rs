@@ -147,15 +147,18 @@ pub fn holds_gil() -> bool {
 
 /// R3: the caller is about to block until another thread answers. Only a blocking thread or
 /// a blocking-pool worker may, and never while holding the GIL: whoever answers may need it.
+///
+/// An allowlist: a thread the module did not start and cannot characterize (`Other`, such as
+/// a server I/O thread) may block too, but a worker of a pool that did not declare a role
+/// (`ForeignPool`) may not, so a pool built without its `start_handler` is refused rather
+/// than let through.
 #[track_caller]
 pub fn check_may_block() {
-    let role = current_role();
-    if HOLDS_GIL.with(Cell::get)
-        || matches!(
-            role,
-            ThreadRole::Main | ThreadRole::SharedPool | ThreadRole::IsolatedPool
-        )
-    {
+    let may_block = matches!(
+        current_role(),
+        ThreadRole::Blocking | ThreadRole::BlockingPool | ThreadRole::Other
+    );
+    if HOLDS_GIL.with(Cell::get) || !may_block {
         violated(Rule::BlockingWait);
     }
 }
@@ -353,6 +356,30 @@ mod tests {
             .build()
             .unwrap();
         assert!(!blocking.install(|| panics(check_may_block)));
+    }
+
+    #[test]
+    fn workers_of_a_pool_without_a_role_may_not_block() {
+        // A pool built without a `start_handler`, like rayon's global pool.
+        let foreign = rayon_core::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        assert_eq!(foreign.install(current_role), ThreadRole::ForeignPool);
+        assert!(foreign.install(|| panics(check_may_block)));
+    }
+
+    #[test]
+    fn unstarted_threads_may_block_but_the_main_thread_may_not() {
+        // A test harness thread stands in for a server I/O thread.
+        std::thread::spawn(|| {
+            assert_eq!(current_role(), ThreadRole::Other);
+            check_may_block();
+            set_thread_role(ThreadRole::Main);
+            assert!(panics(check_may_block));
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

@@ -158,7 +158,9 @@ fn mrange_deferred(
         let rows = decode_snapshot_series(series, &options, &|| false)?;
         return reply_with_mrange_series_results(&ReplyContext::new(ctx.ctx), &rows, &shape);
     };
-    slot.spawn(move || {
+    // A job the lane refuses is dropped unrun, and its blocked client answers with an error as
+    // it drops; the client is blocked, so the command must not answer it as well.
+    let _ = slot.spawn(move || {
         let thread_ctx = ThreadSafeReplyContext::with_blocked_client(blocked_client);
         // A client that disconnects stops the decode: nobody would read the reply.
         let gone = thread_ctx.disconnected();
