@@ -1,7 +1,7 @@
 use crate::common::rdb::*;
 use crate::common::rounding::{MAX_DECIMAL_DIGITS, MAX_SIGNIFICANT_DIGITS, RoundingStrategy};
 use crate::common::{Sample, Timestamp};
-use crate::labels::MetricName;
+use crate::labels::{MetricName, SeriesLabel, check_label_nul};
 use crate::series::chunks::{
     Chunk, ChunkEncoding, ChunkOps, MAX_CHUNK_SIZE, MAX_LOADED_CHUNK_BYTES, MIN_CHUNK_SIZE,
     TimeSeriesChunk, validate_chunk_size,
@@ -288,6 +288,7 @@ pub(crate) const ROUNDING_DROPPED: &str = "rounding to zero significant digits d
 pub(crate) const NEGATIVE_TIMESTAMPS: &str = "negative timestamps";
 pub(crate) const CHUNKS_OUT_OF_ORDER: &str = "chunks out of order";
 pub(crate) const UNDECODABLE_STRAYS_KEPT: &str = "undecodable chunks of another encoding kept";
+pub(crate) const LABEL_NUL_KEPT: &str = "label with a NUL byte kept";
 pub(crate) const STALE_RULE_STATE_CLEARED: &str = "compaction state without an open bucket cleared";
 pub(crate) const OFF_GRID_BUCKET_REBUILT: &str =
     "compaction bucket off its grid marked for rebuild";
@@ -313,6 +314,7 @@ pub(crate) const OFF_GRID_BUCKET_REBUILT: &str =
 /// | Rounding digits outside what `DECIMAL_DIGITS`/`SIGNIFICANT_DIGITS` accept | refused | clamped to 16; zero significant digits dropped |
 /// | Negative timestamps | refused | loaded as they are |
 /// | Chunks out of order or overlapping | refused | loaded as they are |
+/// | A label name or value containing a NUL byte | refused | loaded as it is; the index skips a clashing posting |
 /// | A rule's aggregator state with no open bucket | cleared | cleared |
 /// | A rule's open bucket off its grid | marked `dirty`, rebuilt by the next write | marked `dirty`, rebuilt by the next write |
 ///
@@ -426,6 +428,20 @@ pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<
                 Some(RoundingStrategy::DecimalDigits(MAX_DECIMAL_DIGITS))
             }
         };
+    }
+
+    if let Some(label) = ts
+        .labels
+        .iter()
+        .find(|label| check_label_nul(label.name().as_bytes(), label.value().as_bytes()).is_err())
+    {
+        refuse(format!(
+            "label {:?} has a NUL byte in its name or value",
+            label.name()
+        ))?;
+        // An older build stored it, so it is kept as written. The label index skips a posting
+        // whose key would be a prefix of another (`Postings`), so the radix tree stays sound.
+        repairs.tolerate(LABEL_NUL_KEPT);
     }
 
     let mut prev_last: Option<Timestamp> = None;

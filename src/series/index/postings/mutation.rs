@@ -21,6 +21,21 @@ pub(crate) struct BulkIndexEntry {
     pub label_keys: Vec<IndexKey>,
 }
 
+/// A label key that would be a prefix of another, or have one as its prefix, is left out of the
+/// index. `IndexKey` is NUL-terminated, so that needs a NUL inside a label value: no write
+/// accepts one (`check_label_nul`), and a foreign load refuses it, but an own RDB written by an
+/// older build may still carry one. blart's infallible `entry`/`insert` would reach
+/// `unwrap_unchecked` on such a key (undefined behavior), so every live insert goes through
+/// `try_entry` and the clashing posting is dropped: the series stays readable by key and by its
+/// other labels, and only a filter on that one value misses it.
+fn skip_prefix_clash(key: &[u8]) {
+    log_warning(format!(
+        "label index: skipped key {:?}, which would be a prefix of another key or have one \
+         as its prefix (a label value with a NUL byte)",
+        String::from_utf8_lossy(key)
+    ));
+}
+
 impl Postings {
     pub(super) fn remove_posting_for_label_value(
         &mut self,
@@ -57,16 +72,20 @@ impl Postings {
         value: &str,
     ) -> bool {
         let key = IndexKey::for_label_value(label, value);
-        match self.label_index.entry(key) {
-            ARTEntry::Occupied(mut entry) => {
+        match self.label_index.try_entry(key) {
+            Ok(ARTEntry::Occupied(mut entry)) => {
                 entry.get_mut().add(ts_id);
                 false
             }
-            ARTEntry::Vacant(entry) => {
+            Ok(ARTEntry::Vacant(entry)) => {
                 let mut bitmap = PostingsBitmap::new();
                 bitmap.add(ts_id);
                 entry.insert(bitmap);
                 true
+            }
+            Err(e) => {
+                skip_prefix_clash(&e.byte_repr);
+                false
             }
         }
     }
@@ -135,13 +154,14 @@ impl Postings {
     }
 
     fn add_many_for_key(&mut self, key: IndexKey, ids: &[SeriesRef]) {
-        match self.label_index.entry(key) {
-            ARTEntry::Occupied(mut entry) => entry.get_mut().add_many(ids),
-            ARTEntry::Vacant(entry) => {
+        match self.label_index.try_entry(key) {
+            Ok(ARTEntry::Occupied(mut entry)) => entry.get_mut().add_many(ids),
+            Ok(ARTEntry::Vacant(entry)) => {
                 let mut bitmap = PostingsBitmap::new();
                 bitmap.add_many(ids);
                 entry.insert(bitmap);
             }
+            Err(e) => skip_prefix_clash(&e.byte_repr),
         }
     }
 
@@ -214,6 +234,36 @@ mod tests {
     use crate::series::index::postings::Postings;
 
     type SeriesSpec = (SeriesRef, String, Vec<(String, String)>);
+
+    /// `b` and `b\0c` give the keys `a=b\0` and `a=b\0c\0`, the first a prefix of the
+    /// second. The write path refuses such a value and a foreign load refuses it, but an own
+    /// load tolerates it, so the index must keep the radix tree prefix-free by itself rather
+    /// than reach blart's `unwrap_unchecked` (undefined behavior) on the conflicting insert.
+    #[test]
+    fn prefix_related_label_values_are_skipped_not_inserted() {
+        for (first, second) in [("b", "b\0c"), ("b\0c", "b")] {
+            let mut postings = Postings::default();
+            assert!(postings.add_posting_for_label_value(1, "a", first));
+            // The conflicting key is skipped: no new posting list, and no abort.
+            assert!(!postings.add_posting_for_label_value(2, "a", second));
+
+            let key = IndexKey::for_label_value("a", first);
+            let kept = postings.label_index.get(&key).expect("first posting kept");
+            assert!(
+                kept.contains(1) && !kept.contains(2),
+                "{first:?}/{second:?}"
+            );
+            assert_eq!(postings.label_index.len(), 1, "{first:?}/{second:?}");
+
+            // The same rule on the bulk path.
+            let mut bulk = Postings::default();
+            bulk.bulk_index(vec![
+                make_bulk_entry(1, "k1", &[("a", first)]),
+                make_bulk_entry(2, "k2", &[("a", second)]),
+            ]);
+            assert_eq!(bulk.label_index.len(), 1, "bulk {first:?}/{second:?}");
+        }
+    }
 
     #[test]
     fn test_bulk_index_matches_per_key_indexing() {

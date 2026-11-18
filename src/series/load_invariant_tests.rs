@@ -7,13 +7,14 @@
 
 use crate::common::rounding::RoundingStrategy;
 use crate::common::{Sample, Timestamp};
+use crate::labels::{Label, MetricName};
 use crate::series::chunks::{
     Chunk, ChunkEncoding, ChunkOps, MAX_CHUNK_SIZE, MAX_LOADED_CHUNK_BYTES, SampleCodec,
     TimeSeriesChunk, XorChunk,
 };
 use crate::series::serialization::{
-    BUDGET_CLAMPED, CHUNK_SIZE_CLAMPED, CHUNKS_OUT_OF_ORDER, ENCODING_ADOPTED, LoadTrust,
-    NEGATIVE_TIMESTAMPS, OFF_GRID_BUCKET_REBUILT, OVERSIZED_SPLIT, RETENTION_CLAMPED,
+    BUDGET_CLAMPED, CHUNK_SIZE_CLAMPED, CHUNKS_OUT_OF_ORDER, ENCODING_ADOPTED, LABEL_NUL_KEPT,
+    LoadTrust, NEGATIVE_TIMESTAMPS, OFF_GRID_BUCKET_REBUILT, OVERSIZED_SPLIT, RETENTION_CLAMPED,
     ROUNDING_CLAMPED, ROUNDING_DROPPED, STALE_RULE_STATE_CLEARED, STRAYS_REENCODED,
     UNDECODABLE_STRAYS_KEPT, check_series_invariants, drop_empty_chunks, normalize_series,
 };
@@ -854,5 +855,47 @@ fn a_backfill_into_the_middle_of_a_chunk_keeps_it_in_budget() {
             apply(&mut ts, 0, &op);
         }
         assert_loadable(&ts);
+    }
+}
+
+/// No write accepts a NUL inside a label name or value: the label index's keys are NUL-terminated,
+/// so such a value can make one key a prefix of another, and RTS truncates either at the NUL. A
+/// foreign payload carrying one is refused. An own load keeps the label (an older build stored
+/// it) and tolerates it; the index then skips a posting that would break the radix tree.
+#[test]
+fn a_nul_in_a_label_is_refused_foreign_and_tolerated_own() {
+    for (labels, what) in [
+        (
+            [Label::new("host", "a"), Label::new("tag", "b\0c")],
+            "value",
+        ),
+        ([Label::new("host", "a"), Label::new("t\0g", "b")], "name"),
+    ] {
+        let mut ts = loaded_base(ChunkEncoding::Chimp);
+        ts.labels = MetricName::from(&labels[..]);
+
+        let err = normalize_series(&mut ts.clone(), LoadTrust::Foreign).unwrap_err();
+        assert!(err.contains("NUL"), "{what}: {err}");
+
+        let repairs = normalize_series(&mut ts, LoadTrust::Own).unwrap();
+        assert_eq!(repairs.tolerated, [LABEL_NUL_KEPT], "{what}");
+        assert!(repairs.repaired.is_empty(), "{what}");
+        assert_eq!(
+            ts.labels.get_value(&labels[1].name),
+            Some(labels[1].value.as_str()),
+            "{what}: the label is kept"
+        );
+    }
+
+    // Labels without a NUL load unchanged on both.
+    let mut clean = loaded_base(ChunkEncoding::Chimp);
+    clean.labels = MetricName::from(&[Label::new("t\u{1}g", "b=c\u{1}")][..]);
+    for trust in [LoadTrust::Foreign, LoadTrust::Own] {
+        assert!(
+            normalize_series(&mut clean.clone(), trust)
+                .unwrap()
+                .is_empty(),
+            "{trust:?}"
+        );
     }
 }

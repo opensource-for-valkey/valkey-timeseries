@@ -53,7 +53,10 @@ exactly once. `TS.INFO` reports the series' `metric` in this same form, so it ca
 Label name-value pairs for the series. Names and values must be non-empty, and a name must not
 contain `=` (`TSDB: label name must not contain '='`): no filter could select such a label.
 Values may contain `=`. RedisTimeSeries stores such
-names; see [COMPATIBILITY.md](../../COMPATIBILITY.md) (DIV-0063).
+names; see [COMPATIBILITY.md](../../COMPATIBILITY.md) (DIV-0063). Neither a name nor a value may
+contain a NUL byte (`TSDB: label name must not contain a NUL byte`, `TSDB: label value must not
+contain a NUL byte`, DIV-0068), whether it comes from `LABELS` or from an escape such as `\x00` in
+`METRIC`.
 
 When the labels include `__name__` (including via `METRIC`), the series is identified by its
 full label set, as in Prometheus: creating a second series with exactly the same labels fails

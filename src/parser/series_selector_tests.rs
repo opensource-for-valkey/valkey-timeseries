@@ -109,6 +109,33 @@ mod tests {
         assert_eq!(result.unwrap_err().to_string(), "Empty series selector");
     }
 
+    /// DIV-0068: no stored label name holds a NUL, and RTS fails to parse a filter whose label
+    /// name holds one, so a matcher naming one is a parse error here too — in the RTS form and
+    /// in the Prometheus form, where a quoted name decodes `\x00`. A NUL in a *value* still
+    /// parses (it can only match nothing).
+    #[test]
+    fn test_nul_in_a_matcher_label_name_is_rejected() {
+        for input in [
+            "a\0b=v",
+            "a\0b!=v",
+            "a\0b=(v,w)",
+            r#"{"a\x00b"="v"}"#,
+            r#"cpu{"a\x00b"=~"v.*"}"#,
+            r#"{x="1" or "a\x00b"="v"}"#,
+        ] {
+            assert!(
+                matches!(
+                    parse_series_selector(input),
+                    Err(ParseError::NulInLabelName)
+                ),
+                "{input:?}"
+            );
+        }
+        for input in ["a=b\0c", r#"{a="b\x00c"}"#, r#"{"a\x01b"="v"}"#] {
+            assert!(parse_series_selector(input).is_ok(), "{input:?}");
+        }
+    }
+
     #[test]
     fn test_regex_matcher_with_trailing_token_returns_parse_error() {
         let result = parse_series_selector(r#"{job=~"prometheus" unexpected}"#);

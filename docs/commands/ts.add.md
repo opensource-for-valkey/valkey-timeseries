@@ -34,7 +34,7 @@ TS.ADD key timestamp value
 | `ENCODING <COMPRESSED\|UNCOMPRESSED>`       | Chunk encoding format                                                                                                         | `COMPRESSED`            |
 | `CHUNK_SIZE chunkSize`                      | Size of memory chunks (bytes, must be multiple of 8, range `[4096..134217728]`, supports units: `kb`, `Ki`, `mb`, `Mi`, etc.) | `4096`                  |
 | `METRIC metric`                             | Metric name (alternative to `LABELS` for simple metric identification)                                                        | —                       |
-| `LABELS labelName labelValue ...`           | Labels for a newly created series (even number of arguments; names must not contain `=`); ignored if the series exists        | —                       |
+| `LABELS labelName labelValue ...`           | Labels for a newly created series (even number of arguments; names must not contain `=`, and names and values must not contain a NUL byte); ignored if the series exists        | —                       |
 | `IGNORE ignoreMaxTimediff ignoreMaxValDiff` | Ignore samples within `ignoreMaxTimediff` (ms) and `ignoreMaxValDiff` threshold                                               | No filtering            |
 | `SIGNIFICANT_DIGITS significantDigits`      | Round values to N significant digits (1-16; see note below)                                                                   | No rounding             |
 | `DECIMAL_DIGITS decimalDigits`              | Round values to N decimal places (0-16; `0` rounds to whole numbers); `none` turns rounding off                               | No rounding             |

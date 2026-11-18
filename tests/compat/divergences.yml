@@ -1494,3 +1494,38 @@
     Pinned by TestValueValidation::test_compaction_policy_duration_superset.
   since: 0.1.0
 
+# DIV-0068 came with the label NUL check on the write path. Reference behavior was observed
+# black-box against the pinned redis:8.10 image (2026-11-18): `TS.CREATE k LABELS a "b\0c"` and
+# `LABELS "a\0b" v` succeed and TS.INFO returns the bytes as given, but TS.QUERYINDEX `a=b` matches
+# the first and `a=v` the second (the index cuts both at the NUL), `a=b\0c` is read as `a=b`, and a
+# filter naming `a\0b` fails with "TSDB: failed parsing labels".
+#
+# ⚠️ `behavior`-kind: owner sign-off 2026-11-18 — rejection chosen over escaping the index key,
+# for names as well as values.
+
+- id: DIV-0068
+  command: TS.CREATE
+  kind: behavior
+  documentation_only: true
+  description: >
+    A label name or value containing a NUL byte is rejected ("TSDB: label name must not contain
+    a NUL byte" / "TSDB: label value must not contain a NUL byte") by every command that applies
+    LABELS or METRIC — TS.CREATE, TS.ALTER, and TS.ADD, TS.INCRBY, TS.DECRBY when they create the
+    series — by TS.ADDBULK, and by RESTORE. RTS 8.10 stores it, but its label index cuts names
+    and values at the first NUL, so `a=b` matches a series labelled `a=b\0c`. A FILTER naming a
+    label that contains a NUL is a parse error on both engines; a NUL in a filter value matches
+    nothing here and is cut at the NUL on RTS.
+  rationale: >
+    Accepted (owner sign-off 2026-11-18). The label index keys `name=value` with a NUL terminator
+    so that no key is a prefix of another, which its radix tree requires; a value holding a NUL
+    breaks that (`b` beside `b\0c`), and the tree's insert then reaches undefined behavior.
+    Names are refused too: RTS's own index truncates them and rejects a filter naming one, so no
+    query could rely on them. Escaping inside the key would keep RTS's storage behavior but not its
+    truncating index, and change every index-key reader; rejecting is a visible error where RTS
+    gives inconsistent answers. Stricter input, so `ts-compatibility-mode strict` does not relax
+    it. An own RDB/AOF load tolerates such a label (counted), and the index skips a posting that
+    would clash. Pinned by TestTimeSeriesBasic::test_label_values_containing_nul_are_rejected,
+    TestTimeSeriesBasic::test_label_names_containing_nul_are_rejected,
+    TestTimeSeriesBasic::test_filters_naming_a_label_with_nul_are_rejected and
+    TestRestoreHostilePayloads::test_label_with_nul.
+  since: 0.1.0

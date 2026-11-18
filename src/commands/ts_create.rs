@@ -5,7 +5,7 @@ use crate::commands::command_parser::{
 };
 use crate::common::rounding::{NO_ROUNDING_KEYWORD, RoundingStrategy};
 use crate::error_consts;
-use crate::labels::{Label, check_label_name};
+use crate::labels::{Label, check_label_name, check_label_nul};
 use crate::series::chunks::ChunkEncoding;
 use crate::series::{DuplicatePolicy, TimeSeriesOptions, create_and_store_series};
 use valkey_module::{Context, NextArg, VALKEY_OK, ValkeyError, ValkeyResult, ValkeyString};
@@ -214,7 +214,12 @@ pub fn parse_series_options_onto(
                 // Set here too, not only by LABELS: a second METRIC used to replace the first.
                 metric_set = true;
                 let metric = args_iter.next_string()?;
-                options.labels = Some(parse_metric_name(&metric)?);
+                let labels = parse_metric_name(&metric)?;
+                // Quoted names and values decode escapes, so `\x00` arrives here as a NUL.
+                for label in &labels {
+                    check_label_nul(label.name.as_bytes(), label.value.as_bytes())?;
+                }
+                options.labels = Some(labels);
             }
             CommandArgToken::Ignore => {
                 let (ignore_max_timediff, ignore_max_val_diff) =
@@ -354,6 +359,7 @@ fn parse_labels(args: &[ValkeyString]) -> ValkeyResult<Vec<Label>> {
             return Err(ValkeyError::Str(error_consts::CANNOT_PARSE_LABELS));
         }
         check_label_name(name.as_slice())?;
+        check_label_nul(name.as_slice(), value.as_slice())?;
 
         let label = Label::new(name.to_string_lossy(), value.to_string_lossy());
         labels.push(label);
