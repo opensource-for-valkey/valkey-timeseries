@@ -179,23 +179,23 @@
   since: 0.1.0
 
 - id: DIV-0012
-  command: TS.RANGE
+  command: TS.MRANGE
   kind: unsupported
   description: >
-    The `twa` (time-weighted average) aggregator is not implemented. RTS 8.10
-    computes a time-weighted average over the bucket; we reject the aggregator
-    name with "TSDB: unknown aggregation type" on every command that takes an
-    AGGREGATION token (TS.RANGE/TS.REVRANGE/TS.MRANGE/TS.MREVRANGE and
-    TS.CREATERULE), and `twa` compaction policies are likewise unavailable.
+    The `twa` (time-weighted average) aggregator works in TS.RANGE, TS.REVRANGE, TS.NRANGE
+    and TS.NREVRANGE. RTS 8.10 also computes it for TS.MRANGE, TS.MREVRANGE, TS.CREATERULE
+    and TS.JOIN; we reject the aggregator name there with "TSDB: unknown aggregation type",
+    and `twa` compaction policies are likewise unavailable.
   rationale: >
     owner decision 2026-07-16 (Phase 2 triage) — a feature gap rather than a
     deliberate divergence, deferred to its own task because matching RTS's
     bucket-edge interpolation semantics needs a design pass and its own
     black-box probing. Rejecting cleanly is the safe interim behavior — a
     client gets a detectable error instead of a differently-computed number.
-    Pinned by TestAggregation::test_unsupported_aggregator_is_rejected_not_wrong;
+    Pinned per surface by test_compat_rules.py and test_compat_config.py, and by
+    tests/test_ts_twa_range.py::test_twa_is_rejected_where_it_is_not_supported;
     delete this entry and tests/compat/compat_helpers.py's
-    UNSUPPORTED_AGGREGATORS when twa lands.
+    UNSUPPORTED_AGGREGATORS when twa lands everywhere.
   since: 0.1.0
 
 # DIV-0013..DIV-0016 are Phase 2 read-path findings. All four are pinned by
@@ -1494,3 +1494,25 @@
     Pinned by TestValueValidation::test_compaction_policy_duration_superset.
   since: 0.1.0
 
+# DIV-0068 came with the `twa` aggregator in reverse range queries. A reverse bucket adds its
+# segments as its samples arrive, in time order, so it holds no copy of the bucket's samples.
+# RTS 8.10 adds them newest first.
+#
+# ⚠️ `behavior`-kind: owner sign-off pending.
+
+- id: DIV-0068
+  command: TS.REVRANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    A reverse `twa` bucket (TS.REVRANGE, TS.NREVRANGE) adds its segments in time order. RTS 8.10
+    adds them newest first. The two results agree within the compat suite's 1e-12 relative
+    tolerance, except under catastrophic cancellation. For one reverse bucket over the samples
+    (0, -7e16), (6, 2), (22, 1.5e16) and (34, 1) with a window of 0 to 40, RTS 8.10 returns 0 and
+    this module returns 0.47058823529411764.
+  rationale: >
+    Owner sign-off pending. The sum of the segments depends on the order of the additions only
+    where large values of opposite sign cancel, so no result is more correct than the other.
+    Adding in time order needs no buffer, and the forward scan already does it. Pinned by the
+    unit test reverse_scans_add_segments_in_time_order.
+  since: 0.1.0

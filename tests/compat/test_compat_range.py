@@ -24,8 +24,7 @@ import pytest
 from valkey.exceptions import ResponseError
 
 from compat_helpers import (
-    AGGREGATORS,
-    UNSUPPORTED_AGGREGATORS,
+    RANGE_AGGREGATORS as AGGREGATORS,
     mk_populated,
     mk_series,
 )
@@ -184,20 +183,6 @@ class TestAggregation:
         with pytest.raises(ResponseError):
             diff(range_cmd, "r:bucketneg", "-", "+", "AGGREGATION", "avg", -1000)
 
-    @pytest.mark.parametrize("agg", UNSUPPORTED_AGGREGATORS)
-    def test_unsupported_aggregator_is_rejected_not_wrong(self, diff, range_cmd, agg):
-        """DIV-0012: twa is unimplemented. Pin the *shape* of the gap.
-
-        Asserted against each engine directly rather than through `diff`: this
-        is a known one-sided mismatch, and the point is that our side fails
-        cleanly (a rejection a client can detect) instead of silently returning
-        a differently-computed average. Delete this test when twa lands.
-        """
-        mk_populated(diff, "r:twa", BASE_SAMPLES)
-        diff.reference.execute_command(range_cmd, "r:twa", "-", "+", "AGGREGATION", agg, 1000)
-        with pytest.raises(ResponseError):
-            diff.subject.execute_command(range_cmd, "r:twa", "-", "+", "AGGREGATION", agg, 1000)
-
     def test_unknown_aggregator_rejected(self, diff, range_cmd):
         mk_populated(diff, "r:aggbad", BASE_SAMPLES)
         with pytest.raises(ResponseError):
@@ -289,9 +274,10 @@ class TestBucketBoundaries:
         diff(range_cmd, "r:topgap", "-", "+", "AGGREGATION", "sum", 10, "EMPTY")
 
     @pytest.mark.parametrize("duration", (2**61, 2**61 + 1))
-    def test_large_duration(self, diff, range_cmd, duration):
+    @pytest.mark.parametrize("aggregator", ("sum", "twa"))
+    def test_large_duration(self, diff, range_cmd, duration, aggregator):
         mk_populated(diff, "r:wide", [(I64_MAX - 2, 1.0), (I64_MAX - 1, 2.0)])
-        diff(range_cmd, "r:wide", "-", "+", "AGGREGATION", "sum", duration)
+        diff(range_cmd, "r:wide", "-", "+", "AGGREGATION", aggregator, duration)
 
     def test_duration_above_i64_rejected(self, diff, range_cmd):
         mk_populated(diff, "r:wide2", [(1, 1.0)])

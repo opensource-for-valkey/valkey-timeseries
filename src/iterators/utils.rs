@@ -40,7 +40,7 @@ where
 
 /// Is this sample data as far as `EMPTY` is concerned? A stored NaN is a sample, but it is not a
 /// reading: it neither extends the fill nor gives `last` a value to carry.
-fn is_empty_fill_data(sample: &Sample, value_filter: Option<ValueFilter>) -> bool {
+pub(super) fn is_empty_fill_data(sample: &Sample, value_filter: Option<ValueFilter>) -> bool {
     !sample.value.is_nan() && value_filter.is_none_or(|filter| filter.is_match(sample.value))
 }
 
@@ -169,7 +169,7 @@ fn snapshot_counter_baseline(
 /// `carry_reverse` says the query's *reply* runs newest-first, which `last` depends on even though
 /// buckets are always produced chronologically. `tail_limit` says only that many of the stream's
 /// last rows will be used.
-fn empty_fill_bounds(
+pub(super) fn empty_fill_bounds(
     series: &TimeSeries,
     options: &RangeOptions,
     carry_reverse: bool,
@@ -225,6 +225,15 @@ fn empty_fill_bounds(
         carry_reverse,
         tail_limit,
     }
+}
+
+/// The streams that start from a window of samples know nothing outside it, so `twa` must not
+/// reach them.
+fn debug_assert_no_twa(options: &RangeOptions) {
+    debug_assert!(
+        !options.has_twa(),
+        "twa needs the series for its neighbors; it has no snapshot or base pipeline"
+    );
 }
 
 /// Create an optimized range iterator for the given series and options
@@ -343,6 +352,16 @@ pub(crate) fn create_range_iterator_for_reply<'a>(
     is_reverse: bool,
     reply_reverse: bool,
 ) -> Box<dyn Iterator<Item = Sample> + 'a> {
+    if options.has_twa() {
+        let rows = create_row_iterator_for_reply(
+            series,
+            options,
+            latest_sample,
+            is_reverse,
+            reply_reverse,
+        );
+        return Box::new(rows.map(Sample::from));
+    }
     let tail_limit = options.count.filter(|_| is_reverse);
     let build = |read_floor| {
         range_pipeline(
@@ -551,6 +570,7 @@ pub(crate) fn create_range_iterator_from_base<'a, I>(
 where
     I: Iterator<Item = Sample> + 'a,
 {
+    debug_assert_no_twa(options);
     debug_assert!(options.timestamp_filter.is_none());
     let has_aggregation = options.aggregation.is_some();
     let should_reverse_iter = !has_aggregation && is_reverse;
@@ -629,6 +649,7 @@ pub(crate) fn create_range_iterator_from_snapshot<'a>(
     is_reverse: bool,
     empty_fill: EmptyFillBounds,
 ) -> Box<dyn Iterator<Item = Sample> + 'a> {
+    debug_assert_no_twa(options);
     debug_assert!(options.timestamp_filter.is_none());
     let build = |read_floor| {
         snapshot_range_pipeline(
@@ -666,6 +687,7 @@ pub(crate) fn create_range_tail_iterator_from_snapshot<'a>(
     count: usize,
     empty_fill: EmptyFillBounds,
 ) -> Box<dyn Iterator<Item = Sample> + 'a> {
+    debug_assert_no_twa(options);
     debug_assert!(options.timestamp_filter.is_none());
     if options.aggregation.is_none() {
         let mut newest_first: Vec<Sample> =
@@ -704,7 +726,7 @@ pub(crate) fn create_range_tail_iterator_from_snapshot<'a>(
 /// when FILTER_BY_TS is present) + LATEST chaining + value filter. The output
 /// is always ascending — multi-aggregation consumes ascending input and
 /// reverses rows post-aggregation.
-fn create_filtered_sample_iterator<'a>(
+pub(super) fn create_filtered_sample_iterator<'a>(
     series: &'a TimeSeries,
     options: &RangeOptions,
     latest_sample: Option<Sample>,
@@ -757,6 +779,15 @@ pub(crate) fn create_row_iterator_for_reply<'a>(
     reply_reverse: bool,
 ) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
     let tail_limit = options.count.filter(|_| is_reverse);
+    if options.has_twa() {
+        debug_assert_eq!(
+            is_reverse, reply_reverse,
+            "a twa stream is in the order of its reply"
+        );
+        let rows =
+            super::twa::twa_reply_rows(series, options, latest_sample, is_reverse, tail_limit);
+        return finalize(rows, is_reverse, options.count);
+    }
     let build = |read_floor| {
         row_pipeline(
             series,
@@ -858,6 +889,7 @@ pub(crate) fn create_row_iterator_from_base<'a, I>(
 where
     I: Iterator<Item = Sample> + 'a,
 {
+    debug_assert_no_twa(options);
     row_pipeline_from_base(base, options, latest_sample, empty_fill, is_reverse, None)
 }
 
@@ -929,6 +961,7 @@ pub(crate) fn create_row_iterator_from_snapshot<'a>(
     empty_fill: EmptyFillBounds,
     is_reverse: bool,
 ) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+    debug_assert_no_twa(options);
     let build = |read_floor| {
         snapshot_row_pipeline(
             snapshot,
@@ -963,6 +996,7 @@ pub(crate) fn create_row_tail_iterator_from_snapshot<'a>(
     count: usize,
     empty_fill: EmptyFillBounds,
 ) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
+    debug_assert_no_twa(options);
     let build = |read_floor| -> Box<dyn Iterator<Item = MultiSample> + 'a> {
         Box::new(TailIter::new(
             snapshot_row_pipeline(

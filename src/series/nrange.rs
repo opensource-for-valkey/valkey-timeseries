@@ -1,6 +1,6 @@
 use crate::common::{MultiSample, Sample};
 use crate::iterators::{
-    PivotIter, create_range_iterator, create_row_iterator, get_range_latest_sample,
+    PivotIter, create_pivot_row_iterator, create_range_iterator, get_range_latest_sample,
 };
 use crate::series::TimeSeries;
 use crate::series::request_types::{NRangeOptions, RangeOptions};
@@ -106,8 +106,16 @@ fn create_key_iterator<'a>(
     if range.aggregation.is_some() {
         // One value per aggregator, in the order the key's list named them. This is the
         // multi-aggregation row pipeline even for a single aggregator, so the two cases stay
-        // one code path.
-        create_row_iterator(meta.series, &range, meta.latest, false)
+        // one code path. A `twa` column visits buckets in the command's direction even though
+        // the rows stay oldest first for the pivot, and only the newest rows can reach a
+        // newest-first COUNT.
+        create_pivot_row_iterator(
+            meta.series,
+            &range,
+            meta.latest,
+            options.is_reverse,
+            options.range.count,
+        )
     } else {
         let samples = create_range_iterator(meta.series, &range, meta.latest, false);
         Box::new(samples.map(|sample| MultiSample {
@@ -415,5 +423,90 @@ mod tests {
 
         let rows = process_nrange(&[meta(&s1), meta(&s2)], &options(0, 5000));
         assert!(rows.is_empty());
+    }
+
+    /// Bucket 10 is its own sample, 8, as in the reference.
+    #[test]
+    fn reverse_twa_is_calculated_before_the_pivot_reorders_rows() {
+        let series = make_series(&[(19, 8.0), (20, f64::NAN), (29, 6.0)]);
+        let mut opts = options(5, 24);
+        opts.aggregations = vec![aggregation(10, configs(&[AggregationType::Twa]))];
+        opts.is_reverse = true;
+        let rows = process_nrange(&[meta(&series)], &opts);
+        assert_eq!(rows_of(&rows), vec![(10, vec![Some(8.0)])]);
+    }
+
+    #[test]
+    fn reverse_twa_count_stops_lazy_empty_rows_before_pivoting() {
+        let source = make_series(&[(0, 1.0), (1_000_000_000_000, 2.0)]);
+        let mut opts = options(0, 1_000_000_000_000);
+        opts.is_reverse = true;
+        opts.range.count = Some(1);
+        let mut twa = aggregation(1, configs(&[AggregationType::Twa]));
+        twa.report_empty = true;
+        opts.aggregations = vec![twa];
+        let rows = process_nrange(&[meta(&source)], &opts);
+        assert_eq!(rows_of(&rows), vec![(1_000_000_000_000, vec![Some(2.0)])]);
+    }
+
+    /// The same newest rows as an uncounted query, in both directions and with a second key.
+    #[test]
+    fn reverse_twa_count_returns_the_newest_rows_of_the_uncounted_query() {
+        let first = make_series(&[
+            (0, 1.0),
+            (13, f64::NAN),
+            (25, 5.0),
+            (61, 2.0),
+            (90, f64::NAN),
+        ]);
+        let second = make_series(&[(4, 3.0), (44, 9.0), (70, 1.0)]);
+        for empty in [false, true] {
+            let mut opts = options(0, 100);
+            opts.is_reverse = true;
+            let mut clause = aggregation(10, configs(&[AggregationType::Twa]));
+            clause.report_empty = empty;
+            opts.aggregations = vec![clause];
+            let metas = [meta(&first), meta(&second)];
+            let all = process_nrange(&metas, &opts);
+            for count in 1..=all.len() {
+                opts.range.count = Some(count);
+                assert_eq!(
+                    rows_of(&process_nrange(&metas, &opts)),
+                    rows_of(&all[..count]),
+                    "empty={empty} count={count}"
+                );
+            }
+        }
+    }
+
+    /// EMPTY fills a `last` column with the preceding bucket's value, with or without `twa` in
+    /// the same list, in both directions.
+    #[test]
+    fn last_carries_into_empty_buckets_beside_twa() {
+        let series = make_series(&[(0, 1.0), (10, 2.0), (40, 5.0)]);
+        for columns in [
+            &[AggregationType::Last][..],
+            &[AggregationType::Twa, AggregationType::Last],
+        ] {
+            for is_reverse in [false, true] {
+                let mut opts = options(0, 60);
+                opts.is_reverse = is_reverse;
+                let mut clause = aggregation(10, configs(columns));
+                clause.report_empty = true;
+                opts.aggregations = vec![clause];
+                let rows = process_nrange(&[meta(&series)], &opts);
+                let last = columns.len() - 1;
+                let carried: Vec<(i64, f64)> = rows
+                    .iter()
+                    .filter(|row| row.timestamp == 20 || row.timestamp == 30)
+                    .map(|row| (row.timestamp, row.values[last]))
+                    .collect();
+                let mut expected = vec![(20, 2.0), (30, 2.0)];
+                if is_reverse {
+                    expected.reverse();
+                }
+                assert_eq!(carried, expected, "{columns:?} reverse={is_reverse}");
+            }
+        }
     }
 }

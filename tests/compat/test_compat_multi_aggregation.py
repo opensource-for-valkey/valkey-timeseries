@@ -33,8 +33,8 @@ RANGE_COMMANDS = ("TS.RANGE", "TS.REVRANGE")
 MRANGE_COMMANDS = ("TS.MRANGE", "TS.MREVRANGE")
 
 # Every aggregator name RTS 8.10 accepts as a list element, minus `twa`
-# (DIV-0012: unimplemented here, so a list containing it errors on one side
-# only — pinned by test_twa_inside_a_list_is_rejected). The 8.6 NaN counters
+# (DIV-0012: the TS.MRANGE family still rejects it; TS.RANGE lists that contain it
+# are covered by test_compat_twa_nan.py). The 8.6 NaN counters
 # are ordinary list elements and are included.
 LIST_AGGREGATORS = AGGREGATORS + ("countnan", "countall")
 
@@ -538,16 +538,6 @@ class TestDivergences:
             diff, "TS.CREATERULE", "ma:rule:src", "ma:rule:dst",
             "AGGREGATION", "avg,max", 1000,
         )
-
-    def test_twa_inside_a_list_is_rejected(self, diff, range_cmd):
-        """DIV-0012 on the list surface: `twa` is unimplemented here, so a list
-        containing it fails even though every other element is supported.
-        Delete this test when twa lands."""
-        mk_populated(diff, "ma:twa", MULTI_SAMPLES)
-        args = (range_cmd, "ma:twa", "-", "+", "AGGREGATION", "avg,twa", 1000)
-        diff.reference.execute_command(*args)
-        with pytest.raises(ResponseError):
-            diff.subject.execute_command(*args)
 
     @pytest.mark.parametrize("aggregators", ["countif>15,avg", "avg,rate"])
     def test_extension_list_elements_are_a_superset(self, diff, range_cmd, aggregators):
