@@ -171,6 +171,7 @@ map_enum! {
         SumIf <=> SumIf,
         VarP <=> VarP,
         VarS <=> VarS,
+        Twa <=> Twa,
     }
 }
 

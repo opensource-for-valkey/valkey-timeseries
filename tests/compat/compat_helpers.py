@@ -24,13 +24,15 @@ ALL_RTS_AGGREGATORS = (
     "twa",
 )
 
-# `twa` is not implemented (DIV-0012, kind `unsupported`): we reply "unknown
-# aggregation type" where RTS computes a time-weighted average. That is a
-# reference-errors-nowhere/subject-errors mismatch on every twa cell, which the
-# registry can not express per-delta — so the matrix parametrization excludes it
-# and test_aggregation_twa_unsupported pins the divergence in one place instead.
-# Delete UNSUPPORTED_AGGREGATORS (and that test) when twa lands.
+# `twa` is supported by TS.RANGE/TS.REVRANGE, so their matrices use every RTS
+# aggregator. TS.MRANGE/TS.MREVRANGE and TS.CREATERULE do not support it yet
+# (DIV-0012, kind `unsupported`): we reply "unknown aggregation type" where RTS
+# computes a time-weighted average, a one-sided mismatch the registry can not
+# express per-delta. Their matrices exclude it and per-surface tests pin the gap.
+# Delete UNSUPPORTED_AGGREGATORS (and those tests) when twa lands everywhere.
 UNSUPPORTED_AGGREGATORS = ("twa",)
+
+RANGE_AGGREGATORS = ALL_RTS_AGGREGATORS
 
 AGGREGATORS = tuple(a for a in ALL_RTS_AGGREGATORS if a not in UNSUPPORTED_AGGREGATORS)
 
@@ -56,7 +58,12 @@ def mk_series(diff, key, *extra):
     between the engines (a §7.1 config-parity concern, covered by
     test_compat_config.py) doesn't leak into every read-path test.
     """
-    return diff(
+    return diff(*mk_series_command(key, *extra))
+
+
+def mk_series_command(key, *extra):
+    """The TS.CREATE command that `mk_series` sends, for callers that batch commands."""
+    return (
         "TS.CREATE", key,
         "RETENTION", 0,
         "CHUNK_SIZE", 4096,

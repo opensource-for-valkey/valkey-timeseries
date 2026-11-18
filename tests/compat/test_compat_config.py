@@ -361,7 +361,7 @@ class TestValueValidation:
         assert subject.set_outcome("ts-compaction-policy", "") == "ok"
 
     @pytest.mark.xfail(
-        reason="TWA aggregator (RTS's 13th) is not implemented yet — findings doc #14",
+        reason="twa is not supported in compaction rules yet — findings doc #14",
         strict=True,
     )
     def test_compaction_policy_twa(self, clients):

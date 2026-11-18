@@ -6,6 +6,7 @@ mod sample_merge_iterator;
 mod sample_reducer;
 mod timeseries_range_iterator;
 mod timestamp_filter_iterator;
+mod twa;
 mod utils;
 
 pub(crate) use k_way_merge::KWayMerge;
@@ -19,6 +20,7 @@ pub(crate) use timeseries_range_iterator::{
     rts_reverse_latest_empties_series,
 };
 pub use timestamp_filter_iterator::TimestampFilterIterator;
+pub(crate) use twa::create_pivot_row_iterator;
 pub(crate) use utils::{
     TailIter, create_range_iterator_for_reply, create_range_iterator_from_base,
     create_range_iterator_from_snapshot, create_range_tail_iterator,

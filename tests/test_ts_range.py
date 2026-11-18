@@ -205,6 +205,9 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
             result = self.client.execute_command('TS.RANGE', key, '-', '+',
                                                  'AGGREGATION', 'sum', top)
             assert result == [[0, b'3']]
+            result = self.client.execute_command('TS.RANGE', key, '-', '+',
+                                                 'AGGREGATION', 'twa', top)
+            assert result == [[0, b'1.5']]
 
     def test_filtered_aggregators_skip_nan(self):
         """NaN never matches a condition and is not counted, whatever the operator."""

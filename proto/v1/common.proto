@@ -57,6 +57,7 @@ enum AggregationType {
   AGGREGATION_TYPE_STD_P = 21;
   AGGREGATION_TYPE_VAR_S = 22;
   AGGREGATION_TYPE_VAR_P = 23;
+  AGGREGATION_TYPE_TWA = 24;
 }
 
 enum ComparisonOperator {

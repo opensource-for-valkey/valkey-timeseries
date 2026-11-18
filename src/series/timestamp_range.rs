@@ -246,6 +246,11 @@ impl TimestampRange {
         })
     }
 
+    /// Whether the range names its end rather than ending at the series' newest sample.
+    pub fn has_explicit_end(&self) -> bool {
+        self.end != TimestampValue::Latest
+    }
+
     /// Resolves the bounds against `series`: `-` and `+` are its first and last
     /// timestamps. A relative end is an offset from the resolved start, as in
     /// [`Self::get_timestamps`], taken before the retention clamp.

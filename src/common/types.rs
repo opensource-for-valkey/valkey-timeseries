@@ -113,6 +113,14 @@ impl MultiSample {
     }
 }
 
+impl From<MultiSample> for Sample {
+    /// The row of a single-column aggregation.
+    fn from(row: MultiSample) -> Self {
+        debug_assert_eq!(row.values.len(), 1);
+        Sample::new(row.timestamp, row.values[0])
+    }
+}
+
 impl PartialEq for MultiSample {
     fn eq(&self, other: &Self) -> bool {
         // Mirrors Sample equality: values are equal if both are NaN or numerically equal.

@@ -127,6 +127,7 @@ Entries that stop firing should be removed — a stale entry hides regressions.
 | `test_compat_rules.py` | Phase 1: `TS.CREATERULE`/`TS.DELETERULE` argument and aggregator surface (plan §6) |
 | `test_compat_info.py` | Phase 1: `TS.INFO` field values and the `DEBUG` variant (plan §6) |
 | `test_compat_range.py` | Phase 2: `TS.RANGE`/`TS.REVRANGE` matrix (plan §6) |
+| `test_compat_twa_nan.py` | `twa` in `TS.RANGE`/`TS.REVRANGE`: every NaN pattern at the edges of three buckets, extent corners, LATEST on a compaction destination, and `last` beside `twa` |
 | `test_compat_mrange.py` | Phase 2: `TS.MRANGE`/`TS.MREVRANGE` matrix (plan §6) |
 | `test_compat_multi_aggregation.py` | Phase 2: the `AGGREGATION` aggregator-list surface and its pair-vs-row reply shape (plan §6) |
 | `test_compat_get.py` | Phase 2: `TS.GET`/`TS.MGET` matrix (plan §6) |
