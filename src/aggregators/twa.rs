@@ -15,12 +15,16 @@ pub(crate) fn is_real(sample: &Sample) -> bool {
 /// The value of the line from `a` to `b` at `timestamp`, with `a` before `b`. An endpoint
 /// returns its own value exactly rather than an interpolation of it.
 pub(super) fn value_at(a: Sample, b: Sample, timestamp: Timestamp) -> f64 {
-    // Equal endpoints make a constant line; interpolating two equal infinities gives NaN.
-    if timestamp == a.timestamp || a.value == b.value {
+    if timestamp == a.timestamp {
         return a.value;
     }
     if timestamp == b.timestamp {
         return b.value;
+    }
+    // Interpolating an infinity gives NaN. Between an infinity and a finite value, or equal
+    // infinities, the line stays infinite; opposite infinities have no value.
+    if a.value.is_infinite() || b.value.is_infinite() {
+        return a.value + b.value;
     }
     let elapsed = timestamp.abs_diff(a.timestamp) as f64;
     let span = b.timestamp.abs_diff(a.timestamp) as f64;
@@ -460,5 +464,20 @@ mod tests {
             assert_eq!(average, value);
             assert_eq!(gap_twa(&[p(0, value)], 2, 4, &[p(10, value)]), value);
         }
+    }
+
+    #[test]
+    fn a_line_between_an_infinity_and_a_finite_value_stays_infinite() {
+        for (first, second, expected) in [
+            (f64::INFINITY, 1.0, f64::INFINITY),
+            (1.0, f64::INFINITY, f64::INFINITY),
+            (f64::NEG_INFINITY, 1.0, f64::NEG_INFINITY),
+            (1.0, f64::NEG_INFINITY, f64::NEG_INFINITY),
+        ] {
+            let (average, _) = bucket_twa(None, [p(0, first)], 0, 5, Some(p(20, second)));
+            assert_eq!(average, expected);
+            assert_eq!(gap_twa(&[p(0, first)], 2, 4, &[p(20, second)]), expected);
+        }
+        assert!(gap_twa(&[p(0, f64::INFINITY)], 2, 4, &[p(20, f64::NEG_INFINITY)]).is_nan());
     }
 }

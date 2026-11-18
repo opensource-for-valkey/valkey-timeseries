@@ -10,14 +10,13 @@
 use super::twa::value_at;
 use crate::aggregators::{
     AggregationHandler, AggregationType, Aggregator, BucketTimestamp, EmptyFillBounds, LastCarry,
-    PendingRows, TwaBucket, bucket_start_for, bucket_twa, column_aggregator, gap_twa, is_real,
+    PendingRows, TwaBucket, bucket_start_for, column_aggregator, gap_twa, is_real,
     render_bucket_timestamp, run_start_keeping_last,
 };
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::series::request_types::AggregationOptions;
-use itertools::{PeekNth, peek_nth};
 use smallvec::SmallVec;
-use std::collections::VecDeque;
+use std::iter::Peekable;
 
 /// The order in which a command visits buckets. TWA's value depends on it, because the
 /// sample carried into a bucket comes from the bucket visited before it.
@@ -94,9 +93,6 @@ pub struct TwaContext {
     pub explicit_end: bool,
     pub neighbors: TwaNeighbors,
     pub direction: ScanDirection,
-    /// Whether a stored real sample lies inside the window. `EMPTY` rows use it to decide how
-    /// far they reach; the caller finds it without buffering the window.
-    pub window_has_real: bool,
     /// The still-open compaction bucket that LATEST adds after the stored samples. It brackets
     /// buckets like any sample, but it is not stored data, so it never extends EMPTY rows or
     /// supports a gap.
@@ -106,23 +102,31 @@ pub struct TwaContext {
     pub empty_fill: EmptyFillBounds,
 }
 
-/// The upcoming in-window samples, with whatever has been read ahead kept for later.
-struct Lookahead<I: Iterator<Item = Sample>> {
-    stored: PeekNth<I>,
+/// Opens a cursor over the stored real-or-NaN samples in the window, starting at the first one
+/// at or after the given timestamp. The row iterator reads it only to find real samples, so the
+/// main stream never has to look past its next sample.
+pub type StoredReals<'a> = Box<dyn FnMut(Timestamp) -> Box<dyn Iterator<Item = Sample> + 'a> + 'a>;
+
+/// The upcoming in-window samples. The main stream is read one sample ahead. Real samples
+/// further on come from their own cursor, and at most two of them are kept.
+struct Lookahead<'a, I: Iterator<Item = Sample>> {
+    stored: Peekable<I>,
     latest: Option<Sample>,
-    /// Real samples found among the first `scanned` stored samples at or after the last gap's
-    /// end, oldest first. Gap ends only grow, so each stored sample is scanned once.
-    reals_ahead: VecDeque<Sample>,
-    scanned: usize,
+    open_cursor: StoredReals<'a>,
+    /// Real samples at or after the last threshold, oldest first.
+    reals_ahead: SmallVec<[Sample; 2]>,
+    /// Whether the cursor found no real sample after `reals_ahead`.
+    exhausted: bool,
 }
 
-impl<I: Iterator<Item = Sample>> Lookahead<I> {
-    fn new(stored: I, latest: Option<Sample>) -> Self {
+impl<'a, I: Iterator<Item = Sample>> Lookahead<'a, I> {
+    fn new(stored: I, latest: Option<Sample>, open_cursor: StoredReals<'a>) -> Self {
         Self {
-            stored: peek_nth(stored),
+            stored: stored.peekable(),
             latest,
-            reals_ahead: VecDeque::new(),
-            scanned: 0,
+            open_cursor,
+            reals_ahead: SmallVec::new(),
+            exhausted: false,
         }
     }
 
@@ -131,46 +135,26 @@ impl<I: Iterator<Item = Sample>> Lookahead<I> {
     }
 
     fn next(&mut self) -> Option<Sample> {
-        let Some(sample) = self.stored.next() else {
-            return self.latest.take();
-        };
-        self.scanned = self.scanned.saturating_sub(1);
-        if self
-            .reals_ahead
-            .front()
-            .is_some_and(|real| real.timestamp == sample.timestamp)
-        {
-            self.reals_ahead.pop_front();
-        }
-        Some(sample)
+        self.stored.next().or_else(|| self.latest.take())
     }
 
-    /// Upcoming samples including LATEST's, for bracketing a bucket.
-    fn upcoming(&mut self) -> impl Iterator<Item = Sample> + '_ {
-        let latest = self.latest;
-        (0..)
-            .map_while(|index| self.stored.peek_nth(index).copied())
-            .chain(latest)
-    }
-
-    /// The first `count` upcoming stored real samples at or after `threshold`, which must not
-    /// decrease between calls.
+    /// The first `count` (at most two) stored real samples at or after `threshold`, which must
+    /// not decrease between calls. NaNs between them are skipped without being kept.
     fn stored_reals_from(&mut self, threshold: Timestamp, count: usize) -> SmallVec<[Sample; 2]> {
-        while self
-            .reals_ahead
-            .front()
-            .is_some_and(|real| real.timestamp < threshold)
-        {
-            self.reals_ahead.pop_front();
-        }
-        while self.reals_ahead.len() < count {
-            let Some(sample) = self.stored.peek_nth(self.scanned).copied() else {
-                break;
-            };
-            self.scanned += 1;
-            if is_real(&sample) && sample.timestamp >= threshold {
-                self.reals_ahead.push_back(sample);
-            }
+        self.reals_ahead.retain(|real| real.timestamp >= threshold);
+        if self.reals_ahead.len() < count && !self.exhausted {
+            let from = self
+                .reals_ahead
+                .last()
+                .and_then(|real| real.timestamp.checked_add(1))
+                .map_or(threshold, |next| next.max(threshold));
+            let missing = count - self.reals_ahead.len();
+            let found: SmallVec<[Sample; 2]> = (self.open_cursor)(from)
+                .filter(is_real)
+                .take(missing)
+                .collect();
+            self.exhausted = found.len() < missing;
+            self.reals_ahead.extend(found);
         }
         self.reals_ahead.iter().take(count).copied().collect()
     }
@@ -219,8 +203,8 @@ enum Extent {
     Done,
 }
 
-pub struct TwaRowIterator<I: Iterator<Item = Sample>> {
-    samples: Lookahead<I>,
+pub struct TwaRowIterator<'a, I: Iterator<Item = Sample>> {
+    samples: Lookahead<'a, I>,
     columns: SmallVec<[Column; 2]>,
     width: u64,
     aligned: Timestamp,
@@ -229,18 +213,21 @@ pub struct TwaRowIterator<I: Iterator<Item = Sample>> {
     context: TwaContext,
     /// The last two real samples before the current bucket, oldest first.
     left_reals: SmallVec<[Sample; 2]>,
-    /// A reverse scan adds a bucket's segments newest first, as the reference does. Large
-    /// values can cancel differently in the other order, so the bucket's real samples wait here.
-    reverse_reals: Vec<Sample>,
     earlier: Option<BucketEdge>,
     extent: Extent,
     last_carry: Option<LastCarry>,
     held: PendingRows,
 }
 
-impl<I: Iterator<Item = Sample>> TwaRowIterator<I> {
-    /// `samples` are the window's filtered samples in time order.
-    pub fn new(samples: I, options: &AggregationOptions, mut context: TwaContext) -> Self {
+impl<'a, I: Iterator<Item = Sample>> TwaRowIterator<'a, I> {
+    /// `samples` are the window's filtered samples in time order. `reals` opens a second
+    /// cursor over the same samples, at a given timestamp, to look for real ones ahead.
+    pub fn new(
+        samples: I,
+        reals: StoredReals<'a>,
+        options: &AggregationOptions,
+        mut context: TwaContext,
+    ) -> Self {
         let aligned = options
             .alignment
             .get_aligned_timestamp(context.start, context.end);
@@ -257,14 +244,13 @@ impl<I: Iterator<Item = Sample>> TwaRowIterator<I> {
             })
             .collect();
         Self {
-            samples: Lookahead::new(samples, context.latest),
+            samples: Lookahead::new(samples, context.latest, reals),
             columns,
             width: options.bucket_duration,
             aligned,
             bucket_ts: options.timestamp_output,
             report_empty: options.report_empty,
             left_reals: std::mem::take(&mut context.neighbors.before),
-            reverse_reals: Vec::new(),
             context,
             earlier: None,
             extent: Extent::NotStarted,
@@ -307,7 +293,8 @@ impl<I: Iterator<Item = Sample>> TwaRowIterator<I> {
                 Extent::Done
             };
         };
-        let overlaps = before && after || self.context.window_has_real;
+        let overlaps =
+            before && after || !self.samples.stored_reals_from(Timestamp::MIN, 1).is_empty();
         let next = if overlaps && before && self.key(start) >= 0 {
             self.key(start)
         } else {
@@ -338,12 +325,17 @@ impl<I: Iterator<Item = Sample>> TwaRowIterator<I> {
         match self.context.direction {
             ScanDirection::Forward => Some(next),
             ScanDirection::Reverse => {
+                if is_real(&next) {
+                    return Some(next);
+                }
                 let next_key = self.key(next.timestamp);
-                let (aligned, width) = (self.aligned, self.width);
-                self.samples
-                    .upcoming()
-                    .take_while(|s| bucket_start_for(s.timestamp, aligned, width) == next_key)
-                    .find(is_real)
+                let stored = self.samples.stored_reals_from(next.timestamp, 1);
+                let in_bucket = |sample: &Sample| self.key(sample.timestamp) == next_key;
+                stored.first().copied().filter(in_bucket).or(self
+                    .context
+                    .latest
+                    .filter(is_real)
+                    .filter(in_bucket))
             }
         }
     }
@@ -382,9 +374,7 @@ impl<I: Iterator<Item = Sample>> TwaRowIterator<I> {
             .end
             .min(key.saturating_add_unsigned(self.width));
         let left = self.left_bracket();
-        let mut forward = (self.context.direction == ScanDirection::Forward)
-            .then(|| TwaBucket::open(left, start, end));
-        self.reverse_reals.clear();
+        let mut bucket = TwaBucket::open(left, start, end);
         let mut accepted = false;
         let mut last_raw = None;
         let mut prev_real = None;
@@ -397,11 +387,7 @@ impl<I: Iterator<Item = Sample>> TwaRowIterator<I> {
             .filter(|s| last_raw.is_none() || bucket_end.is_none_or(|end| s.timestamp < end))
         {
             self.samples.next();
-            match forward.as_mut() {
-                Some(bucket) => bucket.push(sample),
-                None if is_real(&sample) => self.reverse_reals.push(sample),
-                None => {}
-            }
+            bucket.push(sample);
             for column in self.columns.iter_mut() {
                 if let Column::Ordinary(aggregator) = column {
                     accepted |= aggregator.update(sample.timestamp, sample.value);
@@ -429,19 +415,7 @@ impl<I: Iterator<Item = Sample>> TwaRowIterator<I> {
                     right.filter(is_real),
                 )
             } else {
-                match forward {
-                    Some(bucket) => bucket.close(right).0,
-                    None => {
-                        bucket_twa(
-                            right,
-                            self.reverse_reals.iter().rev().copied(),
-                            start,
-                            end,
-                            left,
-                        )
-                        .0
-                    }
-                }
+                bucket.close(right).0
             }
         } else if accepted || self.report_empty {
             self.gap_value(key)
@@ -533,7 +507,7 @@ impl<I: Iterator<Item = Sample>> TwaRowIterator<I> {
     }
 }
 
-impl<I: Iterator<Item = Sample>> TwaRowIterator<I> {
+impl<I: Iterator<Item = Sample>> TwaRowIterator<'_, I> {
     /// The next row in time order, before reverse `last` rows are resolved.
     fn next_row(&mut self) -> Option<MultiSample> {
         loop {
@@ -600,7 +574,7 @@ impl<I: Iterator<Item = Sample>> TwaRowIterator<I> {
     }
 }
 
-impl<I: Iterator<Item = Sample>> Iterator for TwaRowIterator<I> {
+impl<I: Iterator<Item = Sample>> Iterator for TwaRowIterator<'_, I> {
     type Item = MultiSample;
 
     fn next(&mut self) -> Option<MultiSample> {
