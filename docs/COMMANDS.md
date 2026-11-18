@@ -1,5 +1,10 @@
 # Command List
 
+`TS.RANGE`, `TS.REVRANGE`, `TS.NRANGE` and `TS.NREVRANGE` support time-weighted average
+aggregation with `AGGREGATION twa`. See [TS.RANGE](commands/ts.range.md#time-weighted-average)
+for the interpolation, NaN and empty-bucket rules. `TS.MRANGE`, `TS.MREVRANGE`, `TS.JOIN`,
+`TS.CREATERULE` and the `ts-compaction-policy` setting do not accept `twa` yet.
+
 Standalone `TS.LABELNAMES`, `TS.LABELVALUES`, `TS.METRICNAMES` and `TS.QUERYLABELS` run on
 bounded background workers when estimated work is large. `TS.QUERYINDEX` and
 `TS.CARD FILTER_BY_RANGE` share these workers for reads estimated to exceed 512 series. Small requests, transactions and

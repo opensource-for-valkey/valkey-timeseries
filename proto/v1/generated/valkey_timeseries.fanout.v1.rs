@@ -115,6 +115,7 @@ pub enum AggregationType {
     StdP = 21,
     VarS = 22,
     VarP = 23,
+    Twa = 24,
 }
 impl AggregationType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -147,6 +148,7 @@ impl AggregationType {
             Self::StdP => "AGGREGATION_TYPE_STD_P",
             Self::VarS => "AGGREGATION_TYPE_VAR_S",
             Self::VarP => "AGGREGATION_TYPE_VAR_P",
+            Self::Twa => "AGGREGATION_TYPE_TWA",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -176,6 +178,7 @@ impl AggregationType {
             "AGGREGATION_TYPE_STD_P" => Some(Self::StdP),
             "AGGREGATION_TYPE_VAR_S" => Some(Self::VarS),
             "AGGREGATION_TYPE_VAR_P" => Some(Self::VarP),
+            "AGGREGATION_TYPE_TWA" => Some(Self::Twa),
             _ => None,
         }
     }

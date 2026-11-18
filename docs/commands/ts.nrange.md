@@ -107,7 +107,11 @@ series' earliest sample or begin after its latest one.
 
 The same set [TS.RANGE](./ts.range.md#supported-aggregators) supports — simple, statistical,
 counter/rate, and filtered — including this module's extensions (`countall`, `countnan`, `increase`,
-`irate`, `rate`, `countif`, `sumif`, `share`, `all`, `any`, `none`). `twa` is not supported.
+`irate`, `rate`, `countif`, `sumif`, `share`, `all`, `any`, `none`).
+
+`twa` is supported alone or in a list for each key. It uses the samples around that key's own
+buckets, as the [TS.RANGE rules](./ts.range.md#time-weighted-average) describe, before the values at
+equal bucket timestamps are joined.
 
 ---
 

@@ -179,23 +179,23 @@
   since: 0.1.0
 
 - id: DIV-0012
-  command: TS.RANGE
+  command: TS.MRANGE
   kind: unsupported
   description: >
-    The `twa` (time-weighted average) aggregator is not implemented. RTS 8.10
-    computes a time-weighted average over the bucket; we reject the aggregator
-    name with "TSDB: unknown aggregation type" on every command that takes an
-    AGGREGATION token (TS.RANGE/TS.REVRANGE/TS.MRANGE/TS.MREVRANGE and
-    TS.CREATERULE), and `twa` compaction policies are likewise unavailable.
+    The `twa` (time-weighted average) aggregator works in TS.RANGE, TS.REVRANGE, TS.NRANGE
+    and TS.NREVRANGE. RTS 8.10 also computes it for TS.MRANGE, TS.MREVRANGE, TS.CREATERULE
+    and TS.JOIN; we reject the aggregator name there with "TSDB: unknown aggregation type",
+    and `twa` compaction policies are likewise unavailable.
   rationale: >
     owner decision 2026-07-16 (Phase 2 triage) — a feature gap rather than a
     deliberate divergence, deferred to its own task because matching RTS's
     bucket-edge interpolation semantics needs a design pass and its own
     black-box probing. Rejecting cleanly is the safe interim behavior — a
     client gets a detectable error instead of a differently-computed number.
-    Pinned by TestAggregation::test_unsupported_aggregator_is_rejected_not_wrong;
+    Pinned per surface by test_compat_rules.py and test_compat_config.py, and by
+    tests/test_ts_twa_range.py::test_twa_is_rejected_where_it_is_not_supported;
     delete this entry and tests/compat/compat_helpers.py's
-    UNSUPPORTED_AGGREGATORS when twa lands.
+    UNSUPPORTED_AGGREGATORS when twa lands everywhere.
   since: 0.1.0
 
 # DIV-0013..DIV-0016 are Phase 2 read-path findings. All four are pinned by

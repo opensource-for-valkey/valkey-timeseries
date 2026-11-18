@@ -2,6 +2,7 @@
 // https://github.com/cryptorelay/redis-aggregation/tree/master
 // License: Apache License 2.0
 
+use super::twa::{TwaBucket, is_real};
 use super::{AggregationType, AllAggregator, AnyAggregator, NoneAggregator};
 use crate::aggregators::filtered::{CountIfAggregator, ShareAggregator, SumIfAggregator};
 use crate::aggregators::kahan::{KahanAvg, KahanSum};
@@ -15,7 +16,7 @@ use crate::series::request_types::ValueComparisonFilter;
 use enum_dispatch::enum_dispatch;
 use get_size2::GetSize;
 use std::fmt::Display;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::time::Duration;
 use valkey_module::{RedisModuleIO, ValkeyError, ValkeyResult, raw};
 
@@ -1097,6 +1098,73 @@ impl AggregationHandler for IRateAggregator {
     }
 }
 
+// -- Twa ------------------------------------------------------------------
+
+/// The open bucket of a `twa` aggregator. `current` is what `LATEST` reports. Range queries use
+/// [`crate::aggregators::TwaRowIterator`] instead.
+#[derive(Clone, Debug, PartialEq, GetSize)]
+pub struct TwaAggregator(Box<TwaBucket>);
+
+impl From<TwaBucket> for TwaAggregator {
+    fn from(bucket: TwaBucket) -> Self {
+        Self(Box::new(bucket))
+    }
+}
+
+impl Default for TwaAggregator {
+    fn default() -> Self {
+        TwaBucket::awaiting(None).into()
+    }
+}
+
+impl Hash for TwaAggregator {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let integral = self.0.integral();
+        integral.start().hash(state);
+        integral.end().hash(state);
+        integral.previous().hash(state);
+        hash_f64(integral.area(), state);
+        integral.covered().hash(state);
+        self.0.carry().hash(state);
+        self.0.has_real().hash(state);
+    }
+}
+
+impl AggregationHandler for TwaAggregator {
+    // Inlined into the shared `Aggregator` dispatch, this floating-point code makes the dispatch
+    // spill and restore an extra register (d8) and use a 160-byte stack frame on every call, for
+    // every aggregator.
+    #[inline(never)]
+    fn update(&mut self, timestamp: Timestamp, value: Value) -> bool {
+        let sample = Sample::new(timestamp, value);
+        self.0.push(sample);
+        is_real(&sample)
+    }
+
+    /// Keeps the carry, the sample the next bucket opens with, as a counter keeps its baseline.
+    fn reset(&mut self) {
+        *self.0 = TwaBucket::awaiting(self.0.carry());
+    }
+
+    fn clear(&mut self) {
+        *self.0 = TwaBucket::awaiting(None);
+    }
+
+    fn current(&self) -> Option<Value> {
+        Some(self.0.latest())
+    }
+}
+
+/// A twa aggregator has no saved state: nothing stores one, and `AggregationType::try_from`
+/// rejects its tag, so a load stops before it reaches this function.
+impl RdbSerializable for TwaAggregator {
+    fn rdb_save(&self, _rdb: *mut RedisModuleIO) {}
+
+    fn rdb_load(_rdb: *mut RedisModuleIO) -> ValkeyResult<Self> {
+        Err(ValkeyError::Str("TSDB: invalid AGGREGATION value"))
+    }
+}
+
 #[enum_dispatch(AggregationHandler)]
 #[derive(Clone, Debug, Hash, PartialEq, GetSize)]
 pub enum Aggregator {
@@ -1123,7 +1191,15 @@ pub enum Aggregator {
     SumIf(SumIfAggregator),
     VarP(VarPAggregator),
     VarS(VarSAggregator),
+    Twa(TwaAggregator),
 }
+
+// Every compaction rule and AGGREGATION column holds an `Aggregator` inline, so new state that
+// is larger than the existing variants goes behind a `Box`.
+const _: () = assert!(
+    size_of::<Aggregator>() <= 40,
+    "Aggregator grew past 40 bytes: box the state of the variant that did it"
+);
 
 impl Default for Aggregator {
     fn default() -> Self {
@@ -1164,6 +1240,7 @@ impl TryFrom<AggregationType> for Aggregator {
             AggregationType::VarP => Aggregator::VarP(VarPAggregator::default()),
             AggregationType::VarS => Aggregator::VarS(VarSAggregator::default()),
             AggregationType::Sum => Aggregator::Sum(SumAggregator::default()),
+            AggregationType::Twa => Aggregator::Twa(TwaAggregator::default()),
         })
     }
 }
@@ -1197,6 +1274,7 @@ impl RdbSerializable for Aggregator {
             Aggregator::StdS(agg) => agg.rdb_save(rdb),
             Aggregator::VarP(agg) => agg.rdb_save(rdb),
             Aggregator::VarS(agg) => agg.rdb_save(rdb),
+            Aggregator::Twa(agg) => agg.rdb_save(rdb),
         }
     }
 
@@ -1237,6 +1315,7 @@ impl RdbSerializable for Aggregator {
             AggregationType::VarS => VarSAggregator::rdb_load(rdb).map(Aggregator::VarS),
             AggregationType::Sum => SumAggregator::rdb_load(rdb).map(Aggregator::Sum),
             AggregationType::SumIf => SumIfAggregator::rdb_load(rdb).map(Aggregator::SumIf),
+            AggregationType::Twa => TwaAggregator::rdb_load(rdb).map(Aggregator::Twa),
         }
     }
 }
@@ -1272,6 +1351,7 @@ impl Aggregator {
             Aggregator::VarS(_) => AggregationType::VarS,
             Aggregator::Sum(_) => AggregationType::Sum,
             Aggregator::SumIf(_) => AggregationType::SumIf,
+            Aggregator::Twa(_) => AggregationType::Twa,
         }
     }
 

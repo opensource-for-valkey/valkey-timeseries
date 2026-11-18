@@ -511,9 +511,18 @@ pub(crate) fn parse_inline_condition(cond_str: &str) -> ValkeyResult<ValueCompar
 /// an aggregator; each element in the list can use a different one. Whether
 /// the condition is required, optional, or disallowed for a given aggregator
 /// is enforced later by [`AggregatorConfig::new`].
-fn parse_aggregation_list_element(part: &str) -> ValkeyResult<AggregationListElement> {
+///
+/// `twa` is served by the range commands only. Where `allow_twa` is false it is as unknown as any
+/// other name, and is refused before the rest of the element or the clause is read.
+fn parse_aggregation_list_element(
+    part: &str,
+    allow_twa: bool,
+) -> ValkeyResult<AggregationListElement> {
     let (name, cond_str) = split_aggregator_condition(part)?;
     let aggregation = AggregationType::try_from(name)?;
+    if aggregation == AggregationType::Twa && !allow_twa {
+        return Err(ValkeyError::Str(error_consts::UNKNOWN_AGGREGATION_TYPE));
+    }
     let condition = cond_str.map(parse_inline_condition).transpose()?;
     Ok((aggregation, condition))
 }
@@ -523,13 +532,16 @@ fn parse_aggregation_list_element(part: &str) -> ValkeyResult<AggregationListEle
 /// `countif>5,sumif<=2`. Order is preserved (it defines the output
 /// column order), duplicate aggregator *types* are rejected regardless of any
 /// inline condition, and the list is capped at [`MAX_AGGREGATIONS`].
-fn parse_aggregation_list(agg_str: &str) -> ValkeyResult<SmallVec<[AggregationListElement; 2]>> {
+fn parse_aggregation_list(
+    agg_str: &str,
+    allow_twa: bool,
+) -> ValkeyResult<SmallVec<[AggregationListElement; 2]>> {
     let mut elements: SmallVec<[AggregationListElement; 2]> = SmallVec::new();
     for part in agg_str.split(',') {
         if part.is_empty() {
             return Err(ValkeyError::Str(error_consts::INVALID_AGGREGATION_LIST));
         }
-        let (aggregation, condition) = parse_aggregation_list_element(part)?;
+        let (aggregation, condition) = parse_aggregation_list_element(part, allow_twa)?;
         if elements.iter().any(|(ty, _)| *ty == aggregation) {
             let msg = format!("TSDB: duplicate aggregation '{}'", aggregation.name());
             return Err(ValkeyError::String(msg));
@@ -544,6 +556,7 @@ fn parse_aggregation_list(agg_str: &str) -> ValkeyResult<SmallVec<[AggregationLi
 
 pub fn parse_aggregation_options(
     args: &mut CommandArgIterator,
+    allow_twa: bool,
 ) -> ValkeyResult<AggregationOptions> {
     // AGGREGATION token already seen. A missing operand is a parse failure
     // ("Couldn't parse AGGREGATION"); a present but unrecognized aggregator name
@@ -551,7 +564,7 @@ pub fn parse_aggregation_options(
     let agg_str = args
         .next_str()
         .map_err(|_e| ValkeyError::Str(error_consts::CANNOT_PARSE_AGGREGATION))?;
-    let aggregators = parse_aggregation_list(agg_str)?;
+    let aggregators = parse_aggregation_list(agg_str, allow_twa)?;
     let bucket_duration_arg = args
         .next_arg()
         .map_err(|_e| ValkeyError::Str(error_consts::CANNOT_PARSE_AGGREGATION))?;
@@ -789,14 +802,17 @@ pub fn parse_series_selector_list(
     Ok(matchers)
 }
 
-fn parse_align_for_aggregation(args: &mut CommandArgIterator) -> ValkeyResult<AggregationOptions> {
+fn parse_align_for_aggregation(
+    args: &mut CommandArgIterator,
+    allow_twa: bool,
+) -> ValkeyResult<AggregationOptions> {
     // ALIGN token already seen
     let alignment_str = args.next_str()?;
 
     expect_next_token(args, CommandArgToken::Aggregation)
         .map_err(|_| ValkeyError::Str(error_consts::ALIGN_REQUIRES_AGGREGATION))?;
 
-    let mut aggregation = parse_aggregation_options(args)?;
+    let mut aggregation = parse_aggregation_options(args, allow_twa)?;
     aggregation.alignment = BucketAlignment::try_from(alignment_str)?;
     Ok(aggregation)
 }
@@ -861,7 +877,7 @@ pub fn parse_range_options(args: &mut CommandArgIterator) -> ValkeyResult<RangeO
         let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
         match token {
             CommandArgToken::Align => {
-                let value = parse_align_for_aggregation(args)?;
+                let value = parse_align_for_aggregation(args, true)?;
                 // ALIGN consumes the AGGREGATION that must follow it, so it fills
                 // both option slots. Non-short-circuiting `&` so each is recorded
                 // whichever one has already been seen.
@@ -872,7 +888,7 @@ pub fn parse_range_options(args: &mut CommandArgIterator) -> ValkeyResult<RangeO
                 }
             }
             CommandArgToken::Aggregation => {
-                let value = parse_aggregation_options(args)?;
+                let value = parse_aggregation_options(args, true)?;
                 if repeated.accept(token) {
                     options.aggregation = Some(value);
                 }
@@ -959,7 +975,7 @@ fn parse_nrange_aggregation_options(
         let arg = args
             .next_str()
             .map_err(|_e| ValkeyError::Str(error_consts::AGGREGATOR_COUNT_MISMATCH))?;
-        let elements = parse_aggregation_list(arg).map_err(|e| {
+        let elements = parse_aggregation_list(arg, true).map_err(|e| {
             // A well-formed bucket duration where an aggregator was expected means fewer
             // aggregators than keys were supplied; say that rather than reporting the
             // duration as an unknown aggregation type.
@@ -978,7 +994,7 @@ fn parse_nrange_aggregation_options(
     let bucket_duration = parse_bucket_duration_arg(&bucket_duration_arg).map_err(|e| {
         // Symmetrically: another aggregator list where the duration belongs means more
         // aggregators than keys.
-        if parse_aggregation_list(&bucket_duration_arg.to_string_lossy()).is_ok() {
+        if parse_aggregation_list(&bucket_duration_arg.to_string_lossy(), true).is_ok() {
             ValkeyError::Str(error_consts::AGGREGATOR_COUNT_MISMATCH)
         } else {
             e
@@ -1184,7 +1200,7 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
         let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
         match token {
             CommandArgToken::Align => {
-                let value = parse_align_for_aggregation(args)?;
+                let value = parse_align_for_aggregation(args, false)?;
                 // See parse_range_options: ALIGN fills the AGGREGATION slot too.
                 if repeated.accept(CommandArgToken::Align)
                     & repeated.accept(CommandArgToken::Aggregation)
@@ -1193,7 +1209,7 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
                 }
             }
             CommandArgToken::Aggregation => {
-                let value = parse_aggregation_options(args)?;
+                let value = parse_aggregation_options(args, false)?;
                 if repeated.accept(token) {
                     options.range.aggregation = Some(value);
                 }
@@ -1396,7 +1412,7 @@ pub(super) fn parse_join_args(
         }
         match token {
             Aggregation => {
-                let aggregation = parse_aggregation_options(args)?;
+                let aggregation = parse_aggregation_options(args, false)?;
                 if aggregation.is_multi() {
                     return Err(ValkeyError::Str(
                         error_consts::MULTI_AGGREGATION_UNSUPPORTED,
@@ -1757,11 +1773,11 @@ mod tests {
         let types =
             |list: &[AggregationListElement]| list.iter().map(|(ty, _)| *ty).collect::<Vec<_>>();
 
-        let single = parse_aggregation_list("avg").unwrap();
+        let single = parse_aggregation_list("avg", true).unwrap();
         assert_eq!(types(&single), vec![AggregationType::Avg]);
         assert!(single.iter().all(|(_, cond)| cond.is_none()));
 
-        let list = parse_aggregation_list("avg,min,max").unwrap();
+        let list = parse_aggregation_list("avg,min,max", true).unwrap();
         assert_eq!(
             types(&list),
             vec![
@@ -1772,7 +1788,7 @@ mod tests {
         );
 
         // case-insensitive
-        let list = parse_aggregation_list("AVG,Max").unwrap();
+        let list = parse_aggregation_list("AVG,Max", true).unwrap();
         assert_eq!(
             types(&list),
             vec![AggregationType::Avg, AggregationType::Max]
@@ -1782,30 +1798,30 @@ mod tests {
     #[test]
     fn test_aggregation_list_errors() {
         // empty elements: leading/trailing/double commas
-        assert!(parse_aggregation_list("avg,,max").is_err());
-        assert!(parse_aggregation_list("avg,max,").is_err());
-        assert!(parse_aggregation_list(",avg").is_err());
-        assert!(parse_aggregation_list("").is_err());
+        assert!(parse_aggregation_list("avg,,max", true).is_err());
+        assert!(parse_aggregation_list("avg,max,", true).is_err());
+        assert!(parse_aggregation_list(",avg", true).is_err());
+        assert!(parse_aggregation_list("", true).is_err());
         // unknown type
-        assert!(parse_aggregation_list("avg,bogus").is_err());
+        assert!(parse_aggregation_list("avg,bogus", true).is_err());
         // duplicates, including differing case
-        let err = parse_aggregation_list("avg,AVG").unwrap_err();
+        let err = parse_aggregation_list("avg,AVG", true).unwrap_err();
         assert!(err.to_string().contains("duplicate aggregation 'avg'"));
         // over the cap: 17 distinct entries
         let too_many = "all,any,avg,count,countall,countif,countnan,first,increase,\
                         irate,last,max,min,none,range,rate,share";
-        let err = parse_aggregation_list(too_many).unwrap_err();
+        let err = parse_aggregation_list(too_many, true).unwrap_err();
         assert_eq!(err.to_string(), error_consts::TOO_MANY_AGGREGATIONS);
         // exactly 16 is allowed (condition-requiring types validated later)
         let sixteen = "all,any,avg,count,countall,countif,countnan,first,increase,\
                        irate,last,max,min,none,range,rate";
-        assert_eq!(parse_aggregation_list(sixteen).unwrap().len(), 16);
+        assert_eq!(parse_aggregation_list(sixteen, true).unwrap().len(), 16);
     }
 
     #[test]
     fn test_inline_aggregation_condition() {
         // each element carries its own condition
-        let list = parse_aggregation_list("countif>5,sumif<=2.5").unwrap();
+        let list = parse_aggregation_list("countif>5,sumif<=2.5", true).unwrap();
         assert_eq!(list[0].0, AggregationType::CountIf);
         let cond = list[0].1.unwrap();
         assert_eq!(cond.operator, ComparisonOperator::GreaterThan);
@@ -1816,7 +1832,7 @@ mod tests {
         assert_eq!(cond.value, 2.5);
 
         // mixed: inline condition alongside a plain (uncontitional) element
-        let list = parse_aggregation_list("countif>5,avg").unwrap();
+        let list = parse_aggregation_list("countif>5,avg", true).unwrap();
         assert!(list[0].1.is_some());
         assert!(list[1].1.is_none());
 
@@ -1829,23 +1845,23 @@ mod tests {
             ("==5", ComparisonOperator::Equal),
             ("!=5", ComparisonOperator::NotEqual),
         ] {
-            let list = parse_aggregation_list(&format!("countif{text}")).unwrap();
+            let list = parse_aggregation_list(&format!("countif{text}"), true).unwrap();
             assert_eq!(list[0].1.unwrap().operator, expected, "operator {text}");
         }
 
         // negative and fractional values
-        let list = parse_aggregation_list("sumif<-3.5").unwrap();
+        let list = parse_aggregation_list("sumif<-3.5", true).unwrap();
         assert_eq!(list[0].1.unwrap().value, -3.5);
     }
 
     #[test]
     fn test_inline_aggregation_condition_errors() {
-        assert!(parse_aggregation_list(">5").is_err()); // empty aggregator name
-        assert!(parse_aggregation_list("countif5").is_err()); // no operator char -> unknown aggregator name
-        assert!(parse_aggregation_list("countif>bogus").is_err()); // bad value
-        assert!(parse_aggregation_list("bogus>5").is_err()); // unknown aggregator
+        assert!(parse_aggregation_list(">5", true).is_err()); // empty aggregator name
+        assert!(parse_aggregation_list("countif5", true).is_err()); // no operator char -> unknown aggregator name
+        assert!(parse_aggregation_list("countif>bogus", true).is_err()); // bad value
+        assert!(parse_aggregation_list("bogus>5", true).is_err()); // unknown aggregator
         // duplicate detection ignores inline condition differences
-        let err = parse_aggregation_list("countif>5,countif<10").unwrap_err();
+        let err = parse_aggregation_list("countif>5,countif<10", true).unwrap_err();
         assert!(err.to_string().contains("duplicate aggregation 'countif'"));
     }
 
@@ -1853,7 +1869,7 @@ mod tests {
     fn test_condition_distribution() {
         // each filter-capable element carries its own inline condition
         let configs =
-            build_aggregator_configs(parse_aggregation_list("countif>5,avg,sum>5").unwrap())
+            build_aggregator_configs(parse_aggregation_list("countif>5,avg,sum>5", true).unwrap())
                 .unwrap();
         assert_eq!(configs.len(), 3);
         assert!(configs[0].filter().is_some()); // countif
@@ -1861,19 +1877,20 @@ mod tests {
         assert!(configs[2].filter().is_some()); // sum
 
         // condition-requiring aggregator without an inline condition is an error
-        let err =
-            build_aggregator_configs(parse_aggregation_list("countif,avg").unwrap()).unwrap_err();
+        let err = build_aggregator_configs(parse_aggregation_list("countif,avg", true).unwrap())
+            .unwrap_err();
         assert!(err.to_string().contains("missing condition"));
 
         // plain list with no inline conditions is fine
         let configs =
-            build_aggregator_configs(parse_aggregation_list("avg,max,count").unwrap()).unwrap();
+            build_aggregator_configs(parse_aggregation_list("avg,max,count", true).unwrap())
+                .unwrap();
         assert!(configs.iter().all(|c| c.filter().is_none()));
     }
 
     #[test]
     fn test_inline_condition_on_non_filterable_aggregator_is_an_error() {
-        let elements = parse_aggregation_list("avg>5").unwrap();
+        let elements = parse_aggregation_list("avg>5", true).unwrap();
         let err = build_aggregator_configs(elements).unwrap_err();
         assert!(err.to_string().contains("does not support a filter"));
     }

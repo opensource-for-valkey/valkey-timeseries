@@ -122,7 +122,7 @@ impl PartialReducer {
             // The coordinator reduces these itself, or the parser rejected them; see
             // `AggregationType::reducer_support`, which a test pins against this match.
             At::All | At::Any | At::None | At::Share => return None,
-            At::First | At::Last | At::Rate | At::IRate | At::Increase => return None,
+            At::First | At::Last | At::Rate | At::IRate | At::Increase | At::Twa => return None,
         };
         Some(Self {
             kind,
@@ -442,6 +442,7 @@ mod tests {
     use super::*;
     use crate::common::binop::ComparisonOperator;
     use crate::iterators::SampleReducer;
+    use crate::tests::assert_value_eq;
 
     /// Deterministic LCG so failures are reproducible.
     struct Rng(u64);
@@ -496,18 +497,6 @@ mod tests {
         configs.push(AggregatorConfig::new(At::Count, Some(filter)).unwrap());
         configs.push(AggregatorConfig::new(At::Sum, Some(filter)).unwrap());
         configs
-    }
-
-    fn assert_value_eq(actual: f64, expected: f64, context: &str) {
-        if expected.is_nan() {
-            assert!(actual.is_nan(), "{context}: expected NaN, got {actual}");
-            return;
-        }
-        let tolerance = 1e-9 * expected.abs().max(1.0);
-        assert!(
-            (actual - expected).abs() <= tolerance,
-            "{context}: expected {expected}, got {actual}"
-        );
     }
 
     /// Invariant: for every decomposable reducer and arbitrary
@@ -736,7 +725,7 @@ mod tests {
     #[test]
     fn test_non_decomposable_reducers_rejected() {
         use AggregationType as At;
-        for ty in [At::Increase, At::IRate, At::Rate] {
+        for ty in [At::Increase, At::IRate, At::Rate, At::Twa] {
             let config = AggregatorConfig::new(ty, None).unwrap();
             assert!(
                 PartialReducer::for_config(&config).is_none(),

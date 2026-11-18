@@ -45,7 +45,7 @@ use smallvec::SmallVec;
 /// a sample of it. `map_enum!` generates exhaustive matches in both directions,
 /// so a newly added variant breaks the build there; this list only needs to stay
 /// in step for coverage.
-const ALL_AGGREGATION_TYPES: [AggregationType; 23] = [
+const ALL_AGGREGATION_TYPES: [AggregationType; 24] = [
     AggregationType::All,
     AggregationType::Any,
     AggregationType::Avg,
@@ -69,6 +69,7 @@ const ALL_AGGREGATION_TYPES: [AggregationType; 23] = [
     AggregationType::SumIf,
     AggregationType::VarP,
     AggregationType::VarS,
+    AggregationType::Twa,
 ];
 
 const ALL_COMPARISON_OPERATORS: [ComparisonOperator; 6] = [
@@ -193,6 +194,7 @@ fn test_aggregation_type_wire_numbers_are_pinned() {
         (AggregationType::StdP, 21),
         (AggregationType::VarS, 22),
         (AggregationType::VarP, 23),
+        (AggregationType::Twa, 24),
     ];
     assert_eq!(
         expected.len(),

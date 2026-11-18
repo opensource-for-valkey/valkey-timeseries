@@ -236,6 +236,11 @@ impl TimestampRange {
         self.start > self.end
     }
 
+    /// Whether the range names its end rather than ending at the series' newest sample.
+    pub fn has_explicit_end(&self) -> bool {
+        self.end != TimestampValue::Latest
+    }
+
     pub fn get_series_range(
         &self,
         series: &TimeSeries,

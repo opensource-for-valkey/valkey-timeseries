@@ -14,6 +14,10 @@ TS.NREVRANGE numkeys key [key ...] fromTimestamp toTimestamp
 Identical to [TS.NRANGE](ts.nrange.md) except that rows are returned in descending timestamp
 order; see that page for the full argument reference.
 
+The `twa` aggregator of each key visits that key's buckets from the newest to the oldest, as
+[TS.REVRANGE](ts.revrange.md) does, before the values at equal bucket timestamps are joined. The other
+aggregators are not affected by the direction.
+
 `COUNT` limits rows in the order they are returned, so here it keeps the **highest** timestamps —
 the last rows `TS.NRANGE` would return, not the first.
 

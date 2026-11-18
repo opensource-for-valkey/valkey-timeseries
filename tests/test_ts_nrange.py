@@ -162,6 +162,41 @@ class TestTimeSeriesNRange(ValkeyTimeSeriesTestCaseBase):
             (2000, [30.0, 30.0, 25.0]),
         ]
 
+    @pytest.mark.parametrize("command", ["TS.NRANGE", "TS.NREVRANGE"])
+    @pytest.mark.parametrize("aggregators,values", [
+        (("twa", "avg"), [[24.0, 10.0], [30.0, 25.0]]),
+        (("twa,avg", "sum"), [[24.0, 15.0, 20.0], [30.0, 30.0, 25.0]]),
+    ])
+    def test_nrange_twa_aggregation(self, command, aggregators, values):
+        self.setup_data()
+        expected = list(zip([1000, 2000], values))
+        if command == "TS.NREVRANGE":
+            expected.reverse()
+        query = (command, 2, "s3", "s4", "-", "+", "AGGREGATION", *aggregators, 1000)
+        assert rows(self.client.execute_command(*query)) == expected
+        assert rows(self.client.execute_command(*query, "COUNT", 1)) == expected[:1]
+
+    @pytest.mark.parametrize("command", ["TS.NRANGE", "TS.NREVRANGE"])
+    @pytest.mark.parametrize("aggregators,values", [
+        (("twa", "avg"), [4.5, 3.0]),
+        (("avg", "twa"), [3.0, 4.5]),
+        (("twa,avg", "min,max"), [4.5, 3.0, 3.0, 3.0]),
+    ])
+    def test_nrange_mixed_twa_timestamp_filter_bounds(self, command, aggregators, values):
+        for key in ("a", "b"):
+            self.client.execute_command("TS.CREATE", key)
+            self.client.execute_command("TS.MADD", key, 0, 1, key, 10, 3, key, 20, 9)
+
+        filters = ("FILTER_BY_TS", 0, 10, 20, "AGGREGATION", *aggregators, 10)
+        query = (command, 2, "a", "b", 5, 15, *filters)
+        # The sample at 20 closes TWA's [10, 15] interval: (3 + 6) / 2.
+        # Ordinary columns use only the sample at 10.
+        assert rows(self.client.execute_command(*query)) == [(10, values)]
+        assert rows(self.client.execute_command(*query, "COUNT", 1)) == [(10, values)]
+        assert rows(self.client.execute_command(
+            command, 2, "a", "b", 10, 10, *filters)) == [(10, [3.0] * len(values))]
+        assert self.client.execute_command(command, 2, "a", "b", 5, 9, *filters) == []
+
     def test_nrange_aggregation_blanks_whole_key_block(self):
         """A key with no samples in a bucket reports NaN for every column it owns."""
 
@@ -312,11 +347,6 @@ class TestTimeSeriesNRange(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError):
             self.client.execute_command(
                 'TS.NRANGE', 2, 's3', 's4', '-', '+', 'AGGREGATION', 'avg', 'bogus', 1000)
-
-        # twa is not supported by this module
-        with pytest.raises(ResponseError):
-            self.client.execute_command(
-                'TS.NRANGE', 2, 's3', 's4', '-', '+', 'AGGREGATION', 'twa', 'avg', 1000)
 
         # a filtered aggregator without its inline condition
         with pytest.raises(ResponseError):

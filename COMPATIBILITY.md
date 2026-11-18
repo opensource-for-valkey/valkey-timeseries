@@ -32,7 +32,7 @@ The set of commands exposed by the module, their argument ordering, their flag a
 
 `TS.READ` carries one deliberate metadata difference from RedisTimeSeries 8.10: its key specification declares `RO` **and** `ACCESS`, where the reference declares `RO` alone. `ACCESS` is the semantically correct flag for a command that returns key data to the caller, it matches every other read command in this module, and dropping it would weaken ACL key-permission checking. The difference is not observable in the reply to any command.
 
-One gap in that surface is worth naming: the `twa` aggregator, which RedisTimeSeries lists for the whole range family, is not supported by this module at all. Every other aggregator RedisTimeSeries documents is, alongside this module's own [extensions](#extensions).
+One gap in that surface is worth naming. The `twa` aggregator works in `TS.RANGE`, `TS.REVRANGE`, `TS.NRANGE` and `TS.NREVRANGE`. `TS.MRANGE`, `TS.MREVRANGE`, `TS.JOIN`, `TS.CREATERULE` and the `ts-compaction-policy` setting do not accept it yet (DIV-0012). Every other aggregator RedisTimeSeries documents is supported, alongside this module's own [extensions](#extensions).
 
 ### Query language and semantics
 

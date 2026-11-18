@@ -109,6 +109,9 @@ fn parse_args(args: &mut CommandArgIterator, dest: SeriesLink) -> ValkeyResult<C
 
     let (agg_name, cond_str) = split_aggregator_condition(args.next_str()?)?;
     let aggregation_type = AggregationType::try_from(agg_name)?;
+    if aggregation_type == AggregationType::Twa {
+        return Err(ValkeyError::Str(error_consts::UNKNOWN_AGGREGATION_TYPE));
+    }
     let value_filter = cond_str.map(parse_inline_condition).transpose()?;
 
     let duration_str = args

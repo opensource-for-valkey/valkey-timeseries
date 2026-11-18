@@ -1,6 +1,6 @@
 use crate::aggregators::{
     Aggregator, AllAggregator, AnyAggregator, CountIfAggregator, NoneAggregator, ShareAggregator,
-    SumIfAggregator,
+    SumIfAggregator, column_aggregator,
 };
 use crate::common::binop::ComparisonOperator;
 use crate::common::hash::hash_f64;
@@ -299,6 +299,13 @@ impl AggregationOptions {
         self.aggregations.len() > 1
     }
 
+    /// Whether any column is `twa`, which needs samples outside the query window.
+    pub fn has_twa(&self) -> bool {
+        self.aggregations
+            .iter()
+            .any(|config| config.aggregation_type() == AggregationType::Twa)
+    }
+
     pub fn create_aggregator(&self) -> Aggregator {
         self.primary().create_aggregator()
     }
@@ -307,7 +314,7 @@ impl AggregationOptions {
     pub fn create_aggregators(&self) -> SmallVec<[Aggregator; 2]> {
         self.aggregations
             .iter()
-            .map(|config| config.create_aggregator())
+            .map(|config| column_aggregator(config, self))
             .collect()
     }
 }
@@ -354,6 +361,14 @@ pub struct RangeOptions {
 }
 
 impl RangeOptions {
+    /// Whether the query aggregates with `twa`, which reads samples outside the window and so
+    /// cannot use a read floor or a snapshot of the window.
+    pub fn has_twa(&self) -> bool {
+        self.aggregation
+            .as_ref()
+            .is_some_and(AggregationOptions::has_twa)
+    }
+
     pub fn get_timestamp_range(&self) -> (Timestamp, Timestamp) {
         self.date_range.get_timestamps(None)
     }

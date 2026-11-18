@@ -7,8 +7,8 @@ command surface those tests take for granted: every aggregator accepted as a
 rule, bucket-duration and alignTimestamp validation, duplicate and conflicting
 rule creation, what TS.INFO reports on both ends of a rule, and the error paths.
 
-`twa` is excluded from the aggregator parametrization for the reason given in
-compat_helpers.UNSUPPORTED_AGGREGATORS (DIV-0012) and pinned separately.
+`twa` is not supported in compaction rules yet. It is excluded from the aggregator
+parametrization (DIV-0012, see compat_helpers.UNSUPPORTED_AGGREGATORS) and pinned separately.
 
 Written clean-room from public RedisTimeSeries documentation and black-box
 observation of the reference server. Do NOT consult RedisTimeSeries source or
@@ -51,7 +51,7 @@ class TestAggregators:
 
     @pytest.mark.parametrize("agg", UNSUPPORTED_AGGREGATORS)
     def test_unsupported_aggregator_is_rejected_not_wrong(self, diff, agg):
-        """DIV-0012: `twa` is not implemented. It must be an error, never a rule
+        """DIV-0012: `twa` is not supported in compaction rules yet. It must be an error, never a rule
         that silently computes something else."""
         src, dst = _pair(diff, "unsup")
         assert diff.reference.execute_command(

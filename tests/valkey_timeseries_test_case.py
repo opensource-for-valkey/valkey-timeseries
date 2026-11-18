@@ -19,6 +19,15 @@ import string
 import logging
 
 
+def assert_rows(actual, expected):
+    """Compare `[timestamp, value...]` rows to `(timestamp, value...)` tuples, with NaN equal."""
+    assert len(actual) == len(expected), (actual, expected)
+    for row, (timestamp, *values) in zip(actual, expected):
+        assert row[0] == timestamp, (actual, expected)
+        cells = row[1:] if len(row) > 2 else [row[1]]
+        assert [float(cell) for cell in cells] == pytest.approx([float(v) for v in values], nan_ok=True), (actual, expected)
+
+
 class Node:
     """This class represents a valkey server instance, regardless of its role"""
 

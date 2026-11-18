@@ -191,6 +191,9 @@ Data retrieval is highly flexible, supporting filtering, aggregation, and arithm
   target series.
 * **Aggregation:** Raw samples can be aggregated at query time using functions such as `avg`, `sum`, `min`, `max`,
   `count`, `first`, `last`, `std.p`, `std.s`, `var.p`, and `var.s`.
+* **Time-weighted average:** `twa` integrates the straight lines between samples over each bucket.
+  `TS.RANGE`, `TS.REVRANGE`, `TS.NRANGE`, `TS.NREVRANGE` accept it. See
+  [TS.RANGE](commands/ts.range.md#time-weighted-average) for its NaN and gap rules.
 * **Alignment:** Time buckets can be aligned to specific intervals to ensure consistent reporting across different
   series.
 
