@@ -199,6 +199,10 @@ impl TryFrom<FanoutAggregatorConfig> for AggregatorConfig {
             .try_into()
             .map_err(|_| ValkeyError::Str(error_consts::UNKNOWN_AGGREGATION_TYPE))?;
         let aggregation_type: AggregationType = aggr_type.try_into()?;
+        // Shards do not compute `twa`; a request that carries it fails as an unknown type.
+        if aggregation_type == AggregationType::Twa {
+            return Err(ValkeyError::Str(error_consts::UNKNOWN_AGGREGATION_TYPE));
+        }
 
         let filter = value
             .value_filter

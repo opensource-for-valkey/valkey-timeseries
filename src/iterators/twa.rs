@@ -6,7 +6,7 @@ use super::utils::{
     TailIter, create_filtered_sample_iterator, create_row_iterator, empty_fill_bounds,
     is_empty_fill_data,
 };
-use crate::aggregators::{ScanDirection, TwaContext, TwaNeighbors, TwaRowIterator};
+use crate::aggregators::{ScanDirection, TwaContext, TwaNeighbors, TwaRowIterator, is_real};
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::series::request_types::RangeOptions;
 use crate::series::{SeriesSampleIterator, TimeSeries};
@@ -89,10 +89,13 @@ fn twa_rows<'a>(
             .value_filter
             .is_none_or(|f| f.is_match(sample.value))
     });
+    let window_has_real = aggregation.report_empty
+        && create_filtered_sample_iterator(series, options, None, None).any(|s| is_real(&s));
     let context = TwaContext {
         start,
         end,
         explicit_end: options.date_range.has_explicit_end(),
+        window_has_real,
         neighbors: twa_neighbors(series, options),
         direction: scan,
         latest,

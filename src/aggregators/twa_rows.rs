@@ -94,6 +94,9 @@ pub struct TwaContext {
     pub explicit_end: bool,
     pub neighbors: TwaNeighbors,
     pub direction: ScanDirection,
+    /// Whether a stored real sample lies inside the window. `EMPTY` rows use it to decide how
+    /// far they reach; the caller finds it without buffering the window.
+    pub window_has_real: bool,
     /// The still-open compaction bucket that LATEST adds after the stored samples. It brackets
     /// buckets like any sample, but it is not stored data, so it never extends EMPTY rows or
     /// supports a gap.
@@ -304,8 +307,7 @@ impl<I: Iterator<Item = Sample>> TwaRowIterator<I> {
                 Extent::Done
             };
         };
-        let window_has_real = !self.samples.stored_reals_from(Timestamp::MIN, 1).is_empty();
-        let overlaps = before && after || window_has_real;
+        let overlaps = before && after || self.context.window_has_real;
         let next = if overlaps && before && self.key(start) >= 0 {
             self.key(start)
         } else {

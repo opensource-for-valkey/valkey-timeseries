@@ -15,7 +15,8 @@ pub(crate) fn is_real(sample: &Sample) -> bool {
 /// The value of the line from `a` to `b` at `timestamp`, with `a` before `b`. An endpoint
 /// returns its own value exactly rather than an interpolation of it.
 pub(super) fn value_at(a: Sample, b: Sample, timestamp: Timestamp) -> f64 {
-    if timestamp == a.timestamp {
+    // Equal endpoints make a constant line; interpolating two equal infinities gives NaN.
+    if timestamp == a.timestamp || a.value == b.value {
         return a.value;
     }
     if timestamp == b.timestamp {
@@ -450,5 +451,14 @@ mod tests {
         assert!(!bucket.has_real());
         let (_, carry) = bucket.close(None);
         assert_eq!(carry, Some(p(6, f64::NAN)));
+    }
+
+    #[test]
+    fn a_line_between_equal_infinities_stays_infinite() {
+        for value in [f64::INFINITY, f64::NEG_INFINITY] {
+            let (average, _) = bucket_twa(None, [p(0, value)], 0, 5, Some(p(10, value)));
+            assert_eq!(average, value);
+            assert_eq!(gap_twa(&[p(0, value)], 2, 4, &[p(10, value)]), value);
+        }
     }
 }

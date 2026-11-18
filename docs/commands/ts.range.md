@@ -120,6 +120,11 @@ cover. Samples outside the query can contribute. `FILTER_BY_TS` and
 `FILTER_BY_VALUE` apply to those samples too. A zero-width interval returns its
 interpolated value or its actual sample value.
 
+To find those samples, `twa` reads outward from each side of the query interval
+until it finds two real samples that pass the filters. If a filter rejects the
+samples near the interval, or a long run of NaNs sits next to it, that read can
+cover the whole history of the series on that side.
+
 NaNs inside a bucket that has real samples are skipped. A NaN from a preceding
 NaN-only bucket, or a raw NaN that closes the bucket, stops interpolation on that
 side. A reverse query can therefore return different `twa` values.
