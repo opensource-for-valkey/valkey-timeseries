@@ -520,6 +520,38 @@ class TestTimeSeriesACL(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError):
             client.execute_command("TS.LABELNAMES")
 
+    # 600 matching series: over the 512-series inline budget for TS.CARD, TS.QUERYINDEX and
+    # TS.QUERYLABELS, and 600 `instance` values over the 256-entry budget for a SEARCH.
+    NON_UTF8_READS = [
+        ("TS.CARD", "FILTER", "service=api"),
+        ("TS.QUERYINDEX", "service=api"),
+        ("TS.QUERYLABELS", "VALUES", "instance", "FILTER", "service=api"),
+        ("TS.LABELVALUES", "instance", "SEARCH", "host", "LIMIT", 3),
+    ]
+
+    @pytest.mark.parametrize("series", [3, 600])
+    def test_non_utf8_user_name_reads_the_same_at_any_size(self, series):
+        """A user name that is not UTF-8 cannot be carried to the analysis lane, so that
+        user's reads stay inline instead of failing once the data outgrows the inline
+        budget. Each answer matches the admin's, and the inline answer inside MULTI."""
+        pipe = self.client.pipeline(transaction=False)
+        for i in range(series):
+            pipe.execute_command("TS.CREATE", f"series:{i}", "LABELS",
+                                 "service", "api", "instance", f"host{i:04}")
+        pipe.execute()
+        name = b"al\xffce"
+        self.client.execute_command("ACL", "SETUSER", name, "on", ">pw",
+                                    "+@timeseries", "+@read", "+multi", "+exec", "~*")
+        client = self.server.get_new_client()
+        client.execute_command("AUTH", name, "pw")
+
+        for cmd in self.NON_UTF8_READS:
+            got = client.execute_command(*cmd)
+            assert got == self.client.execute_command(*cmd), cmd
+            tx = client.pipeline(transaction=True)
+            tx.execute_command(*cmd)
+            assert tx.execute() == [got], cmd
+
 
 class TestTimeSeriesACLCommandRenamed(ValkeyTimeSeriesTestCaseBase):
     """With `ACL` renamed, the module cannot confirm a `~*` grant through `ACL GETUSER`."""
@@ -537,10 +569,10 @@ class TestTimeSeriesACLCommandRenamed(ValkeyTimeSeriesTestCaseBase):
             testdir=self.testdir, server_path=VALKEY_SERVER_PATH, args=args
         )
 
-    def warnings_logged(self) -> int:
+    def warnings_logged(self) -> list:
         logfile = os.path.join(self.server.cwd, self.server.args["logfile"])
         with open(logfile, encoding="latin-1") as f:
-            return sum("ACL GETUSER failed" in line for line in f)
+            return [line for line in f if "ACL GETUSER failed" in line]
 
     def test_failed_getuser_refuses_metadata_and_is_logged_once(self):
         """A failed `ACL GETUSER` refuses the all-keys gate for everyone, `default` included
@@ -556,4 +588,7 @@ class TestTimeSeriesACLCommandRenamed(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command(self.ACL, "SETUSER", "default", "+@all")
         with pytest.raises(ResponseError, match="permissions to query labels"):
             self.client.execute_command("TS.LABELNAMES")
-        assert self.warnings_logged() == 1
+        warnings = self.warnings_logged()
+        assert len(warnings) == 1
+        # The warning says why: here the server's own error for the renamed command.
+        assert "error reply" in warnings[0] and "unknown command" in warnings[0], warnings[0]

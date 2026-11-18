@@ -1,4 +1,4 @@
-use crate::commands::analysis_runner::run_read_on_analysis_lane;
+use crate::commands::analysis_runner::{can_read_on_analysis_lane, run_read_on_analysis_lane};
 use crate::commands::command_parser::{
     parse_filter_by_range_options, parse_hash_tags, validate_selector_list,
 };
@@ -7,7 +7,7 @@ use crate::commands::ts_label_search_fanout_command::LabelSearchFanoutCommand;
 use crate::commands::utils::get_multi_command_targets;
 use crate::common::SortDir;
 use crate::common::constants::METRIC_NAME_LABEL;
-use crate::common::context::{get_current_db, is_blocking_denied};
+use crate::common::context::get_current_db;
 use crate::common::replies::{
     reply_with_array, reply_with_bool, reply_with_bulk_string, reply_with_integer, reply_with_map,
 };
@@ -415,7 +415,9 @@ pub(super) fn run_label_search(
 
     let hints = parsed.build_search_hints()?;
     let plan = plan_series_filter(ctx, &parsed)?;
-    if !is_blocking_denied(ctx) && should_run_in_background(ctx, &parsed, &hints, plan.as_ref()) {
+    if should_run_in_background(ctx, &parsed, &hints, plan.as_ref())
+        && can_read_on_analysis_lane(ctx)
+    {
         let include_metadata = parsed.include_metadata;
         return run_read_on_analysis_lane(
             ctx,

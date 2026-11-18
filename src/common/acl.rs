@@ -516,62 +516,70 @@ fn cached_all_keys_grants(
         description,
         |a, b| a.0 == b.0,
         || {
-            let answer = query_all_keys_grants(ctx, &user_name());
-            if answer.is_none() {
-                static REPORTED: AtomicBool = AtomicBool::new(false);
-                if !REPORTED.swap(true, Ordering::Relaxed) {
-                    log_warning(
-                        "ACL GETUSER failed or gave an unexpected reply: users granted `~*` get \
-                         per-key checks, and commands that need read access to every key \
-                         (label names, values and statistics) refuse them until their rules \
-                         change. Those commands need the ACL command callable from modules.",
-                    );
-                }
-            }
-            answer
+            query_all_keys_grants(ctx, &user_name())
+                .inspect_err(|reason| {
+                    static REPORTED: AtomicBool = AtomicBool::new(false);
+                    if !REPORTED.swap(true, Ordering::Relaxed) {
+                        log_warning(format!(
+                            "ACL GETUSER failed ({reason}): users granted `~*` get per-key \
+                             checks, and commands that need read access to every key (label \
+                             names, values and statistics) refuse them until their rules change. \
+                             Those commands need the ACL command callable from modules."
+                        ));
+                    }
+                })
+                .ok()
         },
     )
 }
 
 /// Reads the user's selectors from `ACL GETUSER`, whose reply keeps each
 /// selector's key patterns in a field of its own, unlike the flat rule string.
-/// `None` when the reply is not the expected shape (or the user is gone).
-fn query_all_keys_grants(ctx: &Context, user_name: &ValkeyString) -> Option<AllKeysGrants> {
+/// On failure, why: the server's error reply, the user being gone, or the part
+/// of the reply that is not the expected shape.
+fn query_all_keys_grants(ctx: &Context, user_name: &ValkeyString) -> Result<AllKeysGrants, String> {
     /// A field of a RESP2 map reply (a flat key/value array).
-    fn field<'a>(map: &'a CallReply, name: &[u8]) -> Option<CallReply<'a>> {
+    fn field<'a>(map: &'a CallReply, name: &str) -> Result<CallReply<'a>, String> {
         let CallReply::Array(pairs) = map else {
-            return None;
+            return Err(format!("expected a map holding `{name}`"));
         };
         (0..pairs.len())
             .step_by(2)
             .find_map(|i| match pairs.get(i)? {
-                Ok(CallReply::String(key)) if key.as_bytes() == name => pairs.get(i + 1)?.ok(),
+                Ok(CallReply::String(key)) if key.as_bytes() == name.as_bytes() => {
+                    pairs.get(i + 1)?.ok()
+                }
                 _ => None,
             })
+            .ok_or_else(|| format!("no `{name}` field in the reply"))
     }
 
-    fn selector_keys(selector: &CallReply, grants: &mut AllKeysGrants) -> Option<()> {
-        let CallReply::String(keys) = field(selector, b"keys")? else {
-            return None;
+    fn selector_keys(selector: &CallReply, grants: &mut AllKeysGrants) -> Result<(), String> {
+        let CallReply::String(keys) = field(selector, "keys")? else {
+            return Err("`keys` is not a string".to_owned());
         };
         grants.add_selector(keys.as_bytes());
-        Some(())
+        Ok(())
     }
 
     let getuser = ctx.create_string("GETUSER");
     let options = CallOptionsBuilder::new().errors_as_replies().build();
     let reply: CallResult = ctx.call_ext("ACL", &options, &[&getuser, user_name]);
-    let user = reply.ok()?;
+    let user = reply.map_err(|err| format!("error reply: {err}"))?;
+    if let CallReply::Null(_) = user {
+        return Err("the user no longer exists".to_owned());
+    }
     let mut grants = AllKeysGrants(0);
     // The root selector's fields sit at the top level.
     selector_keys(&user, &mut grants)?;
-    let CallReply::Array(selectors) = field(&user, b"selectors")? else {
-        return None;
+    let CallReply::Array(selectors) = field(&user, "selectors")? else {
+        return Err("`selectors` is not an array".to_owned());
     };
     for selector in selectors.iter() {
-        selector_keys(&selector.ok()?, &mut grants)?;
+        let selector = selector.map_err(|err| format!("error reply in `selectors`: {err}"))?;
+        selector_keys(&selector, &mut grants)?;
     }
-    Some(grants)
+    Ok(grants)
 }
 
 impl Drop for ModuleUser {

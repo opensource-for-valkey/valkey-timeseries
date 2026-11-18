@@ -114,8 +114,8 @@ pub(crate) enum SeriesReadPlacement {
 /// the read by its exact match count, so a narrow filter on a large database stays inline,
 /// and it is the read's own plan on whichever thread runs it. Other selectors are planned by
 /// the read, and the database's size stands in for the match count. A read over the inline
-/// budget goes to the lane, unless the client cannot block (`MULTI`, a script, a module
-/// call), which is read inline.
+/// budget goes to the lane unless [`can_read_on_analysis_lane`] says no, and is then read
+/// inline.
 ///
 /// A plan fixes which series the read visits: series created after it are not read, and
 /// series deleted before their batch are skipped.
@@ -126,13 +126,22 @@ pub(crate) fn schedule_series_read(
 ) -> ValkeyResult<SeriesReadPlacement> {
     let db = get_current_db(ctx);
     let plan = plan_if_cheap(db, selection, range)?;
-    if !is_blocking_denied(ctx)
-        && series_read_exceeds_inline_budget(&get_db_index(db), plan.as_ref())
+    if series_read_exceeds_inline_budget(&get_db_index(db), plan.as_ref())
+        && can_read_on_analysis_lane(ctx)
     {
         Ok(SeriesReadPlacement::Background(plan))
     } else {
         Ok(SeriesReadPlacement::Inline(plan))
     }
+}
+
+/// Whether a read of the caller's database may move to the analysis lane: the client can
+/// block (not `MULTI`, a script or a module call), and its ACL user name can be carried there
+/// exactly ([`caller_user_name`]). A name that is not UTF-8 cannot, so that caller's reads
+/// stay inline, where they run as the client's own context. Refusing it on the lane alone
+/// would make the same command succeed or fail with the size of the data.
+pub(crate) fn can_read_on_analysis_lane(ctx: &Context) -> bool {
+    !is_blocking_denied(ctx) && caller_user_name(ctx).is_ok()
 }
 
 /// [`run_on_analysis_lane`] for a read of the caller's database: `read` runs on the lane
@@ -141,8 +150,8 @@ pub(crate) fn schedule_series_read(
 /// what it read; an error from `read` is answered as an error reply.
 ///
 /// The read gives the module lock back between batches, so it is not a point-in-time view:
-/// it can observe writes made while it runs. Callers check [`is_blocking_denied`] first and
-/// run inline when it is set; [`schedule_series_read`] does that for a series read.
+/// it can observe writes made while it runs. Callers check [`can_read_on_analysis_lane`] first
+/// and run inline when it says no; [`schedule_series_read`] does that for a series read.
 pub(crate) fn run_read_on_analysis_lane<T, R, P>(
     ctx: &Context,
     what: &str,
