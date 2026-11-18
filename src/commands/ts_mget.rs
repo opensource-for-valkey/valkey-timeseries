@@ -4,6 +4,7 @@ use crate::commands::fanout_codec::{MGetValue, mget_value};
 use crate::commands::utils::reply_with_mget_values;
 use crate::commands::{parse_command_arg_token, parse_label_list, parse_series_selector_list};
 use crate::common::Sample;
+use crate::common::replies::ReplyContext;
 use crate::common::threads::GilSource;
 use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, is_clustered};
@@ -51,7 +52,7 @@ pub fn ts_mget_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         .map(Into::into)
         .collect::<Vec<MGetValue>>();
 
-    reply_with_mget_values(ctx, &mget_results)
+    reply_with_mget_values(&ReplyContext::new(ctx.ctx), &mget_results)
 }
 
 /// Parses `TS.MGET [LATEST] [WITHLABELS | SELECTED_LABELS label...] [HASHTAG tags] FILTER

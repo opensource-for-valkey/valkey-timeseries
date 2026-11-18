@@ -2,9 +2,9 @@ use super::fanout_codec::generated::{Label as FanoutLabel, Sample as FanoutSampl
 use crate::commands::fanout_codec::MGetValue;
 use crate::common::constants::{REDUCER_KEY, SOURCE_KEY};
 use crate::common::replies::{
-    IntoRawCtx, ReplyContext, is_resp3_client, reply_label_ex, reply_with_array,
-    reply_with_bulk_string, reply_with_labels, reply_with_labels_map, reply_with_map,
-    reply_with_multi_samples, reply_with_sample_ex, reply_with_samples, reply_with_slice,
+    IntoRawCtx, ReplyContext, reply_label_ex, reply_with_array, reply_with_bulk_string,
+    reply_with_labels, reply_with_labels_map, reply_with_map, reply_with_multi_samples,
+    reply_with_sample_ex, reply_with_samples, reply_with_slice,
 };
 use crate::fanout::{FanoutTarget, client_allows_replica_fanout, compute_query_fanout_mode};
 use crate::labels::Label;
@@ -162,9 +162,11 @@ pub(super) fn reply_with_mrange_series_results(
     Ok(ValkeyValue::NoReply)
 }
 
-pub(super) fn reply_with_mget_values<C: IntoRawCtx>(ctx: C, values: &[MGetValue]) -> ValkeyResult {
-    let raw_ctx = ctx.into_raw();
-    if is_resp3_client(raw_ctx) {
+/// Writes a `TS.MGET` reply. The protocol comes from `ctx` rather than the server, so this is
+/// safe from a fan-out reply written off the main thread.
+pub(super) fn reply_with_mget_values(ctx: &ReplyContext<'_>, values: &[MGetValue]) -> ValkeyResult {
+    let raw_ctx = ctx.raw();
+    if ctx.is_resp3() {
         // RESP3: map keyed by series key; each value is [labels-map, sample].
         reply_with_map(raw_ctx, values.len());
         for value in values {
