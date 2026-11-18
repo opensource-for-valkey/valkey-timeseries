@@ -41,6 +41,11 @@ so a reader on a not-yet-created key is woken by the first write.
 `milliseconds` is the wait limit; `0` waits indefinitely. `min_count` must be positive, and may
 not exceed `MAX_COUNT` when both are given.
 
+A finite wait limit may be at most 4611686018427387903 ms (about 146 million years). A larger one
+is not rejected up front: a read whose threshold is already met still returns normally, but one
+that would have to wait fails with `ERR timeout is out of range` instead of blocking. Use `0` to
+wait indefinitely.
+
 The wait limit is either a bare number of milliseconds or a unit-suffixed duration — see
 [Duration syntax](#duration-syntax) below. `BLOCK 5000 1`, `BLOCK 5s 1`, and `BLOCK 2h5m 1` all
 name a wait limit; `BLOCK 0 1` and `BLOCK 0s 1` both wait indefinitely.
@@ -312,6 +317,7 @@ this for you.
 | `min_count` zero or negative | `TSDB: BLOCK min_count must be a positive integer` |
 | Negative `milliseconds`, or a wait limit that is neither a number of milliseconds nor a valid [duration](#duration-syntax) | `TSDB: BLOCK milliseconds must be a non-negative integer` |
 | `min_count` greater than `max_count` | `TSDB: BLOCK min_count must be <= MAX_COUNT` |
+| `milliseconds` above 4611686018427387903, when the read has to wait | `ERR timeout is out of range` |
 | `CONDITION` operator outside the six spellings | `TSDB: invalid comparison operator` |
 | `CONDITION` value not a number | `TSDB: CONDITION value must be a number` |
 | Duplicate clause, missing value, or unknown token | `ERR wrong number of arguments for 'ts.read' command` |

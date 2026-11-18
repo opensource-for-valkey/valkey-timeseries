@@ -392,7 +392,7 @@ Blocking reads (`TS.READ ... BLOCK`), counted on the node serving the client. A 
 |------|------|-------------|
 | `blocked_read_blocked_total` | counter | Reads the server blocked on a key |
 | `blocked_read_served_without_block_total` | counter | `BLOCK` reads served at once because enough qualifying samples already existed |
-| `blocked_read_block_refused_total` | counter | `BLOCK` reads that had to wait but could not: a context that forbids blocking (`MULTI`, a script), or the server declining to block the client |
+| `blocked_read_block_refused_total` | counter | `BLOCK` reads that had to wait but could not: a context that forbids blocking (`MULTI`, a script), a wait limit too large to schedule (`ERR timeout is out of range`), or the server declining to block the client |
 | `blocked_read_block_timeouts_total` | counter | Blocked reads released by the timeout callback: a deadline, or `CLIENT UNBLOCK ... TIMEOUT` |
 | `blocked_read_spurious_wakeups_total` | counter | Wakeups after which a blocked read re-checked its key and stayed blocked (a write that left it below `min_count`, or a condition no new sample met) |
 | `blocked_read_unblocked_by_delete_total` | counter | Blocked reads released with an empty reply because their key was deleted |

@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicI64, AtomicU64};
 pub static BLOCKED: AtomicU64 = AtomicU64::new(0);
 /// `BLOCK` reads that found enough qualifying samples at once and never blocked.
 pub static SERVED_WITHOUT_BLOCK: AtomicU64 = AtomicU64::new(0);
-/// `BLOCK` reads that had to wait but could not: a deny-blocking context (`MULTI`, a script), or
-/// the server declined to block the client.
+/// `BLOCK` reads that had to wait but could not: a deny-blocking context (`MULTI`, a script), a
+/// wait limit too large to schedule, or the server declined to block the client.
 pub static BLOCK_REFUSED: AtomicU64 = AtomicU64::new(0);
 /// Blocked reads released by the timeout callback: a deadline, or `CLIENT UNBLOCK ... TIMEOUT`.
 pub static BLOCK_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
@@ -33,7 +33,7 @@ static COUNTERS: &[(&str, &AtomicU64, &str)] = &[
     (
         "block_refused",
         &BLOCK_REFUSED,
-        "BLOCK reads that had to wait but could not (MULTI, a script, or the server declining)",
+        "BLOCK reads that had to wait but could not (MULTI, a script, a wait limit too large to schedule, or the server declining)",
     ),
     (
         "block_timeouts",

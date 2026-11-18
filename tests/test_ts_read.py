@@ -420,6 +420,39 @@ class TestTsReadBlocking(TsReadTestBase):
         finally:
             reader.close(self.client)
 
+    def blocked_read_gauge(self):
+        return self.client.info("ts_blocked_read")["ts_blocked_read_blocked_clients"]
+
+    @pytest.mark.parametrize(
+        "timeout_ms",
+        [str(2**63 - 1), str(2**62)],
+        ids=["i64-max", "above-cap"],
+    )
+    @pytest.mark.parametrize("key_state", ["empty", "missing"])
+    def test_out_of_range_timeout_is_an_error_and_blocks_nothing(self, timeout_ms, key_state):
+        """A wait limit too large to schedule is refused up front, leaving no blocked state.
+
+        2**62 is one past the module's cap (i64::MAX / 2) and would still fit the server's own
+        deadline arithmetic; i64::MAX does not. Both must error without blocking, and the
+        module's blocked-reader gauge must not move.
+        """
+        if key_state == "empty":
+            self.client.execute_command("TS.CREATE", "k")
+        gauge_before = self.blocked_read_gauge()
+        for _ in range(3):
+            with pytest.raises(ResponseError, match="^timeout is out of range$"):
+                self.client.execute_command("TS.READ", "k", 0, "BLOCK", timeout_ms, 1)
+        assert self.blocked_read_gauge() == gauge_before
+        assert self.blocked_clients() == 0
+        # Exactly one reply per command: the connection is still in step.
+        assert self.client.ping()
+
+    def test_out_of_range_timeout_is_not_consulted_when_no_wait_is_needed(self):
+        """A read that is satisfiable at once never schedules a wait, so the limit is moot."""
+        self.seed("k", [100])
+        reply = self.client.execute_command("TS.READ", "k", "-", "BLOCK", str(2**63 - 1), 1)
+        assert self.timestamps(reply) == [100]
+
     def test_samples_are_not_consumed(self):
         """Probe #22: readers are independent; one reader's reply does not remove data."""
         self.client.execute_command("TS.CREATE", "k")
@@ -1790,6 +1823,16 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
         assert stats["blocked_read_block_timeouts_total"] == 0
         assert stats["blocked_read_spurious_wakeups_total"] == 0
         assert stats["blocked_read_unblocked_by_delete_total"] == 0
+
+    def test_out_of_range_timeout_is_a_refusal_not_a_block(self):
+        self.client.execute_command("TS.CREATE", "k")
+        self.reset_stats()
+        with pytest.raises(ResponseError, match="timeout is out of range"):
+            self.client.execute_command("TS.READ", "k", 0, "BLOCK", str(2**63 - 1), 1)
+        stats = self.stats()
+        assert stats["blocked_read_block_refused_total"] == 1
+        assert stats["blocked_read_blocked_total"] == 0
+        assert stats["blocked_read_blocked_clients"] == 0
 
     def test_timeout_is_counted_and_releases_the_gauge(self):
         self.seed("k", [100])
