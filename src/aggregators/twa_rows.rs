@@ -102,17 +102,21 @@ pub struct TwaContext {
     pub empty_fill: EmptyFillBounds,
 }
 
-/// Opens a cursor over the stored real-or-NaN samples in the window, starting at the first one
-/// at or after the given timestamp. The row iterator reads it only to find real samples, so the
-/// main stream never has to look past its next sample.
-pub type StoredReals<'a> = Box<dyn FnMut(Timestamp) -> Box<dyn Iterator<Item = Sample> + 'a> + 'a>;
+/// A second cursor over the window's stored samples that finds real ones, so the main stream
+/// never has to look past its next sample.
+pub trait StoredReals {
+    /// The first real stored sample at or after `from` that passes the query's filters. `from`
+    /// never decreases between calls and is always past the last sample returned, so the cursor
+    /// keeps its position and never reads a sample twice.
+    fn next_real_from(&mut self, from: Timestamp) -> Option<Sample>;
+}
 
 /// The upcoming in-window samples. The main stream is read one sample ahead. Real samples
 /// further on come from their own cursor, and at most two of them are kept.
 struct Lookahead<'a, I: Iterator<Item = Sample>> {
     stored: Peekable<I>,
     latest: Option<Sample>,
-    open_cursor: StoredReals<'a>,
+    reals: Box<dyn StoredReals + 'a>,
     /// Real samples at or after the last threshold, oldest first.
     reals_ahead: SmallVec<[Sample; 2]>,
     /// Whether the cursor found no real sample after `reals_ahead`.
@@ -120,11 +124,11 @@ struct Lookahead<'a, I: Iterator<Item = Sample>> {
 }
 
 impl<'a, I: Iterator<Item = Sample>> Lookahead<'a, I> {
-    fn new(stored: I, latest: Option<Sample>, open_cursor: StoredReals<'a>) -> Self {
+    fn new(stored: I, latest: Option<Sample>, reals: Box<dyn StoredReals + 'a>) -> Self {
         Self {
             stored: stored.peekable(),
             latest,
-            open_cursor,
+            reals,
             reals_ahead: SmallVec::new(),
             exhausted: false,
         }
@@ -138,23 +142,23 @@ impl<'a, I: Iterator<Item = Sample>> Lookahead<'a, I> {
         self.stored.next().or_else(|| self.latest.take())
     }
 
-    /// The first `count` (at most two) stored real samples at or after `threshold`, which must
-    /// not decrease between calls. NaNs between them are skipped without being kept.
+    /// The first `count` (at most two) stored real samples at or after `threshold`. A threshold
+    /// lower than the one before it has no stored sample in between, so the cursor only reads
+    /// forward. NaNs between real samples are skipped without being kept.
     fn stored_reals_from(&mut self, threshold: Timestamp, count: usize) -> SmallVec<[Sample; 2]> {
         self.reals_ahead.retain(|real| real.timestamp >= threshold);
-        if self.reals_ahead.len() < count && !self.exhausted {
-            let from = self
-                .reals_ahead
-                .last()
-                .and_then(|real| real.timestamp.checked_add(1))
-                .map_or(threshold, |next| next.max(threshold));
-            let missing = count - self.reals_ahead.len();
-            let found: SmallVec<[Sample; 2]> = (self.open_cursor)(from)
-                .filter(is_real)
-                .take(missing)
-                .collect();
-            self.exhausted = found.len() < missing;
-            self.reals_ahead.extend(found);
+        while self.reals_ahead.len() < count && !self.exhausted {
+            let from = match self.reals_ahead.last() {
+                Some(last) => match last.timestamp.checked_add(1) {
+                    Some(next) => next.max(threshold),
+                    None => break,
+                },
+                None => threshold,
+            };
+            match self.reals.next_real_from(from) {
+                Some(real) => self.reals_ahead.push(real),
+                None => self.exhausted = true,
+            }
         }
         self.reals_ahead.iter().take(count).copied().collect()
     }
@@ -220,11 +224,11 @@ pub struct TwaRowIterator<'a, I: Iterator<Item = Sample>> {
 }
 
 impl<'a, I: Iterator<Item = Sample>> TwaRowIterator<'a, I> {
-    /// `samples` are the window's filtered samples in time order. `reals` opens a second
-    /// cursor over the same samples, at a given timestamp, to look for real ones ahead.
+    /// `samples` are the window's filtered samples in time order. `reals` is a second cursor
+    /// over the same samples that finds the real ones ahead.
     pub fn new(
         samples: I,
-        reals: StoredReals<'a>,
+        reals: Box<dyn StoredReals + 'a>,
         options: &AggregationOptions,
         mut context: TwaContext,
     ) -> Self {

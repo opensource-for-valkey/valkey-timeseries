@@ -8,8 +8,9 @@ use super::utils::{
 };
 use crate::aggregators::{ScanDirection, StoredReals, TwaContext, TwaNeighbors, TwaRowIterator};
 use crate::common::{MultiSample, Sample, Timestamp};
+use crate::series::chunks::ChunkOps;
 use crate::series::request_types::RangeOptions;
-use crate::series::{SeriesSampleIterator, TimeSeries};
+use crate::series::{SeriesSampleIterator, TimeSeries, ValueFilter};
 use itertools::Either;
 use smallvec::SmallVec;
 
@@ -98,28 +99,95 @@ fn twa_rows<'a>(
         latest,
         empty_fill: empty_fill_bounds(series, options, reply_reverse, tail_limit),
     };
-    let (window_start, window_end) = (start, end);
-    let value_filter = options.value_filter;
-    let timestamp_filter = options.timestamp_filter.clone();
-    let reals: StoredReals<'a> = Box::new(move |from| {
-        let floor = from.max(window_start);
-        let samples: Box<dyn Iterator<Item = Sample> + 'a> = match timestamp_filter.as_deref() {
-            Some(timestamps) => Box::new(TimestampFilterIterator::new(
-                series, timestamps, floor, window_end, false,
-            )),
-            None => Box::new(SeriesSampleIterator::new(
-                series,
-                floor.max(series.get_min_timestamp()),
-                window_end,
-                false,
-            )),
+    let reals = SeriesReals {
+        series,
+        start,
+        end,
+        timestamp_filter: options.timestamp_filter.clone(),
+        value_filter: options.value_filter,
+        samples: None,
+        reach: Timestamp::MIN,
+    };
+    Box::new(TwaRowIterator::new(
+        stored,
+        Box::new(reals),
+        aggregation,
+        context,
+    ))
+}
+
+/// [`StoredReals`] over the series. It reads forward and keeps its position. It reopens only
+/// when a lookup starts in a later chunk than the one it reads, so it skips whole chunks without
+/// decoding them and decodes each chunk at most once.
+struct SeriesReals<'a> {
+    series: &'a TimeSeries,
+    start: Timestamp,
+    end: Timestamp,
+    timestamp_filter: Option<Vec<Timestamp>>,
+    value_filter: Option<ValueFilter>,
+    samples: Option<Either<SeriesSampleIterator<'a>, TimestampFilterIterator<'a>>>,
+    /// The last timestamp of the chunk that holds the cursor's position.
+    reach: Timestamp,
+}
+
+impl SeriesReals<'_> {
+    /// The index and the last timestamp of the first chunk with samples at or after `at`.
+    fn chunk_at(&self, at: Timestamp) -> Option<(usize, Timestamp)> {
+        let (index, _) = self.series.get_chunk_index_bounds(at, self.end)?;
+        Some((index, self.series.chunks[index].last_timestamp()))
+    }
+
+    fn open(&mut self, from: Timestamp) {
+        let floor = from.max(self.start).max(self.series.get_min_timestamp());
+        let samples = match self.timestamp_filter.as_deref() {
+            // Never reopened: this iterator walks the filter list and the chunks forward.
+            Some(timestamps) => {
+                self.reach = Timestamp::MAX;
+                Either::Right(TimestampFilterIterator::new(
+                    self.series,
+                    timestamps,
+                    floor,
+                    self.end,
+                    false,
+                ))
+            }
+            None => {
+                let chunks = match self.chunk_at(floor) {
+                    Some((index, last)) => {
+                        self.reach = last;
+                        &self.series.chunks[index..]
+                    }
+                    None => {
+                        self.reach = Timestamp::MAX;
+                        &[]
+                    }
+                };
+                Either::Left(SeriesSampleIterator::over_chunks(
+                    chunks, floor, self.end, false,
+                ))
+            }
         };
-        match value_filter {
-            Some(filter) => Box::new(samples.filter(move |sample| filter.is_match(sample.value))),
-            None => samples,
+        self.samples = Some(samples);
+    }
+}
+
+impl StoredReals for SeriesReals<'_> {
+    fn next_real_from(&mut self, from: Timestamp) -> Option<Sample> {
+        if self.samples.is_none() || from > self.reach {
+            self.open(from);
         }
-    });
-    Box::new(TwaRowIterator::new(stored, reals, aggregation, context))
+        let value_filter = self.value_filter;
+        let real = self
+            .samples
+            .as_mut()?
+            .find(|sample| sample.timestamp >= from && is_empty_fill_data(sample, value_filter))?;
+        if real.timestamp > self.reach
+            && let Some((_, last)) = self.chunk_at(real.timestamp)
+        {
+            self.reach = last;
+        }
+        Some(real)
+    }
 }
 
 /// The rows of one key of a pivoted query, always oldest first. A `twa` column picks its
@@ -300,6 +368,46 @@ mod tests {
                         "count={count}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn rows_do_not_depend_on_how_the_samples_are_split_into_chunks() {
+        // Sparse real samples between NaN runs, so EMPTY buckets send the row driver to its
+        // second cursor again and again, across many chunks.
+        let samples: Vec<(Timestamp, f64)> = (0..3000)
+            .map(|i| {
+                let value = if i % 9 < 2 { (i % 13) as f64 } else { f64::NAN };
+                (i * 7, value)
+            })
+            .collect();
+        let one_chunk = series_of(&samples);
+        let mut many_chunks = TimeSeries {
+            chunk_size_bytes: 2 * size_of::<Sample>(),
+            ..TimeSeries::default()
+        };
+        for &(ts, value) in &samples {
+            many_chunks.add(ts, value, None);
+        }
+        assert!(one_chunk.chunks.len() < 10 && many_chunks.chunks.len() > 100);
+        let bits = |rows: Vec<(Timestamp, Vec<f64>)>| -> Vec<(Timestamp, Vec<u64>)> {
+            rows.into_iter()
+                .map(|(ts, values)| (ts, values.iter().map(|v| v.to_bits()).collect()))
+                .collect()
+        };
+        for value_filter in [None, Some(ValueFilter::new(2.0, 9.0).unwrap())] {
+            let mut options = RangeOptions::with_range(100, 20900).unwrap();
+            options.value_filter = value_filter;
+            options.aggregation = Some(aggregation(&[AggregationType::Twa], 5, true));
+            for is_reverse in [false, true] {
+                let expected = bits(rows_of(&one_chunk, &options, is_reverse));
+                assert!(expected.len() > 4000);
+                assert_eq!(
+                    bits(rows_of(&many_chunks, &options, is_reverse)),
+                    expected,
+                    "filter={value_filter:?} reverse={is_reverse}"
+                );
             }
         }
     }

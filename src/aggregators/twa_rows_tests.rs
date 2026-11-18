@@ -11,14 +11,29 @@ mod tests {
 
     const NAN: f64 = f64::NAN;
 
-    /// A cursor over the window's samples that opens at a timestamp.
-    fn cursor(inside: Vec<Sample>) -> StoredReals<'static> {
-        let inside: Rc<[Sample]> = inside.into();
-        Box::new(move |at| {
-            let from = inside.partition_point(|sample| sample.timestamp < at);
-            let inside = Rc::clone(&inside);
-            Box::new((from..inside.len()).map(move |index| inside[index]))
-        })
+    /// A cursor over the window's samples that fails the test if a lookup starts at or before a
+    /// sample it has already returned.
+    struct VecReals {
+        inside: Vec<Sample>,
+        next: usize,
+    }
+
+    impl StoredReals for VecReals {
+        fn next_real_from(&mut self, from: Timestamp) -> Option<Sample> {
+            if let Some(returned) = self.next.checked_sub(1) {
+                assert!(from > self.inside[returned].timestamp, "lookup moved back");
+            }
+            self.next = self
+                .inside
+                .partition_point(|sample| sample.timestamp < from);
+            let offset = self.inside[self.next..].iter().position(is_real)?;
+            self.next += offset + 1;
+            Some(self.inside[self.next - 1])
+        }
+    }
+
+    fn cursor(inside: Vec<Sample>) -> Box<dyn StoredReals> {
+        Box::new(VecReals { inside, next: 0 })
     }
 
     fn timeline(points: &[(Timestamp, f64)]) -> impl Iterator<Item = Sample> + '_ {
