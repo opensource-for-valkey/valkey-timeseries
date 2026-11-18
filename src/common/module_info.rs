@@ -34,13 +34,19 @@ use valkey_module_macros::info_command_handler;
 /// section selected. That thread may hold any lock the module has (an index's write lock, say),
 /// and a `std` lock taken again by its holder deadlocks: the report never finishes and the
 /// process hangs instead of exiting. So a crash report carries only the sections
-/// [`InfoSection::crash_safe`] admits. A new section must be classified there.
+/// [`InfoSection::crash_safe`] admits, and of those only the ones it can read without
+/// initializing anything ([`InfoSection::readable_in_crash_report`]). A new section must be
+/// classified in both.
 #[info_command_handler]
 fn module_info(ctx: &InfoContext, for_crash_report: bool) -> ValkeyResult<()> {
     for &section in SECTIONS {
-        if section.emitted(for_crash_report) {
-            write_section(ctx, section.name(), || section.fields())?;
+        if !section.emitted(for_crash_report) {
+            continue;
         }
+        if for_crash_report && !section.readable_in_crash_report() {
+            continue;
+        }
+        write_section(ctx, section.name(), || section.fields(for_crash_report))?;
     }
     Ok(())
 }
@@ -101,19 +107,24 @@ impl InfoSection {
     }
 
     /// Whether the section may go into a crash report: every value it reads is an atomic load,
-    /// or a sum over a fixed set of them, so it takes no lock and walks no structure. Allocating
-    /// is allowed: the server's own crash report allocates too.
+    /// or a sum over a fixed set of them, so it takes no lock, walks no structure, and
+    /// initializes nothing lazily — a `LazyLock` is a lock too, and the faulting thread may be
+    /// the one running its initializer. Allocating is allowed: the server's own crash report
+    /// allocates too.
     ///
     /// - `index` walks every database's postings under each index's read lock: not safe.
     /// - `compaction`, `rdb`, `blocked_read`, `chunk`: plain counters and gauges.
     /// - `task`, `asm`, `index_reconciliation`: counters and gauges, and duration histograms
-    ///   that metered snapshots with atomic loads (INFO leaves them out, but reads them).
+    ///   that metered snapshots with atomic loads (INFO leaves them out, but reads them). The
+    ///   histograms are forced when the registries are built, so reading them initializes nothing.
     /// - `string_interning`: the pool's entry count (a sum of papaya's striped counters) and an
-    ///   atomic byte count.
-    /// - `fanout`: counters, and two map sizes read the same way, without a guard.
+    ///   atomic byte count, both read without creating the pool (zero before its first string).
+    /// - `fanout`: counters, and two map sizes read the same way, without a guard and without
+    ///   creating the maps.
     /// - `clustermap`, `exec`: not mirrored, so not audited; not safe until they are.
     ///
-    /// The mirrored metrics are read through metered's registry, which takes no lock either.
+    /// The mirrored metrics are read through metered's registry, which takes no lock either, and
+    /// only once it exists ([`Self::readable_in_crash_report`]).
     const fn crash_safe(self) -> bool {
         match self {
             InfoSection::Index => false,
@@ -137,10 +148,25 @@ impl InfoSection {
         !for_crash_report || self.crash_safe()
     }
 
-    fn fields(self) -> Vec<(String, InfoValue)> {
+    /// Whether a crash report can read the section right now without initializing anything.
+    /// The metrics sections need the registries, which a crash report must not build: it reads
+    /// them only once the first `INFO` or `TS._DEBUG METRICS` has, and otherwise leaves the
+    /// section out. Once built they stay built, so a `true` holds for [`Self::fields`].
+    fn readable_in_crash_report(self) -> bool {
+        match self {
+            InfoSection::Index | InfoSection::Compaction => true,
+            InfoSection::Metrics(_) => metrics::current_if_built(&[]).is_some(),
+        }
+    }
+
+    fn fields(self, for_crash_report: bool) -> Vec<(String, InfoValue)> {
         match self {
             InfoSection::Index => index_fields(),
             InfoSection::Compaction => compaction_fields(),
+            InfoSection::Metrics(section) if for_crash_report => {
+                // Never builds the registries; checked built before the section was opened.
+                info_fields_from(metrics::current_if_built(&[section]).unwrap_or_default())
+            }
             InfoSection::Metrics(section) => info_fields(section),
         }
     }
@@ -191,8 +217,13 @@ fn compaction_fields() -> Vec<(String, InfoValue)> {
 ///
 /// Returning plain data keeps the conversion testable without a server.
 fn info_fields(section: Section) -> Vec<(String, InfoValue)> {
+    info_fields_from(metrics::current(&[section]))
+}
+
+/// [`info_fields`] for readings already taken.
+fn info_fields_from(readings: Vec<metrics::MetricReading>) -> Vec<(String, InfoValue)> {
     let mut fields = Vec::new();
-    for reading in metrics::current(&[section]) {
+    for reading in readings {
         if let Some(value) = info_value(&reading.value) {
             fields.push((reading.name.clone(), value));
         }

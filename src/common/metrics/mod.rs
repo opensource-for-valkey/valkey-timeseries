@@ -28,9 +28,13 @@
 //!
 //! Metrics are node-local. Two rules keep them honest:
 //!
-//! - Reading a metric must not walk the keyspace or the index, nor take a lock. A gauge is a
-//!   load, or a lock-free call that is itself O(1): `INFO` reads the mirrored sections into the
-//!   server's crash report, on a thread that may hold any of the module's locks.
+//! - Reading a metric must not walk the keyspace or the index, take a lock, or initialize
+//!   anything lazily. A gauge is a load, or a lock-free call that is itself O(1): `INFO` reads
+//!   the mirrored sections into the server's crash report, on a thread that may hold any of the
+//!   module's locks, or may have faulted inside a `LazyLock`'s initializer, which waits forever
+//!   if the same thread forces it again. A gauge over a lazily created structure reads it with
+//!   `LazyLock::get`, reporting what an empty one would; the crash report reads the registries
+//!   themselves only once something else has built them ([`current_if_built`]).
 //! - Nothing may be counted in a forked child (`rdb_save`, the index aux save, `aof_rewrite`)
 //!   through an ordinary static: the parent never sees it. Count on the receiving side instead,
 //!   or in memory shared with the child, as the `rdb` save counters are (see [`rdb`]).
@@ -433,7 +437,24 @@ fn subtract_histogram(current: &HistogramSnapshot, base: &HistogramSnapshot) -> 
 /// `INFO` reports, since a scraper expects counters that never go backwards. Ordered as
 /// [`snapshot`].
 pub fn current(sections: &[Section]) -> Vec<MetricReading> {
-    REGISTRIES
+    read_sections(&REGISTRIES, sections)
+}
+
+/// [`current`] without building the registries: `None` until something has built them (the
+/// first `INFO` or `TS._DEBUG METRICS` since load).
+///
+/// For the crash report, which runs on the faulting thread: if that thread faulted while
+/// building the registries, forcing them again from the crash report would wait on its own
+/// initialization forever, and the report would never finish.
+pub fn current_if_built(sections: &[Section]) -> Option<Vec<MetricReading>> {
+    LazyLock::get(&REGISTRIES).map(|registries| read_sections(registries, sections))
+}
+
+fn read_sections(
+    registries: &'static [SectionRegistry],
+    sections: &[Section],
+) -> Vec<MetricReading> {
+    registries
         .iter()
         .filter(|entry| sections.is_empty() || sections.contains(&entry.section))
         .flat_map(read_registry)
@@ -727,6 +748,19 @@ mod tests {
     fn registries_follow_section_order() {
         let order: Vec<_> = REGISTRIES.iter().map(|entry| entry.section).collect();
         assert_eq!(order, Section::ALL);
+    }
+
+    /// Once the registries exist, the non-forcing read sees the same families as [`current`].
+    /// (Whether they exist before that depends on which tests ran first, so only the built
+    /// case is pinned.)
+    #[test]
+    fn current_if_built_reads_the_built_registries() {
+        let names = |readings: Vec<MetricReading>| -> Vec<String> {
+            readings.into_iter().map(|reading| reading.name).collect()
+        };
+        let forced = names(current(&[Section::Fanout]));
+        let built = current_if_built(&[Section::Fanout]).expect("current built the registries");
+        assert_eq!(names(built), forced);
     }
 
     /// Metered's own check: a declared unit must suffix the name, label names must be legal,
