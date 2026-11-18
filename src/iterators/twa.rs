@@ -6,7 +6,7 @@ use super::utils::{
     TailIter, create_filtered_sample_iterator, create_row_iterator, empty_fill_bounds,
     is_empty_fill_data,
 };
-use crate::aggregators::{ScanDirection, TwaContext, TwaNeighbors, TwaRowIterator, is_real};
+use crate::aggregators::{ScanDirection, StoredReals, TwaContext, TwaNeighbors, TwaRowIterator};
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::series::request_types::RangeOptions;
 use crate::series::{SeriesSampleIterator, TimeSeries};
@@ -89,19 +89,37 @@ fn twa_rows<'a>(
             .value_filter
             .is_none_or(|f| f.is_match(sample.value))
     });
-    let window_has_real = aggregation.report_empty
-        && create_filtered_sample_iterator(series, options, None, None).any(|s| is_real(&s));
     let context = TwaContext {
         start,
         end,
         explicit_end: options.date_range.has_explicit_end(),
-        window_has_real,
         neighbors: twa_neighbors(series, options),
         direction: scan,
         latest,
         empty_fill: empty_fill_bounds(series, options, reply_reverse, tail_limit),
     };
-    Box::new(TwaRowIterator::new(stored, aggregation, context))
+    let (window_start, window_end) = (start, end);
+    let value_filter = options.value_filter;
+    let timestamp_filter = options.timestamp_filter.clone();
+    let reals: StoredReals<'a> = Box::new(move |from| {
+        let floor = from.max(window_start);
+        let samples: Box<dyn Iterator<Item = Sample> + 'a> = match timestamp_filter.as_deref() {
+            Some(timestamps) => Box::new(TimestampFilterIterator::new(
+                series, timestamps, floor, window_end, false,
+            )),
+            None => Box::new(SeriesSampleIterator::new(
+                series,
+                floor.max(series.get_min_timestamp()),
+                window_end,
+                false,
+            )),
+        };
+        match value_filter {
+            Some(filter) => Box::new(samples.filter(move |sample| filter.is_match(sample.value))),
+            None => samples,
+        }
+    });
+    Box::new(TwaRowIterator::new(stored, reals, aggregation, context))
 }
 
 /// The rows of one key of a pivoted query, always oldest first. A `twa` column picks its

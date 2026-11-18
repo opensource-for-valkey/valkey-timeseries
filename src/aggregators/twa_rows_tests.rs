@@ -6,8 +6,20 @@ mod tests {
     use crate::tests::aggregation;
     use crate::tests::assert_rows_close as assert_rows;
     use crate::tests::generators::{DataGenerator, TimestampModel};
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     const NAN: f64 = f64::NAN;
+
+    /// A cursor over the window's samples that opens at a timestamp.
+    fn cursor(inside: Vec<Sample>) -> StoredReals<'static> {
+        let inside: Rc<[Sample]> = inside.into();
+        Box::new(move |at| {
+            let from = inside.partition_point(|sample| sample.timestamp < at);
+            let inside = Rc::clone(&inside);
+            Box::new((from..inside.len()).map(move |index| inside[index]))
+        })
+    }
 
     fn timeline(points: &[(Timestamp, f64)]) -> impl Iterator<Item = Sample> + '_ {
         points.iter().map(|&(t, v)| Sample::new(t, v))
@@ -106,7 +118,7 @@ mod tests {
             &self,
             samples: &[(Timestamp, f64)],
             direction: ScanDirection,
-        ) -> TwaRowIterator<std::vec::IntoIter<Sample>> {
+        ) -> TwaRowIterator<'static, std::vec::IntoIter<Sample>> {
             let samples: Vec<Sample> = samples.iter().map(|&(t, v)| Sample::new(t, v)).collect();
             let (neighbors, inside) = TwaNeighbors::split(samples, self.start, self.end);
             let options = AggregationOptions {
@@ -117,13 +129,17 @@ mod tests {
                 start: self.start,
                 end: self.end,
                 explicit_end: self.explicit_end,
-                window_has_real: inside.iter().any(is_real),
                 neighbors,
                 direction,
                 latest: self.latest,
                 empty_fill: self.empty_fill,
             };
-            TwaRowIterator::new(inside.into_iter(), &options, context)
+            TwaRowIterator::new(
+                inside.clone().into_iter(),
+                cursor(inside),
+                &options,
+                context,
+            )
         }
 
         fn twa(
@@ -337,12 +353,15 @@ mod tests {
     }
 
     #[test]
-    fn reverse_scans_add_segments_newest_first() {
-        // The reference sums this bucket from 34 back to 0, where the large values cancel to 0.
+    fn reverse_scans_add_segments_in_time_order() {
+        // RedisTimeSeries adds this bucket's segments from 34 back to 0 and gets 0. The large
+        // values cancel in a different order here and the average is 0.47058823529411764.
+        // DIV-0071 records this difference.
         let samples = [(0, -7e16), (6, 2.0), (22, 1.5e16), (34, 1.0)];
         let query = Query::new(0, 40, 50);
-        assert_rows(&query.twa(&samples, Reverse), &[(0, 0.0)]);
+        assert_rows(&query.twa(&samples, Reverse), &[(0, 0.47058823529411764)]);
     }
+
     #[test]
     fn an_inverted_window_averages_its_gap_from_end_to_start() {
         // [15, 12] selects nothing; the line y = 2t averages 27 over [12, 15].
@@ -433,16 +452,20 @@ mod tests {
             start,
             end,
             explicit_end: true,
-            window_has_real: inside.iter().any(is_real),
             neighbors,
             direction: ScanDirection::from_reverse(reverse),
             empty_fill: fill,
             ..Default::default()
         };
         let options = options(&[AggregationType::Last, AggregationType::Twa]);
-        TwaRowIterator::new(inside.into_iter(), &options, context)
-            .map(|row| (row.timestamp, row.values[0]))
-            .collect()
+        TwaRowIterator::new(
+            inside.clone().into_iter(),
+            cursor(inside),
+            &options,
+            context,
+        )
+        .map(|row| (row.timestamp, row.values[0]))
+        .collect()
     }
 
     fn same_bits(a: &[(Timestamp, f64)], b: &[(Timestamp, f64)]) -> bool {
@@ -502,5 +525,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The first row of a query over `inside`, and how many samples it read from the main stream.
+    fn first_row_and_pulls(
+        inside: Vec<Sample>,
+        (start, end, width): (Timestamp, Timestamp, u64),
+        direction: ScanDirection,
+        empty: bool,
+    ) -> (Option<MultiSample>, usize) {
+        let pulled = Rc::new(Cell::new(0));
+        let counter = Rc::clone(&pulled);
+        let main = inside
+            .clone()
+            .into_iter()
+            .inspect(move |_| counter.set(counter.get() + 1));
+        let context = TwaContext {
+            start,
+            end,
+            explicit_end: true,
+            direction,
+            ..Default::default()
+        };
+        let options = aggregation(&[AggregationType::Twa], width, empty);
+        let row = TwaRowIterator::new(main, cursor(inside), &options, context).next();
+        (row, pulled.get())
+    }
+
+    #[test]
+    fn a_nan_run_is_not_read_through_the_main_stream() {
+        let mut inside = vec![Sample::new(0, 1.0)];
+        inside.extend((1..=100_000).map(|t| Sample::new(t, NAN)));
+        let (row, pulled) = first_row_and_pulls(inside, (0, 100_000, 10), Forward, true);
+        assert_eq!(row.map(|row| row.timestamp), Some(0));
+        assert!(pulled <= 12, "pulled {pulled} samples");
+    }
+
+    #[test]
+    fn a_reverse_scan_finds_its_right_edge_without_reading_the_next_bucket() {
+        let mut inside = vec![Sample::new(0, 1.0), Sample::new(5, 3.0)];
+        inside.extend((1_000_000..1_100_000).map(|t| Sample::new(t, NAN)));
+        inside.push(Sample::new(1_100_000, 9.0));
+        let (row, pulled) = first_row_and_pulls(inside, (0, 2_000_000, 1_000_000), Reverse, false);
+        let row = row.unwrap();
+        assert_eq!(row.timestamp, 0);
+        assert!(row.values[0].is_finite());
+        assert!(pulled <= 4, "pulled {pulled} samples");
     }
 }
