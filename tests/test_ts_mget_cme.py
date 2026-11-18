@@ -1,5 +1,5 @@
 import pytest
-from valkey import ResponseError, ValkeyCluster
+from valkey import ResponseError, Valkey, ValkeyCluster
 from valkeytestframework.util.waiters import *
 from valkeytestframework.conftest import resource_port_tracker
 from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCase
@@ -102,6 +102,27 @@ class TestTimeSeriesMgetCluster(ValkeyTimeSeriesClusterTestCase):
             # Should only have name and region labels
             label_names = {l[0] for l in labels if l is not None}
             assert label_names.issubset({b'name', b'region'})
+
+    @pytest.mark.parametrize('label_args', [
+        ('WITHLABELS',),
+        ('SELECTED_LABELS', 'name', 'region', 'absent'),
+    ])
+    def test_mget_cme_resp3_matches_resp2(self, label_args):
+        """A cross-shard MGET over RESP3 is a map keyed by series, with the RESP2 content."""
+        self.setup_test_data()
+
+        query = ('TS.MGET', *label_args, 'FILTER', 'name=cpu')
+        primary = self.get_primary(0)
+        resp2 = self.new_client_for_primary(0).execute_command(*query)
+        resp3 = Valkey(host=primary.bind_ip, port=primary.port, protocol=3).execute_command(*query)
+
+        assert isinstance(resp3, dict)
+        assert len(resp2) == 4
+        assert sorted(resp3) == sorted(item[0] for item in resp2)
+        for key, labels, sample in resp2:
+            labels3, sample3 = resp3[key]
+            assert labels3 == {name: value for name, value in labels}
+            assert sample3 == [sample[0], float(sample[1])]
 
     def test_mget_cme_complex_filter(self):
         """Test TS.MGET with complex filters across cluster"""
