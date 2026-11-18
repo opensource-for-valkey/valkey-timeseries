@@ -33,7 +33,7 @@ static COUNTERS: &[(&str, &AtomicU64, &str)] = &[
     (
         "block_refused",
         &BLOCK_REFUSED,
-        "BLOCK reads that had to wait but could not (MULTI, a script, or the server declining)",
+        "BLOCK reads that had to wait but could not (MULTI, a script, a wait limit too large to schedule, or the server declining)",
     ),
     (
         "block_timeouts",
