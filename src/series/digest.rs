@@ -1,14 +1,17 @@
 use crate::aggregators::Aggregator;
-use crate::common::hash::DeterministicHasher;
+use crate::common::hash::StableHasher;
 use crate::common::rounding::RoundingStrategy;
 use crate::labels::MetricName;
 use crate::series::{CompactionRule, SampleDuplicatePolicy, SeriesLink};
-use std::hash::BuildHasher;
+use std::hash::{Hash, Hasher};
 use valkey_module::digest::Digest;
 
 fn calc_aggregator_digest(aggregator: &Aggregator, digest: &mut Digest) {
-    let hash = DeterministicHasher::default().hash_one(aggregator);
-    digest.add_string_buffer(hash.to_le_bytes().as_ref());
+    // `DEBUG DIGEST` is compared between a primary and its replicas, so the hash must not
+    // depend on the build: see `StableHasher`.
+    let mut hasher = StableHasher::new();
+    aggregator.hash(&mut hasher);
+    digest.add_string_buffer(hasher.finish().to_le_bytes().as_ref());
 }
 
 pub(super) fn calc_duplicate_policy_digest(policy: &SampleDuplicatePolicy, digest: &mut Digest) {

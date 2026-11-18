@@ -16,7 +16,7 @@ use super::postings::serialization;
 use super::{TIMESERIES_INDEX, ensure_series_indexed_by_key, get_db_index};
 use crate::common::context::{create_key_string, get_current_db, set_current_db};
 use crate::common::encoding::{try_read_u8, try_read_uvarint, write_u8, write_uvarint};
-use crate::common::hash::{BuildNoHashHasher, DeterministicHasher};
+use crate::common::hash::{BuildNoHashHasher, StableHasher};
 use crate::common::logging::{log_debug, log_notice, log_warning};
 use crate::common::metrics::index_reconciliation::RECONCILE;
 use crate::common::metrics::rdb::{LOAD_FAILURE, LOAD_SUCCESS, save_counters};
@@ -89,19 +89,16 @@ impl LoadStats {
     }
 }
 
-/// Shared so the per-series load path does not rebuild the seed state on every call.
-static DIGEST_HASHER: LazyLock<DeterministicHasher> = LazyLock::new(DeterministicHasher::new);
-
-/// Per-entry digest contribution. Fixed-seed so both sides of the comparison agree; the digest
-/// never leaves the process (it is not persisted), so only intra-run consistency is required.
+/// Per-entry digest contribution. Both sides of the comparison must agree; the digest never
+/// leaves the process (it is not persisted), so only intra-run consistency is required.
 ///
 /// Not collision-resistant against a chosen-input adversary, and deliberately so: the threat
 /// model here is corruption and bugs, not forgery. Engineering a collision would require
 /// controlling key names *and* corrupting the RDB, and would buy only a skipped sweep — an
 /// index entry that stays stale until the query path's self-heal reaches it.
 fn entry_hash(id: SeriesRef, key_name: &[u8]) -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut hasher = DIGEST_HASHER.build_hasher();
+    use std::hash::Hasher;
+    let mut hasher = StableHasher::new();
     hasher.write_u64(id);
     hasher.write(key_name);
     hasher.finish()
