@@ -1,7 +1,7 @@
 use super::reply_context::ReplyContext;
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::labels::Label;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::{c_char, c_long};
 use valkey_module::{
     Context, ContextFlags, Status, VALKEYMODULE_POSTPONED_ARRAY_LEN,
@@ -42,12 +42,7 @@ impl IntoRawCtx for &Context {
 }
 
 pub fn reply_with_str(ctx: &Context, s: &str) -> Status {
-    let msg = CString::new(s).unwrap_or_else(|_| {
-        // Remove any interior NUL bytes to ensure CString::new cannot fail here.
-        let sanitized: String = s.chars().filter(|c| *c != '\0').collect();
-        CString::new(sanitized).unwrap()
-    });
-    raw::reply_with_simple_string(ctx.ctx, msg.as_ptr())
+    reply_with_simple_str(ctx.ctx, s)
 }
 
 /// Reply with a borrowed byte slice, without copying into a [`ValkeyValue`].
@@ -193,19 +188,9 @@ pub fn reply_with_bool<C: IntoRawCtx>(ctx: C, value: bool) -> Status {
     raw::reply_with_bool(raw_ctx, value.into())
 }
 
-fn str_as_legal_resp_string(s: &str) -> CString {
-    let mut bytes = s.as_bytes().to_owned();
-    for b in &mut bytes {
-        if breaks_resp_line(*b) {
-            *b = b' ';
-        }
-    }
-    CString::new(bytes).unwrap()
-}
-
 pub fn reply_error_string<C: IntoRawCtx>(ctx: C, s: &str) -> Status {
     let raw_ctx = ctx.into_raw();
-    let msg = str_as_legal_resp_string(s);
+    let msg = Context::str_as_legal_resp_string(s);
     unsafe { raw::RedisModule_ReplyWithError.unwrap()(raw_ctx, msg.as_ptr()).into() }
 }
 
@@ -322,8 +307,8 @@ fn reply_with_postponed_array<C: IntoRawCtx>(ctx: C) -> Status {
 pub fn reply<C: IntoRawCtx>(ctx: C, result: ValkeyResult) -> Status {
     let raw_ctx = ctx.into_raw();
     match result {
-        // `Context::reply` copies a simple string into a new `CString` (and panics on a NUL);
-        // a short, clean one needs no allocation.
+        // `Context::reply` copies every simple string into a new `CString`; a short, clean one
+        // needs no allocation.
         Ok(ValkeyValue::SimpleStringStatic(s)) => reply_with_simple_str(raw_ctx, s),
         Ok(ValkeyValue::SimpleString(s)) => reply_with_simple_str(raw_ctx, &s),
         other => Context::new(raw_ctx).reply(other),
@@ -340,7 +325,7 @@ fn reply_with_simple_str(raw_ctx: *mut raw::RedisModuleCtx, s: &str) -> Status {
     match inline_c_str(s, &mut buf) {
         Some(msg) => raw::reply_with_simple_string(raw_ctx, msg.as_ptr()),
         None => {
-            let msg = str_as_legal_resp_string(s);
+            let msg = Context::str_as_legal_resp_string(s);
             raw::reply_with_simple_string(raw_ctx, msg.as_ptr())
         }
     }
@@ -416,7 +401,7 @@ mod tests {
         for s in ["a\rb", "a\nb", "a\0b"] {
             let mut buf = [0u8; INLINE_SIMPLE_STRING + 1];
             assert!(inline_c_str(s, &mut buf).is_none(), "{s:?}");
-            assert_eq!(str_as_legal_resp_string(s).as_bytes(), b"a b");
+            assert_eq!(Context::str_as_legal_resp_string(s).as_bytes(), b"a b");
         }
     }
 }

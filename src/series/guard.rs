@@ -55,7 +55,7 @@ pub struct SeriesGuardMut<'a> {
 
 impl SeriesGuardMut<'_> {
     pub fn from_key(ctx: &'_ Context, key: &ValkeyString) -> ValkeyResult<Self> {
-        let value_key = ctx.open_key_writable(key);
+        let value_key = ctx.open_key_writable(key)?;
         match value_key.get_value::<TimeSeries>(&VK_TIME_SERIES_TYPE) {
             Ok(Some(series)) => Ok(SeriesGuardMut { series }),
             Ok(None) => Err(ValkeyError::Str(error_consts::KEY_NOT_FOUND)),

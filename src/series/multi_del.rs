@@ -48,7 +48,7 @@ pub fn delete_series_by_selectors(
 }
 
 fn delete_key(ctx: &Context, key: &ValkeyString) -> ValkeyResult<usize> {
-    match ctx.open_key_writable(key).delete() {
+    match ctx.open_key_writable(key).and_then(|k| k.delete()) {
         Ok(_) => Ok(1),
         Err(e) => {
             let msg = format!(
