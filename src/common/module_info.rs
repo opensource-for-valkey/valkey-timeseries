@@ -149,9 +149,10 @@ impl InfoSection {
     }
 
     /// Whether a crash report can read the section right now without initializing anything.
-    /// The metrics sections need the registries, which a crash report must not build: it reads
-    /// them only once the first `INFO` or `TS._DEBUG METRICS` has, and otherwise leaves the
-    /// section out. Once built they stay built, so a `true` holds for [`Self::fields`].
+    /// The metrics sections need the registries, which a crash report must not build. Module
+    /// init builds them ([`metrics::init`]), so this is `false` only for a crash during or before
+    /// that build, and the section is then left out. Once built they stay built, so a `true`
+    /// holds for [`Self::fields`].
     fn readable_in_crash_report(self) -> bool {
         match self {
             InfoSection::Index | InfoSection::Compaction => true,

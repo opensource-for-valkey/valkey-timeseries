@@ -121,8 +121,9 @@ straddle an update.
 The `INFO ts_<section>` mirrors described under each section below also go into the server's crash
 report, with `ts_compaction`. `ts_index` does not: it walks the label index under locks the
 crashing thread may hold, so the crash report leaves it out rather than risk hanging. For the
-same reason a crash report never initializes anything: the mirrored sections appear in it only
-once `INFO` or `TS._DEBUG METRICS` has run at least once since the module loaded.
+same reason a crash report never initializes anything: the module builds its metrics when it
+loads, so the mirrored sections appear in every crash report except one raised while the module
+is still loading.
 
 ### Syntax
 

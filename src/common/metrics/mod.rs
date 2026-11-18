@@ -34,7 +34,7 @@
 //!   module's locks, or may have faulted inside a `LazyLock`'s initializer, which waits forever
 //!   if the same thread forces it again. A gauge over a lazily created structure reads it with
 //!   `LazyLock::get`, reporting what an empty one would; the crash report reads the registries
-//!   themselves only once something else has built them ([`current_if_built`]).
+//!   themselves only once built, which module init does ([`init`], [`current_if_built`]).
 //! - Nothing may be counted in a forked child (`rdb_save`, the index aux save, `aof_rewrite`)
 //!   through an ordinary static: the parent never sees it. Count on the receiving side instead,
 //!   or in memory shared with the child, as the `rdb` save counters are (see [`rdb`]).
@@ -440,8 +440,17 @@ pub fn current(sections: &[Section]) -> Vec<MetricReading> {
     read_sections(&REGISTRIES, sections)
 }
 
-/// [`current`] without building the registries: `None` until something has built them (the
-/// first `INFO` or `TS._DEBUG METRICS` since load).
+/// Builds the registries now. Called from module init, so that a crash report — which must not
+/// build them itself (see [`current_if_built`]) — finds them built and carries the mirrored
+/// sections from the first command on, not only after the first `INFO`. Building them forces the
+/// duration histograms and registers the gauges' read closures; it runs no read and starts
+/// nothing, so it needs nothing initialized first but the save counters ([`rdb::init`]).
+pub fn init() {
+    LazyLock::force(&REGISTRIES);
+}
+
+/// [`current`] without building the registries: `None` until they are built, which module
+/// init does ([`init`]), so only a crash during that build or before it sees `None`.
 ///
 /// For the crash report, which runs on the faulting thread: if that thread faulted while
 /// building the registries, forcing them again from the crash report would wait on its own
@@ -765,8 +774,9 @@ mod tests {
         let names = |readings: Vec<MetricReading>| -> Vec<String> {
             readings.into_iter().map(|reading| reading.name).collect()
         };
+        init();
+        assert!(registries_built(), "init built the registries");
         let forced = names(current(&[Section::Fanout]));
-        assert!(registries_built(), "current built the registries");
         let built = current_if_built(&[Section::Fanout]).expect("current built the registries");
         assert_eq!(names(built), forced);
     }
