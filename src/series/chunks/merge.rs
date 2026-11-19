@@ -1,9 +1,8 @@
-use crate::common::hash::TimestampSet;
 use crate::common::logging::log_warning;
 use crate::common::{Sample, Timestamp};
 use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
-use crate::iterators::{SampleIter, SampleMergeIterator};
+use crate::iterators::SampleMergeIterator;
 use crate::series::chunks::{ChunkOps, TimeSeriesChunk};
 use crate::series::{DuplicatePolicy, SampleAddResult};
 
@@ -17,9 +16,9 @@ use crate::series::{DuplicatePolicy, SampleAddResult};
 ///
 /// Encodings only supply `append` (write one sample into the rebuilt chunk state) and commit
 /// that state after this returns.
-pub(crate) fn merge_chunk_samples<'a, F>(
-    existing: SampleIter<'a>,
-    samples: &'a [Sample],
+pub(crate) fn merge_chunk_samples<F>(
+    existing: impl Iterator<Item = Sample>,
+    samples: &[Sample],
     dp_policy: Option<DuplicatePolicy>,
     mut append: F,
 ) -> TsdbResult<Vec<SampleAddResult>>
@@ -28,21 +27,16 @@ where
 {
     let dp_policy = dp_policy.unwrap_or(DuplicatePolicy::KeepLast);
 
-    // Track the input timestamps so we produce exactly one result per unique input
-    // timestamp, and none for pre-existing samples that are only being rewritten.
-    let mut sample_set: TimestampSet =
-        TimestampSet::with_capacity_and_hasher(samples.len(), Default::default());
-    for sample in samples {
-        sample_set.insert(sample.timestamp);
-    }
-
     let mut results = Vec::with_capacity(samples.len());
-    let right = SampleIter::Slice(samples.iter());
-    let mut merge_iterator = SampleMergeIterator::new(existing, right, dp_policy);
+    let mut merge_iterator = SampleMergeIterator::new(existing, samples.iter().copied(), dp_policy);
+    // A result is owed for each step that consumed an incoming sample, once per timestamp: a
+    // pre-existing sample only being rewritten gets none, and a repeated input timestamp gets one.
+    let mut last_reported: Option<Timestamp> = None;
 
-    while let Some((sample, blocked)) = merge_iterator.next_internal() {
+    while let Some((sample, blocked, from_right)) = merge_iterator.next_internal() {
         append(sample)?;
-        if sample_set.remove(&sample.timestamp) {
+        if from_right && last_reported != Some(sample.timestamp) {
+            last_reported = Some(sample.timestamp);
             if blocked {
                 results.push(SampleAddResult::Duplicate);
             } else {

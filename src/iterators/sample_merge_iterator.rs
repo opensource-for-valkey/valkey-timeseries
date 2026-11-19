@@ -1,27 +1,23 @@
 use crate::common::Sample;
-use crate::iterators::SampleIter;
 use crate::series::DuplicatePolicy;
 use std::iter::Peekable;
 
 /// Merges a chunk's stored samples (`left`) with incoming ones (`right`) in timestamp order,
 /// resolving equal timestamps by the duplicate policy.
 ///
-/// [`next_internal`](Self::next_internal) returns each surviving sample and whether the policy
-/// refused the incoming one. On a refusal it emits the stored sample, with both inputs consumed,
-/// because the rebuilt chunk still has to contain it. It is deliberately not an `Iterator`:
-/// a caller has to see the flag, and one that dropped flagged samples would lose stored data.
-pub(crate) struct SampleMergeIterator<'a> {
-    left: Peekable<SampleIter<'a>>,
-    right: Peekable<SampleIter<'a>>,
+/// [`next_internal`](Self::next_internal) returns each surviving sample, whether the policy
+/// refused the incoming one, and whether the step consumed an incoming sample. On a refusal it
+/// emits the stored sample, with both inputs consumed, because the rebuilt chunk still has to
+/// contain it. It is deliberately not an `Iterator`: a caller has to see the flags, and one that
+/// dropped flagged samples would lose stored data.
+pub(crate) struct SampleMergeIterator<L: Iterator<Item = Sample>, R: Iterator<Item = Sample>> {
+    left: Peekable<L>,
+    right: Peekable<R>,
     duplicate_policy: DuplicatePolicy,
 }
 
-impl<'a> SampleMergeIterator<'a> {
-    pub(crate) fn new(
-        left: SampleIter<'a>,
-        right: SampleIter<'a>,
-        duplicate_policy: DuplicatePolicy,
-    ) -> Self {
+impl<L: Iterator<Item = Sample>, R: Iterator<Item = Sample>> SampleMergeIterator<L, R> {
+    pub(crate) fn new(left: L, right: R, duplicate_policy: DuplicatePolicy) -> Self {
         SampleMergeIterator {
             left: left.peekable(),
             right: right.peekable(),
@@ -29,13 +25,18 @@ impl<'a> SampleMergeIterator<'a> {
         }
     }
 
-    pub(crate) fn next_internal(&mut self) -> Option<(Sample, bool)> {
+    /// The next sample to store, as `(sample, blocked, from_right)`: `blocked` when the policy
+    /// refused the incoming sample at that timestamp, `from_right` when this step consumed an
+    /// incoming sample (so it owes the caller a result for it).
+    pub(crate) fn next_internal(&mut self) -> Option<(Sample, bool, bool)> {
         let mut blocked = false;
+        let mut from_right = false;
 
         let sample = match (self.left.peek(), self.right.peek()) {
             (Some(&left), Some(&right)) => {
                 if left.timestamp == right.timestamp {
                     let ts = left.timestamp;
+                    from_right = true;
                     if let Ok(val) =
                         self.duplicate_policy
                             .duplicate_value(ts, left.value, right.value)
@@ -56,14 +57,18 @@ impl<'a> SampleMergeIterator<'a> {
                 } else if left.timestamp < right.timestamp {
                     self.left.next()
                 } else {
+                    from_right = true;
                     self.right.next()
                 }
             }
             (Some(_), None) => self.left.next(),
-            (None, Some(_)) => self.right.next(),
+            (None, Some(_)) => {
+                from_right = true;
+                self.right.next()
+            }
             (None, None) => None,
         };
 
-        sample.map(|sample| (sample, blocked))
+        sample.map(|sample| (sample, blocked, from_right))
     }
 }
