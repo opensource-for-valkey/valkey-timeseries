@@ -121,7 +121,9 @@ with the rule.
 A new series gets its rules in the order the policies are configured. Two policies that name the
 same destination (they differ only in retention) give one rule, from the first configured, as on
 RedisTimeSeries. A destination is the source key's own bytes plus the suffix, so binary keys keep
-distinct destinations, and a `|regex` filter matches the raw key bytes. In cluster mode a
+distinct destinations. A `|regex` filter (a Valkey TimeSeries extension) matches the raw key
+bytes in Unicode mode: `.` and `\w` match whole UTF-8 characters and never a byte that is not
+valid UTF-8, so use a `(?-u:…)` class for those (`^a(?-u:.)*$`, `(?-u:\xff)`). In cluster mode a
 destination must share its source's hash slot: give the source a hash tag (`{cpu}.load` gets
 `{cpu}.load_AVG_60000`). A destination that would land in another slot is not created; the source
 is created without that rule, a warning is logged (at most once a minute), and `INFO

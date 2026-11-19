@@ -381,8 +381,10 @@ fn parse_compaction_policy_with_filter(
             ));
         }
 
-        // Test if the regex is valid by trying to compile it
-        regex::Regex::new(filter)
+        // Compiled as the byte regex it is matched with (`PolicyConfig::build`), so it accepts
+        // what that accepts: `(?-u:…)` byte classes such as `(?-u:\xff)`, which a text regex
+        // rejects, are the only way to match a key byte that is not valid UTF-8.
+        regex::bytes::Regex::new(filter)
             .map_err(|_| ValkeyError::String(format!("TSDB: invalid regex filter \"{filter}\"")))?;
     }
 
@@ -737,6 +739,32 @@ mod tests {
             crate::aggregators::Aggregator::try_from(AggregationType::Max).unwrap()
         );
         assert_eq!(*retention, 3600000);
+    }
+
+    #[test]
+    fn filters_match_utf8_by_character_and_other_bytes_through_byte_classes() {
+        // Unicode mode, the default: `.` is one UTF-8 character, so `é` (two bytes) is one
+        // `.`, and a byte that is not valid UTF-8 matches no `.`.
+        let mut config = PolicyConfig::new();
+        config
+            .add_policies_from_config("avg:1M:1d|^a.$", false)
+            .unwrap();
+        assert!(config.create_compaction_rules("aé").is_some());
+        assert!(config.create_compaction_rules(b"a\xff").is_none());
+
+        // A `(?-u:…)` class matches any byte. It used to be rejected at CONFIG SET, as the
+        // filter was validated as a text regex and only then compiled as a byte one.
+        for filter in [r"^a(?-u:.)$", r"^a(?-u:\xff)$"] {
+            let mut config = PolicyConfig::new();
+            config
+                .add_policies_from_config(&format!("avg:1M:1d|{filter}"), false)
+                .unwrap_or_else(|e| panic!("{filter}: {e:?}"));
+            let rules = config.create_compaction_rules(b"a\xff").expect(filter);
+            assert!(
+                rules.contains_key(b"a\xff_AVG_60000".as_slice()),
+                "{filter}"
+            );
+        }
     }
 
     #[test]

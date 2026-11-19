@@ -209,6 +209,28 @@ class TestRuleCreation:
             assert field(diff.subject, key, name) == field(diff.reference, key, name), name
         assert field(diff.subject, dst, b"sourceKey") == src
 
+    def test_info_lists_rules_in_creation_order(self, diff):
+        """TS.INFO lists a series' rules in the order they were created, in both protocols. The
+        reply diff compares RESP3 maps as dicts, which ignores order, so the destinations are
+        compared as lists here. RESP3 rules used to come from a HashMap, in hash order."""
+        src = "c:ord:src"
+        dests = ["c:ord:zz", "c:ord:mm", "c:ord:aa", "c:ord:qq", "c:ord:bb", "c:ord:yy"]
+
+        def destinations(client):
+            info = client.execute_command("TS.INFO", src)
+            info = info if isinstance(info, dict) else dict(zip(info[::2], info[1::2]))
+            rules = info[b"rules"]
+            return list(rules) if isinstance(rules, dict) else [rule[0] for rule in rules]
+
+        for client in (diff.reference, diff.subject):
+            client.execute_command("TS.CREATE", src)
+            for dst in dests:
+                client.execute_command("TS.CREATE", dst)
+                client.execute_command("TS.CREATERULE", src, dst, "AGGREGATION", "avg", 1000)
+        expected = [d.encode() for d in dests]
+        assert destinations(diff.reference) == expected
+        assert destinations(diff.subject) == expected
+
     def test_wrongtype_source_and_destination(self, diff):
         diff("SET", "g:wt:string", "hello")
         mk_series(diff, "g:wt:series")
