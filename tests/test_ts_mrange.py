@@ -715,12 +715,21 @@ class TestTimeSeriesMRangeDeferred(ValkeyTimeSeriesTestCaseDebugMode):
                 assert isinstance(deferred, list), query
 
     def test_killed_clients_leave_nothing_blocked(self):
-        """Clients killed while their deferred reads queue or run are let go: nothing stays
+        """Clients killed while their deferred reads are in flight are let go: nothing stays
         blocked, the lane drains, and the next read is answered."""
         self.load()
         query = ('TS.MRANGE', '-', '+', 'FILTER', 'group=d')
         readers = [self.server.get_new_client() for _ in range(16)]
-        ids = [reader.client_id() for reader in readers]
+        ids = {reader.client_id() for reader in readers}
+
+        def all_reads_sent():
+            # A client is blocked only while the lane decodes its read, a few ms on CI, so
+            # polling blocked_clients can miss the whole burst. Once the server has dispatched a
+            # reader's MRANGE, CLIENT LIST names it as the reader's last command and keeps it,
+            # whether the read is still queued, running or already answered.
+            sent = {int(entry['id']) for entry in self.client.client_list()
+                    if entry.get('cmd', '').lower() == 'ts.mrange'}
+            return ids <= sent
 
         def run(reader):
             try:
@@ -731,7 +740,7 @@ class TestTimeSeriesMRangeDeferred(ValkeyTimeSeriesTestCaseDebugMode):
         threads = [threading.Thread(target=run, args=(r,), daemon=True) for r in readers]
         for thread in threads:
             thread.start()
-        wait_for_true(lambda: self.client.info('clients')['blocked_clients'] > 0, timeout=15)
+        wait_for_true(all_reads_sent, timeout=15)
         for client_id in ids:
             self.client.execute_command('CLIENT', 'KILL', 'ID', client_id)
         for thread in threads:
