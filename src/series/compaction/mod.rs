@@ -5,7 +5,8 @@
 //! - `engine`: one rule against one destination — bucket arithmetic, Context-free;
 //! - `cascade`: every rule of a source, then each destination's own rules, with destination
 //!   resolution and keyspace notifications;
-//! - `links`: `LATEST`, relinking after `RENAME`, and rule-cycle checks.
+//! - `links`: `LATEST`, relinking after `RENAME`, and rule-cycle checks;
+//! - `compaction_policy`: `ts-compaction-policy`, the rules created for a new series.
 
 use crate::aggregators::{AggregationHandler, Aggregator, calc_bucket_start};
 use crate::common::rdb::{
@@ -20,11 +21,13 @@ use std::sync::atomic::AtomicU64;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, raw};
 
 mod cascade;
+mod compaction_policy;
 mod engine;
 mod links;
 
 pub use cascade::apply_compaction;
 pub(crate) use cascade::fail_next_compaction;
+pub use compaction_policy::*;
 pub use engine::CompactionOp;
 #[cfg(feature = "test-utils")]
 pub use engine::{bench_ingest_one, bench_rule};
@@ -230,6 +233,9 @@ pub(super) fn rebuild_open_bucket_as_of(
 pub static COMPACTION_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Open-bucket rebuilds of `dirty` rules (`ts_compaction_state_rebuilds_total`).
 pub static COMPACTION_STATE_REBUILDS: AtomicU64 = AtomicU64::new(0);
+/// `ts-compaction-policy` destinations not created because, in cluster mode, they would hash to
+/// another slot than their source (`ts_compaction_policy_skipped_total`).
+pub static COMPACTION_POLICY_SKIPS: AtomicU64 = AtomicU64::new(0);
 
 /// Resync `series`' rules after `[start, end]` was removed from it (stored under `key`). The
 /// removal is already committed, so a rule failure is logged rather than returned — see

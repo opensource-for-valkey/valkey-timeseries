@@ -370,3 +370,57 @@ class TestValueValidation:
         subject, reference = clients
         assert reference.set_outcome("ts-compaction-policy", "twa:1h:1d") == "ok"
         assert subject.set_outcome("ts-compaction-policy", "twa:1h:1d") == "ok"
+
+
+def _rules_and_retentions(client, key):
+    """`TS.INFO key` rules, in order, with each destination's retention."""
+    info = client.execute_command("TS.INFO", key)
+    info = dict(zip(info[::2], info[1::2]))
+    rules = [list(rule) for rule in info[b"rules"]]
+    retentions = []
+    for rule in rules:
+        dest = client.execute_command("TS.INFO", rule[0])
+        retentions.append(dict(zip(dest[::2], dest[1::2]))[b"retentionTime"])
+    return rules, retentions
+
+
+class TestCompactionPolicyEffects:
+    """What a configured policy creates when a write auto-creates a series."""
+
+    @pytest.mark.parametrize("policy", [
+        "max:1M:1d;avg:1M:1d;min:1M:1d",
+        "min:1M:1d;max:1M:1d;avg:1M:1d",
+        "avg:1M:1d;avg:1M:7d",         # same destination: the first policy wins
+        "avg:1M:7d;avg:1M:1d;avg:2M:1d",
+        "avg:1M:1d;avg:1M:1d",         # a repeated policy is accepted and gives one rule
+    ])
+    def test_rules_follow_the_configured_order(self, clients, policy):
+        """Rules are attached in configured order, and of two policies naming the same
+        destination (differing only in retention) the first one is created."""
+        outcomes = []
+        for engine in clients:
+            engine.client.flushall()
+            assert engine.set_outcome("ts-compaction-policy", policy) == "ok"
+            engine.client.execute_command("TS.ADD", "pol:k", 1000, 1)
+            outcomes.append(_rules_and_retentions(engine.client, "pol:k"))
+            engine.client.flushall()
+        subject, reference = outcomes
+        assert subject == reference, policy
+
+    def test_destinations_of_binary_keys_keep_their_bytes(self, clients):
+        """A destination is the source key's bytes plus the suffix. `a\\xfe` and `a\\xff` each
+        get their own: the names used to go through a lossy UTF-8 conversion, so both mapped to
+        `a\\ufffd_AVG_60000` and the second source silently got no rule."""
+        outcomes = []
+        for engine in clients:
+            engine.client.flushall()
+            assert engine.set_outcome("ts-compaction-policy", "avg:1M:1d") == "ok"
+            for key in (b"a\xfe", b"a\xff", b"{cpu}.load"):
+                engine.client.execute_command("TS.ADD", key, 1000, 1)
+            keys = sorted(engine.client.keys("*"))
+            rules = {k: _rules_and_retentions(engine.client, k)[0]
+                     for k in (b"a\xfe", b"a\xff", b"{cpu}.load")}
+            outcomes.append((keys, rules))
+            engine.client.flushall()
+        subject, reference = outcomes
+        assert subject == reference

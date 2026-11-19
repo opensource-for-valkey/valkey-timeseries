@@ -44,6 +44,7 @@ pub fn ts_info_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     // Written field by field, in a fixed order. Returned as a `ValkeyValue::Map` — a
     // `HashMap` — the fields came back in a different order on every call.
+    let is_resp3 = is_resp3_client(ctx);
     let reply = ReplyContext::new(ctx.ctx);
     reply.reply_with_map(fields.len());
     for name in INFO_FIELD_ORDER {
@@ -52,10 +53,12 @@ pub fn ts_info_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             continue;
         };
         reply.reply_with_string(name);
-        if *name == "Chunks" {
-            reply_with_chunks_info(&reply, &series);
-        } else {
-            reply.reply(Ok(value));
+        match *name {
+            "Chunks" => reply_with_chunks_info(&reply, &series),
+            "rules" if is_resp3 => reply_with_rules_map(&reply, value),
+            _ => {
+                reply.reply(Ok(value));
+            }
         }
     }
     // Anything not in the list still has to go out: the map length above counted it.
@@ -117,7 +120,7 @@ fn get_rules_state(ts: &TimeSeries) -> ValkeyValue {
                 ValkeyValue::Null
             };
             ValkeyValue::Array(vec![
-                ValkeyValue::BulkString(String::from_utf8_lossy(rule.dest.key()).into_owned()),
+                ValkeyValue::StringBuffer(rule.dest.key().to_vec()),
                 rule.bucket_start
                     .map_or(ValkeyValue::Null, ValkeyValue::Integer),
                 ValkeyValue::Integer(i64::from(rule.has_samples)),
@@ -127,6 +130,25 @@ fn get_rules_state(ts: &TimeSeries) -> ValkeyValue {
         })
         .collect();
     ValkeyValue::Array(entries)
+}
+
+/// `rules` on RESP3: a map of `destKey -> [bucketDuration, aggregator, alignTimestamp]` in rule
+/// order, as the reference replies, built from [`get_rules_info`]'s rule-ordered entries. It is
+/// written pair by pair because neither map value can carry that order: `ValkeyValue::Map` is a
+/// `HashMap`, and `OrderedMap` sorts by key.
+fn reply_with_rules_map(reply: &ReplyContext, rules: ValkeyValue) {
+    let ValkeyValue::Array(rules) = rules else {
+        unreachable!("get_rules_info builds an array");
+    };
+    reply.reply_with_map(rules.len());
+    for rule in rules {
+        let ValkeyValue::Array(mut fields) = rule else {
+            unreachable!("get_rules_info builds one array per rule");
+        };
+        let dest_key = fields.remove(0);
+        reply.reply(Ok(dest_key));
+        reply.reply(Ok(ValkeyValue::Array(fields)));
+    }
 }
 
 /// `Chunks` for TS.INFO DEBUG: one map per chunk, its fields in a fixed order.
@@ -215,11 +237,11 @@ fn get_ts_info(ctx: &Context, ts: &TimeSeries, debug: bool, key: &ValkeyString) 
     let source_key = get_source_key(ctx, ts);
     map.insert(
         "sourceKey".into(),
-        source_key.map_or(ValkeyValue::Null, ValkeyValue::from),
+        source_key.map_or(ValkeyValue::Null, ValkeyValue::BulkValkeyString),
     );
     map.insert(
         ValkeyValueKey::String("rules".to_string()),
-        get_rules_info(ctx, ts, is_resp3),
+        get_rules_info(ctx, ts),
     );
 
     map.insert(
@@ -297,13 +319,12 @@ fn rule_aggregator_name(rule: &crate::series::CompactionRule) -> String {
         .to_uppercase()
 }
 
-/// Compaction rules for TS.INFO.
-///
-/// RESP3: a map of `destKey -> [bucketDuration, aggregator, alignTimestamp]`.
-/// RESP2: an array of `[destKey, bucketDuration, aggregator, alignTimestamp]`.
+/// Compaction rules for TS.INFO, in rule order: an array of
+/// `[destKey, bucketDuration, aggregator, alignTimestamp]`. That is the RESP2 reply; a RESP3
+/// client gets the same entries as a map, from [`reply_with_rules_map`].
 /// A rule whose destination no longer exists, or no longer names this series as
 /// its source, is dropped from the reply (and logged), in both protocols.
-fn get_rules_info(ctx: &Context, series: &TimeSeries, is_resp3: bool) -> ValkeyValue {
+fn get_rules_info(ctx: &Context, series: &TimeSeries) -> ValkeyValue {
     let resolved = series
         .rules
         .iter()
@@ -320,32 +341,17 @@ fn get_rules_info(ctx: &Context, series: &TimeSeries, is_resp3: bool) -> ValkeyV
                 ctx.log_warning("Compaction rule has an invalid destination; omitting it");
                 return None;
             }
-            Some((dest_key.to_string_lossy(), rule))
+            // The key's own bytes: a lossy conversion turned a binary key into one no command
+            // can name.
+            Some((dest_key, rule))
         })
         .collect::<Vec<_>>();
-
-    if is_resp3 {
-        let rules_map: HashMap<ValkeyValueKey, ValkeyValue> = resolved
-            .into_iter()
-            .map(|(dest_key, x)| {
-                (
-                    ValkeyValueKey::String(dest_key.clone()),
-                    ValkeyValue::Array(vec![
-                        ValkeyValue::Integer(x.bucket_duration as i64),
-                        ValkeyValue::SimpleString(rule_aggregator_name(x)),
-                        ValkeyValue::Integer(x.align_timestamp),
-                    ]),
-                )
-            })
-            .collect();
-        return ValkeyValue::Map(rules_map);
-    }
 
     let rules_value = resolved
         .into_iter()
         .map(|(dest_key, x)| {
             ValkeyValue::Array(vec![
-                ValkeyValue::BulkString(dest_key.clone()),
+                ValkeyValue::BulkValkeyString(dest_key),
                 ValkeyValue::Integer(x.bucket_duration as i64),
                 ValkeyValue::SimpleString(rule_aggregator_name(x)),
                 ValkeyValue::Integer(x.align_timestamp),
@@ -356,11 +362,11 @@ fn get_rules_info(ctx: &Context, series: &TimeSeries, is_resp3: bool) -> ValkeyV
 }
 
 /// The key of the series that feeds `series`, if it still has a rule for it.
-fn get_source_key(ctx: &Context, series: &TimeSeries) -> Option<String> {
+fn get_source_key(ctx: &Context, series: &TimeSeries) -> Option<ValkeyString> {
     series.src_series.as_ref()?;
     let Some(source_key) = live_source_key(ctx, series) else {
         ctx.log_warning("Compaction source series not found");
         return None;
     };
-    Some(source_key.to_string_lossy())
+    Some(source_key)
 }

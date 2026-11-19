@@ -5,9 +5,11 @@ use crate::common::context::{
 };
 use crate::common::rounding::{NO_ROUNDING_KEYWORD, RoundingStrategy};
 use crate::error_consts;
+use crate::fanout::{calculate_hash_slot, is_clustered};
 use crate::labels::{InternedLabel, Label, MetricName};
 use crate::parser::metric_name::parse_metric_name;
 use crate::series::chunks::ChunkEncoding;
+use crate::series::compaction::note_cross_slot_destination;
 use crate::series::index::{TimeSeriesIndex, get_db_index, next_timeseries_id};
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
 use crate::series::{
@@ -354,8 +356,7 @@ fn add_default_compactions(
         return Ok(());
     }
 
-    let key_str = key.to_string_lossy();
-    let Some(compaction_rules) = create_compaction_rules_from_config(&key_str) else {
+    let Some(compaction_rules) = create_compaction_rules_from_config(key.as_slice()) else {
         // No compaction rules available for this key
         return Ok(());
     };
@@ -377,7 +378,16 @@ fn add_default_compactions(
         let duration_str = bucket_duration.to_string();
         labels.push(Label::new("time_bucket", &duration_str));
 
-        let child_key = create_key_string(ctx, dest_key.as_bytes());
+        // In cluster mode a destination must live in its source's slot: the source's node owns
+        // that slot and no other, so a destination named into another slot would be created
+        // where the cluster cannot reach it. A source with a hash tag (`{cpu}.load`) keeps
+        // its destinations in its slot; an untagged one's rule is skipped and counted.
+        if is_clustered(ctx) && calculate_hash_slot(&dest_key) != calculate_hash_slot(key) {
+            note_cross_slot_destination(key, &dest_key);
+            continue;
+        }
+
+        let child_key = create_key_string(ctx, &dest_key);
         let options = TimeSeriesOptions {
             src: Some(SeriesLink::from_key(key.as_slice())),
             retention: Some(Duration::from_millis(retention)),
@@ -393,7 +403,7 @@ fn add_default_compactions(
             // wants the rule frees the key and re-creates the source.
             let msg = format!(
                 "TSDB: compaction series for key '{child_key}' already exists; policy rule for \
-                 '{key_str}' skipped."
+                 '{key}' skipped."
             );
             ctx.log_warning(&msg);
             continue;

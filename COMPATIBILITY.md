@@ -107,7 +107,7 @@ after planning are not included. Large standalone `TS.QUERYINDEX` and `TS.QUERYL
 and range-filtered `TS.CARD` counts, are read the same way on background workers (see
 _Standalone background reads_ below).
 
-Requirements common to both modules are unchanged and are not part of this divergence: a compaction rule is a two-key operation whose source and destination must occupy the same hash slot (`TS.CREATERULE`, `TS.DELETERULE`, and any default compaction policy in a clustered deployment), and `TS.MADD` operates within a single slot. Hash tags remain the mechanism for both.
+Requirements common to both modules are unchanged and are not part of this divergence: a compaction rule is a two-key operation whose source and destination must occupy the same hash slot (`TS.CREATERULE`, `TS.DELETERULE`, and any default compaction policy in a clustered deployment), and `TS.MADD` operates within a single slot. Hash tags remain the mechanism for both. A default compaction policy whose destination would land in another slot than its source (an untagged source key) is not applied in Valkey TimeSeries: the source is created without that rule, and the skip is logged and counted (`ts_compaction_policy_skipped_total`), rather than the destination being created where the cluster cannot reach it.
 
 **Why.** Using the cluster bus keeps fan-out inside the machinery an operator already runs, secures, and monitors, rather than introducing a parallel transport with its own ports and credentials to distribute. The timeout is the consequence of that choice being made explicit: a scatter/gather across shards can fail partially, and reporting that as an error is preferred to returning a silently incomplete result set.
 

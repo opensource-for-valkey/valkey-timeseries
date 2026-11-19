@@ -104,7 +104,8 @@ destination) marks the rule `dirty`; the next write to the source rebuilds the r
 from the source samples before applying itself. The command that hit the failure still succeeds
 and replicates — its write to the source is already committed — and the failure is logged. A
 closed bucket lost to the failure is not repaired. `INFO ts_compaction` reports `ts_compaction_failures_total` (applications that failed) and
-`ts_compaction_state_rebuilds_total` (dirty rules rebuilt), both since module start, and
+`ts_compaction_state_rebuilds_total` (dirty rules rebuilt), both since module start (with
+`ts_compaction_policy_skipped_total`, below), and
 `TS.INFO key DEBUG` shows each rule's open-bucket state under `rulesState` (the last element of
 each entry is the `dirty` flag). A non-zero failure counter is the signal that a destination may
 be missing a bucket.
@@ -116,6 +117,17 @@ and at module load. `count>5`/`sum>5` run as `countif`/`sumif`. The condition is
 destination key (`{key}_COUNTIF_GT_5_60000`, operators spelled `EQ`/`NE`/`GT`/`GTE`/`LT`/`LTE`) and
 of the destination's labels (`aggregation=countif`, `condition=>5`), and it is replicated inline
 with the rule.
+
+A new series gets its rules in the order the policies are configured. Two policies that name the
+same destination (they differ only in retention) give one rule, from the first configured, as on
+RedisTimeSeries. A destination is the source key's own bytes plus the suffix, so binary keys keep
+distinct destinations. A `|regex` filter (a Valkey TimeSeries extension) matches the raw key
+bytes in Unicode mode: `.` and `\w` match whole UTF-8 characters and never a byte that is not
+valid UTF-8, so use a `(?-u:…)` class for those (`^a(?-u:.)*$`, `(?-u:\xff)`). In cluster mode a
+destination must share its source's hash slot: give the source a hash tag (`{cpu}.load` gets
+`{cpu}.load_AVG_60000`). A destination that would land in another slot is not created; the source
+is created without that rule, a warning is logged (at most once a minute), and `INFO
+ts_compaction` counts it in `ts_compaction_policy_skipped_total`.
 
 ### Metadata & Indexing
 
