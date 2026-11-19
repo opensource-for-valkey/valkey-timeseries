@@ -388,20 +388,10 @@ impl ChunkOps for UncompressedChunk {
         if samples.is_empty() {
             return Ok(Vec::new());
         }
+        // One sample takes the same paths as several: it used to be routed through
+        // `add_sample`/`upsert_sample`, which refused an append to a full chunk (the batch path
+        // never does) and reported the input rather than the value it stored.
         let first = samples[0];
-
-        if samples.len() == 1 {
-            if self.is_empty() {
-                self.add_sample(&first)?;
-                return Ok(vec![SampleAddResult::Ok(first)]);
-            }
-            let policy = dp_policy.unwrap_or(DuplicatePolicy::KeepLast);
-            return match self.upsert_sample(first, policy) {
-                Ok(_) => Ok(vec![SampleAddResult::Ok(first)]),
-                Err(TsdbError::DuplicateSample(_)) => Ok(vec![SampleAddResult::Duplicate]),
-                Err(e) => Err(e),
-            };
-        }
 
         if self.is_empty() || first.timestamp > self.last_timestamp() {
             self.samples.extend_from_slice(samples);

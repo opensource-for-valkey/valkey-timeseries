@@ -94,14 +94,15 @@ pub(crate) fn merge_by_capacity(
     let remaining_capacity = dest
         .estimate_remaining_sample_capacity()
         .min(room / src_bytes_per_sample);
-    let first_ts = src.first_timestamp().max(min_timestamp);
-    // if there is enough capacity in the previous block, merge the last block into it
-    if remaining_capacity >= count {
-        // merge_samples needs a materialized, multi-pass slice and rebuilds the
-        // destination per call, so one transient buffer is unavoidable — but its
-        // size is known (src.len()), so pre-size it to avoid reallocation churn.
-        let mut samples = Vec::with_capacity(count);
-        samples.extend(src.iter());
+    // Neither path moves a sample below `min_timestamp` (both used to differ: the whole-source
+    // merge carried expired samples along). The source is decoded strictly: `iter()` and
+    // `get_range` end early at a decode error, and emptying or rewriting the source after such
+    // a read lost every sample past it while reporting a successful merge.
+    let floor = src.first_timestamp().max(min_timestamp);
+    let mut samples = src.decode_all()?;
+    let below = samples.partition_point(|s| s.timestamp < floor);
+    samples.drain(..below);
+    if remaining_capacity >= samples.len() {
         let res = dest.merge_samples(&samples, duplicate_policy)?;
         let merged = res.iter().filter(|s| s.is_ok()).count();
         // reuse last block
@@ -109,9 +110,7 @@ pub(crate) fn merge_by_capacity(
         return Ok(Some(merged));
     } else if remaining_capacity > count / 4 {
         // do a partial merge
-        let samples = src.get_range(first_ts, src.last_timestamp())?;
-        // `samples` can be shorter than `count` when `min_timestamp` clips the front.
-        let (left, right) = samples.split_at(remaining_capacity.min(samples.len()));
+        let (left, right) = samples.split_at(remaining_capacity);
         let res = dest.merge_samples(left, duplicate_policy)?;
         src.set_data(right)?;
         let count = res.iter().filter(|s| s.is_ok()).count();

@@ -7,6 +7,8 @@ mod merge;
 #[cfg(test)]
 mod proptest_roundtrip;
 mod range_iter;
+#[cfg(test)]
+mod rewrite_integrity_tests;
 mod serialization;
 mod stream;
 mod timeseries_chunk;

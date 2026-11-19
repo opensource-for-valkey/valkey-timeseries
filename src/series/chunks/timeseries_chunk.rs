@@ -24,6 +24,16 @@ pub enum TimeSeriesChunk {
 }
 
 impl TimeSeriesChunk {
+    /// Every stored sample, in order, or the decode error that stops the read: unlike
+    /// `iter()`/`get_range`, which end early, for rewrites that must refuse a partial read.
+    pub(crate) fn decode_all(&self) -> TsdbResult<Vec<Sample>> {
+        match self {
+            TimeSeriesChunk::Uncompressed(chunk) => Ok(chunk.samples.clone()),
+            TimeSeriesChunk::Gorilla(chunk) => chunk.decode_all(),
+            TimeSeriesChunk::Chimp(chunk) => chunk.decode_all(),
+        }
+    }
+
     pub fn new(compression: ChunkEncoding, chunk_size: usize) -> Self {
         use TimeSeriesChunk::*;
         match compression {

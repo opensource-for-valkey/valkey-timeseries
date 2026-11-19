@@ -109,6 +109,23 @@ impl<C: SampleCodec> Default for XorChunk<C> {
 }
 
 impl<C: SampleCodec> XorChunk<C> {
+    /// Every stored sample, in order, or the decode error that stops the read. For rewrites
+    /// that must not proceed on a partial read (see `merge_by_capacity`).
+    pub(crate) fn decode_all(&self) -> TsdbResult<Vec<Sample>> {
+        let mut samples = Vec::new();
+        samples.try_reserve_exact(self.len()).map_err(|e| {
+            TsdbError::DecodingError(format!(
+                "cannot reserve {} samples for a {} chunk: {e}",
+                self.len(),
+                C::ENCODING.name()
+            ))
+        })?;
+        for item in self.encoder.iter() {
+            samples.push(item?);
+        }
+        Ok(samples)
+    }
+
     pub fn with_max_size(max_size: usize) -> Self {
         Self {
             encoder: C::with_soft_cap(max_size),
@@ -323,6 +340,23 @@ impl<C: SampleCodec> ChunkOps for XorChunk<C> {
             return Ok(0);
         }
 
+        // A window between two samples removes nothing: settle that by reading only as far as
+        // the window before rebuilding the chunk (and regrowing a fresh encoder) for nothing.
+        let mut hits = false;
+        for value in self.encoder.iter() {
+            let sample = value?;
+            if sample.timestamp > end_ts {
+                break;
+            }
+            if sample.timestamp >= start_ts {
+                hits = true;
+                break;
+            }
+        }
+        if !hits {
+            return Ok(0);
+        }
+
         let mut new_encoder = C::with_soft_cap(self.max_size);
         let saved_count = self.len();
 
@@ -443,10 +477,23 @@ impl<C: SampleCodec> ChunkOps for XorChunk<C> {
             return append_samples(self, samples);
         }
 
+        // The stored samples are read strictly: `iter()` ends quietly at a decode error, which
+        // rebuilt the chunk from the readable prefix and lost the rest while reporting success.
+        let mut decode_error = None;
+        let existing = self.encoder.iter().map_while(|item| match item {
+            Ok(sample) => Some(sample),
+            Err(e) => {
+                decode_error = Some(e);
+                None
+            }
+        });
         let mut encoder = C::with_soft_cap(self.max_size);
-        let result = merge_chunk_samples(self.iter(), samples, dp_policy, |sample| {
+        let result = merge_chunk_samples(existing, samples, dp_policy, |sample| {
             push_sample(&mut encoder, &sample)
         })?;
+        if let Some(e) = decode_error {
+            return Err(e);
+        }
 
         self.encoder = encoder;
         Ok(result)
