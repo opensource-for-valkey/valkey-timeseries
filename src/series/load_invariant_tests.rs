@@ -13,10 +13,11 @@ use crate::series::chunks::{
     TimeSeriesChunk, XorChunk,
 };
 use crate::series::serialization::{
-    BUDGET_CLAMPED, CHUNK_SIZE_CLAMPED, CHUNKS_OUT_OF_ORDER, ENCODING_ADOPTED, LABEL_NUL_KEPT,
-    LoadTrust, NEGATIVE_TIMESTAMPS, OFF_GRID_BUCKET_REBUILT, OVERSIZED_SPLIT, RETENTION_CLAMPED,
-    ROUNDING_CLAMPED, ROUNDING_DROPPED, STALE_RULE_STATE_CLEARED, STRAYS_REENCODED,
-    UNDECODABLE_STRAYS_KEPT, check_series_invariants, drop_empty_chunks, normalize_series,
+    BUDGET_CLAMPED, CHUNK_SIZE_CLAMPED, CHUNKS_OVERLAPPING, CHUNKS_REORDERED, ENCODING_ADOPTED,
+    LABEL_NUL_KEPT, LoadTrust, NEGATIVE_TIMESTAMPS, OFF_GRID_BUCKET_REBUILT, OVERSIZED_SPLIT,
+    RETENTION_CLAMPED, ROUNDING_CLAMPED, ROUNDING_DROPPED, STALE_RULE_STATE_CLEARED,
+    STRAYS_REENCODED, UNDECODABLE_STRAYS_KEPT, check_series_invariants, drop_empty_chunks,
+    normalize_series,
 };
 use crate::series::{
     DuplicatePolicy, SPLIT_SLACK_DIVISOR, TimeSeries, bulk_insert_samples, defrag_series,
@@ -440,6 +441,13 @@ fn stored_samples(ts: &TimeSeries) -> Vec<Sample> {
     ts.chunks.iter().flat_map(|chunk| chunk.iter()).collect()
 }
 
+/// Every stored sample in timestamp order, whatever order the chunks are in.
+fn sorted_samples(ts: &TimeSeries) -> Vec<Sample> {
+    let mut samples = stored_samples(ts);
+    samples.sort_by_key(|sample| sample.timestamp);
+    samples
+}
+
 /// What an own load does with a series a foreign load refuses.
 enum OwnLoad {
     /// Brought back within these rules, keeping every sample.
@@ -461,17 +469,17 @@ fn forged_series_are_refused_when_foreign_and_kept_when_own() {
 
         let mut ts = base.clone();
         ts.chunks.reverse();
-        cases.push(("descending chunks", ts, AsIs(CHUNKS_OUT_OF_ORDER)));
+        cases.push(("descending chunks", ts, Repaired(&[CHUNKS_REORDERED])));
 
         let mut ts = base.clone();
         let copy = ts.chunks.clone();
         ts.chunks.extend(copy);
-        cases.push(("every chunk twice", ts, AsIs(CHUNKS_OUT_OF_ORDER)));
+        cases.push(("every chunk twice", ts, AsIs(CHUNKS_OVERLAPPING)));
 
         let mut ts = base.clone();
         let dup = ts.chunks[1].clone();
         ts.chunks.insert(1, dup);
-        cases.push(("one chunk twice", ts, AsIs(CHUNKS_OUT_OF_ORDER)));
+        cases.push(("one chunk twice", ts, AsIs(CHUNKS_OVERLAPPING)));
 
         let mut ts = base.clone();
         let mut negative = TimeSeriesChunk::new(encoding, 128);
@@ -546,9 +554,11 @@ fn forged_series_are_refused_when_foreign_and_kept_when_own() {
             let mut loaded = ts.clone();
             let repairs = normalize_series(&mut loaded, LoadTrust::Own)
                 .unwrap_or_else(|e| panic!("{encoding}: an own load refused {what}: {e}"));
+            // A repair may reorder chunks, never drop or change a sample.
+            let expected = sorted_samples(&ts);
             assert_eq!(
-                stored_samples(&loaded),
-                stored_samples(&ts),
+                sorted_samples(&loaded),
+                expected,
                 "{encoding}: {what} lost samples"
             );
             match own {
@@ -559,7 +569,7 @@ fn forged_series_are_refused_when_foreign_and_kept_when_own() {
                     // Visible, too: a clamp that hid samples would pass the checks above.
                     assert_eq!(
                         loaded.get_range(0, i64::MAX),
-                        stored_samples(&ts),
+                        expected,
                         "{encoding}: {what}"
                     );
                 }
@@ -570,6 +580,63 @@ fn forged_series_are_refused_when_foreign_and_kept_when_own() {
                 }
             }
         }
+    }
+}
+
+/// An own load with disjoint chunks out of order comes back sorted, so the lookups that rely on
+/// chunk order (the range iterator's seek, the upsert's routing, point reads) see every sample.
+/// Without the repair, a reverse read over the first layout skipped `[60..69]`, and an add at 55
+/// in the second went into `[100..109]` beside the stored 55 instead of updating it.
+#[test]
+fn own_load_sorts_disjoint_chunks_out_of_order() {
+    fn chunk(encoding: ChunkEncoding, first: Timestamp) -> TimeSeriesChunk {
+        let mut chunk = TimeSeriesChunk::new(encoding, 4096);
+        for ts in first..first + 10 {
+            chunk.add_sample(&Sample::new(ts, ts as f64)).unwrap();
+        }
+        chunk
+    }
+    fn loaded(encoding: ChunkEncoding, firsts: &[Timestamp]) -> TimeSeries {
+        let mut ts = new_series(encoding, 4096);
+        ts.chunks = firsts.iter().map(|&first| chunk(encoding, first)).collect();
+        ts.update_first_last_timestamps();
+        ts.recalculate_total_samples();
+        let repairs = normalize_series(&mut ts, LoadTrust::Own).unwrap();
+        assert_eq!(repairs.repaired, [CHUNKS_REORDERED], "{encoding}");
+        assert!(repairs.tolerated.is_empty(), "{encoding}");
+        assert_loadable(&ts);
+        ts
+    }
+    let timestamps = |samples: Vec<Sample>| -> Vec<Timestamp> {
+        samples.into_iter().map(|sample| sample.timestamp).collect()
+    };
+
+    for encoding in ENCODINGS {
+        let ts = loaded(encoding, &[0, 50, 100, 60, 200]);
+        assert_eq!(ts.last_timestamp(), 209, "{encoding}");
+        let reverse =
+            timestamps(crate::series::SeriesSampleIterator::new(&ts, 55, 75, true).collect());
+        let expected: Vec<Timestamp> = (55..=59).chain(60..=69).rev().collect();
+        assert_eq!(reverse, expected, "{encoding}");
+
+        let mut ts = loaded(encoding, &[0, 100, 50]);
+        assert_eq!(
+            ts.get_sample(55).unwrap(),
+            Some(Sample::new(55, 55.0)),
+            "{encoding}"
+        );
+        let total = ts.total_samples;
+        assert!(
+            ts.add(55, -1.0, Some(DuplicatePolicy::KeepLast)).is_ok(),
+            "{encoding}"
+        );
+        assert_eq!(ts.total_samples, total, "{encoding}: the add duplicated 55");
+        assert_eq!(
+            ts.get_sample(55).unwrap(),
+            Some(Sample::new(55, -1.0)),
+            "{encoding}"
+        );
+        assert_loadable(&ts);
     }
 }
 
