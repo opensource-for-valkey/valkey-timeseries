@@ -20,7 +20,7 @@ use crate::iterators::{KWayMerge, RowReducer, SampleReducer, create_sample_itera
 use crate::series::chunks::{ChunkOps, TimeSeriesChunk, UncompressedChunk};
 use crate::series::mrange::{
     MRangeScope, SampleLimit, build_mrange_grouped_labels, collect_rows, decode_group_partials,
-    decode_shard_snapshots, group_partial_reducer, is_shard_snapshot_answerable,
+    decode_shard_snapshots, group_partial_reducer, is_snapshot_answerable,
     process_mrange_group_partials, process_mrange_query, snapshot_shard_group_partials,
     snapshot_shard_mrange, sort_mrange_results,
 };
@@ -194,7 +194,7 @@ impl FanoutClientCommand for MRangeFanoutCommand {
             MRangeScope::RemoteShard
         };
         let expired = || ctx.expired();
-        let series = if is_shard_snapshot_answerable(&options) {
+        let series = if is_snapshot_answerable(&options) {
             let snapshots = {
                 let ctx = ctx.lock_unexpired()?;
                 snapshot_shard_mrange(&ctx, &options, limit)?
