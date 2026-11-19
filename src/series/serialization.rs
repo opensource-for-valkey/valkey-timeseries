@@ -323,7 +323,7 @@ pub(crate) const OFF_GRID_BUCKET_REBUILT: &str =
 /// than what the rule protects against. Before this branch those series loaded unchecked.
 /// Every repair and tolerance is counted and logged (`note_series_repairs`).
 ///
-/// Budgets come first because the split works from them: `needs_split` adds a quarter of a
+/// Budgets come first because the split works from them: `should_split` adds a quarter of a
 /// budget to itself, which overflows for a forged `usize::MAX`.
 pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<Repairs, String> {
     let own = trust == LoadTrust::Own;

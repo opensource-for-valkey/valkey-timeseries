@@ -121,13 +121,11 @@ fn parse_encoding(encoding: &str) -> Option<ChunkEncoding> {
 ///   always `SAMPLE_SIZE`.
 /// - `TimeSeriesChunk::utilization` and `estimate_remaining_sample_capacity` derive from
 ///   the above.
-/// - Two split rules exist. The upsert path splits a chunk before inserting once
-///   `utilization() >= SPLIT_FACTOR` (1.2), via `TimeSeriesChunk::should_split`. The merge
-///   path splits once `size() > max + max / SPLIT_SLACK_DIVISOR` (just over 1.25), via
-///   `TimeSeries::needs_split`, and the upsert path applies that rule too after inserting:
-///   a sample inserted mid-chunk re-encodes the ones after it, so a chunk under 1.2 before
-///   an upsert can end far past its budget after it. The thresholds are nearly equal and no
-///   reason for keeping two is recorded; they are a candidate for unification.
+/// - One split rule: a chunk of more than one sample splits once
+///   `size() > max + max / SPLIT_SLACK_DIVISOR` (just over 1.25), via
+///   `TimeSeriesChunk::should_split`. The upsert path checks it before inserting and again
+///   after, as the merge path does: a sample inserted mid-chunk re-encodes the ones after it,
+///   so a chunk under the line before an upsert can end far past its budget after it.
 #[enum_dispatch]
 pub trait ChunkOps {
     /// The chunk's samples with timestamps in `[start, end]`, ascending. A decode error ends
@@ -191,7 +189,7 @@ pub trait ChunkOps {
     fn bytes_per_sample(&self) -> usize;
     fn clear(&mut self);
     /// Replace the chunk's contents with `samples` (sorted ascending, may be empty — an empty
-    /// slice empties the chunk). `max_size` is not enforced here; see `TimeSeries::needs_split`.
+    /// slice empties the chunk). `max_size` is not enforced here; see `TimeSeriesChunk::should_split`.
     fn set_data(&mut self, samples: &[Sample]) -> TsdbResult<()>;
 }
 

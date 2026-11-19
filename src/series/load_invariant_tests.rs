@@ -525,7 +525,7 @@ fn forged_series_are_refused_when_foreign_and_kept_when_own() {
             Repaired(&[BUDGET_CLAMPED]),
         ));
 
-        // The budget is clamped before the split: `needs_split` adds a quarter of it to itself.
+        // The budget is clamped before the split: `should_split` adds a quarter of it to itself.
         let mut ts = base.clone();
         let mut big = oversized_chunk(encoding, last);
         set_budget(&mut big, usize::MAX);

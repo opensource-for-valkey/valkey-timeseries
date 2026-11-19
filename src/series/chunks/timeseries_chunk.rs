@@ -1,12 +1,11 @@
 use crate::common::rdb::{rdb_load_u8, rdb_save_u8};
 use crate::common::{Sample, Timestamp};
-use crate::config::SPLIT_FACTOR;
 use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
 use crate::iterators::SampleIter;
 use crate::series::chunks::chimp::ChimpChunk;
 use crate::series::{
-    DuplicatePolicy, SampleAddResult,
+    DuplicatePolicy, SPLIT_SLACK_DIVISOR, SampleAddResult,
     chunks::{Chunk, ChunkEncoding, ChunkOps, GorillaChunk, UncompressedChunk},
 };
 use core::mem::size_of;
@@ -165,10 +164,21 @@ impl TimeSeriesChunk {
         size_of::<Self>() + self.get_heap_size()
     }
 
-    /// The upsert-path split rule: `utilization() >= SPLIT_FACTOR`. The merge path uses
-    /// `TimeSeries::needs_split` instead. See the `# Capacity` section on [`ChunkOps`].
+    /// Whether this chunk is big enough that a split should halve it: the one split rule, for
+    /// an upsert's pre-check and for the post-check after a merge or an upsert. "Full" is not
+    /// the test: a chunk completed by appends sits at its size limit (the append that crosses
+    /// it is the last one accepted), and the next append seals it and starts a new chunk —
+    /// halving it later would re-encode every sample it holds only to leave two half-empty
+    /// chunks, once per chunk-full of appends. Only a chunk grown past
+    /// `max_size + max_size / SPLIT_SLACK_DIVISOR` is split; bulk ingest plans its overfill
+    /// below that line (see `bulk_add`). Bytes alone decide: an uncompressed chunk's `is_full`
+    /// counts samples against a capacity the RDB loader raises to the loaded count, so testing
+    /// it left the halves of an oversized loaded chunk unsplit and still over
+    /// `MAX_LOADED_CHUNK_BYTES`. See the `# Capacity` section on [`ChunkOps`].
     pub fn should_split(&self) -> bool {
-        self.utilization() >= SPLIT_FACTOR
+        let max = self.max_size();
+        // A single sample cannot be split, however small the budget.
+        self.len() > 1 && self.size() > max + max / SPLIT_SLACK_DIVISOR
     }
 
     pub(crate) fn upsert(

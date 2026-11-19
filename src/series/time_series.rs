@@ -24,7 +24,7 @@ use orx_parallel::Par;
 use orx_parallel::ParResult;
 use smallvec::SmallVec;
 use std::mem::size_of;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 use std::vec;
 use valkey_module::digest::Digest;
@@ -56,7 +56,7 @@ pub(crate) fn seal_chunk(chunk: &mut TimeSeriesChunk) {
 }
 
 /// A chunk is split only once it exceeds `max_size` by more than `max_size / SPLIT_SLACK_DIVISOR`
-/// (see [`TimeSeries::needs_split`]).
+/// (see [`TimeSeriesChunk::should_split`]).
 pub(crate) const SPLIT_SLACK_DIVISOR: usize = 4;
 
 /// Represents a time series consisting of chunks of samples, each with a timestamp and value.
@@ -549,7 +549,7 @@ impl TimeSeries {
     }
 
     /// After an upsert into the chunks at `touched`: split as a merge would if one grew past
-    /// [`Self::needs_split`]. An insert into the middle of a compressed chunk re-encodes the
+    /// [`TimeSeriesChunk::should_split`]. An insert into the middle of a compressed chunk re-encodes the
     /// samples after it as well, so one sample can grow a chunk by more than a sample's worth
     /// — 70 bytes on a 48-byte Gorilla budget — and the pre-insert `should_split` cannot see
     /// that coming. The sample is stored either way, so a failed split only leaves the chunk
@@ -557,7 +557,10 @@ impl TimeSeries {
     fn split_if_grown(&mut self, touched: std::ops::Range<usize>) {
         let end = touched.end.min(self.chunks.len());
         let start = touched.start.min(end);
-        if !self.chunks[start..end].iter().any(Self::needs_split) {
+        if !self.chunks[start..end]
+            .iter()
+            .any(TimeSeriesChunk::should_split)
+        {
             return;
         }
         if let Err(e) = self.split_chunks_if_needed() {
@@ -566,47 +569,34 @@ impl TimeSeries {
         }
     }
 
-    /// Whether a merge left `chunk` big enough that a split should halve it. "Full" is not
-    /// the test: a chunk completed by appends sits at its size limit (the append that
-    /// crosses it is the last one accepted), and the next append seals it and starts a new
-    /// chunk — halving it later would re-encode every sample it holds only to leave two
-    /// half-empty chunks, once per chunk-full of appends. Only a chunk that a merge has grown
-    /// past `max_size + max_size / SPLIT_SLACK_DIVISOR` is split; bulk ingest plans its
-    /// overfill below that line (see `bulk_add`). Bytes alone decide: an uncompressed chunk's
-    /// `is_full` counts samples against a capacity the RDB loader raises to the loaded count,
-    /// so testing it left the halves of an oversized loaded chunk unsplit and still over
-    /// `MAX_LOADED_CHUNK_BYTES`.
-    ///
-    /// This is the merge-path split rule; the upsert path uses `TimeSeriesChunk::should_split`.
-    /// See the `# Capacity` section on [`ChunkOps`](crate::series::chunks::ChunkOps).
-    pub(crate) fn needs_split(chunk: &TimeSeriesChunk) -> bool {
-        let max = chunk.max_size();
-        // A single sample cannot be split, however small the budget.
-        chunk.len() > 1 && chunk.size() > max + max / SPLIT_SLACK_DIVISOR
-    }
-
-    /// Splits until no chunk [`needs_split`](Self::needs_split). One merge can grow a chunk to
-    /// many times its budget (a `TS.MADD` backfilling a whole batch into one chunk's span), and a
-    /// single halving left it that way, so a stored chunk had no size bound at all. Each pass
-    /// halves every oversized chunk's sample count, so the loop ends within `log2(len)` passes;
-    /// the RDB loader's chunk-size limit relies on it.
+    /// Splits until no chunk [`should_split`](TimeSeriesChunk::should_split). One merge can grow
+    /// a chunk to many times its budget (a `TS.MADD` backfilling a whole batch into one chunk's
+    /// span), and a single halving left it that way, so a stored chunk had no size bound at all.
+    /// Each pass halves every oversized chunk's sample count, so the loop ends within
+    /// `log2(len)` passes; the RDB loader's chunk-size limit relies on it.
     pub(crate) fn split_chunks_if_needed(&mut self) -> TsdbResult<()> {
         // Almost every merge ends here with nothing to split: decide that with a scan
-        // before entering a parallel section.
-        loop {
-            let to_split = self.chunks.iter().filter(|c| Self::needs_split(c)).count();
-            if to_split == 0 {
-                break;
-            }
-            self.split_oversized_chunks(to_split)?;
+        // before entering a parallel section. After that, only the halves a pass produced
+        // can still be oversized, so each pass reports how many are, and no pass rescans.
+        let mut to_split = self.chunks.iter().filter(|c| c.should_split()).count();
+        while to_split > 0 {
+            to_split = self.split_oversized_chunks(to_split)?;
         }
         Ok(())
     }
 
-    /// Halves every chunk that [`needs_split`](Self::needs_split), once. `to_split` is how many
-    /// there are, which sizes the parallel section.
-    fn split_oversized_chunks(&mut self, to_split: usize) -> TsdbResult<()> {
+    /// Halves every chunk that [`should_split`](TimeSeriesChunk::should_split), once, and
+    /// returns how many of the halves still should. `to_split` is how many chunks need it,
+    /// which sizes the parallel section.
+    fn split_oversized_chunks(&mut self, to_split: usize) -> TsdbResult<usize> {
         let errored: AtomicBool = AtomicBool::new(false);
+        let still_oversized = AtomicUsize::new(0);
+        let count_oversized = |lower: &TimeSeriesChunk, upper: &TimeSeriesChunk| {
+            let n = usize::from(lower.should_split()) + usize::from(upper.should_split());
+            if n > 0 {
+                still_oversized.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
 
         // todo: track error, but allow partials
         // A split re-encodes two half chunks (~thousands of samples), so a
@@ -615,13 +605,14 @@ impl TimeSeries {
             self.chunks
                 .par_mut_rayon()
                 .num_threads(request_par_threads(to_split, to_split * SPLIT_WORK))
-                .filter(|c| Self::needs_split(c))
+                .filter(|c| c.should_split())
                 .flat_map(|chunks| {
                     if let Ok(mut split_chunk) = chunks.split() {
                         // `split` re-encodes both halves from scratch, so both arrive with a
                         // doubling-grown buffer around half a chunk of data.
                         seal_chunk(chunks);
                         seal_chunk(&mut split_chunk);
+                        count_oversized(chunks, &split_chunk);
                         Some(split_chunk)
                     } else {
                         errored.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -631,10 +622,11 @@ impl TimeSeries {
                 .collect::<Vec<_>>()
         } else {
             let mut new_chunks = Vec::with_capacity(std::cmp::max(2, self.chunks.len() / 6));
-            for c in self.chunks.iter_mut().filter(|c| Self::needs_split(c)) {
+            for c in self.chunks.iter_mut().filter(|c| c.should_split()) {
                 if let Ok(mut split_chunk) = c.split() {
                     seal_chunk(c);
                     seal_chunk(&mut split_chunk);
+                    count_oversized(c, &split_chunk);
                     new_chunks.push(split_chunk);
                 } else {
                     errored.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -680,7 +672,7 @@ impl TimeSeries {
             return Err(TsdbError::ChunkSplitError);
         }
 
-        Ok(())
+        Ok(still_oversized.into_inner())
     }
 
     pub(super) fn recalculate_total_samples(&mut self) {

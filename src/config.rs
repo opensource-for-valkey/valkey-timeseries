@@ -29,7 +29,6 @@ use valkey_module::{
 
 /// Minimal Valkey version that supports the TimeSeries Module
 pub const TIMESERIES_MIN_SUPPORTED_VERSION: &[i64; 3] = &[8, 0, 0];
-pub const SPLIT_FACTOR: f64 = 1.2;
 
 const ONE_DAY_MS: i64 = 24 * 60 * 60 * 1000;
 const ONE_YEAR_MS: i64 = 365 * ONE_DAY_MS;
