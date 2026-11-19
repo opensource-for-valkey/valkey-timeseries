@@ -4,9 +4,7 @@ use crate::common::Timestamp;
 use crate::parser::parse_policy_duration_ms;
 use crate::series::request_types::AggregatorConfig;
 use crate::series::{CompactionRule, SeriesLink};
-use ahash::{HashSet, HashSetExt};
 use regex::RegexSet;
-use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::{LazyLock, RwLock};
 use valkey_module::{ValkeyError, ValkeyResult};
@@ -65,11 +63,64 @@ impl Display for CompactionPolicy {
     }
 }
 
+/// The rules `ts-compaction-policy` creates for one new series: one per destination key, in the
+/// order the policies are configured.
+#[derive(Debug, Default)]
+pub struct PolicyRules(Vec<(String, (CompactionRule, u64))>);
+
+impl PolicyRules {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn get(&self, dest_key: &str) -> Option<&(CompactionRule, u64)> {
+        self.0
+            .iter()
+            .find(|(key, _)| key == dest_key)
+            .map(|(_, rule)| rule)
+    }
+
+    pub fn contains_key(&self, dest_key: &str) -> bool {
+        self.get(dest_key).is_some()
+    }
+
+    /// The destination keys, in rule order.
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.0.iter().map(|(key, _)| key)
+    }
+}
+
+impl std::ops::Index<&str> for PolicyRules {
+    type Output = (CompactionRule, u64);
+
+    fn index(&self, dest_key: &str) -> &Self::Output {
+        self.get(dest_key)
+            .unwrap_or_else(|| panic!("no policy rule for destination {dest_key:?}"))
+    }
+}
+
+impl IntoIterator for PolicyRules {
+    type Item = (String, (CompactionRule, u64));
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+/// The parsed `ts-compaction-policy`.
+///
+/// Policies keep their configured order, which is the order a new series gets its rules in and
+/// which decides between two policies naming the same destination (the first wins), as on
+/// RedisTimeSeries. A filtered policy (`|regex`, an extension) holds the index of its filter in
+/// `filters`, which are compiled together once per configuration.
 pub struct PolicyConfig {
+    policies: Vec<(CompactionPolicy, Option<usize>)>,
     filters: RegexSet,
-    /// Maps filter strings to indices of policies that match the filter.
-    filtered_policies: HashMap<String, Vec<CompactionPolicy>>,
-    global_policies: Vec<CompactionPolicy>,
 }
 
 impl Default for PolicyConfig {
@@ -81,164 +132,92 @@ impl Default for PolicyConfig {
 impl PolicyConfig {
     pub fn new() -> Self {
         PolicyConfig {
+            policies: Vec::new(),
             filters: RegexSet::empty(),
-            filtered_policies: HashMap::new(),
-            global_policies: Vec::new(),
         }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.global_policies.is_empty() && self.filtered_policies.is_empty()
     }
 
     pub(crate) fn clear(&mut self) {
-        self.filters = RegexSet::empty();
-        self.filtered_policies.clear();
-        self.global_policies.clear();
+        *self = Self::new();
     }
 
-    fn add_regex_filter(&mut self, filter: &str) -> ValkeyResult<()> {
-        // add the filter to the regex set
-        let mut new_filters: Vec<String> = self.filtered_policies.keys().cloned().collect();
-        new_filters.push(filter.to_string());
-        self.filters = RegexSet::new(&new_filters).map_err(|_| {
-            let msg = format!("TSDB: invalid compaction regex filter: \"{filter}\"");
-            ValkeyError::String(msg)
-        })?;
-        Ok(())
-    }
-
-    pub fn add_policies(
-        &mut self,
-        policies: Vec<CompactionPolicy>,
-        filter: Option<String>,
-    ) -> ValkeyResult<()> {
-        if let Some(filter) = filter {
-            // see if we've already added this filter
-            let indices = match self.filtered_policies.get_mut(&filter) {
-                Some(indices) => indices,
-                None => {
-                    self.add_regex_filter(&filter)?;
-                    // if not, we need to create a new entry
-                    self.filtered_policies
-                        .insert(filter.clone(), Vec::with_capacity(policies.len()));
-                    self.filtered_policies.get_mut(&filter).unwrap()
-                }
-            };
-            let existing_set: HashSet<&CompactionPolicy> = indices.iter().collect();
-
-            for policy in policies.iter() {
-                if existing_set.contains(policy) {
-                    let msg = format!(
-                        "TSDB: duplicate compaction policy with filter \"{filter}\": {policy}",
-                    );
-                    return Err(ValkeyError::String(msg));
-                }
-            }
-
-            indices.extend(policies);
-
-            return Ok(());
+    /// A configuration holding `entries` in order. Fails, leaving nothing changed, when the
+    /// filters do not compile together (each one was already checked alone by the parser).
+    fn build(entries: Vec<(CompactionPolicy, Option<String>)>) -> ValkeyResult<Self> {
+        let mut patterns: Vec<String> = Vec::new();
+        let mut policies = Vec::with_capacity(entries.len());
+        for (policy, filter) in entries {
+            let index = filter.map(|filter| {
+                patterns
+                    .iter()
+                    .position(|p| *p == filter)
+                    .unwrap_or_else(|| {
+                        patterns.push(filter);
+                        patterns.len() - 1
+                    })
+            });
+            policies.push((policy, index));
         }
-
-        self.global_policies.extend(policies);
-
-        Ok(())
+        let filters = RegexSet::new(&patterns).map_err(|e| {
+            ValkeyError::String(format!("TSDB: invalid compaction regex filters: {e}"))
+        })?;
+        Ok(Self { policies, filters })
     }
 
-    /// Add policies with filters to the global configuration
+    /// The configured policies, in order, with their filters.
+    fn entries(&self) -> Vec<(CompactionPolicy, Option<String>)> {
+        let patterns = self.filters.patterns();
+        self.policies
+            .iter()
+            .map(|(policy, index)| (*policy, index.map(|i| patterns[i].clone())))
+            .collect()
+    }
+
+    /// Parses `config_value` and replaces the configuration with it (`replace`) or appends it.
+    /// The new configuration is built in full before it takes effect, so a failure leaves the one
+    /// in effect untouched.
     pub fn add_policies_from_config(
         &mut self,
         config_value: &str,
         replace: bool,
     ) -> ValkeyResult<()> {
-        let policies_with_filters = parse_compaction_policies(config_value)?;
-
-        // Group policies by filter for efficient storage
-        let mut filter_groups: HashMap<Option<String>, Vec<CompactionPolicy>> = HashMap::new();
-
-        for (policy, filter) in policies_with_filters {
-            filter_groups.entry(filter).or_default().push(policy);
-        }
-
-        if replace {
-            self.clear();
-        }
-
-        // Add each group to the config
-        for (filter, policies) in filter_groups {
-            self.add_policies(policies, filter)?;
-        }
-
+        let parsed = parse_compaction_policies(config_value)?;
+        let mut entries = if replace { Vec::new() } else { self.entries() };
+        entries.extend(parsed);
+        *self = Self::build(entries)?;
         Ok(())
     }
 
-    fn match_policy(&self, key: &str) -> Option<HashSet<CompactionPolicy>> {
-        if self.is_empty() {
+    /// The rules a new series named `key` gets: one for each policy that applies to it, in
+    /// configured order, skipping a policy whose destination an earlier one already names.
+    pub fn create_compaction_rules(&self, key: &str) -> Option<PolicyRules> {
+        if self.policies.is_empty() {
             return None;
         }
-
-        let mut result_set: HashSet<CompactionPolicy> =
-            HashSet::with_capacity(self.global_policies.len());
-
-        if !self.global_policies.is_empty() {
-            for policy in &self.global_policies {
-                result_set.insert(*policy);
+        let matched = (!self.filters.is_empty()).then(|| self.filters.matches(key));
+        let mut rules: Vec<(String, (CompactionRule, u64))> = Vec::new();
+        for (policy, filter) in &self.policies {
+            if let Some(index) = filter
+                && !matched.as_ref().is_some_and(|m| m.matched(*index))
+            {
+                continue;
             }
-        }
-
-        if self.filters.is_empty() {
-            return Some(result_set);
-        }
-
-        let matches = self.filters.matches(key);
-        if matches.matched_any() {
-            let filters = self.filters.patterns();
-            for match_idx in matches.iter() {
-                let Some(pattern) = filters.get(match_idx) else {
-                    continue;
-                };
-                let Some(policies) = self.filtered_policies.get(pattern) else {
-                    continue;
-                };
-                for policy in policies {
-                    result_set.insert(*policy);
-                }
+            let dest_key = policy.format_key(key);
+            if rules.iter().any(|(existing, _)| *existing == dest_key) {
+                continue;
             }
-        }
-
-        if result_set.is_empty() {
-            None
-        } else {
-            Some(result_set)
-        }
-    }
-
-    pub fn create_compaction_rules(
-        &self,
-        key: &str,
-    ) -> Option<HashMap<String, (CompactionRule, u64)>> {
-        let policies = self.match_policy(key)?;
-
-        if policies.is_empty() {
-            return None;
-        }
-
-        let mut rules = HashMap::with_capacity(policies.len());
-        for policy in policies {
-            let rule_key = policy.format_key(key);
             let rule = CompactionRule {
-                dest: SeriesLink::from_key(rule_key.as_bytes()),
+                dest: SeriesLink::from_key(dest_key.as_bytes()),
                 aggregator: policy.aggregator.create_aggregator(),
                 bucket_duration: policy.bucket_duration_ms,
                 align_timestamp: policy.bucket_alignment,
-                bucket_start: None, // End timestamp is not set initially
+                bucket_start: None,
                 has_samples: false,
                 dirty: false,
             };
-            rules.insert(rule_key, (rule, policy.retention_ms));
+            rules.push((dest_key, (rule, policy.retention_ms)));
         }
-        Some(rules)
+        (!rules.is_empty()).then_some(PolicyRules(rules))
     }
 }
 
@@ -422,9 +401,7 @@ pub fn clear_compaction_policy_config() {
     config.clear();
 }
 
-pub fn create_compaction_rules_from_config(
-    series_key: &str,
-) -> Option<HashMap<String, (CompactionRule, u64)>> {
+pub fn create_compaction_rules_from_config(series_key: &str) -> Option<PolicyRules> {
     let compaction_config = COMPACTION_POLICY_CONFIG
         .read()
         .expect("Failed to acquire compaction policy config read lock");
@@ -472,7 +449,14 @@ mod tests {
                 .windows(2)
                 .all(|w| hash_of(&w[0]) == hash_of(&w[1]))
         );
-        assert_eq!(policies.iter().copied().collect::<HashSet<_>>().len(), 1);
+        assert_eq!(
+            policies
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1
+        );
 
         // NaN equals itself under the filter's `eq`, so it must hash alike too; distinct values
         // and operators still differ.
@@ -956,6 +940,83 @@ mod tests {
         let rules3 = config.create_compaction_rules("test").unwrap();
         assert_eq!(rules3.len(), 1); // Should only have the new one
         assert!(rules3.contains_key("test_MAX_45000"));
+    }
+
+    fn dest_keys(config: &PolicyConfig, key: &str) -> Vec<String> {
+        config
+            .create_compaction_rules(key)
+            .map(|rules| {
+                rules
+                    .keys()
+                    .map(|k| String::from_utf8_lossy(k.as_ref()).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Rules are created in the order the policies are configured, as RedisTimeSeries does:
+    /// `TS.INFO` lists them in that order, and with them their destinations are created and
+    /// replicated in that order.
+    #[test]
+    fn rules_follow_the_configured_order() {
+        let mut config = PolicyConfig::new();
+        for (policy, expected) in [
+            (
+                "max:1M:1d;avg:1M:1d;min:1M:1d",
+                ["k_MAX_60000", "k_AVG_60000", "k_MIN_60000"],
+            ),
+            (
+                "min:1M:1d;max:1M:1d;avg:1M:1d",
+                ["k_MIN_60000", "k_MAX_60000", "k_AVG_60000"],
+            ),
+            (
+                "min:1M:1d|^k;max:1M:1d;avg:1M:1d|k",
+                ["k_MIN_60000", "k_MAX_60000", "k_AVG_60000"],
+            ),
+        ] {
+            config.add_policies_from_config(policy, true).unwrap();
+            for _ in 0..20 {
+                assert_eq!(dest_keys(&config, "k"), expected, "{policy}");
+            }
+        }
+    }
+
+    /// Two policies that name the same destination (they differ only in retention) give one
+    /// rule, from the first configured, as on RedisTimeSeries. It used to depend on hash order.
+    #[test]
+    fn the_first_policy_for_a_destination_wins() {
+        let mut config = PolicyConfig::new();
+        for (policy, retention) in [
+            ("avg:1M:1d;avg:1M:7d|^important", 86_400_000),
+            ("avg:1M:7d|^important;avg:1M:1d", 604_800_000),
+            ("avg:1M:1d;avg:1M:7d", 86_400_000),
+            ("avg:1M:1d;avg:1M:1d", 86_400_000),
+        ] {
+            config.add_policies_from_config(policy, true).unwrap();
+            for _ in 0..20 {
+                let rules = config.create_compaction_rules("important:1").unwrap();
+                assert_eq!(rules.len(), 1, "{policy}");
+                let (_, kept) = &rules["important:1_AVG_60000"];
+                assert_eq!(*kept, retention, "{policy}");
+            }
+        }
+    }
+
+    /// A replacement whose filter does not compile leaves the previous policy in effect. It used
+    /// to clear first, so the failure left an empty or partial configuration while the stored
+    /// parameter text kept the old value.
+    #[test]
+    fn a_failed_replacement_keeps_the_previous_policy() {
+        let mut config = PolicyConfig::new();
+        config
+            .add_policies_from_config("max:1M:1h;min:1M:1h|^k", true)
+            .unwrap();
+        assert!(
+            config
+                .add_policies_from_config("avg:1M:1h|^k;sum:1M:1h|([", true)
+                .is_err()
+        );
+        assert_eq!(dest_keys(&config, "k"), ["k_MAX_60000", "k_MIN_60000"]);
     }
 }
 
