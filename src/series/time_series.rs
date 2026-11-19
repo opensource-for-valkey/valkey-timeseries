@@ -402,12 +402,23 @@ impl TimeSeries {
         }
         let mut chunk = self.create_chunk();
         chunk.add_sample(&sample)?;
+        // No `shrink_to_fit` here: it would undo `push`'s doubling, so the next push would
+        // reallocate and copy the whole vector again. The elements are small handles; the
+        // payload slack that matters is the sealed chunk's, which `seal_chunk` returns.
         self.chunks.push(chunk);
-        // trim chunks to keep memory usage in check
-        self.chunks.shrink_to_fit();
         self.record_appended_sample(sample);
 
         Ok(())
+    }
+
+    /// Gives back the chunk list's capacity once it is more than twice what the list holds.
+    /// Shrinking on every removal would cost a reallocation per chunk a retention series
+    /// rolls over (the next append grows it straight back); at a 2x bound the waste stays
+    /// within what `push`'s doubling leaves anyway.
+    fn shrink_chunk_list(&mut self) {
+        if self.chunks.capacity() > 2 * self.chunks.len() {
+            self.chunks.shrink_to_fit();
+        }
     }
 
     pub(super) fn append_chunk(&mut self) {
@@ -1067,7 +1078,7 @@ impl TimeSeries {
             return 0;
         }
         let deleted_count = self.chunks.drain(..expired).map(|chunk| chunk.len()).sum();
-        self.chunks.shrink_to_fit();
+        self.shrink_chunk_list();
         deleted_count
     }
 
@@ -1195,7 +1206,7 @@ impl TimeSeries {
         let saved_len = self.chunks.len();
         self.chunks.retain(|chunk| !chunk.is_empty());
         if self.chunks.len() < saved_len {
-            self.chunks.shrink_to_fit();
+            self.shrink_chunk_list();
         }
 
         // Update metadata. After a failure the chunks that succeeded have still lost their
