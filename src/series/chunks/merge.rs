@@ -1,9 +1,8 @@
-use crate::common::hash::TimestampSet;
 use crate::common::logging::log_warning;
 use crate::common::{Sample, Timestamp};
 use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
-use crate::iterators::{SampleIter, SampleMergeIterator};
+use crate::iterators::SampleMergeIterator;
 use crate::series::chunks::{ChunkOps, TimeSeriesChunk};
 use crate::series::{DuplicatePolicy, SampleAddResult};
 
@@ -17,9 +16,9 @@ use crate::series::{DuplicatePolicy, SampleAddResult};
 ///
 /// Encodings only supply `append` (write one sample into the rebuilt chunk state) and commit
 /// that state after this returns.
-pub(crate) fn merge_chunk_samples<'a, F>(
-    existing: SampleIter<'a>,
-    samples: &'a [Sample],
+pub(crate) fn merge_chunk_samples<F>(
+    existing: impl Iterator<Item = Sample>,
+    samples: &[Sample],
     dp_policy: Option<DuplicatePolicy>,
     mut append: F,
 ) -> TsdbResult<Vec<SampleAddResult>>
@@ -28,21 +27,16 @@ where
 {
     let dp_policy = dp_policy.unwrap_or(DuplicatePolicy::KeepLast);
 
-    // Track the input timestamps so we produce exactly one result per unique input
-    // timestamp, and none for pre-existing samples that are only being rewritten.
-    let mut sample_set: TimestampSet =
-        TimestampSet::with_capacity_and_hasher(samples.len(), Default::default());
-    for sample in samples {
-        sample_set.insert(sample.timestamp);
-    }
-
     let mut results = Vec::with_capacity(samples.len());
-    let right = SampleIter::Slice(samples.iter());
-    let mut merge_iterator = SampleMergeIterator::new(existing, right, dp_policy);
+    let mut merge_iterator = SampleMergeIterator::new(existing, samples.iter().copied(), dp_policy);
+    // A result is owed for each step that consumed an incoming sample, once per timestamp: a
+    // pre-existing sample only being rewritten gets none, and a repeated input timestamp gets one.
+    let mut last_reported: Option<Timestamp> = None;
 
-    while let Some((sample, blocked)) = merge_iterator.next_internal() {
+    while let Some((sample, blocked, from_right)) = merge_iterator.next_internal() {
         append(sample)?;
-        if sample_set.remove(&sample.timestamp) {
+        if from_right && last_reported != Some(sample.timestamp) {
+            last_reported = Some(sample.timestamp);
             if blocked {
                 results.push(SampleAddResult::Duplicate);
             } else {
@@ -100,14 +94,22 @@ pub(crate) fn merge_by_capacity(
     let remaining_capacity = dest
         .estimate_remaining_sample_capacity()
         .min(room / src_bytes_per_sample);
-    let first_ts = src.first_timestamp().max(min_timestamp);
-    // if there is enough capacity in the previous block, merge the last block into it
-    if remaining_capacity >= count {
-        // merge_samples needs a materialized, multi-pass slice and rebuilds the
-        // destination per call, so one transient buffer is unavoidable — but its
-        // size is known (src.len()), so pre-size it to avoid reallocation churn.
-        let mut samples = Vec::with_capacity(count);
-        samples.extend(src.iter());
+    // Decide before decoding where the floor cannot shorten the source: then every sample
+    // counts, and room for a quarter of them or less merges nothing. That is the usual case
+    // in defrag (a chunk completed by appends is full), which runs on the main thread, so it
+    // must not decode a whole chunk only to learn nothing moves.
+    if min_timestamp <= src.first_timestamp() && remaining_capacity <= count / 4 {
+        return Ok(None);
+    }
+    // Neither path moves a sample below `min_timestamp` (both used to differ: the whole-source
+    // merge carried expired samples along). The source is decoded strictly: `iter()` and
+    // `get_range` end early at a decode error, and emptying or rewriting the source after such
+    // a read lost every sample past it while reporting a successful merge.
+    let floor = src.first_timestamp().max(min_timestamp);
+    let mut samples = src.decode_all()?;
+    let below = samples.partition_point(|s| s.timestamp < floor);
+    samples.drain(..below);
+    if remaining_capacity >= samples.len() {
         let res = dest.merge_samples(&samples, duplicate_policy)?;
         let merged = res.iter().filter(|s| s.is_ok()).count();
         // reuse last block
@@ -115,9 +117,7 @@ pub(crate) fn merge_by_capacity(
         return Ok(Some(merged));
     } else if remaining_capacity > count / 4 {
         // do a partial merge
-        let samples = src.get_range(first_ts, src.last_timestamp())?;
-        // `samples` can be shorter than `count` when `min_timestamp` clips the front.
-        let (left, right) = samples.split_at(remaining_capacity.min(samples.len()));
+        let (left, right) = samples.split_at(remaining_capacity);
         let res = dest.merge_samples(left, duplicate_policy)?;
         src.set_data(right)?;
         let count = res.iter().filter(|s| s.is_ok()).count();
