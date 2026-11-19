@@ -427,6 +427,10 @@ fn process_mrange(
             // coordinator would group it under the empty value.
             metas.retain(|meta| meta.group_label_value.is_some());
             options.grouping = None;
+            // The coordinator labels a group from its key, reducer and sources only, so a
+            // member's own labels would be built and shipped just to be dropped.
+            options.with_labels = false;
+            options.selected_labels.clear();
         }
     }
     let is_grouped = options.grouping.is_some();
@@ -1520,6 +1524,14 @@ pub(crate) fn snapshot_shard_mrange(
         return Err(ValkeyError::Str(error_consts::MISSING_FILTER));
     }
     let series_guards = series_by_selectors(ctx, &options.filters, None)?;
+    // Under GROUPBY the coordinator labels a group from its key, reducer and sources only;
+    // a member's own labels would be copied under the lock just to be dropped.
+    if options.grouping.is_some() && (options.with_labels || !options.selected_labels.is_empty()) {
+        let mut members = options.clone();
+        members.with_labels = false;
+        members.selected_labels.clear();
+        return Ok(snapshot_series(ctx, &series_guards, &members, limit));
+    }
     Ok(snapshot_series(ctx, &series_guards, options, limit))
 }
 
