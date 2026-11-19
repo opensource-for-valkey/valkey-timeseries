@@ -1,11 +1,5 @@
-use crate::common::{Sample, Timestamp};
-use crate::series::types::ValueFilter;
+use crate::common::Timestamp;
 use smallvec::SmallVec;
-
-#[inline]
-pub(crate) fn filter_samples_by_value(samples: &mut Vec<Sample>, value_filter: &ValueFilter) {
-    samples.retain(|s| s.value >= value_filter.min && s.value <= value_filter.max)
-}
 
 pub(crate) fn filter_timestamp_slice(
     ts_filter: &[Timestamp],

@@ -1,5 +1,4 @@
-use super::chunks::utils::{filter_samples_by_value, filter_timestamp_slice};
-use super::{SampleAddResult, SampleDuplicatePolicy, TimeSeriesOptions, ValueFilter};
+use super::{SampleAddResult, SampleDuplicatePolicy, TimeSeriesOptions};
 use crate::common::hash::IntMap;
 use crate::common::logging::log_warning;
 use crate::common::metrics::WarningLimit;
@@ -811,33 +810,6 @@ impl TimeSeries {
             }
         }
         Some(count)
-    }
-
-    pub fn get_range_filtered(
-        &self,
-        start_timestamp: Timestamp,
-        end_timestamp: Timestamp,
-        timestamp_filter: Option<&[Timestamp]>,
-        value_filter: Option<ValueFilter>,
-    ) -> Vec<Sample> {
-        let start_timestamp = start_timestamp.max(self.get_min_timestamp());
-        if start_timestamp > end_timestamp {
-            return Vec::new();
-        }
-
-        // TODO: propagate errors
-        let mut samples = if let Some(ts_filter) = timestamp_filter {
-            let timestamps = filter_timestamp_slice(ts_filter, start_timestamp, end_timestamp);
-            self.samples_by_timestamps(&timestamps).unwrap_or_default()
-        } else {
-            self.get_range(start_timestamp, end_timestamp)
-        };
-
-        if let Some(value_filter) = value_filter {
-            filter_samples_by_value(&mut samples, &value_filter);
-        }
-
-        samples
     }
 
     pub fn get_sample(&self, start_time: Timestamp) -> ValkeyResult<Option<Sample>> {
