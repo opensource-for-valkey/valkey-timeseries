@@ -21,9 +21,12 @@ pub(super) struct CompactionContext<'a> {
     /// not `written`, decides the `ts.add:dest` notification: a back-fill that rewrites an
     /// already-closed bucket also lands in `written` (so it still cascades) but is silent.
     pub(super) closed_bucket: bool,
-    /// The span `[start, end]` of `dest` a [`CompactionOp::RemoveRange`] rewrote: recomputed from
-    /// the parent, or retracted as re-opened. It is the range `dest`'s own rules must resync, set
-    /// before any of it is touched so a removal that fails partway still names it.
+    /// The span `[start, end]` of `dest` that `dest`'s own rules must resync: what a
+    /// [`CompactionOp::RemoveRange`] rewrote (recomputed from the parent, or retracted as
+    /// re-opened), set before any of it is touched so a removal that fails partway still names
+    /// it, and any bucket an [`CompactionOp::Ingest`] retracted because a back-fill left it with
+    /// no counted sample. A retraction writes nothing to `written`, so without this the next
+    /// level never learned of it and kept the bucket it had aggregated from the retracted one.
     pub(super) rewritten: Option<(Timestamp, Timestamp)>,
 }
 
@@ -55,6 +58,14 @@ impl<'a> CompactionContext<'a> {
 
     fn has_samples(&self) -> bool {
         self.rule.has_samples
+    }
+
+    /// Widens [`Self::rewritten`] to cover `[start, end]`.
+    fn note_rewritten(&mut self, start: Timestamp, end: Timestamp) {
+        self.rewritten = Some(match self.rewritten {
+            Some((from, to)) => (from.min(start), to.max(end)),
+            None => (start, end),
+        });
     }
 }
 
@@ -274,15 +285,17 @@ fn handle_mixed_batch_compaction(
     // high-water mark has risen — so it is taken as the max over the whole bucket.
     //
     // A bucket only reaches the destination when it closes, so `recalculate_bucket` (which
-    // writes) is for buckets the rule has already moved past. When the rule has no open bucket
-    // at all this upsert is opening it, as `handle_sample_compaction` does for a rule's first
-    // sample — publishing here would expose a bucket still accepting samples.
-    // A batch reaches that state whenever a timestamp appears twice in the caller's order: the
-    // repeat reads as a back-fill, `samples` carries the timestamp once, so it is classified as
-    // an upsert and never streams through the append path that would have opened the bucket.
+    // writes) is for buckets the rule has already moved past, and the rule's open bucket is
+    // re-aggregated instead. When the rule has no open bucket at all (it was created on a source
+    // that already held samples, and nothing has advanced it since), the one bucket still
+    // accepting samples is the one holding the source's last sample: a back-fill into it opens
+    // it, as `handle_sample_compaction` does for a rule's first sample, and publishing it would
+    // expose a bucket still filling. A back-fill into an older bucket is closed and is published
+    // now, as RedisTimeSeries does. It used to open that older bucket instead, so `LATEST` read
+    // it after newer published buckets, and a `TS.DEL` of the source's tail discarded it.
     //
     // Buckets are processed newest first, so when this batch opens the rule's bucket it opens
-    // the latest one.
+    // the latest one, and the older ones then see it as open.
     let mut buckets: SmallVec<[(Timestamp, Timestamp); TEMP_VEC_LEN]> = SmallVec::new();
     for (sample, min_ts) in &upserts {
         let bucket_start = ctx.rule.calc_bucket_start(sample.timestamp);
@@ -294,7 +307,14 @@ fn handle_mixed_batch_compaction(
 
     for &(bucket_start, min_ts) in buckets.iter().rev() {
         let bucket_last = ctx.rule.bucket_last(bucket_start);
-        if ctx.rule.bucket_start.is_none() || ctx.rule.bucket_start == Some(bucket_start) {
+        let accepting = match ctx.rule.bucket_start {
+            Some(open) => open == bucket_start,
+            None => ctx
+                .parent
+                .last_sample
+                .is_none_or(|last| ctx.rule.calc_bucket_start(last.timestamp) == bucket_start),
+        };
+        if accepting {
             recalculate_current_bucket(ctx, bucket_start, bucket_last, min_ts)?;
         } else {
             recalculate_bucket(ctx, bucket_start, bucket_last, min_ts, null_ts_filter)?;
@@ -356,7 +376,12 @@ fn finalize_current_bucket(
         // Finalize the current bucket
         let aggregated_value = AggregationHandler::finalize(&mut ctx.rule.aggregator);
         let stored_before = ctx.written.len();
-        add_dest_bucket(ctx, current_bucket_start, aggregated_value)?;
+        add_dest_bucket(
+            ctx,
+            current_bucket_start,
+            aggregated_value,
+            BucketWrite::Close,
+        )?;
         // A bucket the destination refused (a duplicate it ignored, or one below its retention
         // window) was not published, so it does not count as a close.
         ctx.closed_bucket |= ctx.written.len() > stored_before;
@@ -421,10 +446,16 @@ where
 
     if has_samples {
         let aggregated_value = AggregationHandler::finalize(&mut bucket_aggregator);
-        add_dest_bucket(ctx, bucket_start, aggregated_value)?;
-    } else {
-        // No samples in this bucket anymore, remove it from destination
-        ctx.dest.remove_range(bucket_start, bucket_last)?;
+        add_dest_bucket(
+            ctx,
+            bucket_start,
+            aggregated_value,
+            BucketWrite::Recalculation,
+        )?;
+    } else if ctx.dest.remove_range(bucket_start, bucket_last)? > 0 {
+        // No counted sample is left in the bucket, so it leaves the destination, and the
+        // destination's own rules must resync it (see `CompactionContext::rewritten`).
+        ctx.note_rewritten(bucket_start, bucket_last);
     }
 
     Ok(())
@@ -498,7 +529,8 @@ fn recompute_closed_buckets(
         let bucket_start = ctx.rule.calc_bucket_start(sample.timestamp);
         if current.is_none_or(|(open, _)| open != bucket_start) {
             if let Some((open, true)) = current {
-                add_dest_bucket(ctx, open, AggregationHandler::finalize(&mut aggregator))?;
+                let value = AggregationHandler::finalize(&mut aggregator);
+                add_dest_bucket(ctx, open, value, BucketWrite::Recalculation)?;
             }
             AggregationHandler::reset(&mut aggregator);
             current = Some((bucket_start, false));
@@ -510,7 +542,8 @@ fn recompute_closed_buckets(
         }
     }
     if let Some((open, true)) = current {
-        add_dest_bucket(ctx, open, AggregationHandler::finalize(&mut aggregator))?;
+        let value = AggregationHandler::finalize(&mut aggregator);
+        add_dest_bucket(ctx, open, value, BucketWrite::Recalculation)?;
     }
 
     Ok(())
@@ -658,15 +691,25 @@ fn refresh_successor(
 ///
 /// This deliberately diverges from the reference (DIV-0060), which keeps the stale value although
 /// its own `TS.RANGE ... AGGREGATION` over the source reports NaN for the bucket.
-fn add_dest_bucket(ctx: &mut CompactionContext, ts: Timestamp, value: f64) -> TsdbResult<()> {
+///
+/// A [`BucketWrite::Close`] goes through the destination's `IGNORE` filter like any new write;
+/// a [`BucketWrite::Recalculation`] does not (see `TimeSeries::add_unfiltered`).
+fn add_dest_bucket(
+    ctx: &mut CompactionContext,
+    ts: Timestamp,
+    value: f64,
+    write: BucketWrite,
+) -> TsdbResult<()> {
     let bucket_start = ctx.rule.calc_bucket_start(ts);
     if value.is_nan() && !ctx.dest.is_empty() {
         ctx.dest.remove_range(bucket_start, bucket_start)?;
     }
-    match ctx
-        .dest
-        .add(bucket_start, value, Some(DuplicatePolicy::KeepLast))
-    {
+    let policy = Some(DuplicatePolicy::KeepLast);
+    let result = match write {
+        BucketWrite::Close => ctx.dest.add(bucket_start, value, policy),
+        BucketWrite::Recalculation => ctx.dest.add_unfiltered(bucket_start, value, policy),
+    };
+    match result {
         SampleAddResult::Ok(sample) => {
             ctx.written.push(sample);
             Ok(())
@@ -679,6 +722,15 @@ fn add_dest_bucket(ctx: &mut CompactionContext, ts: Timestamp, value: f64) -> Ts
             Err(TsdbError::General(base_msg))
         }
     }
+}
+
+/// What an [`add_dest_bucket`] write is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BucketWrite {
+    /// A bucket the rule just closed: new to the destination.
+    Close,
+    /// A bucket the rule had already published, recomputed from the source.
+    Recalculation,
 }
 
 /// Aggregate the source samples in `[start, end]` that pass `filter`, ignoring anything below

@@ -187,39 +187,14 @@ fn process_series_with_compaction(
         CompactionOp::RemoveRange { .. } => {
             let mut pending: SmallVec<[PendingRemoval; TEMP_VEC_LEN]> = SmallVec::new();
             queue_rewritten_outcomes(&mut keys, &outcomes, &mut pending);
-            if !pending.is_empty() {
-                visited.insert(&series.key);
-            }
-
-            while let Some((child_key, (start, end))) = pending.pop() {
-                if visited.contains(child_key.as_slice()) {
-                    continue;
-                }
-                let Ok(Some(mut child)) = try_get_timeseries_mut(ctx, &child_key, None) else {
-                    continue;
-                };
-                if child.rules.is_empty() {
-                    continue;
-                }
-                visited.insert(child_key.as_slice());
-
-                let child_destinations = get_compaction_series(ctx, &mut child, &visited);
-                if child_destinations.is_empty() {
-                    continue;
-                }
-                let Destinations {
-                    keys: mut child_keys,
-                    series: child_guards,
-                } = child_destinations;
-                let child_op = CompactionOp::RemoveRange { start, end };
-                let AppliedRules { outcomes, error } =
-                    apply_rules_on_destinations(&mut child, child_guards, child_op);
-                first_error = first_error.or(error);
-                queue_rewritten_outcomes(&mut child_keys, &outcomes, &mut pending);
-            }
+            cascade_removals(ctx, &series.key, pending, &mut first_error);
         }
         _ => {
             let mut pending: SmallVec<[PendingCompactionWrite; TEMP_VEC_LEN]> = SmallVec::new();
+            // Buckets a back-fill retracted at any level: they wrote nothing for that level's
+            // rules to ingest, so they are resynced below once every level has ingested.
+            let mut retracted: SmallVec<[PendingRemoval; TEMP_VEC_LEN]> = SmallVec::new();
+            queue_rewritten_outcomes(&mut keys, &outcomes, &mut retracted);
             queue_written_outcomes(&mut keys, outcomes, &mut written, &mut pending);
             if !pending.is_empty() {
                 visited.insert(&series.key);
@@ -258,8 +233,13 @@ fn process_series_with_compaction(
                 let AppliedRules { outcomes, error } =
                     apply_rules_on_destinations(&mut child, child_guards, batch_op);
                 first_error = first_error.or(error);
+                queue_rewritten_outcomes(&mut child_keys, &outcomes, &mut retracted);
                 queue_written_outcomes(&mut child_keys, outcomes, &mut written, &mut pending);
             }
+            // A retracted bucket is a removal from its destination, so the destination's own
+            // rules recompute the span from what it holds now, as for a `TS.DEL`. This runs
+            // after the ingest, so it reads each level's final state.
+            cascade_removals(ctx, &series.key, retracted, &mut first_error);
         }
     }
 
@@ -304,18 +284,63 @@ fn queue_written_outcomes(
     }
 }
 
+/// Applies `pending` removals level by level: each destination's rules recompute the span of it
+/// the level above rewrote, and queue what they rewrote in turn. `source_key` (the series whose
+/// rules started the pass) is never revisited, and neither is any level already resynced.
+fn cascade_removals(
+    ctx: &Context,
+    source_key: &[u8],
+    mut pending: SmallVec<[PendingRemoval; TEMP_VEC_LEN]>,
+    first_error: &mut Option<TsdbError>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut visited = Visited::default();
+    visited.insert(source_key);
+    while let Some((child_key, (start, end))) = pending.pop() {
+        if visited.contains(child_key.as_slice()) {
+            continue;
+        }
+        let Ok(Some(mut child)) = try_get_timeseries_mut(ctx, &child_key, None) else {
+            continue;
+        };
+        if child.rules.is_empty() {
+            continue;
+        }
+        visited.insert(child_key.as_slice());
+
+        let child_destinations = get_compaction_series(ctx, &mut child, &visited);
+        if child_destinations.is_empty() {
+            continue;
+        }
+        let Destinations {
+            keys: mut child_keys,
+            series: child_guards,
+        } = child_destinations;
+        let child_op = CompactionOp::RemoveRange { start, end };
+        let AppliedRules { outcomes, error } =
+            apply_rules_on_destinations(&mut child, child_guards, child_op);
+        *first_error = first_error.take().or(error);
+        queue_rewritten_outcomes(&mut child_keys, &outcomes, &mut pending);
+    }
+}
+
 /// A cascaded removal: (destination key, the span of it the level above rewrote).
 type PendingRemoval = (ValkeyString, (Timestamp, Timestamp));
 
-/// Queues every destination that a removal rewrote for the next cascade level, with its span.
+/// Queues every destination whose span a removal rewrote, or an ingest retracted, for the next
+/// cascade level, with that span.
 fn queue_rewritten_outcomes(
     keys: &mut [Option<ValkeyString>],
     outcomes: &[RuleOutcome],
     pending: &mut SmallVec<[PendingRemoval; TEMP_VEC_LEN]>,
 ) {
     for outcome in outcomes {
+        // Cloned, not taken: on the ingest path the same destination may also have written
+        // samples to queue (`queue_written_outcomes`, which takes the key).
         if let Some(span) = outcome.rewritten
-            && let Some(dest_key) = keys[outcome.rule_index].take()
+            && let Some(dest_key) = keys[outcome.rule_index].clone()
         {
             pending.push((dest_key, span));
         }

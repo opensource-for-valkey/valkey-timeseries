@@ -800,3 +800,24 @@ class TestTSCreateRule(ValkeyTimeSeriesTestCaseBase):
         # Verify hour compaction created data. The bucket is not closed yet, so we should see the latest data
         latest = self.client.execute_command("TS.GET", hour_key, "LATEST")
         assert latest is not None, "Latest hour compaction data should exist"
+
+    def test_backfill_that_retracts_a_bucket_retracts_it_downstream(self):
+        """A back-fill can leave a bucket with no counted sample, so it is removed from the
+        destination. The destination's own rules must see that removal: `dst` aggregates `mid`,
+        and `mid@0` disappearing must take `dst@0` with it. Here the back-filled NaN is the only
+        sample of bucket 0 inside the retention window (floor 5), and NaN is not counted."""
+        c = self.client
+        c.execute_command("TS.CREATE", "rtr:src", "RETENTION", 15)
+        c.execute_command("TS.CREATE", "rtr:mid")
+        c.execute_command("TS.CREATE", "rtr:dst")
+        c.execute_command("TS.CREATERULE", "rtr:src", "rtr:mid", "AGGREGATION", "sum", 10)
+        c.execute_command("TS.CREATERULE", "rtr:mid", "rtr:dst", "AGGREGATION", "sum", 10)
+        for ts, value in ((0, 5), (10, 7), (20, 8)):
+            c.execute_command("TS.ADD", "rtr:src", ts, value)
+        assert c.execute_command("TS.RANGE", "rtr:mid", "-", "+") == [[0, b"5"], [10, b"7"]]
+        assert c.execute_command("TS.RANGE", "rtr:dst", "-", "+") == [[0, b"5"]]
+
+        c.execute_command("TS.ADD", "rtr:src", 5, "nan")
+        assert c.execute_command("TS.RANGE", "rtr:mid", "-", "+") == [[10, b"7"]]
+        assert c.execute_command("TS.RANGE", "rtr:dst", "-", "+") == []
+        assert c.execute_command("TS.RANGE", "rtr:dst", "-", "+", "LATEST") == [[10, b"7"]]
