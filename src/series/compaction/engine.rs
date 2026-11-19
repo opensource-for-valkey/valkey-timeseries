@@ -220,7 +220,11 @@ fn handle_mixed_batch_compaction(
             // same still-open 500ms bucket must report `last`=1 (`1999`'s value); streaming
             // `1500` straight in overwrites it with `1500`'s value instead.
             Some(max) if ts <= max => {
-                if !advanced.contains(&ts) || Some(ctx.rule.calc_bucket_start(ts)) != open_bucket {
+                // `advanced` only grows past the high-water mark, so it is strictly increasing:
+                // a binary search keeps a batch of k back-fills O(k log k), not O(k^2).
+                if Some(ctx.rule.calc_bucket_start(ts)) != open_bucket
+                    || advanced.binary_search(&ts).is_err()
+                {
                     backfilled.push((ts, max));
                 }
             }
