@@ -8,10 +8,10 @@ use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 use crate::series::{
-    PerSeriesSamples, SampleAddResult, SeriesGuardMut, multi_series_merge_samples,
-    try_get_timeseries_mut,
+    PerSeriesSamples, SampleAddResult, SeriesGuardMut, batch_feeds_itself,
+    multi_series_merge_samples, try_get_timeseries_mut,
 };
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use smallvec::SmallVec;
 use std::ops::DerefMut;
 use valkey_module::{
@@ -122,6 +122,23 @@ fn handle_update(
         SampleAddResult::Error(error_consts::INVALID_VALUE),
     );
 
+    // A batch that writes a rule's source and, further down, its destination is applied item by
+    // item (see `handle_update_sequentially`). Every other batch merges per series, which is
+    // equivalent there: each compaction cascade then writes only series outside the batch.
+    let members: AHashSet<&[u8]> = input_map
+        .iter()
+        .filter(|(_, s)| s.series.is_some())
+        .map(|(k, _)| k.as_slice())
+        .collect();
+    if batch_feeds_itself(
+        ctx,
+        input_map.values().filter_map(|s| s.series.as_deref()),
+        |key| members.contains(key),
+    ) {
+        handle_update_sequentially(ctx, input_map, all_inputs, &mut results);
+        return Ok(results);
+    }
+
     let mut per_series_samples: Vec<PerSeriesSamples> = Vec::with_capacity(4);
     // Sample counts before the merge, so blocked `TS.READ` readers are woken only for series
     // that actually gained a sample. Collected here because the mutable borrows taken by
@@ -181,6 +198,56 @@ fn handle_update(
     }
 
     Ok(results)
+}
+
+/// Applies the items one at a time, in argument order, each with its compaction cascade, as
+/// RedisTimeSeries does: a direct write to a destination that follows the source item closing
+/// the same bucket replaces the rolled-up value, and one that precedes it is replaced.
+///
+/// The batch's guards are released first, so no series is borrowed twice: each item opens its
+/// series, applies the sample and runs the rules, and lets go before the next item, whose own
+/// cascade may write that series. Merging per series instead applied every direct write before
+/// any rule, in hash-map order, so the destination's final value depended on the hash seed.
+///
+/// Results, the retention trim (deferred to the end, as on the merge path) and the `TS.READ`
+/// wake-up are what `handle_update` produces for the same items.
+fn handle_update_sequentially(
+    ctx: &Context,
+    input_map: &mut AHashMap<&ValkeyString, SeriesSamples>,
+    all_inputs: &[ParsedInput],
+    results: &mut [SampleAddResult],
+) {
+    let mut counts_before: SmallVec<[(&ValkeyString, usize); 8]> = SmallVec::new();
+    for (key, samples) in input_map.iter_mut() {
+        if let Some(series) = samples.series.take() {
+            counts_before.push((*key, series.total_samples));
+        }
+    }
+
+    for (index, input) in all_inputs.iter().enumerate() {
+        // A parse error or a series-level error is already in `results`.
+        if !input.res.is_ok() {
+            continue;
+        }
+        let Ok(Some(mut series)) = try_get_timeseries_mut(ctx, input.key, None) else {
+            results[index] = SampleAddResult::Error(error_consts::INVALID_TIMESERIES_KEY);
+            continue;
+        };
+        let mut group = PerSeriesSamples::new(series.deref_mut());
+        group.add_sample(Sample::new(input.timestamp, input.value), index);
+        for (i, res) in multi_series_merge_samples(vec![group], Some(ctx)) {
+            results[i] = res;
+        }
+    }
+
+    for (key, count_before) in counts_before {
+        if let Ok(Some(mut series)) = try_get_timeseries_mut(ctx, key, None) {
+            if series.total_samples > count_before {
+                signal_timeseries_ready(ctx, key);
+            }
+            series.apply_retention();
+        }
+    }
 }
 
 fn parse_args<'a>(

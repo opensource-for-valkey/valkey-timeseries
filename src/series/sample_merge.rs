@@ -284,9 +284,9 @@ fn add_group_sequentially(input: &mut PerSeriesSamples) -> SmallVec<[(usize, Sam
         // RedisTimeSeries runs no compaction for it. Replayed, a rejected repeat whose bucket a
         // later item had closed read as a back-fill and recalculated that bucket under the
         // retention floor in force, dropping its older samples (`RETENTION 1000`, sum/1000,
-        // `TS.MADD k 1100 1 k 1800 2 k 2500 4 k 1800 8` published 2, not 3). It also made the
-        // primary disagree with its replicas, which never see the rejected item: the
-        // propagated TS.MADD carries accepted items only.
+        // `TS.MADD k 1100 1 k 1800 2 k 2500 4 k 1800 8` published 2, not 3). Replicas agree
+        // either way: the TS.MADD is propagated with every item that parsed, policy
+        // rejections included, and a replica rejects the same items when it replays it.
         if res.is_ok() {
             touched.push(item.timestamp);
             input.added_order.push(item.timestamp);

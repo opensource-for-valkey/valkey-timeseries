@@ -207,6 +207,36 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         assert info_dict["retentionTime"] == retention_ms
         assert info_dict["totalSamples"] == 10
 
+    def test_madd_over_a_rule_chain_is_applied_in_argument_order(self):
+        """A TS.MADD that writes a rule's source and, further down the chain, its destination
+        applies the items in argument order, each with its compaction. That gives the same
+        result every time, and the replica (which replays the same TS.MADD) the same result."""
+        client = self.client
+        replica = self.replicas[0].client
+        cases = [
+            (["src", 10, 7, "mid", 0, 100, "mid", 20, 1], [[0, b"100"], [20, b"1"]], [[0, b"100"]]),
+            (["mid", 0, 100, "src", 10, 7, "mid", 20, 1], [[0, b"5"], [20, b"1"]], [[0, b"5"]]),
+        ]
+        for run in range(10):
+            for case, (items, mid_expected, dst_expected) in enumerate(cases):
+                p = f"chain:{run}:{case}:"
+                client.execute_command("TS.CREATE", p + "src", "DUPLICATE_POLICY", "LAST")
+                client.execute_command("TS.CREATE", p + "mid", "DUPLICATE_POLICY", "LAST")
+                client.execute_command("TS.CREATE", p + "dst")
+                client.execute_command("TS.CREATERULE", p + "src", p + "mid", "AGGREGATION", "sum", 10)
+                client.execute_command("TS.CREATERULE", p + "mid", p + "dst", "AGGREGATION", "sum", 20)
+                client.execute_command("TS.ADD", p + "src", 0, 5)
+                client.execute_command("TS.MADD", *[p + a if isinstance(a, str) else a for a in items])
+                assert client.execute_command("TS.RANGE", p + "mid", "-", "+") == mid_expected, (run, case)
+                assert client.execute_command("TS.RANGE", p + "dst", "-", "+") == dst_expected, (run, case)
+        self.wait_for_replication()
+        for run in range(10):
+            for case in range(len(cases)):
+                for name in ("src", "mid", "dst"):
+                    key = f"chain:{run}:{case}:{name}"
+                    assert client.execute_command("TS.RANGE", key, "-", "+") == \
+                        replica.execute_command("TS.RANGE", key, "-", "+"), key
+
     def test_replication_ts_createrule(self):
         """Test that compaction rules replicate correctly"""
         source_key = "ts:source"
