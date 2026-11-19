@@ -138,20 +138,6 @@ impl TimeSeries {
         Ok(res)
     }
 
-    /// Utility to create a time series from an existing chunk. Useful for dealing with
-    /// deserialized data from clustered commands.
-    pub(crate) fn from_chunk(chunk: TimeSeriesChunk) -> TsdbResult<Self> {
-        let mut ts = TimeSeries::with_options(TimeSeriesOptions {
-            chunk_size: Some(chunk.max_size()),
-            chunk_encoding: chunk.get_encoding(),
-            ..Default::default()
-        })?;
-        ts.total_samples = chunk.len();
-        ts.chunks.push(chunk);
-        ts.update_first_last_timestamps();
-        Ok(ts)
-    }
-
     #[cfg(test)]
     pub(crate) fn from_chunks(chunks: Vec<TimeSeriesChunk>) -> TsdbResult<Self> {
         let mut ts = TimeSeries::with_options(TimeSeriesOptions {
