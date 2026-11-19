@@ -125,6 +125,28 @@ pub fn check_label_name(name: &[u8]) -> ValkeyResult<()> {
     Ok(())
 }
 
+/// Rejects a label whose name or value contains a NUL byte (DIV-0068).
+///
+/// The label index stores `name=value` with a NUL terminator so that no key is a prefix of
+/// another, which its radix tree requires: a value `b` beside `b\0c` gave `a=b\0` and
+/// `a=b\0c\0`, and the second insert reached undefined behavior. A name cannot cause that, but
+/// RedisTimeSeries indexes a name cut at its first NUL (`a=v` matches a series labelled `a\0b`)
+/// and fails to parse a filter that names one, so names are refused too: no label holds a NUL,
+/// and the filter parser rejects a NUL anywhere in a matcher (`parse_series_selector`).
+///
+/// The write path checks this wherever `LABELS` or `METRIC` is parsed. A foreign load
+/// (`RESTORE`, a slot import) refuses a payload carrying one; an own load tolerates it
+/// (`normalize_series`, and an own AOF's replayed commands), and the label index leaves it out.
+pub fn check_label_nul(name: &[u8], value: &[u8]) -> ValkeyResult<()> {
+    if name.contains(&0) {
+        return Err(ValkeyError::Str(error_consts::LABEL_NAME_CONTAINS_NUL));
+    }
+    if value.contains(&0) {
+        return Err(ValkeyError::Str(error_consts::LABEL_VALUE_CONTAINS_NUL));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +168,39 @@ mod tests {
             assert!(
                 check_label_name(name.as_bytes()).is_ok(),
                 "{name:?} was rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn label_names_and_values_must_not_contain_nul() {
+        for bad in ["\0", "b\0c", "b\0", "\0b"] {
+            assert!(
+                matches!(
+                    check_label_nul(b"a", bad.as_bytes()),
+                    Err(ValkeyError::Str(error_consts::LABEL_VALUE_CONTAINS_NUL))
+                ),
+                "value {bad:?} was accepted"
+            );
+            assert!(
+                matches!(
+                    check_label_nul(bad.as_bytes(), b"v"),
+                    Err(ValkeyError::Str(error_consts::LABEL_NAME_CONTAINS_NUL))
+                ),
+                "name {bad:?} was accepted"
+            );
+        }
+        // `=` (in values), other control bytes and non-ASCII text stay legal.
+        for good in ["b", "b=c", "\u{1}", "\n", "région", "\u{FFFD}"] {
+            assert!(
+                check_label_nul(b"a", good.as_bytes()).is_ok(),
+                "value {good:?} was rejected"
+            );
+        }
+        for good in ["b", "\u{1}", "\n", "région", "__name__"] {
+            assert!(
+                check_label_nul(good.as_bytes(), b"v").is_ok(),
+                "name {good:?} was rejected"
             );
         }
     }

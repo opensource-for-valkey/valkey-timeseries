@@ -42,16 +42,30 @@ pub fn parse_series_selector(s: &str) -> ParseResult<SeriesSelector> {
     if s.trim().is_empty() {
         return Err(ParseError::EmptySeriesSelector);
     }
-    if let Some((label, op, value_at)) = split_rts_predicate(s) {
+    // DIV-0068: no stored label holds a NUL. A raw one is refused before parsing; one a quoted
+    // string decodes (`\x00`) is caught on the parsed matchers below.
+    if s.contains('\0') {
+        return Err(ParseError::NulInFilter);
+    }
+    let selector = if let Some((label, op, value_at)) = split_rts_predicate(s) {
         let filter = parse_rts_predicate(s, label, op, value_at)?;
-        return Ok(SeriesSelector::with_filters(vec![filter]));
+        SeriesSelector::with_filters(vec![filter])
+    } else {
+        let mut cur = Cursor::new(s);
+        let mut selector = parse_one_selector(&mut cur)?;
+        while cur.next_if(Token::OpOr)?.is_some() {
+            selector = selector.or_with(parse_one_selector(&mut cur)?);
+        }
+        cur.expect(&[Token::OpOr, Token::Eof], "series selector")?;
+        selector
+    };
+    if selector
+        .groups()
+        .flat_map(|group| group.iter())
+        .any(LabelFilter::contains_nul)
+    {
+        return Err(ParseError::NulInFilter);
     }
-    let mut cur = Cursor::new(s);
-    let mut selector = parse_one_selector(&mut cur)?;
-    while cur.next_if(Token::OpOr)?.is_some() {
-        selector = selector.or_with(parse_one_selector(&mut cur)?);
-    }
-    cur.expect(&[Token::OpOr, Token::Eof], "series selector")?;
     Ok(selector)
 }
 

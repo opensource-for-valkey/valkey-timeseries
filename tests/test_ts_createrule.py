@@ -63,6 +63,25 @@ class TestTSCreateRule(ValkeyTimeSeriesTestCaseBase):
         expected_rule = CompactionRule(dest_key, 60000, "avg", None)
         assert expected_rule == rules[0]
 
+    def test_create_rule_between_keys_containing_nul(self):
+        """Key names are binary-safe. The rule-graph walk rebuilt each partner's key through a
+        C string, so a rule touching a key with a NUL byte aborted the server."""
+        src, mid, dst = b"nul:\x00src", b"nul:\x00mid", b"nul:dst\x00"
+        for key in (src, mid, dst):
+            self.client.execute_command("TS.CREATE", key)
+        assert self.client.execute_command("TS.CREATERULE", src, mid, "AGGREGATION", "sum", 10) == b"OK"
+        # The second rule walks the chain through `mid`'s back-link to `src`.
+        assert self.client.execute_command("TS.CREATERULE", mid, dst, "AGGREGATION", "sum", 20) == b"OK"
+        for t, v in [(0, 1), (5, 2), (10, 3), (20, 4), (40, 5)]:
+            self.client.execute_command("TS.ADD", src, t, v)
+        assert self.client.ping()
+        assert self.client.execute_command("TS.RANGE", mid, "-", "+") == [[0, b"3"], [10, b"3"], [20, b"4"]]
+        assert self.client.execute_command("TS.RANGE", dst, "-", "+") == [[0, b"6"]]
+        # Re-creating the reverse edge is a cycle and must be refused, not crash.
+        with pytest.raises(ResponseError):
+            self.client.execute_command("TS.CREATERULE", dst, src, "AGGREGATION", "sum", 10)
+        assert self.client.ping()
+
     def test_create_rule_with_align_timestamp(self):
         """Test rule creation with alignment timestamp"""
         source_key = "test:source2"

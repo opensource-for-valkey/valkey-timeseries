@@ -43,6 +43,13 @@ impl IndexKey {
         }
     }
 
+    /// Whether the label text holds a NUL before the terminator. Such a key is never stored: it
+    /// can be a prefix of another key, or have one as its prefix (`a=b\0` and `a=b\0c\0`), which
+    /// the radix tree cannot hold. No write accepts such a label (DIV-0068).
+    pub fn has_interior_nul(&self) -> bool {
+        self.as_str().contains('\0')
+    }
+
     pub fn as_str(&self) -> &str {
         self.sub_string(0)
     }

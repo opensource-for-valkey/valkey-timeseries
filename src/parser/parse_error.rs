@@ -39,6 +39,10 @@ pub enum ParseError {
     /// Reported as soon as the limit is passed, so an oversized operand is not parsed to the end.
     #[error("too many labels")]
     TooManyLabels,
+    /// A matcher holds a NUL byte, in its label name or its value. No stored label holds one
+    /// (DIV-0068), so the filter is a mistake, and a negated one would select every series.
+    #[error("filter must not contain a NUL byte")]
+    NulInFilter,
     /// What the lexer reports for input no token matches: logos builds its error value with
     /// `Default`. `Cursor` replaces it with an `Unexpected` naming the text.
     #[default]

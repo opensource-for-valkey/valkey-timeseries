@@ -187,3 +187,26 @@ class TestRestoreHostilePayloads(ValkeyTimeSeriesTestCaseBase):
                  f("last_ts"): count - 1, f("last_value"): 0.0, f("ts_delta"): 1,
                  f("leading"): 0, f("trailing"): 0, f("free_bits"): 0}
         self.assert_rejected(set_token(payload, edits), "a 3 MiB chunk")
+
+    def test_label_with_nul(self):
+        """DIV-0068: no write stores a NUL inside a label name or value (the label index's
+        keys are NUL-terminated, and `b` beside `b\\0c` broke the radix tree's no-prefix
+        contract). A RESTORE carrying one is refused, even when no other series shares the prefix."""
+        client = self.client
+        client.config_set("rdbcompression", "no")
+        client.execute_command("TS.CREATE", "lbl", "LABELS", "host", "a", "tag", "bXc")
+        client.execute_command("TS.ADD", "lbl", 1000, 1.5)
+        payload = Payload(client.dump("lbl"))
+        s = Series(payload)
+        t = payload.tokens
+        labels = {t[2 + 2 * i][1]: 2 + 2 * i + 1 for i in range(t[s.fields["label_count"]][1])}
+        assert t[labels[b"tag"]][1] == b"bXc"
+        self.assert_restores(set_token(payload, {labels[b"tag"]: b"b=c"}), "lbl")
+
+        for value in (b"b\x00c", b"\x00", b"b\x00"):
+            self.assert_rejected(set_token(payload, {labels[b"tag"]: value}), f"value {value!r}")
+        for name in (b"t\x00g", b"\x00", b"tag\x00"):
+            self.assert_rejected(set_token(payload, {labels[b"tag"] - 1: name}), f"name {name!r}")
+        client.execute_command("TS.CREATE", "sibling", "LABELS", "tag", "b")
+        self.assert_rejected(set_token(payload, {labels[b"tag"]: b"b\x00c"}), "a prefix sibling")
+        assert client.execute_command("TS.QUERYINDEX", "tag=b") == [b"sibling"]

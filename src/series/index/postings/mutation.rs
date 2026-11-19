@@ -21,6 +21,22 @@ pub(crate) struct BulkIndexEntry {
     pub label_keys: Vec<IndexKey>,
 }
 
+/// A label holding a NUL is left out of the label index (`IndexKey::has_interior_nul`). No write
+/// accepts one and a foreign load refuses it, but an own RDB or AOF from an older build may still
+/// carry one: the series keeps the label and stays readable by key and by its other labels, and
+/// only a filter on that label misses it (a filter holding a NUL is a parse error anyway).
+/// Indexing it instead would either reach blart's `unwrap_unchecked` in `entry`/`insert`
+/// (undefined behavior) or, once inserted first, make a later valid key clash and be dropped.
+///
+/// With such keys never stored, no valid key can clash, so `try_entry` failing is unreachable;
+/// it is still handled rather than unwrapped, logged once and without the label's contents.
+fn skip_prefix_clash() {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log_warning("label index: skipped a key that clashes with another as a prefix");
+    }
+}
+
 impl Postings {
     pub(super) fn remove_posting_for_label_value(
         &mut self,
@@ -57,16 +73,23 @@ impl Postings {
         value: &str,
     ) -> bool {
         let key = IndexKey::for_label_value(label, value);
-        match self.label_index.entry(key) {
-            ARTEntry::Occupied(mut entry) => {
+        if key.has_interior_nul() {
+            return false;
+        }
+        match self.label_index.try_entry(key) {
+            Ok(ARTEntry::Occupied(mut entry)) => {
                 entry.get_mut().add(ts_id);
                 false
             }
-            ARTEntry::Vacant(entry) => {
+            Ok(ARTEntry::Vacant(entry)) => {
                 let mut bitmap = PostingsBitmap::new();
                 bitmap.add(ts_id);
                 entry.insert(bitmap);
                 true
+            }
+            Err(_) => {
+                skip_prefix_clash();
+                false
             }
         }
     }
@@ -135,13 +158,17 @@ impl Postings {
     }
 
     fn add_many_for_key(&mut self, key: IndexKey, ids: &[SeriesRef]) {
-        match self.label_index.entry(key) {
-            ARTEntry::Occupied(mut entry) => entry.get_mut().add_many(ids),
-            ARTEntry::Vacant(entry) => {
+        if key.has_interior_nul() {
+            return;
+        }
+        match self.label_index.try_entry(key) {
+            Ok(ARTEntry::Occupied(mut entry)) => entry.get_mut().add_many(ids),
+            Ok(ARTEntry::Vacant(entry)) => {
                 let mut bitmap = PostingsBitmap::new();
                 bitmap.add_many(ids);
                 entry.insert(bitmap);
             }
+            Err(_) => skip_prefix_clash(),
         }
     }
 
@@ -214,6 +241,55 @@ mod tests {
     use crate::series::index::postings::Postings;
 
     type SeriesSpec = (SeriesRef, String, Vec<(String, String)>);
+
+    /// A label holding a NUL is never indexed. `b` and `b\0c` give the keys `a=b\0` and
+    /// `a=b\0c\0`, the first a prefix of the second, which blart's radix tree cannot hold. No
+    /// write accepts such a label, but an own load keeps one an older build stored; indexing it
+    /// would either reach undefined behavior or, once inserted first, block a later valid `a=b`.
+    #[test]
+    fn labels_with_nul_are_not_indexed_and_never_block_valid_ones() {
+        for (legacy_name, legacy_value) in [("a", "b\0c"), ("a\0b", "v"), ("a", "\0")] {
+            for legacy_first in [true, false] {
+                let what = format!("{legacy_name:?}={legacy_value:?} legacy_first={legacy_first}");
+                let mut postings = Postings::default();
+                let add_legacy = |p: &mut Postings| {
+                    assert!(
+                        !p.add_posting_for_label_value(1, legacy_name, legacy_value),
+                        "{what}"
+                    );
+                };
+                if legacy_first {
+                    add_legacy(&mut postings);
+                }
+                assert!(postings.add_posting_for_label_value(2, "a", "b"), "{what}");
+                if !legacy_first {
+                    add_legacy(&mut postings);
+                }
+                let key = IndexKey::for_label_value("a", "b");
+                let valid = postings
+                    .label_index
+                    .get(&key)
+                    .expect("valid posting indexed");
+                assert!(valid.contains(2) && !valid.contains(1), "{what}");
+                assert_eq!(postings.label_index.len(), 1, "{what}");
+
+                let mut bulk = Postings::default();
+                let mut entries = vec![
+                    make_bulk_entry(1, "k1", &[(legacy_name, legacy_value)]),
+                    make_bulk_entry(2, "k2", &[("a", "b")]),
+                ];
+                if !legacy_first {
+                    entries.reverse();
+                }
+                bulk.bulk_index(entries);
+                assert_eq!(bulk.label_index.len(), 1, "bulk {what}");
+                assert!(
+                    bulk.label_index.get(&key).unwrap().contains(2),
+                    "bulk {what}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_bulk_index_matches_per_key_indexing() {

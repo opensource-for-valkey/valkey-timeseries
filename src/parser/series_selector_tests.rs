@@ -109,6 +109,43 @@ mod tests {
         assert_eq!(result.unwrap_err().to_string(), "Empty series selector");
     }
 
+    /// DIV-0068: no stored label holds a NUL, so a matcher holding one, in its name or its
+    /// value, is always a mistake, and a negated one (`a!=b\0c`) would select everything. It is a
+    /// parse error in the RTS form and in the Prometheus form, where a quoted string decodes
+    /// `\x00`. A regex escape for NUL is regex syntax and parses, unless the regex reduces to a
+    /// literal value holding one (`=~"b\\x00c"` is `="b\0c"`), whose negation would select
+    /// everything too.
+    #[test]
+    fn test_nul_in_a_matcher_is_rejected() {
+        for input in [
+            "a\0b=v",
+            "a\0b!=v",
+            "a\0b=(v,w)",
+            "a=b\0c",
+            "a!=b\0c",
+            "a=(x,b\0c)",
+            "a!=(x,\0)",
+            r#"{"a\x00b"="v"}"#,
+            r#"cpu{"a\x00b"=~"v.*"}"#,
+            r#"{x="1" or "a\x00b"="v"}"#,
+            r#"{a="b\x00c"}"#,
+            r#"{x="1",a!="b\x00c"}"#,
+            r#"{x="1",a!~"b\x00c"}"#,
+            r#"{x="1",a=~"(b\x00|c)"}"#,
+            r#"{a=("x","b\x00c")}"#,
+            r#"{x="1",a!~"b\\x00c"}"#,
+        ] {
+            assert!(
+                matches!(parse_series_selector(input), Err(ParseError::NulInFilter)),
+                "{input:?}: {:?}",
+                parse_series_selector(input).err()
+            );
+        }
+        for input in ["a=b\u{1}c", r#"{"a\x01b"="v"}"#, r#"{x="1",a=~"b\\x00.+"}"#] {
+            assert!(parse_series_selector(input).is_ok(), "{input:?}");
+        }
+    }
+
     #[test]
     fn test_regex_matcher_with_trailing_token_returns_parse_error() {
         let result = parse_series_selector(r#"{job=~"prometheus" unexpected}"#);

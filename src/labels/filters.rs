@@ -590,6 +590,31 @@ impl LabelFilter {
         })
     }
 
+    /// Whether the label name, a value, or a regex as written holds a NUL byte. No stored label
+    /// holds one (DIV-0068), so the selector parser refuses such a matcher.
+    pub fn contains_nul(&self) -> bool {
+        fn value_has_nul(value: &PredicateValue) -> bool {
+            match value {
+                PredicateValue::Empty => false,
+                PredicateValue::String(s) => s.contains('\0'),
+                PredicateValue::List(list) => list.iter().any(|s| s.contains('\0')),
+            }
+        }
+        self.label.contains('\0')
+            || match &self.matcher {
+                PredicateMatch::Equal(v)
+                | PredicateMatch::NotEqual(v)
+                | PredicateMatch::StartsWith(v)
+                | PredicateMatch::NotStartsWith(v)
+                | PredicateMatch::Contains(v)
+                | PredicateMatch::NotContains(v) => value_has_nul(v),
+                PredicateMatch::RegexEqual(r) | PredicateMatch::RegexNotEqual(r) => {
+                    r.value.contains('\0')
+                }
+                PredicateMatch::MatchAll | PredicateMatch::MatchNone => false,
+            }
+    }
+
     pub fn equals(label: String, value: &str) -> Self {
         Self {
             label,

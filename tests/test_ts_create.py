@@ -249,6 +249,89 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command("TS.CREATE", "eq:value", "LABELS", "a", "b=c")
         assert self.ts_info("eq:value")["labels"] == {"a": "b=c"}
 
+    def test_label_values_containing_nul_are_rejected(self):
+        """DIV-0068: a label value may not contain a NUL byte. The label index keys
+        `name=value` with a NUL terminator, so `b` and `b\\0c` made one key a prefix of the
+        other, which the radix tree's insert does not survive. Every write that applies LABELS
+        or METRIC rejects it and creates nothing; an existing series' labels are left alone."""
+        bulk = '{"values":[1.0],"timestamps":[100]}'
+        writes = [
+            ("TS.CREATE", "nul:create"),
+            ("TS.ADD", "nul:add", 100, 1),
+            ("TS.INCRBY", "nul:incr", 1),
+            ("TS.DECRBY", "nul:decr", 1),
+            ("TS.ADDBULK", "nul:bulk", bulk),
+        ]
+        for value in (b"b\x00c", b"\x00", b"b\x00"):
+            for command in writes:
+                with pytest.raises(ResponseError, match="must not contain a NUL"):
+                    self.client.execute_command(*command, "LABELS", "ok", "1", "a", value)
+                assert self.client.exists(command[1]) == 0, (command, value)
+
+        # METRIC's quoted values decode `\x00` escapes, so they reach the same rule.
+        with pytest.raises(ResponseError, match="must not contain a NUL"):
+            self.client.execute_command("TS.CREATE", "nul:metric", "METRIC", 'm{a="b\\x00c"}')
+        assert self.client.exists("nul:metric") == 0
+
+        self.client.execute_command("TS.CREATE", "nul:alter", "LABELS", "a", "b")
+        with pytest.raises(ResponseError, match="must not contain a NUL"):
+            self.client.execute_command("TS.ALTER", "nul:alter", "LABELS", "a", b"b\x00c")
+        assert self.ts_info("nul:alter")["labels"] == {"a": "b"}
+
+        # The pair that broke the index: `nul:alter` already holds `a=b`.
+        with pytest.raises(ResponseError, match="must not contain a NUL"):
+            self.client.execute_command("TS.CREATE", "nul:sibling", "LABELS", "a", b"b\x00c")
+        assert self.client.ping()
+        assert self.client.execute_command("TS.QUERYINDEX", "a=b") == [b"nul:alter"]
+
+        # Other control bytes stay legal.
+        self.client.execute_command("TS.CREATE", "nul:ctl", "LABELS", "a", b"b\x01c")
+        assert self.client.execute_command("TS.QUERYINDEX", "a=b") == [b"nul:alter"]
+
+    def test_label_names_containing_nul_are_rejected(self):
+        """DIV-0068: a label name may not contain a NUL byte either. RTS stores one but indexes
+        the name cut at the NUL (`a=v` matches a series labelled `a\\0b`) and fails to parse a
+        filter naming it, so here labels hold no NUL at all. Creating such a series used to abort
+        the server: its replicated TS.CREATE was built through a C string."""
+        bulk = '{"values":[1.0],"timestamps":[100]}'
+        writes = [
+            ("TS.CREATE", "nuln:create"),
+            ("TS.ADD", "nuln:add", 100, 1),
+            ("TS.INCRBY", "nuln:incr", 1),
+            ("TS.DECRBY", "nuln:decr", 1),
+            ("TS.ADDBULK", "nuln:bulk", bulk),
+        ]
+        for name in (b"a\x00b", b"\x00", b"a\x00"):
+            for command in writes:
+                with pytest.raises(ResponseError, match="label name must not contain a NUL"):
+                    self.client.execute_command(*command, "LABELS", "ok", "1", name, "v")
+                assert self.client.exists(command[1]) == 0, (command, name)
+        with pytest.raises(ResponseError, match="label name must not contain a NUL"):
+            self.client.execute_command("TS.CREATE", "nuln:metric", "METRIC", 'm{"a\\x00b"="v"}')
+        assert self.client.exists("nuln:metric") == 0
+
+        self.client.execute_command("TS.CREATE", "nuln:alter", "LABELS", "a", "v")
+        with pytest.raises(ResponseError, match="label name must not contain a NUL"):
+            self.client.execute_command("TS.ALTER", "nuln:alter", "LABELS", b"a\x00b", "v")
+        assert self.ts_info("nuln:alter")["labels"] == {"a": "v"}
+        assert self.client.ping()
+
+    def test_filters_holding_a_nul_are_rejected(self):
+        """DIV-0068: no label holds a NUL, so a filter holding one, in a label name or a value, is
+        a parse error on every command that takes FILTER. RTS fails to parse a NUL in a name and
+        cuts a value at the NUL; here a value is refused too, because a negated one
+        (`a!=b\\0c`) would otherwise select every series, TS.MDEL included."""
+        self.client.execute_command("TS.CREATE", "nulf:1", "LABELS", "a", "b", "host", "h")
+        self.client.execute_command("TS.CREATE", "nulf:2", "LABELS", "a", "c", "host", "h")
+        commands = (("TS.QUERYINDEX",), ("TS.MGET", "FILTER"), ("TS.MRANGE", "-", "+", "FILTER"),
+                    ("TS.CARD", "FILTER"), ("TS.MDEL", "FILTER"))
+        for matchers in ((b"a\x00b=v",), (b"a=b\x00c",), ("host=h", b"a!=b\x00c"),
+                         ("host=h", b"a!=(x,\x00)"), ('{host="h",a!="b\\x00c"}',)):
+            for command in commands:
+                with pytest.raises(ResponseError, match="NUL"):
+                    self.client.execute_command(*command, *matchers)
+        assert sorted(self.client.execute_command("TS.QUERYINDEX", "host=h")) == [b"nulf:1", b"nulf:2"]
+
     def test_option_operand_named_labels_is_not_the_keyword(self):
         """An option's operand spelled `labels` is that option's value, not the LABELS
         keyword: `METRIC labels` used to split there and leave METRIC with no operand."""

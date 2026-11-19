@@ -1,5 +1,6 @@
 use crate::aggregators::AggregationHandler;
 use crate::common::Sample;
+use crate::common::context::create_key_string;
 use crate::error_consts;
 use crate::series::{SeriesLink, TimeSeries, try_get_timeseries, try_get_timeseries_mut};
 use std::collections::HashSet;
@@ -136,7 +137,7 @@ struct RuleNode {
 /// A key that holds no series is no node, whether missing or overwritten with another type: a
 /// link to it is stale, and the walks skip it rather than fail the new rule with `WRONGTYPE`.
 fn rule_node(ctx: &Context, key: &[u8]) -> ValkeyResult<Option<RuleNode>> {
-    let key = ctx.create_string(key);
+    let key = create_key_string(ctx, key);
     let series = match try_get_timeseries(ctx, &key, None) {
         Err(ValkeyError::WrongType) => return Ok(None),
         other => other?,

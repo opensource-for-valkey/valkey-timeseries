@@ -3,10 +3,13 @@ use crate::commands::command_parser::{
     parse_decimal_digit_rounding, parse_duplicate_policy, parse_ignore_options, parse_metric_name,
     parse_retention, parse_significant_digit_rounding,
 };
+use crate::common::metrics::rdb::note_series_repairs;
 use crate::common::rounding::{NO_ROUNDING_KEYWORD, RoundingStrategy};
 use crate::error_consts;
-use crate::labels::{Label, check_label_name};
+use crate::labels::{Label, check_label_name, check_label_nul};
 use crate::series::chunks::ChunkEncoding;
+use crate::series::index::persistence::is_loading_active;
+use crate::series::serialization::LABEL_NUL_KEPT;
 use crate::series::{DuplicatePolicy, TimeSeriesOptions, create_and_store_series};
 use valkey_module::{Context, NextArg, VALKEY_OK, ValkeyError, ValkeyResult, ValkeyString};
 
@@ -214,7 +217,12 @@ pub fn parse_series_options_onto(
                 // Set here too, not only by LABELS: a second METRIC used to replace the first.
                 metric_set = true;
                 let metric = args_iter.next_string()?;
-                options.labels = Some(parse_metric_name(&metric)?);
+                let labels = parse_metric_name(&metric)?;
+                // Quoted names and values decode escapes, so `\x00` arrives here as a NUL.
+                for label in &labels {
+                    check_label_nul_unless_own_load(label.name.as_bytes(), label.value.as_bytes())?;
+                }
+                options.labels = Some(labels);
             }
             CommandArgToken::Ignore => {
                 let (ignore_max_timediff, ignore_max_val_diff) =
@@ -332,6 +340,20 @@ fn series_option_operands(token: CommandArgToken) -> usize {
     }
 }
 
+/// Refuses a label holding a NUL (DIV-0068), except while the server replays its own AOF or a
+/// full sync from its primary: an older build may have written `TS.ALTER ... LABELS a "b\0c"`,
+/// and own data is kept and counted, as `normalize_series` does for an RDB. The label index
+/// leaves such a label out (`IndexKey::has_interior_nul`).
+fn check_label_nul_unless_own_load(name: &[u8], value: &[u8]) -> ValkeyResult<()> {
+    match check_label_nul(name, value) {
+        Err(_) if is_loading_active() => {
+            note_series_repairs(b"", "own", &[], &[LABEL_NUL_KEPT]);
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 /// Parse labels from the command arguments. It's variadic, so it should be the last argument
 /// in the command, otherwise we end in ambiguity
 fn parse_labels(args: &[ValkeyString]) -> ValkeyResult<Vec<Label>> {
@@ -354,6 +376,7 @@ fn parse_labels(args: &[ValkeyString]) -> ValkeyResult<Vec<Label>> {
             return Err(ValkeyError::Str(error_consts::CANNOT_PARSE_LABELS));
         }
         check_label_name(name.as_slice())?;
+        check_label_nul_unless_own_load(name.as_slice(), value.as_slice())?;
 
         let label = Label::new(name.to_string_lossy(), value.to_string_lossy());
         labels.push(label);
