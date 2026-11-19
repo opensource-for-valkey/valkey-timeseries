@@ -2,7 +2,6 @@ pub mod background_tasks;
 mod bulk_add;
 pub mod chunks;
 mod compaction;
-mod compaction_policy;
 mod defrag;
 mod digest;
 mod guard;
@@ -29,7 +28,6 @@ mod utils;
 
 pub use bulk_add::*;
 pub use compaction::*;
-pub use compaction_policy::*;
 pub use defrag::defrag_series;
 pub use guard::*;
 pub use link::SeriesLink;
