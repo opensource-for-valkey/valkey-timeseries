@@ -2,7 +2,6 @@
 #[allow(clippy::excessive_precision)] // TODO: Audit test values for truncation
 mod tests {
     use crate::common::Sample;
-    use crate::config::SPLIT_FACTOR;
     use crate::error::TsdbError;
     use crate::series::chunks::merge::merge_by_capacity;
     use crate::series::{
@@ -1055,8 +1054,7 @@ mod tests {
                 Err(TsdbError::CapacityFull(_)) => break,
                 Err(e) => panic!("unexpected error: {e:?}"),
             }
-            let threshold = (chunk.max_size() as f64 * SPLIT_FACTOR) as usize;
-            if chunk.size() > threshold {
+            if chunk.should_split() {
                 break;
             }
         }

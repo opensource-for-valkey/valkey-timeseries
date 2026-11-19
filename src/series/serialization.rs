@@ -239,6 +239,18 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
 /// alone: deletes, defrag and the retention trim all drop the chunks they empty, and
 /// `get_last_chunk` creates a chunk on demand. So this changes no series the server wrote, and
 /// the digest hashes samples, not chunks. Applied to every load, foreign or not.
+/// Whether `chunks`, sorted by first timestamp, would be disjoint. Only reached once the load
+/// has found them out of order, so the sort costs nothing on an ordinary load.
+fn chunks_disjoint_once_sorted(chunks: &[TimeSeriesChunk]) -> bool {
+    let mut bounds: Vec<(Timestamp, Timestamp)> = chunks
+        .iter()
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| (chunk.first_timestamp(), chunk.last_timestamp()))
+        .collect();
+    bounds.sort_unstable();
+    bounds.windows(2).all(|pair| pair[0].1 < pair[1].0)
+}
+
 pub(crate) fn drop_empty_chunks(ts: &mut TimeSeries) -> bool {
     if ts.chunks.len() < 2 || !ts.chunks.iter().any(|chunk| chunk.is_empty()) {
         return false;
@@ -286,7 +298,8 @@ pub(crate) const RETENTION_CLAMPED: &str = "retention clamped";
 pub(crate) const ROUNDING_CLAMPED: &str = "rounding digits clamped";
 pub(crate) const ROUNDING_DROPPED: &str = "rounding to zero significant digits dropped";
 pub(crate) const NEGATIVE_TIMESTAMPS: &str = "negative timestamps";
-pub(crate) const CHUNKS_OUT_OF_ORDER: &str = "chunks out of order";
+pub(crate) const CHUNKS_REORDERED: &str = "chunks out of order sorted";
+pub(crate) const CHUNKS_OVERLAPPING: &str = "overlapping chunks";
 pub(crate) const UNDECODABLE_STRAYS_KEPT: &str = "undecodable chunks of another encoding kept";
 pub(crate) const LABEL_NUL_KEPT: &str = "label with a NUL byte kept";
 pub(crate) const STALE_RULE_STATE_CLEARED: &str = "compaction state without an open bucket cleared";
@@ -313,7 +326,8 @@ pub(crate) const OFF_GRID_BUCKET_REBUILT: &str =
 /// | Retention past `i64::MAX` ms | refused | clamped to `i64::MAX` ms |
 /// | Rounding digits outside what `DECIMAL_DIGITS`/`SIGNIFICANT_DIGITS` accept | refused | clamped to 16; zero significant digits dropped |
 /// | Negative timestamps | refused | loaded as they are |
-/// | Chunks out of order or overlapping | refused | loaded as they are |
+/// | Chunks out of order, but disjoint | refused | sorted |
+/// | Chunks overlapping | refused | loaded as they are |
 /// | A label name or value containing a NUL byte | refused | loaded as it is; the label index leaves it out |
 /// | A rule's aggregator state with no open bucket | cleared | cleared |
 /// | A rule's open bucket off its grid | marked `dirty`, rebuilt by the next write | marked `dirty`, rebuilt by the next write |
@@ -323,7 +337,7 @@ pub(crate) const OFF_GRID_BUCKET_REBUILT: &str =
 /// than what the rule protects against. Before this branch those series loaded unchecked.
 /// Every repair and tolerance is counted and logged (`note_series_repairs`).
 ///
-/// Budgets come first because the split works from them: `needs_split` adds a quarter of a
+/// Budgets come first because the split works from them: `should_split` adds a quarter of a
 /// budget to itself, which overflows for a forged `usize::MAX`.
 pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<Repairs, String> {
     let own = trust == LoadTrust::Own;
@@ -446,6 +460,7 @@ pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<
     }
 
     let mut prev_last: Option<Timestamp> = None;
+    let mut out_of_order = false;
     for (i, chunk) in ts.chunks.iter().enumerate() {
         // Only a sole empty chunk is left.
         if chunk.is_empty() {
@@ -463,13 +478,28 @@ pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<
         }
         if let Some(prev) = prev_last
             && first <= prev
+            && !out_of_order
         {
             refuse(format!(
                 "chunk {i} starts at {first}, not after the previous chunk's {prev}"
             ))?;
-            repairs.tolerate(CHUNKS_OUT_OF_ORDER);
+            out_of_order = true;
         }
         prev_last = Some(prev_last.map_or(last, |prev| prev.max(last)));
+    }
+    if out_of_order {
+        // Every chunk lookup - the binary searches, the range iterator's seek, the upsert's
+        // routing - relies on ordered, disjoint chunks. Disjoint chunks that are merely out of
+        // order are put back in order, which keeps every sample. Overlapping ones have no such
+        // repair (which copy of a timestamp wins is not recorded), so they load as they are;
+        // reads and writes on such a series may then pass over a copy, as the binary chunk
+        // searches always could.
+        if chunks_disjoint_once_sorted(&ts.chunks) {
+            ts.chunks.sort_by_key(|chunk| chunk.first_timestamp());
+            repairs.repair(CHUNKS_REORDERED);
+        } else {
+            repairs.tolerate(CHUNKS_OVERLAPPING);
+        }
     }
 
     // Rule state is repaired on every load: the repair is a no-op on anything the engine wrote,

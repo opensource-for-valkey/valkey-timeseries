@@ -137,12 +137,12 @@ pub(super) fn register(registry: &mut Registry<'static>) {
         .register(
             counter("load_repairs")
                 .source(&SERIES_REPAIRS)
-                .help("Rules a loaded series broke and was repaired for (empty chunks dropped, an oversized chunk split, a budget clamped, ...), one per rule per series"),
+                .help("Rules a loaded series broke and was repaired for (empty chunks dropped, chunks out of order sorted, an oversized chunk split, a budget clamped, ...), one per rule per series"),
         )
         .register(
             counter("load_tolerated")
                 .source(&SERIES_TOLERATED)
-                .help("Rules a series loaded from the server's own RDB or AOF still breaks (negative timestamps, chunks out of order), one per rule per series; RESTORE refuses these"),
+                .help("Rules a series loaded from the server's own RDB or AOF still breaks (negative timestamps, overlapping chunks), one per rule per series; RESTORE refuses these"),
         )
         .register(
             counter_value("saves")

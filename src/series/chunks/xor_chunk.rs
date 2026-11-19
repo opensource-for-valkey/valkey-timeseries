@@ -132,9 +132,8 @@ impl<C: SampleCodec> XorChunk<C> {
     /// The bit stream grows by doubling, so counting `Vec::capacity` reported up to ~2x the data
     /// actually held: a chunk created with `CHUNK_SIZE 4096` reported 8288. `is_full` has always
     /// measured the payload, and `UncompressedChunk::size` is likewise `len`-based, so the three
-    /// now agree. It also fed `utilization`, and so `should_split` -- which only governs an
-    /// upsert into an already-sealed chunk; the append path is gated by `is_full` and was
-    /// unaffected. The full allocation is still reported by `memory_usage`, which is what
+    /// now agree. It also feeds `should_split`, the split rule, which only governs upserts and
+    /// merges; the append path is gated by `is_full`. The full allocation is still reported by `memory_usage`, which is what
     /// `MEMORY USAGE` and `TS.INFO memoryUsage` read.
     pub fn data_size(&self) -> usize {
         self.encoder.bytes().len()

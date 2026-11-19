@@ -24,7 +24,7 @@ use orx_parallel::Par;
 use orx_parallel::ParResult;
 use smallvec::SmallVec;
 use std::mem::size_of;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 use std::vec;
 use valkey_module::digest::Digest;
@@ -56,7 +56,7 @@ pub(crate) fn seal_chunk(chunk: &mut TimeSeriesChunk) {
 }
 
 /// A chunk is split only once it exceeds `max_size` by more than `max_size / SPLIT_SLACK_DIVISOR`
-/// (see [`TimeSeries::needs_split`]).
+/// (see [`TimeSeriesChunk::should_split`]).
 pub(crate) const SPLIT_SLACK_DIVISOR: usize = 4;
 
 /// Represents a time series consisting of chunks of samples, each with a timestamp and value.
@@ -402,12 +402,23 @@ impl TimeSeries {
         }
         let mut chunk = self.create_chunk();
         chunk.add_sample(&sample)?;
+        // No `shrink_to_fit` here: it would undo `push`'s doubling, so the next push would
+        // reallocate and copy the whole vector again. The elements are small handles; the
+        // payload slack that matters is the sealed chunk's, which `seal_chunk` returns.
         self.chunks.push(chunk);
-        // trim chunks to keep memory usage in check
-        self.chunks.shrink_to_fit();
         self.record_appended_sample(sample);
 
         Ok(())
+    }
+
+    /// Gives back the chunk list's capacity once it is more than twice what the list holds.
+    /// Shrinking on every removal would cost a reallocation per chunk a retention series
+    /// rolls over (the next append grows it straight back); at a 2x bound the waste stays
+    /// within what `push`'s doubling leaves anyway.
+    fn shrink_chunk_list(&mut self) {
+        if self.chunks.capacity() > 2 * self.chunks.len() {
+            self.chunks.shrink_to_fit();
+        }
     }
 
     pub(super) fn append_chunk(&mut self) {
@@ -454,23 +465,14 @@ impl TimeSeries {
             }
             0
         } else {
-            let (pos, found) = get_chunk_index(&self.chunks, sample.timestamp);
-            if found {
-                pos
-            } else {
-                // The timestamp falls in a *gap* between chunks — chunks need not be
-                // contiguous (a split leaves one). `get_chunk_index` reports a miss as
-                // `chunks.len()`, which is not a usable index, so resolve it here: route the
-                // sample into the chunk starting after the gap, the same rule the bulk path
-                // uses (`group_samples_by_chunk`), which keeps chunks non-overlapping.
-                // `upsert_sample` is only reached for `timestamp <= last_timestamp`, so a
-                // chunk starting after the gap always exists; the last chunk is a defensive
-                // fallback.
-                self.chunks
-                    .iter()
-                    .position(|c| c.first_timestamp() > sample.timestamp)
-                    .unwrap_or(chunks_len - 1)
-            }
+            // On a miss the timestamp falls in a *gap* between chunks — chunks need not be
+            // contiguous (a split leaves one) — and `pos` is the chunk starting after the gap:
+            // the sample goes there, the same rule the bulk path uses
+            // (`group_samples_by_chunk`), which keeps chunks non-overlapping. `upsert_sample` is
+            // only reached for `timestamp <= last_timestamp`, so that chunk always exists; the
+            // last chunk is a defensive fallback.
+            let (pos, _found) = get_chunk_index(&self.chunks, sample.timestamp);
+            pos.min(chunks_len - 1)
         };
 
         let is_last = target_idx + 1 == chunks_len;
@@ -547,7 +549,7 @@ impl TimeSeries {
     }
 
     /// After an upsert into the chunks at `touched`: split as a merge would if one grew past
-    /// [`Self::needs_split`]. An insert into the middle of a compressed chunk re-encodes the
+    /// [`TimeSeriesChunk::should_split`]. An insert into the middle of a compressed chunk re-encodes the
     /// samples after it as well, so one sample can grow a chunk by more than a sample's worth
     /// — 70 bytes on a 48-byte Gorilla budget — and the pre-insert `should_split` cannot see
     /// that coming. The sample is stored either way, so a failed split only leaves the chunk
@@ -555,7 +557,10 @@ impl TimeSeries {
     fn split_if_grown(&mut self, touched: std::ops::Range<usize>) {
         let end = touched.end.min(self.chunks.len());
         let start = touched.start.min(end);
-        if !self.chunks[start..end].iter().any(Self::needs_split) {
+        if !self.chunks[start..end]
+            .iter()
+            .any(TimeSeriesChunk::should_split)
+        {
             return;
         }
         if let Err(e) = self.split_chunks_if_needed() {
@@ -564,47 +569,34 @@ impl TimeSeries {
         }
     }
 
-    /// Whether a merge left `chunk` big enough that a split should halve it. "Full" is not
-    /// the test: a chunk completed by appends sits at its size limit (the append that
-    /// crosses it is the last one accepted), and the next append seals it and starts a new
-    /// chunk — halving it later would re-encode every sample it holds only to leave two
-    /// half-empty chunks, once per chunk-full of appends. Only a chunk that a merge has grown
-    /// past `max_size + max_size / SPLIT_SLACK_DIVISOR` is split; bulk ingest plans its
-    /// overfill below that line (see `bulk_add`). Bytes alone decide: an uncompressed chunk's
-    /// `is_full` counts samples against a capacity the RDB loader raises to the loaded count,
-    /// so testing it left the halves of an oversized loaded chunk unsplit and still over
-    /// `MAX_LOADED_CHUNK_BYTES`.
-    ///
-    /// This is the merge-path split rule; the upsert path uses `TimeSeriesChunk::should_split`.
-    /// See the `# Capacity` section on [`ChunkOps`](crate::series::chunks::ChunkOps).
-    pub(crate) fn needs_split(chunk: &TimeSeriesChunk) -> bool {
-        let max = chunk.max_size();
-        // A single sample cannot be split, however small the budget.
-        chunk.len() > 1 && chunk.size() > max + max / SPLIT_SLACK_DIVISOR
-    }
-
-    /// Splits until no chunk [`needs_split`](Self::needs_split). One merge can grow a chunk to
-    /// many times its budget (a `TS.MADD` backfilling a whole batch into one chunk's span), and a
-    /// single halving left it that way, so a stored chunk had no size bound at all. Each pass
-    /// halves every oversized chunk's sample count, so the loop ends within `log2(len)` passes;
-    /// the RDB loader's chunk-size limit relies on it.
+    /// Splits until no chunk [`should_split`](TimeSeriesChunk::should_split). One merge can grow
+    /// a chunk to many times its budget (a `TS.MADD` backfilling a whole batch into one chunk's
+    /// span), and a single halving left it that way, so a stored chunk had no size bound at all.
+    /// Each pass halves every oversized chunk's sample count, so the loop ends within
+    /// `log2(len)` passes; the RDB loader's chunk-size limit relies on it.
     pub(crate) fn split_chunks_if_needed(&mut self) -> TsdbResult<()> {
         // Almost every merge ends here with nothing to split: decide that with a scan
-        // before entering a parallel section.
-        loop {
-            let to_split = self.chunks.iter().filter(|c| Self::needs_split(c)).count();
-            if to_split == 0 {
-                break;
-            }
-            self.split_oversized_chunks(to_split)?;
+        // before entering a parallel section. After that, only the halves a pass produced
+        // can still be oversized, so each pass reports how many are, and no pass rescans.
+        let mut to_split = self.chunks.iter().filter(|c| c.should_split()).count();
+        while to_split > 0 {
+            to_split = self.split_oversized_chunks(to_split)?;
         }
         Ok(())
     }
 
-    /// Halves every chunk that [`needs_split`](Self::needs_split), once. `to_split` is how many
-    /// there are, which sizes the parallel section.
-    fn split_oversized_chunks(&mut self, to_split: usize) -> TsdbResult<()> {
+    /// Halves every chunk that [`should_split`](TimeSeriesChunk::should_split), once, and
+    /// returns how many of the halves still should. `to_split` is how many chunks need it,
+    /// which sizes the parallel section.
+    fn split_oversized_chunks(&mut self, to_split: usize) -> TsdbResult<usize> {
         let errored: AtomicBool = AtomicBool::new(false);
+        let still_oversized = AtomicUsize::new(0);
+        let count_oversized = |lower: &TimeSeriesChunk, upper: &TimeSeriesChunk| {
+            let n = usize::from(lower.should_split()) + usize::from(upper.should_split());
+            if n > 0 {
+                still_oversized.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
 
         // todo: track error, but allow partials
         // A split re-encodes two half chunks (~thousands of samples), so a
@@ -613,13 +605,14 @@ impl TimeSeries {
             self.chunks
                 .par_mut_rayon()
                 .num_threads(request_par_threads(to_split, to_split * SPLIT_WORK))
-                .filter(|c| Self::needs_split(c))
+                .filter(|c| c.should_split())
                 .flat_map(|chunks| {
                     if let Ok(mut split_chunk) = chunks.split() {
                         // `split` re-encodes both halves from scratch, so both arrive with a
                         // doubling-grown buffer around half a chunk of data.
                         seal_chunk(chunks);
                         seal_chunk(&mut split_chunk);
+                        count_oversized(chunks, &split_chunk);
                         Some(split_chunk)
                     } else {
                         errored.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -629,10 +622,11 @@ impl TimeSeries {
                 .collect::<Vec<_>>()
         } else {
             let mut new_chunks = Vec::with_capacity(std::cmp::max(2, self.chunks.len() / 6));
-            for c in self.chunks.iter_mut().filter(|c| Self::needs_split(c)) {
+            for c in self.chunks.iter_mut().filter(|c| c.should_split()) {
                 if let Ok(mut split_chunk) = c.split() {
                     seal_chunk(c);
                     seal_chunk(&mut split_chunk);
+                    count_oversized(c, &split_chunk);
                     new_chunks.push(split_chunk);
                 } else {
                     errored.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -678,7 +672,7 @@ impl TimeSeries {
             return Err(TsdbError::ChunkSplitError);
         }
 
-        Ok(())
+        Ok(still_oversized.into_inner())
     }
 
     pub(super) fn recalculate_total_samples(&mut self) {
@@ -963,10 +957,7 @@ impl TimeSeries {
 
     pub fn range_iter(&self, start: Timestamp, end: Timestamp) -> SeriesSampleIterator<'_> {
         let start = start.max(self.get_min_timestamp());
-        // Seek to the first chunk that reaches `start`: the iterator's forward scan would step
-        // through every older chunk to get there. It stops at the first chunk past `end` itself.
-        let first = find_start_chunk_index(&self.chunks, start);
-        SeriesSampleIterator::over_chunks(&self.chunks[first..], start, end, false)
+        SeriesSampleIterator::over_chunks(&self.chunks, start, end, false)
     }
 
     /// Samples in the chunks `[start, end]` touches, without copying or decoding them: what
@@ -1079,7 +1070,7 @@ impl TimeSeries {
             return 0;
         }
         let deleted_count = self.chunks.drain(..expired).map(|chunk| chunk.len()).sum();
-        self.chunks.shrink_to_fit();
+        self.shrink_chunk_list();
         deleted_count
     }
 
@@ -1207,7 +1198,7 @@ impl TimeSeries {
         let saved_len = self.chunks.len();
         self.chunks.retain(|chunk| !chunk.is_empty());
         if self.chunks.len() < saved_len {
-            self.chunks.shrink_to_fit();
+            self.shrink_chunk_list();
         }
 
         // Update metadata. After a failure the chunks that succeeded have still lost their
@@ -1574,21 +1565,21 @@ pub(super) fn find_start_chunk_index(arr: &[TimeSeriesChunk], ts: Timestamp) -> 
     }
 }
 
-/// Return the index of the chunk in which the timestamp belongs. Assumes !chunks.is_empty()
+/// The chunk holding `timestamp` in its range, as `(index, true)`; on a miss, `(index, false)`
+/// where `index` is the insertion point: the first chunk starting after `timestamp`, or
+/// `chunks.len()` when every chunk ends before it. Both branches agree on that, as the binary
+/// search's `Err` does.
 fn get_chunk_index(chunks: &[TimeSeriesChunk], timestamp: Timestamp) -> (usize, bool) {
     match chunks {
         [] => (0, false),
-        _ if chunks.len() <= LINEAR_SCAN_MAX => chunks
-            .iter()
-            .enumerate()
-            .find_map(|(i, chunk)| {
-                if chunk.is_timestamp_in_range(timestamp) {
-                    Some((i, true))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or((chunks.len(), false)),
+        _ if chunks.len() <= LINEAR_SCAN_MAX => {
+            // Chunks are ordered and disjoint, so the first one that has not ended before
+            // `timestamp` either holds it or starts after it.
+            match chunks.iter().position(|c| timestamp <= c.last_timestamp()) {
+                Some(i) => (i, timestamp >= chunks[i].first_timestamp()),
+                None => (chunks.len(), false),
+            }
+        }
         _ => binary_search_chunks_by_timestamp(chunks, timestamp),
     }
 }
@@ -1836,5 +1827,75 @@ mod tests {
         assert_eq!(find_start_chunk_index(&chunks, 45), 2);
         assert_eq!(find_start_chunk_index(&chunks, 35), 2);
         assert_eq!(find_start_chunk_index(&chunks, 70), 4);
+    }
+
+    /// `get_chunk_index` reports a miss as the insertion point in both branches, which is what
+    /// lets `upsert_sample` route a gap sample without a second scan.
+    #[test]
+    fn test_get_chunk_index_linear_scan_agrees_with_binary_search() {
+        use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
+
+        // Chunks covering [0,9], [20,29], [40,49], [60,69].
+        let chunks: Vec<TimeSeriesChunk> = (0..4)
+            .map(|c| {
+                let samples: Vec<Sample> = (0..10)
+                    .map(|i| Sample {
+                        timestamp: c * 20 + i,
+                        value: i as f64,
+                    })
+                    .collect();
+                TimeSeriesChunk::Uncompressed(UncompressedChunk::new(1024, &samples))
+            })
+            .collect();
+        assert!(chunks.len() <= LINEAR_SCAN_MAX);
+
+        for ts in -5..80 {
+            assert_eq!(
+                get_chunk_index(&chunks, ts),
+                binary_search_chunks_by_timestamp(&chunks, ts),
+                "ts={ts}"
+            );
+        }
+        assert_eq!(get_chunk_index(&chunks, 45), (2, true));
+        assert_eq!(get_chunk_index(&chunks, 35), (2, false));
+        assert_eq!(get_chunk_index(&chunks, -1), (0, false));
+        assert_eq!(get_chunk_index(&chunks, 70), (4, false));
+    }
+
+    /// A back-fill into the gap a split leaves goes into the chunk after the gap, at every chunk
+    /// count, including past the linear-scan limit.
+    #[test]
+    fn test_upsert_into_a_gap_lands_in_the_next_chunk() {
+        use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
+
+        for chunk_count in [3, LINEAR_SCAN_MAX as i64 + 4] {
+            // Chunks covering [0,9], [100,109], ...
+            let chunks: Vec<TimeSeriesChunk> = (0..chunk_count)
+                .map(|c| {
+                    let samples: Vec<Sample> = (0..10)
+                        .map(|i| Sample {
+                            timestamp: c * 100 + i,
+                            value: i as f64,
+                        })
+                        .collect();
+                    TimeSeriesChunk::Uncompressed(UncompressedChunk::new(4096, &samples))
+                })
+                .collect();
+            let mut series = TimeSeries::from_chunks(chunks).unwrap();
+
+            assert!(series.add(150, 1.0, None).is_ok());
+            assert_eq!(series.chunks.len(), chunk_count as usize);
+            assert_eq!(
+                series.chunks[2].first_timestamp(),
+                150,
+                "{chunk_count} chunks"
+            );
+            assert_eq!(
+                series.chunks[1].last_timestamp(),
+                109,
+                "{chunk_count} chunks"
+            );
+            assert_eq!(series.total_samples, chunk_count as usize * 10 + 1);
+        }
     }
 }

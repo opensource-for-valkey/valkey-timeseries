@@ -3,6 +3,7 @@ use crate::iterators::SampleIter;
 use crate::series::TimeSeries;
 use crate::series::chunks::{ChunkOps, TimeSeriesChunk};
 use crate::series::request_types::RangeOptions;
+use crate::series::time_series::find_start_chunk_index;
 
 /// An iterator over samples in a TimeSeries — or a copy of its chunks — within a
 /// specified timestamp range. Supports both forward and reverse iteration.
@@ -52,13 +53,32 @@ impl<'a> SeriesSampleIterator<'a> {
         // Match TimestampRange semantics: an inverted window contains no samples.
         // Marking it done here prevents every iterator caller from having to rely
         // on its underlying chunk encoding to handle the range safely.
-        let chunks_done = chunks.is_empty() || start > end;
-        // Empty chunks are skipped while scanning, so starting a reverse scan at the
-        // last chunk of a series with no samples still yields nothing.
-        let chunk_index: usize = if is_reverse && !chunks.is_empty() {
-            chunks.len() - 1
-        } else {
+        let mut chunks_done = chunks.is_empty() || start > end;
+        // Seek to the chunk nearest the window, so that a narrow window at the far end of a
+        // long series does not step through every chunk header in between. The scan in
+        // `next_chunk` takes over from there: it skips empty chunks (only an empty series
+        // holds one) and stops at the window's other edge.
+        let chunk_index: usize = if chunks_done {
             0
+        } else if is_reverse {
+            // The last chunk that starts at or before `end`. A reverse read of recent data
+            // starts in the last chunk, so check that before searching.
+            let last = chunks.len() - 1;
+            if chunks[last].first_timestamp() <= end {
+                last
+            } else {
+                match chunks[..last].partition_point(|c| c.first_timestamp() <= end) {
+                    0 => {
+                        chunks_done = true;
+                        0
+                    }
+                    n => n - 1,
+                }
+            }
+        } else {
+            // The first chunk that reaches `start`; `chunks.len()` when none does, which the
+            // forward scan reads as done.
+            find_start_chunk_index(chunks, start)
         };
 
         let mut this = Self {
@@ -820,6 +840,46 @@ mod tests {
             assert_eq!(samples.len(), 10);
             for (i, sample) in samples.iter().enumerate() {
                 assert_eq!(sample.timestamp, ((9 - i) * 10) as Timestamp);
+            }
+        }
+
+        /// The seek in `over_chunks` lands where a chunk-by-chunk scan from the near end would
+        /// have: every window, forward and reverse, over chunk lists below and above the
+        /// linear-scan limit (so both `find_start_chunk_index` branches run), with gaps between
+        /// chunks and window edges on, inside and between them.
+        #[test]
+        fn seek_agrees_with_a_full_scan() {
+            for chunk_count in [1, 5, 40] {
+                let chunks: Vec<TimeSeriesChunk> = (0..chunk_count)
+                    .map(|i| {
+                        let base = i * 100;
+                        create_chunk(&[(base, 0.0), (base + 10, 1.0), (base + 20, 2.0)])
+                    })
+                    .collect();
+                let all: Vec<Sample> = chunks.iter().flat_map(|c| c.iter()).collect();
+                let last = chunk_count * 100;
+                let edges: Vec<Timestamp> = (-5..=last + 5).step_by(5).collect();
+
+                for &start in &edges {
+                    for &end in &edges {
+                        let expected: Vec<Sample> = all
+                            .iter()
+                            .copied()
+                            .filter(|s| (start..=end).contains(&s.timestamp))
+                            .collect();
+                        let forward: Vec<Sample> =
+                            SeriesSampleIterator::over_chunks(&chunks, start, end, false).collect();
+                        assert_eq!(forward, expected, "{chunk_count} chunks, [{start}, {end}]");
+
+                        let mut reverse: Vec<Sample> =
+                            SeriesSampleIterator::over_chunks(&chunks, start, end, true).collect();
+                        reverse.reverse();
+                        assert_eq!(
+                            reverse, expected,
+                            "{chunk_count} chunks, [{start}, {end}] rev"
+                        );
+                    }
+                }
             }
         }
     }

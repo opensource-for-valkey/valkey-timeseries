@@ -384,8 +384,56 @@ fn bench_timestamp_filter(c: &mut Criterion) {
     group.finish();
 }
 
+const SEEK_SERIES_SAMPLES: usize = 500_000;
+
+/// `series_seek` group: a one-minute `TS.RANGE`/`TS.REVRANGE` window (`create_range_iterator`, the
+/// live reply's reader) at the far end of a long series from where each direction starts, so a
+/// reader that steps chunk by chunk to the window instead of seeking pays for every chunk header
+/// in between. Uncompressed 4 KiB chunks hold 256 samples, so that series has ~2,000 of them.
+fn bench_series_seek(c: &mut Criterion) {
+    let mut group = c.benchmark_group("series_seek");
+    group.measurement_time(Duration::from_secs(2));
+
+    const STEP: Timestamp = 1_000;
+    let last = (SEEK_SERIES_SAMPLES as Timestamp - 1) * STEP;
+    let minute = 60 * STEP;
+    let cases: [(&str, Timestamp, Timestamp, bool); 4] = [
+        ("range_tail", last - minute, last, false),
+        ("range_head", 0, minute, false),
+        ("revrange_head", 0, minute, true),
+        ("revrange_tail", last - minute, last, true),
+    ];
+
+    for encoding in [ChunkEncoding::Uncompressed, ChunkEncoding::Gorilla] {
+        let mut series = TimeSeries::with_options(TimeSeriesOptions {
+            chunk_encoding: encoding,
+            chunk_size: Some(CHUNK_SIZE_4K),
+            ..Default::default()
+        })
+        .expect("valid series options");
+        for i in 0..SEEK_SERIES_SAMPLES {
+            series.add(i as Timestamp * STEP, (i % 97) as f64, None);
+        }
+
+        for (case, start, end, is_reverse) in cases {
+            let options = RangeOptions::with_range(start, end).expect("valid range");
+            let bench_id = format!("{}/{case}", encoding.name());
+            group.bench_function(BenchmarkId::from_parameter(&bench_id), |b| {
+                b.iter(|| {
+                    for s in create_range_iterator(&series, &options, None, is_reverse) {
+                        std::hint::black_box((s.timestamp, s.value));
+                    }
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_series_seek,
     bench_timestamp_filter,
     bench_scan,
     bench_scan_next,
