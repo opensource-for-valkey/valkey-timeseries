@@ -24,7 +24,7 @@ use crate::series::index::series_by_selectors;
 use crate::series::request_types::{
     MRangeOptions, MRangeSeriesResult, RangeGroupingOptions, RangeOptions, SeriesResultData,
 };
-use crate::series::{RangeSnapshot, SeriesGuard, SnapshotKeep, TimeSeries};
+use crate::series::{RangeSnapshot, SeriesGuard, SnapshotKeep, TimeSeries, get_series_labels};
 use ahash::AHashMap;
 use orx_parallel::Par;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1187,29 +1187,29 @@ pub(crate) fn collect_samples<I: Iterator<Item = Sample>>(
     samples
 }
 
+/// [`get_series_labels`] as owned reply labels. A selected label the series lacks comes back
+/// with an empty value, which the reply layer writes as a null: `SELECTED_LABELS` names every
+/// label asked for, present or not.
 fn convert_labels(
     series: &TimeSeries,
     with_labels: bool,
     selected_labels: &[String],
 ) -> Vec<Label> {
-    if !with_labels && selected_labels.is_empty() {
-        return Vec::new();
-    }
-
+    let labels = get_series_labels(series, with_labels, selected_labels);
     if selected_labels.is_empty() {
-        return series.labels.iter().map(|l| l.into()).collect();
+        return labels.into_iter().flatten().map(Label::from).collect();
     }
-
-    selected_labels
-        .iter()
-        .map(|name| {
-            series
-                .get_label(name)
-                .map(|label| label.into())
-                .unwrap_or_else(|| Label {
+    labels
+        .into_iter()
+        .zip(selected_labels)
+        .map(|(label, name)| {
+            label.map_or_else(
+                || Label {
                     name: name.clone(),
                     value: String::new(),
-                })
+                },
+                Label::from,
+            )
         })
         .collect()
 }
@@ -1319,16 +1319,11 @@ fn snapshot_supports(range: &RangeOptions) -> bool {
     range.timestamp_filter.is_none()
 }
 
-/// Whether the non-clustered path can answer `options` from snapshots. GROUPBY included:
-/// the reduce runs over the snapshots as it does over the live series ([`GroupMember`]).
+/// Whether a TS.MRANGE, or a shard's share of a clustered one, can be answered from snapshots.
+/// GROUPBY included: standalone, the reduce runs over the snapshots as it does over the live
+/// series ([`GroupMember`]); on a shard, each series is only tagged with its group and the
+/// coordinator reduces.
 pub(crate) fn is_snapshot_answerable(options: &MRangeOptions) -> bool {
-    snapshot_supports(&options.range)
-}
-
-/// Whether a shard can answer its share of a clustered TS.MRANGE from
-/// snapshots. Grouping is fine here: a shard only tags each series with its
-/// group, and the coordinator reduces.
-pub(crate) fn is_shard_snapshot_answerable(options: &MRangeOptions) -> bool {
     snapshot_supports(&options.range)
 }
 
@@ -1514,7 +1509,7 @@ fn snapshot_one(
 /// ACL-check the series, then snapshot them. [`decode_shard_snapshots`] does
 /// the rest once the lock is released, so the shard's main thread waits only
 /// for the copy, not the decode. `options` must satisfy
-/// [`is_shard_snapshot_answerable`], and `limit` must be the one the decode is given.
+/// [`is_snapshot_answerable`], and `limit` must be the one the decode is given.
 pub(crate) fn snapshot_shard_mrange(
     ctx: &Context,
     options: &MRangeOptions,
