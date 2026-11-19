@@ -246,7 +246,9 @@ impl SampleDuplicatePolicy {
         override_policy: Option<DuplicatePolicy>,
     ) -> bool {
         let time_delta = current_sample.timestamp - last_sample.timestamp;
-        if time_delta >= 0 && time_delta <= self.max_time_delta as i64 {
+        // Compared as `u64`: the window is unsigned, and a cast to `i64` turned one past
+        // `i64::MAX` negative, which matched nothing.
+        if time_delta >= 0 && time_delta as u64 <= self.max_time_delta {
             if self.resolve_policy(override_policy) != DuplicatePolicy::KeepLast {
                 return false;
             }
@@ -678,6 +680,25 @@ mod tests {
             value: 10.00001,
         };
         assert!(!policy.is_duplicate(&current_sample, &last_sample, None));
+    }
+
+    /// A time window past `i64::MAX` is wider than any gap, not negative: the `as i64` cast
+    /// made it negative, which turned IGNORE off for the series.
+    #[test]
+    fn test_sample_duplicate_policy_time_window_past_i64_covers_every_gap() {
+        let last = Sample::new(100, 10.0);
+        let current = Sample::new(105, 10.0);
+        for max_time_delta in [100, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+            let policy = SampleDuplicatePolicy {
+                policy: Some(DuplicatePolicy::KeepLast),
+                max_time_delta,
+                max_value_delta: 0.0,
+            };
+            assert!(
+                policy.is_duplicate(&current, &last, None),
+                "max_time_delta {max_time_delta}"
+            );
+        }
     }
 
     #[test]

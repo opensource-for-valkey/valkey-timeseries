@@ -14,10 +14,10 @@ use crate::series::chunks::{
 };
 use crate::series::serialization::{
     BUDGET_CLAMPED, CHUNK_SIZE_CLAMPED, CHUNKS_OVERLAPPING, CHUNKS_REORDERED, ENCODING_ADOPTED,
-    LABEL_NUL_KEPT, LoadTrust, NEGATIVE_TIMESTAMPS, OFF_GRID_BUCKET_REBUILT, OVERSIZED_SPLIT,
-    RETENTION_CLAMPED, ROUNDING_CLAMPED, ROUNDING_DROPPED, STALE_RULE_STATE_CLEARED,
-    STRAYS_REENCODED, UNDECODABLE_STRAYS_KEPT, check_series_invariants, drop_empty_chunks,
-    normalize_series,
+    IGNORE_CLAMPED, IGNORE_RESET, LABEL_NUL_KEPT, LoadTrust, NEGATIVE_TIMESTAMPS,
+    OFF_GRID_BUCKET_REBUILT, OVERSIZED_SPLIT, RETENTION_CLAMPED, ROUNDING_CLAMPED,
+    ROUNDING_DROPPED, STALE_RULE_STATE_CLEARED, STRAYS_REENCODED, UNDECODABLE_STRAYS_KEPT,
+    check_series_invariants, drop_empty_chunks, normalize_series,
 };
 use crate::series::{
     DuplicatePolicy, SPLIT_SLACK_DIVISOR, TimeSeries, bulk_insert_samples, defrag_series,
@@ -502,6 +502,24 @@ fn forged_series_are_refused_when_foreign_and_kept_when_own() {
         cases.push(("retention past i64", ts, Repaired(&[RETENTION_CLAMPED])));
 
         let mut ts = base.clone();
+        ts.sample_duplicates.max_time_delta = u64::MAX;
+        cases.push((
+            "IGNORE time window past i64",
+            ts,
+            Repaired(&[IGNORE_CLAMPED]),
+        ));
+        for value in [f64::NAN, -1.0, f64::NEG_INFINITY] {
+            let mut ts = base.clone();
+            ts.sample_duplicates.max_time_delta = 100;
+            ts.sample_duplicates.max_value_delta = value;
+            cases.push((
+                "IGNORE value window unparseable",
+                ts,
+                Repaired(&[IGNORE_RESET]),
+            ));
+        }
+
+        let mut ts = base.clone();
         ts.rounding = Some(RoundingStrategy::SignificantDigits(0));
         cases.push(("zero significant digits", ts, Repaired(&[ROUNDING_DROPPED])));
         for rounding in [
@@ -637,6 +655,54 @@ fn own_load_sorts_disjoint_chunks_out_of_order() {
             "{encoding}"
         );
         assert_loadable(&ts);
+    }
+}
+
+/// IGNORE parameters the parser accepts (`parse_ignore_options`: a time window of `0..=i64::MAX`
+/// ms, a value window that is neither NaN nor negative) load unchanged on any load. Past them,
+/// an own load keeps what the stored values did: a time window past `i64::MAX` covers every gap,
+/// as `i64::MAX` does; a NaN or negative value window never matches, so IGNORE was off and is
+/// reset to the zeros of a series created without it. Either way the series can then be spelled
+/// out as a `TS.CREATE` the parser accepts, as replication does.
+#[test]
+fn ignore_parameters_are_held_to_the_write_path_range() {
+    let accepted = [
+        (0, 0.0),
+        (100, 0.5),
+        (i64::MAX as u64, f64::MAX),
+        (1, f64::INFINITY),
+    ];
+    for trust in [LoadTrust::Foreign, LoadTrust::Own] {
+        for (time, value) in accepted {
+            let mut ts = loaded_base(ChunkEncoding::Chimp);
+            ts.sample_duplicates.max_time_delta = time;
+            ts.sample_duplicates.max_value_delta = value;
+            let repairs = normalize_series(&mut ts, trust).unwrap();
+            assert!(repairs.is_empty(), "{trust:?} ({time}, {value})");
+            assert_eq!(ts.sample_duplicates.max_time_delta, time);
+            assert_eq!(ts.sample_duplicates.max_value_delta, value);
+        }
+    }
+    for ((time, value), repaired) in [
+        ((i64::MAX as u64 + 1, 0.5), (i64::MAX as u64, 0.5)),
+        ((u64::MAX, 0.5), (i64::MAX as u64, 0.5)),
+        ((100, f64::NAN), (0, 0.0)),
+        ((100, -0.5), (0, 0.0)),
+        ((u64::MAX, f64::NAN), (0, 0.0)),
+    ] {
+        let mut ts = loaded_base(ChunkEncoding::Chimp);
+        ts.sample_duplicates.max_time_delta = time;
+        ts.sample_duplicates.max_value_delta = value;
+        let err = normalize_series(&mut ts.clone(), LoadTrust::Foreign).unwrap_err();
+        assert!(err.contains("IGNORE"), "({time}, {value}): {err}");
+
+        normalize_series(&mut ts, LoadTrust::Own).unwrap();
+        let dup = &ts.sample_duplicates;
+        assert_eq!(
+            (dup.max_time_delta, dup.max_value_delta.to_bits()),
+            (repaired.0, f64::to_bits(repaired.1)),
+            "({time}, {value})"
+        );
     }
 }
 
