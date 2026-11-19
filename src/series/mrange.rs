@@ -247,11 +247,8 @@ pub(crate) fn process_mrange_group_partials(
             .map(|g| estimated_work(&g.series, &options.range))
             .sum(),
     );
-    let results = grouped
-        .into_iter()
-        .iter_into_par_rayon()
-        .num_threads(threads)
-        .map(|(label_value, group_data)| {
+    let reduce_group =
+        |(label_value, group_data): (String, GroupedSeriesData<MRangeSeriesMeta<'_>>)| {
             if deadline.passed() {
                 return GroupPartialsResult {
                     group_label_value: label_value,
@@ -299,8 +296,17 @@ pub(crate) fn process_mrange_group_partials(
                 states,
                 column_count,
             }
-        })
-        .collect();
+        };
+    let results: Vec<GroupPartialsResult> = if threads == 1 {
+        grouped.into_iter().map(reduce_group).collect()
+    } else {
+        grouped
+            .into_iter()
+            .iter_into_par_rayon()
+            .num_threads(threads)
+            .map(reduce_group)
+            .collect()
+    };
     deadline.finish(results)
 }
 
@@ -603,82 +609,87 @@ fn handle_non_grouped(
 
     let work = work_with_encoding(estimated_work(&metas, &options.range), compress);
     let threads = request_par_threads(metas.len(), work);
-    metas
-        .into_par_rayon()
-        .num_threads(threads)
-        .map(|meta| {
-            if deadline.passed() {
-                return MRangeSeriesResult::default();
-            }
-            // Multi-aggregation yields rows, which chunks cannot store. Under
-            // aggregation push-down a shard produces these rows too; they ship
-            // as per-column chunks (SeriesRangeResponse.columns), so the
-            // clustered path is valid here.
-            let data = if is_multi {
-                let reply_reverse = options.is_reverse || options.reply_reverse;
-                let iter = match limit {
-                    Some(SampleLimit::Tail(count)) => create_row_tail_iterator(
+    let answer_one = |meta: MRangeSeriesMeta<'_>| {
+        if deadline.passed() {
+            return MRangeSeriesResult::default();
+        }
+        // Multi-aggregation yields rows, which chunks cannot store. Under
+        // aggregation push-down a shard produces these rows too; they ship
+        // as per-column chunks (SeriesRangeResponse.columns), so the
+        // clustered path is valid here.
+        let data = if is_multi {
+            let reply_reverse = options.is_reverse || options.reply_reverse;
+            let iter = match limit {
+                Some(SampleLimit::Tail(count)) => create_row_tail_iterator(
+                    meta.series,
+                    &options.range,
+                    meta.latest,
+                    count,
+                    reply_reverse,
+                ),
+                limit => {
+                    let iter = create_row_iterator_for_reply(
                         meta.series,
                         &options.range,
                         meta.latest,
-                        count,
+                        options.is_reverse,
                         reply_reverse,
-                    ),
-                    limit => {
-                        let iter = create_row_iterator_for_reply(
-                            meta.series,
-                            &options.range,
-                            meta.latest,
-                            options.is_reverse,
-                            reply_reverse,
-                        );
-                        match limit {
-                            Some(limit) => limit.apply(iter),
-                            None => iter,
-                        }
+                    );
+                    match limit {
+                        Some(limit) => limit.apply(iter),
+                        None => iter,
                     }
-                };
-                SeriesResultData::Rows(iter.collect())
-            } else {
-                let iter = match limit {
-                    Some(SampleLimit::Tail(count)) => create_range_tail_iterator(
-                        meta.series,
-                        &options.range,
-                        meta.latest,
-                        count,
-                        options.is_reverse || options.reply_reverse,
-                    ),
-                    limit => {
-                        let iter = create_iter(meta.series, &options, meta.latest);
-                        match limit {
-                            Some(limit) => limit.apply(iter),
-                            None => iter,
-                        }
-                    }
-                };
-                let samples = iter.collect::<Vec<_>>();
-                // Only a response that crosses the network is worth compressing —
-                // and only once it holds enough samples to pay for the chunk
-                // header (see `samples_to_chunk`).
-                if compress {
-                    SeriesResultData::Chunk(samples_to_chunk_lossless(samples))
-                } else {
-                    let chunk = UncompressedChunk::from_vec(samples);
-                    SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(chunk))
                 }
             };
-
-            let labels = convert_labels(meta.series, options.with_labels, &options.selected_labels);
-
-            MRangeSeriesResult {
-                group_label_value: meta.group_label_value,
-                key: meta.source_key,
-                labels,
-                sources: Vec::new(),
-                data,
+            SeriesResultData::Rows(iter.collect())
+        } else {
+            let iter = match limit {
+                Some(SampleLimit::Tail(count)) => create_range_tail_iterator(
+                    meta.series,
+                    &options.range,
+                    meta.latest,
+                    count,
+                    options.is_reverse || options.reply_reverse,
+                ),
+                limit => {
+                    let iter = create_iter(meta.series, &options, meta.latest);
+                    match limit {
+                        Some(limit) => limit.apply(iter),
+                        None => iter,
+                    }
+                }
+            };
+            let samples = iter.collect::<Vec<_>>();
+            // Only a response that crosses the network is worth compressing —
+            // and only once it holds enough samples to pay for the chunk
+            // header (see `samples_to_chunk`).
+            if compress {
+                SeriesResultData::Chunk(samples_to_chunk_lossless(samples))
+            } else {
+                let chunk = UncompressedChunk::from_vec(samples);
+                SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(chunk))
             }
-        })
-        .collect()
+        };
+
+        let labels = convert_labels(meta.series, options.with_labels, &options.selected_labels);
+
+        MRangeSeriesResult {
+            group_label_value: meta.group_label_value,
+            key: meta.source_key,
+            labels,
+            sources: Vec::new(),
+            data,
+        }
+    };
+    if threads == 1 {
+        metas.into_iter().map(answer_one).collect()
+    } else {
+        metas
+            .into_par_rayon()
+            .num_threads(threads)
+            .map(answer_one)
+            .collect()
+    }
 }
 
 /// GROUPBY/REDUCE over `metas`. `deadline` is asked before each member series is bucketed and
@@ -737,16 +748,21 @@ fn handle_grouping<M: GroupMember>(
         let template = grouping.aggregation.create_aggregator();
         let series_refs: Vec<&M> = dense.iter().flat_map(|(_, g, _)| g.series.iter()).collect();
         let series_threads = request_par_threads(series_refs.len(), total_work);
-        let mut rows: Vec<Vec<Sample>> = series_refs
-            .par_rayon()
-            .num_threads(series_threads)
-            .map(|meta| {
-                if deadline.passed() {
-                    return Vec::new();
-                }
-                series_bucket_rows(*meta, &options.range)
-            })
-            .collect();
+        let bucket_rows = |meta: &&M| {
+            if deadline.passed() {
+                return Vec::new();
+            }
+            series_bucket_rows(*meta, &options.range)
+        };
+        let mut rows: Vec<Vec<Sample>> = if series_threads == 1 {
+            series_refs.iter().map(bucket_rows).collect()
+        } else {
+            series_refs
+                .par_rayon()
+                .num_threads(series_threads)
+                .map(bucket_rows)
+                .collect()
+        };
         let mut rows = rows.drain(..);
         for (label_value, group_data, grid) in dense {
             let group_rows: Vec<Vec<Sample>> =
@@ -761,43 +777,50 @@ fn handle_grouping<M: GroupMember>(
         }
     }
 
-    let merged_items = merged
-        .into_iter()
-        .iter_into_par_rayon()
-        .num_threads(threads)
-        .map(|(label_value, group_data)| {
-            if deadline.passed() {
-                return MRangeSeriesResult::default();
-            }
-            let grouping = options
-                .grouping
-                .as_ref()
-                .expect("Grouping options should be present");
-            let data = if is_multi {
-                let rows = get_grouped_rows(&group_data.series, &options, grouping, count);
-                SeriesResultData::Rows(rows)
-            } else {
-                let samples = get_grouped_samples(&group_data.series, &options, grouping, count);
-                // Grouping only runs on the node answering the client
-                // (`process_mrange` returns early when clustered), so these
-                // samples never cross the network and compressing them would
-                // only be undone by the reply serializer.
-                SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(
-                    samples,
-                )))
-            };
-            let labels = group_data.labels;
-            let key = format!("{}={}", grouping.group_label, label_value).into_bytes();
-            MRangeSeriesResult {
-                key,
-                group_label_value: Some(label_value),
-                labels,
-                sources: group_data.source_keys,
-                data,
-            }
-        })
-        .collect::<Vec<_>>();
-    items.extend(merged_items);
+    let reduce_merged = |(label_value, group_data): MergedGroup<_>| {
+        if deadline.passed() {
+            return MRangeSeriesResult::default();
+        }
+        let grouping = options
+            .grouping
+            .as_ref()
+            .expect("Grouping options should be present");
+        let data = if is_multi {
+            let rows = get_grouped_rows(&group_data.series, &options, grouping, count);
+            SeriesResultData::Rows(rows)
+        } else {
+            let samples = get_grouped_samples(&group_data.series, &options, grouping, count);
+            // Grouping only runs on the node answering the client
+            // (`process_mrange` returns early when clustered), so these
+            // samples never cross the network and compressing them would
+            // only be undone by the reply serializer.
+            SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(
+                samples,
+            )))
+        };
+        let labels = group_data.labels;
+        let key = format!("{}={}", grouping.group_label, label_value).into_bytes();
+        MRangeSeriesResult {
+            key,
+            group_label_value: Some(label_value),
+            labels,
+            sources: group_data.source_keys,
+            data,
+        }
+    };
+    // `threads` was sized for every group, but the dense table may have served most of
+    // them (or all, leaving nothing here): one group or none is not worth the pool.
+    if threads == 1 || merged.len() < 2 {
+        items.extend(merged.into_iter().map(reduce_merged));
+    } else {
+        let merged_items: Vec<MRangeSeriesResult> = merged
+            .into_iter()
+            .iter_into_par_rayon()
+            .num_threads(threads)
+            .map(reduce_merged)
+            .collect();
+        items.extend(merged_items);
+    }
 
     Ok(items)
 }
@@ -933,14 +956,17 @@ impl BucketGrid {
         let mut data_start = Timestamp::MAX;
         let mut data_end = Timestamp::MIN;
         for meta in members {
-            let Some((first, last)) = meta.extent() else {
-                continue;
-            };
-            data_start = data_start.min(first);
-            data_end = data_end.max(last);
+            // A compaction destination with no closed bucket yet stores nothing but can still
+            // report an open LATEST bucket, so its LATEST counts toward the extent even with
+            // no stored one; skipping it left that bucket off the grid, failing the fold and
+            // sending the group back through the merge to be decoded again.
             if let Some(latest) = meta.latest() {
                 data_start = data_start.min(latest.timestamp);
                 data_end = data_end.max(latest.timestamp);
+            }
+            if let Some((first, last)) = meta.extent() {
+                data_start = data_start.min(first);
+                data_end = data_end.max(last);
             }
         }
         if data_start > data_end {
@@ -1548,16 +1574,21 @@ pub(crate) fn decode_shard_snapshots(
     // The decode runs after the lock is released, so it is where a requester that
     // has given up stops this share, as `handle_non_grouped` does under the lock.
     let deadline = ReadDeadline::new(expired);
-    let items: Vec<MRangeSeriesResult> = series
-        .into_par_rayon()
-        .num_threads(threads)
-        .map(|s| {
-            if deadline.passed() {
-                return MRangeSeriesResult::default();
-            }
-            decode_snapshot(s, options, limit, compress)
-        })
-        .collect();
+    let decode_one = |s: SnapshotSeries| {
+        if deadline.passed() {
+            return MRangeSeriesResult::default();
+        }
+        decode_snapshot(s, options, limit, compress)
+    };
+    let items: Vec<MRangeSeriesResult> = if threads == 1 {
+        series.into_iter().map(decode_one).collect()
+    } else {
+        series
+            .into_par_rayon()
+            .num_threads(threads)
+            .map(decode_one)
+            .collect()
+    };
     let mut items = deadline.finish(items)?;
     if options.exclude_empty {
         items.retain(|item| !item.data.is_empty());
@@ -1612,66 +1643,71 @@ pub(crate) fn decode_group_partials(
     // As in `process_mrange_group_partials`: a requester that has given up stops the
     // reduce between groups, and the share answers with the error.
     let deadline = ReadDeadline::new(expired);
-    let results = grouped
-        .into_iter()
-        .iter_into_par_rayon()
-        .num_threads(threads)
-        .map(|(label_value, members)| {
-            if deadline.passed() {
-                return GroupPartialsResult {
-                    group_label_value: label_value,
-                    source_keys: Vec::new(),
-                    timestamps: Vec::new(),
-                    states: Vec::new(),
-                    column_count: 1,
-                };
-            }
-            let mut source_keys: Vec<Vec<u8>> = members.iter().map(|s| s.key.clone()).collect();
-            source_keys.sort();
-
-            // The live path's base reader over the copied chunks, unboxed, so each
-            // member's aggregation inlines the decode as it does on the live path.
-            let (timestamps, states, column_count) = if let Some(columns) = multi_columns {
-                let iterators = members
-                    .iter()
-                    .map(|s| {
-                        create_row_iterator_from_base(
-                            s.snapshot.sample_iter(false),
-                            &options.range,
-                            s.latest,
-                            s.empty_fill,
-                            false,
-                        )
-                    })
-                    .collect();
-                let (timestamps, states) = reduce_group_rows(iterators, reducer, columns, limit);
-                (timestamps, states, columns)
-            } else {
-                let iterators = members
-                    .iter()
-                    .map(|s| {
-                        create_range_iterator_from_base(
-                            s.snapshot.sample_iter(false),
-                            &options.range,
-                            s.latest,
-                            false,
-                            s.empty_fill,
-                        )
-                    })
-                    .collect();
-                let (timestamps, states) = reduce_group_samples(iterators, reducer, limit);
-                (timestamps, states, 1)
-            };
-
-            GroupPartialsResult {
+    let reduce_group = |(label_value, members): (String, Vec<SnapshotSeries>)| {
+        if deadline.passed() {
+            return GroupPartialsResult {
                 group_label_value: label_value,
-                source_keys,
-                timestamps,
-                states,
-                column_count,
-            }
-        })
-        .collect();
+                source_keys: Vec::new(),
+                timestamps: Vec::new(),
+                states: Vec::new(),
+                column_count: 1,
+            };
+        }
+        let mut source_keys: Vec<Vec<u8>> = members.iter().map(|s| s.key.clone()).collect();
+        source_keys.sort();
+
+        // The live path's base reader over the copied chunks, unboxed, so each
+        // member's aggregation inlines the decode as it does on the live path.
+        let (timestamps, states, column_count) = if let Some(columns) = multi_columns {
+            let iterators = members
+                .iter()
+                .map(|s| {
+                    create_row_iterator_from_base(
+                        s.snapshot.sample_iter(false),
+                        &options.range,
+                        s.latest,
+                        s.empty_fill,
+                        false,
+                    )
+                })
+                .collect();
+            let (timestamps, states) = reduce_group_rows(iterators, reducer, columns, limit);
+            (timestamps, states, columns)
+        } else {
+            let iterators = members
+                .iter()
+                .map(|s| {
+                    create_range_iterator_from_base(
+                        s.snapshot.sample_iter(false),
+                        &options.range,
+                        s.latest,
+                        false,
+                        s.empty_fill,
+                    )
+                })
+                .collect();
+            let (timestamps, states) = reduce_group_samples(iterators, reducer, limit);
+            (timestamps, states, 1)
+        };
+
+        GroupPartialsResult {
+            group_label_value: label_value,
+            source_keys,
+            timestamps,
+            states,
+            column_count,
+        }
+    };
+    let results: Vec<GroupPartialsResult> = if threads == 1 {
+        grouped.into_iter().map(reduce_group).collect()
+    } else {
+        grouped
+            .into_iter()
+            .iter_into_par_rayon()
+            .num_threads(threads)
+            .map(reduce_group)
+            .collect()
+    };
     deadline.finish(results)
 }
 
@@ -2129,6 +2165,25 @@ mod tests {
         let mut reverse = options.clone();
         reverse.is_reverse = true;
         assert_eq!(plan(&reverse, Some(1)), (1, 0));
+    }
+
+    /// A member with no stored samples still reports LATEST's open bucket, so the grid must
+    /// reach it: otherwise the fold fails and the group is decoded a second time by the merge.
+    #[test]
+    fn test_grid_spans_the_latest_of_an_empty_member() {
+        let stored = make_series(&(0..4).map(|i| (i * 100, 1.0)).collect::<Vec<_>>());
+        let empty = TimeSeries::default();
+        let options = grouped_sum_options(100);
+        let members = vec![
+            meta(&stored, "a", None),
+            MRangeSeriesMeta {
+                latest: Some(Sample::new(900, 2.0)),
+                ..meta(&empty, "b", None)
+            },
+        ];
+        let grid = BucketGrid::for_query(&options.range, &members).expect("a grid");
+        assert!(grid.slot(900).is_some(), "LATEST's bucket is off the grid");
+        assert!(grid.slot(0).is_some());
     }
 
     #[test]
