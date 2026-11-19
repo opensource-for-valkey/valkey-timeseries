@@ -1,6 +1,8 @@
 use crate::common::context::create_key_string;
 use crate::series::index::{TIMESERIES_INDEX, get_timeseries_index, with_timeseries_postings};
-use crate::series::{SeriesGuardMut, SeriesRef, TimeSeries, try_get_timeseries_mut};
+use crate::series::{
+    SeriesGuardMut, SeriesRef, TimeSeries, try_get_timeseries, try_get_timeseries_mut,
+};
 use smallvec::SmallVec;
 use valkey_module::Context;
 
@@ -82,11 +84,22 @@ pub(super) fn fetch_series_batch(
             exhausted = false;
             break;
         }
-        let Ok(Some(s)) = try_get_timeseries_mut(ctx, &key, None) else {
-            stale_ids.push(id);
-            continue;
+        // `pred` is decided on a read-only open, and only an accepted series is opened for
+        // writing: closing a key opened for writing signals it as modified (the module does not
+        // declare `NO_IMPLICIT_SIGNAL_MODIFIED`), which aborts a client's `WATCH` on it and
+        // invalidates client-side caches. Opening every scanned series writably did that to
+        // each one on every tick, although nothing about most of them changed.
+        let accepted = match try_get_timeseries(ctx, &key, None) {
+            Ok(Some(s)) => pred(&s),
+            _ => {
+                stale_ids.push(id);
+                continue;
+            }
         };
-        if pred(&s) {
+        if !accepted {
+            continue;
+        }
+        if let Ok(Some(s)) = try_get_timeseries_mut(ctx, &key, None) {
             series.push(s);
         }
     }

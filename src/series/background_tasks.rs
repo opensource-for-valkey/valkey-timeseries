@@ -19,6 +19,12 @@ const INDEX_OPTIMIZE_INTERVAL: Duration = Duration::from_secs(60);
 const DB_CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
 
 /// A periodic task and its monotonic deadline, in milliseconds since [`TASK_EPOCH`]. Starts due.
+///
+/// Only the cron callback polls the schedule, one tick at a time on the main thread, so
+/// [`Self::poll`]'s load-then-store is not a race. The deadline is atomic for the loading-event
+/// handler ([`SchedulePause`]), which runs on that same thread between ticks. A second, concurrent
+/// poller would need `poll` to claim the deadline with a compare-exchange, or a task could fire
+/// twice.
 struct ScheduledTask {
     run: fn(),
     interval_ms: u64,

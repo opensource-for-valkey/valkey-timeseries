@@ -2555,4 +2555,32 @@ mod tests {
         assert_eq!(range[0].timestamp, 150);
         assert_eq!(series.visible_total_samples(), 51);
     }
+
+    /// What the retention trim acts on: a stored sample older than the series' floor. A series
+    /// without retention, an empty one, or one already trimmed has none, so the trim leaves it
+    /// alone (and need not open it for writing).
+    #[test]
+    fn has_expired_samples_is_what_the_trim_would_drop() {
+        let mut series = TimeSeries::with_options(TimeSeriesOptions {
+            retention: Some(Duration::from_millis(1000)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!series.has_expired_samples(), "empty");
+        for ts in (0..5000).step_by(10) {
+            assert!(series.add_deferring_retention(ts, 1.0, None).is_ok());
+        }
+        assert!(
+            series.has_expired_samples(),
+            "untrimmed samples below the floor"
+        );
+        series.trim().unwrap();
+        assert!(!series.has_expired_samples(), "trimmed");
+
+        let mut plain = TimeSeries::new();
+        for ts in (0..5000).step_by(10) {
+            assert!(plain.add_deferring_retention(ts, 1.0, None).is_ok());
+        }
+        assert!(!plain.has_expired_samples(), "no retention");
+    }
 }

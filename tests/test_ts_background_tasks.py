@@ -45,3 +45,43 @@ class TestTaskCadence(ValkeyTimeSeriesTestCaseDebugMode):
         time.sleep(3)
         assert self.started() == before
         wait_for_true(lambda: self.started() > before, timeout=15)
+
+
+class TestRetentionTrimTask(ValkeyTimeSeriesTestCaseDebugMode):
+
+    def trim_runs(self):
+        """(started, completed) trim runs. A run counts as started before its body runs, and as
+        completed only once the body has returned. A dispatch skipped because a run is in flight
+        counts as neither, as it scans nothing. A run is bounded (a few db turns, 40 accepted
+        series), so it covers a whole db only when the db is small: see the test below."""
+        stats = self.debug_metrics('task')
+        return (stats['task_retention_trim_started_total'],
+                stats['task_retention_trim_completed_total'])
+
+    def test_trim_tick_leaves_untouched_series_unmodified(self):
+        """The retention trim opens a series for writing only when it has samples to drop.
+        It used to open every series it scanned for writing, so each tick signalled every
+        series as modified: a WATCH on any of them aborted the transaction (and client-side
+        caching was told to invalidate), although nothing had changed."""
+        now = int(time.time() * 1000)
+        self.client.execute_command('TS.CREATE', 'w:retention', 'RETENTION', 10_000_000)
+        self.client.execute_command('TS.ADD', 'w:retention', now, 1)
+        self.client.execute_command('TS.CREATE', 'w:plain')
+        self.client.execute_command('TS.ADD', 'w:plain', now, 1)
+
+        watchers = {}
+        for key in ('w:retention', 'w:plain'):
+            client = self.server.get_new_client()
+            client.execute_command('WATCH', key)
+            watchers[key] = client
+        # Wait for a run that started after the WATCH to complete. At most `started` runs had
+        # begun when it was sampled, so once more than that many have completed, one of them
+        # began, and so scanned, entirely after the WATCH. That one run covers both keys: the
+        # server has one db holding two series, far below a scan's first 256-id read, so every
+        # run scans it from the start to the end.
+        started, _ = self.trim_runs()
+        wait_for_true(lambda: self.trim_runs()[1] > started, timeout=30)
+        for key, client in watchers.items():
+            client.execute_command('MULTI')
+            client.execute_command('PING')
+            assert client.execute_command('EXEC') is not None, f"WATCH on {key} was aborted"
