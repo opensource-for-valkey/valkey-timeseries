@@ -98,6 +98,101 @@ fn gorilla_rewrites_refuse_a_chunk_they_cannot_decode() {
     );
 }
 
+/// A capacity merge into a destination with no room merges nothing, so it must not read the
+/// source: defrag visits every chunk pair on the main thread, and a chunk completed by appends
+/// is full. Proven with a source that cannot be decoded: reading it would fail.
+fn a_capacity_merge_with_no_room_reads_nothing<C: SampleCodec>(
+    stream: impl Fn(&mut C) -> &mut Vec<u8>,
+    wrap: impl Fn(XorChunk<C>) -> TimeSeriesChunk,
+) {
+    let name = C::ENCODING.name();
+    let source = wrap(truncated(&stream));
+    let mut dest = TimeSeriesChunk::new(C::ENCODING, 64);
+    dest.set_data(&samples(100)).unwrap();
+    assert!(
+        dest.size() >= dest.max_size(),
+        "{name}: the destination must be full"
+    );
+
+    let mut src = source.clone();
+    let result = merge_by_capacity(&mut dest, &mut src, i64::MIN, None);
+    assert!(matches!(result, Ok(None)), "{name}: {result:?}");
+    assert_eq!(src, source, "{name}");
+}
+
+/// A capacity merge that fails partway through defrag leaves the series consistent: a chunk
+/// emptied by an earlier merge is still dropped and the counts are recomputed, then the error is
+/// returned. Returning at the error used to leave the emptied chunk in the series, with zeroed
+/// timestamps that misdirect the chunk search, and stale counts.
+fn defrag_stays_consistent_when_a_merge_fails<C: SampleCodec>(
+    stream: impl Fn(&mut C) -> &mut Vec<u8>,
+    wrap: impl Fn(XorChunk<C>) -> TimeSeriesChunk,
+) {
+    let name = C::ENCODING.name();
+    let mut first = TimeSeriesChunk::new(C::ENCODING, 65536);
+    first
+        .set_data(&[Sample::new(10, 1.0), Sample::new(20, 2.0)])
+        .unwrap();
+    let mut second = TimeSeriesChunk::new(C::ENCODING, 4096);
+    second
+        .set_data(&[Sample::new(100, 3.0), Sample::new(200, 4.0)])
+        .unwrap();
+    let corrupt = wrap(truncated(&stream));
+
+    let mut series =
+        crate::series::TimeSeries::from_chunks(vec![first, second, corrupt.clone()]).unwrap();
+    series.retention = std::time::Duration::ZERO;
+
+    // `second` drains into `first`, then `corrupt` cannot be read.
+    let result = crate::series::defrag_series(&mut series);
+    assert!(result.is_err(), "{name}: defrag reported {result:?}");
+    assert_eq!(series.chunks.len(), 2, "{name}: the emptied chunk was kept");
+    assert!(series.chunks.iter().all(|c| !c.is_empty()), "{name}");
+    assert_eq!(series.chunks[0].len(), 4, "{name}");
+    assert_eq!(
+        series.chunks[1], corrupt,
+        "{name}: the corrupt chunk was changed"
+    );
+    assert_eq!(
+        series.total_samples,
+        series.chunks.iter().map(|c| c.len()).sum::<usize>(),
+        "{name}"
+    );
+    assert_eq!(series.first_timestamp, 10, "{name}");
+}
+
+#[test]
+fn chimp_capacity_merge_with_no_room_reads_nothing() {
+    a_capacity_merge_with_no_room_reads_nothing::<ChimpCompressor>(
+        |e| &mut e.stream_mut_for_test().stream,
+        TimeSeriesChunk::Chimp,
+    );
+}
+
+#[test]
+fn gorilla_capacity_merge_with_no_room_reads_nothing() {
+    a_capacity_merge_with_no_room_reads_nothing::<GorillaEncoder>(
+        |e| &mut e.stream_mut_for_test().stream,
+        TimeSeriesChunk::Gorilla,
+    );
+}
+
+#[test]
+fn chimp_defrag_stays_consistent_when_a_merge_fails() {
+    defrag_stays_consistent_when_a_merge_fails::<ChimpCompressor>(
+        |e| &mut e.stream_mut_for_test().stream,
+        TimeSeriesChunk::Chimp,
+    );
+}
+
+#[test]
+fn gorilla_defrag_stays_consistent_when_a_merge_fails() {
+    defrag_stays_consistent_when_a_merge_fails::<GorillaEncoder>(
+        |e| &mut e.stream_mut_for_test().stream,
+        TimeSeriesChunk::Gorilla,
+    );
+}
+
 #[test]
 fn chimp_removal_with_nothing_to_remove_rewrites_nothing() {
     a_removal_with_nothing_to_remove_rewrites_nothing::<ChimpCompressor>(|e| {

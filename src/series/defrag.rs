@@ -18,10 +18,15 @@ pub fn defrag_series(series: &mut TimeSeries) -> TsdbResult {
     let min_timestamp = series.get_min_timestamp();
     let duplicate_policy = series.sample_duplicates.policy;
 
+    // A merge that fails (a source that does not decode) stops the merging, but not what
+    // follows it: earlier merges may already have emptied chunks, and returning straight away
+    // left them in the series with zeroed timestamps, misdirecting the chunk search, and the
+    // counts stale. The error is returned once the chunks and counts are consistent again.
+    let mut merge_error = None;
     let mut iter = series.chunks.iter_mut();
     // we ensure above that we have at least 2 chunks
     let mut prev_chunk = iter.next().unwrap();
-    while let Some(mut chunk) = iter.next() {
+    'chunks: while let Some(mut chunk) = iter.next() {
         if chunk.is_empty() {
             continue;
         }
@@ -31,13 +36,20 @@ pub fn defrag_series(series: &mut TimeSeries) -> TsdbResult {
         // `chunk` becomes the next destination: pulling a later chunk into `prev_chunk` past
         // it (as this loop used to) put newer samples ahead of older ones and left the chunks
         // overlapping, breaking the binary search, upsert routing and range reads.
-        while merge_by_capacity(prev_chunk, chunk, min_timestamp, duplicate_policy)?.is_some()
-            && chunk.is_empty()
-        {
-            let Some(next_chunk) = iter.next() else {
-                break;
-            };
-            chunk = next_chunk;
+        loop {
+            match merge_by_capacity(prev_chunk, chunk, min_timestamp, duplicate_policy) {
+                Ok(Some(_)) if chunk.is_empty() => {
+                    let Some(next_chunk) = iter.next() else {
+                        break;
+                    };
+                    chunk = next_chunk;
+                }
+                Ok(_) => break,
+                Err(err) => {
+                    merge_error = Some(err);
+                    break 'chunks;
+                }
+            }
         }
 
         prev_chunk = chunk;
@@ -84,7 +96,11 @@ pub fn defrag_series(series: &mut TimeSeries) -> TsdbResult {
     series.recalculate_total_samples();
     series.update_first_last_timestamps();
 
-    split
+    // A merge error comes first: it stopped the pass, and a split error came after it.
+    match merge_error {
+        Some(err) => Err(err),
+        None => split,
+    }
 }
 
 #[cfg(test)]

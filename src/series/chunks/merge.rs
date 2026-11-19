@@ -94,6 +94,13 @@ pub(crate) fn merge_by_capacity(
     let remaining_capacity = dest
         .estimate_remaining_sample_capacity()
         .min(room / src_bytes_per_sample);
+    // Decide before decoding where the floor cannot shorten the source: then every sample
+    // counts, and room for a quarter of them or less merges nothing. That is the usual case
+    // in defrag (a chunk completed by appends is full), which runs on the main thread, so it
+    // must not decode a whole chunk only to learn nothing moves.
+    if min_timestamp <= src.first_timestamp() && remaining_capacity <= count / 4 {
+        return Ok(None);
+    }
     // Neither path moves a sample below `min_timestamp` (both used to differ: the whole-source
     // merge carried expired samples along). The source is decoded strictly: `iter()` and
     // `get_range` end early at a decode error, and emptying or rewriting the source after such
