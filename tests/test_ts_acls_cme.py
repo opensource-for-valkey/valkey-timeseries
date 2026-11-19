@@ -331,6 +331,42 @@ class TestTimeSeriesAclCluster(ValkeyTimeSeriesClusterTestCase):
         # samples for the authorized key are returned
         assert len(rows[0][2]) == 2
 
+    @pytest.mark.parametrize("command", ["TS.MRANGE", "TS.MREVRANGE"])
+    @pytest.mark.parametrize("reducer,expected", [
+        ("sum", b"60"), ("max", b"20"), ("avg", b"20"), ("count", b"3"), ("any>0", b"1"),
+    ])
+    def test_groupby_reduces_authorized_keys_on_every_shard(self, command, reducer, expected):
+        """A user who may read every matched key, but not every key, can GROUPBY ... REDUCE from
+        any coordinator, whatever the reducer. The reducers the shards pre-aggregate (`sum`,
+        `max`, `avg`, `count`, ...) used to demand read access to *all* keys there, while the
+        others (`any`, ...) and a standalone server did not; the per-key check is the rule."""
+        cluster = self.new_cluster_client()
+        self._setup_per_shard_data(cluster)
+        self._create_user_on_all_primaries("grouper", "pw", "+@timeseries", "+@read", "~ts:acl:*")
+
+        for coordinator in range(self.CLUSTER_SIZE):
+            client = self._get_primary_user_client(coordinator, "grouper", "pw")
+            rows = client.execute_command(
+                command, 2000, 2000, "FILTER", "name=cpu", "GROUPBY", "name", "REDUCE", reducer
+            )
+            assert len(rows) == 1, (coordinator, rows)
+            assert rows[0][0] == b"name=cpu", (coordinator, rows)
+            assert rows[0][2] == [[2000, expected]], (coordinator, reducer, rows)
+
+    @pytest.mark.parametrize("reducer", ["sum", "any>0"])
+    def test_groupby_fails_closed_when_matching_unauthorized_keys(self, reducer):
+        """The per-key check still refuses a GROUPBY whose filter matches a key the caller
+        cannot read, with either kind of reducer."""
+        cluster = self.new_cluster_client()
+        self._setup_per_shard_data(cluster)
+        self._create_user_on_all_primaries("grouper", "pw", "+@timeseries", "+@read", PATTERN_SHARD1)
+
+        client = self._get_primary_user_client(0, "grouper", "pw")
+        with pytest.raises(ResponseError):
+            client.execute_command(
+                "TS.MRANGE", 0, 10000, "FILTER", "name=cpu", "GROUPBY", "name", "REDUCE", reducer
+            )
+
     def test_mdel_fails_closed_when_matching_unauthorized_keys(self):
         """TS.MDEL is destructive: it fails closed and never deletes a key the
         caller lacks delete permission on."""

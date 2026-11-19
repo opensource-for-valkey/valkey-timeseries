@@ -2,7 +2,6 @@ use crate::aggregators::{
     AggregationHandler, Aggregator, EmptyFillBounds, PartialReducer, PartialRowReducer,
     PartialSampleReducer, PartialState, bucket_start_for,
 };
-use crate::common::acl::check_metadata_permissions;
 use crate::common::constants::{REDUCER_KEY, SOURCE_KEY};
 use crate::common::context::key_for_display;
 use crate::common::threads::{
@@ -207,8 +206,9 @@ pub(crate) fn process_mrange_group_partials(
     limit: Option<SampleLimit>,
     expired: &(dyn Fn() -> bool + Sync),
 ) -> ValkeyResult<Vec<GroupPartialsResult>> {
-    check_metadata_permissions(ctx)?;
-
+    // ACL is enforced per matched key in `series_by_selectors` below, as on every other
+    // TS.MRANGE path: requiring read access to *all* keys here refused a GROUPBY over keys the
+    // caller may read, but only for the reducers that push down to the shards.
     if options.filters.is_empty() {
         return Err(ValkeyError::Str(error_consts::MISSING_FILTER));
     }
@@ -1558,15 +1558,14 @@ pub(crate) fn decode_shard_snapshots(
     Ok(items)
 }
 
-/// A shard's share of a pushed-down GROUPBY, under the lock: check permissions, resolve
-/// and ACL-check the series, then snapshot them with their group labels.
+/// A shard's share of a pushed-down GROUPBY, under the lock: resolve and ACL-check the series
+/// (per matched key, in `snapshot_shard_mrange`), then snapshot them with their group labels.
 /// [`decode_group_partials`] does the rest once the lock is released. `options` must
 /// carry the grouping and no `FILTER_BY_TS`.
 pub(crate) fn snapshot_shard_group_partials(
     ctx: &Context,
     options: &MRangeOptions,
 ) -> ValkeyResult<Vec<SnapshotSeries>> {
-    check_metadata_permissions(ctx)?;
     // No limit: COUNT applies to each group's reduced stream, not to a member's own.
     snapshot_shard_mrange(ctx, options, None)
 }
