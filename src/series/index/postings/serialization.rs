@@ -237,7 +237,7 @@ fn split_label_key(key: &IndexKey) -> (&[u8], &[u8]) {
 /// still carrying stale ids — persisting them would persist a cleanup obligation. Subtracting
 /// yields exactly the state a completed GC drain would produce. A stale id whose key is still
 /// in the RDB (a fork can land mid-ASM-export, before the engine's lazy delete) is resurrected
-/// by the post-load count-verification scan, matching the keyspace either way. The subtraction
+/// by the post-load repair scan, matching the keyspace either way. The subtraction
 /// only costs anything when `stale_ids` is non-empty (rare: the cron GC drains continuously);
 /// entries that become empty are dropped, so the group directory is built in a first pass over
 /// the label index and the entries are written straight into `buf` by a second.

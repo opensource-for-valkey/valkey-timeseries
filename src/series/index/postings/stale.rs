@@ -187,7 +187,6 @@ impl Postings {
             self.stale_ids.begin_pass();
         }
 
-        let mut keys_processed = 0;
         let mut keys_to_remove = Vec::new();
         let mut next_key = None;
 
@@ -200,7 +199,9 @@ impl Postings {
         };
 
         let stale = &self.stale_ids;
-        for (key, bitmap) in self.label_index.range_mut::<IndexKey, _>(range) {
+        for (keys_processed, (key, bitmap)) in
+            self.label_index.range_mut::<IndexKey, _>(range).enumerate()
+        {
             if keys_processed == count {
                 // Save the first *unprocessed* key as the next starting point.
                 next_key = Some(key.clone());
@@ -218,8 +219,6 @@ impl Postings {
             if should_remove {
                 keys_to_remove.push(key.clone());
             }
-
-            keys_processed += 1;
         }
 
         // Process empty keys
@@ -227,10 +226,11 @@ impl Postings {
             self.label_index.remove(&key);
         }
 
-        // If we processed some keys but didn't reach the end, we can return the next key to continue from.
-        // If we processed keys and there are no more keys to process, it means we've reached the end of the index,
-        // so we can clear the stale IDs as they have been fully processed.
-        if keys_processed > 0 && next_key.is_none() {
+        // A batch that stopped short returns the key to continue from. One that ran out of keys
+        // has reached the end of the index, so the pass's stale ids are masked out of every
+        // bitmap and retire. That includes a pass that visited no key at all: an empty label
+        // index (every series in the db is unlabelled) holds no posting to mask.
+        if next_key.is_none() {
             self.stale_ids.finish_pass();
         }
 
@@ -241,6 +241,24 @@ impl Postings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A db whose series all lack labels has an empty label index, so a drain pass visits no
+    /// key. It has still reached the end: the tombstones must retire, or `masks_any_ids` stays
+    /// true for good and every read takes the masking path.
+    #[test]
+    fn a_pass_over_an_empty_label_index_retires_the_tombstones() {
+        let mut postings = Postings::default();
+        postings
+            .id_to_key
+            .insert(7, b"k".to_vec().into_boxed_slice());
+        postings.all_postings.add(7);
+        postings.mark_ids_as_stale(&[7]);
+        assert!(postings.has_stale_ids());
+
+        assert!(postings.remove_stale_ids(None, 50).is_none());
+        assert!(!postings.has_stale_ids(), "the pass reached the end");
+        assert!(!postings.masks_any_ids());
+    }
 
     #[test]
     fn test_remove_stale_ids_across_multiple_batches() {

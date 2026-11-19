@@ -113,21 +113,22 @@ fn handle_key_rename(ctx: &Context, old_key: &[u8], new_key: &[u8]) {
     relink_renamed_series(ctx, &mut series, old_key);
 }
 
-/// Handle the "restore" event, which is triggered for each key restored from disk during server
-/// startup or slot migration.
-fn handle_key_restore(ctx: &Context, key: &[u8]) {
+/// Handle the "loaded" event, raised for each key an RDB load (a startup RDB, an AOF's RDB base,
+/// a full sync) brings into the keyspace.
+fn handle_key_loaded(ctx: &Context, key: &[u8]) {
     let db = get_current_db(ctx);
     // Fast path: during an RDB load whose index for this db was preloaded from the aux payload,
-    // skip the per-key work entirely (string allocation, keyspace lookup, index lock).
-    // `rdb_load` has already assigned `_db` and counted the series; post-load verification in
-    // `persistence.rs` catches any aux/keyspace drift.
+    // skip the per-key work entirely (string allocation, keyspace lookup, index lock): the aux
+    // index was saved with the same RDB and already holds this key. `rdb_load` has assigned
+    // `_db` and counted the series; post-load verification in `persistence.rs` catches any
+    // aux/keyspace drift. Only `loaded` may take it: a `restore` is never in the aux index.
     if should_skip_load_indexing(db) {
         return;
     }
     // Fallback (bulk_build.rs): during an RDB/replication load window whose index was
     // not preloaded, buffer the series for one sorted bulk build at load end instead of paying
     // per-label ART inserts per key. Falls through when buffering is inactive for this window
-    // (AOF load, memory cap crossed, or runtime `restore` outside a load window).
+    // (AOF load, memory cap crossed).
     if bulk_build::try_buffer_loaded_key(ctx, db, key) {
         return;
     }
@@ -160,8 +161,7 @@ pub(crate) fn generic_key_events_handler(
 ) {
     hashify::fnc_map!(event.as_bytes(),
         "loaded" => {
-            // Handle the "loaded" event, which is triggered for each key loaded from disk during server startup.
-            handle_key_restore(ctx, key);
+            handle_key_loaded(ctx, key);
         },
         "move_from" => {
             *lock(&MOVE_FROM_DB) = get_current_db(ctx);
@@ -185,7 +185,11 @@ pub(crate) fn generic_key_events_handler(
             }
         },
         "restore" => {
-            handle_key_restore(ctx, key);
+            // A `RESTORE` (or `MIGRATE`'s receiving end), at runtime or replayed from an AOF's
+            // command tail: either way a key the preloaded index never saw, so it is indexed
+            // here, under a fresh id. Taking the `loaded` fast path inside an AOF's load window
+            // left it out of the index for good.
+            index_series_by_key(ctx, key);
         },
         "copy_to" => {
             // The type `copy` callback cannot touch the index (it runs on the main thread with the

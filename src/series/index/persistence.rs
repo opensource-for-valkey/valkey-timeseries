@@ -494,7 +494,9 @@ fn take_preloaded_dbs() -> Vec<i32> {
 /// the preloaded index but not in the keyspace, so the two digests agree on a dangling id.
 /// `force_sweep` — set whenever the server reports expired keys for the load — skips the
 /// digest shortcut. The server's count covers every key type, so this can sweep when no
-/// series expired; that is the safe direction.
+/// series expired; that is the safe direction. A forced sweep whose digest matched still skips
+/// the repair scan: a matching digest means every loaded series is indexed under its id, so
+/// once the sweep has stale-marked the expired ones there is nothing left for the scan to find.
 fn reconcile_preloaded_indexes(force_sweep: bool) {
     let dbs: Vec<i32> = take_preloaded_dbs();
     if dbs.is_empty() {
@@ -522,7 +524,8 @@ fn reconcile_preloaded_indexes(force_sweep: bool) {
                 .unwrap_or_default();
 
             let indexed = read_indexed_stats(db);
-            if !force_sweep && !loaded.incomplete && indexed == loaded {
+            let digest_matched = !loaded.incomplete && indexed == loaded;
+            if digest_matched && !force_sweep {
                 // Notice rather than debug: this is the once-per-db outcome that says the
                 // sweep was skipped, and it is the only externally visible evidence that the
                 // digest fast path is working.
@@ -533,23 +536,30 @@ fn reconcile_preloaded_indexes(force_sweep: bool) {
                 continue;
             }
 
-            log_notice(format!(
-                "Postings index for db {db}: index ({} series) does not match the loaded set ({} series{}); reconciling",
-                indexed.count,
-                loaded.count,
-                if loaded.incomplete {
-                    ", digest unavailable"
-                } else if force_sweep {
-                    ", keys expired during load"
-                } else {
-                    ""
-                }
-            ));
+            if digest_matched {
+                log_notice(format!(
+                    "Postings index for db {db}: {} indexed series match the loaded set by digest, but keys expired during load; reconciling without a repair scan",
+                    indexed.count
+                ));
+            } else {
+                log_notice(format!(
+                    "Postings index for db {db}: index ({} series) does not match the loaded set ({} series{}); reconciling",
+                    indexed.count,
+                    loaded.count,
+                    if loaded.incomplete {
+                        ", digest unavailable"
+                    } else {
+                        ""
+                    }
+                ));
+            }
             reconcile_db(db, run);
             if run.check_shutdown() {
                 return;
             }
-            verify_and_repair_db(db, loaded.count, run);
+            if !digest_matched {
+                verify_and_repair_db(db, loaded.count, run);
+            }
         }
     });
 }
@@ -574,27 +584,22 @@ fn read_indexed_count(db: i32) -> u64 {
     postings.id_to_key.len() as u64
 }
 
-/// Post-sweep verification for a preloaded db. `reconcile_db` has just established that every
-/// id remaining in `id_to_key` maps to a live key with a matching series id — i.e. the index is
-/// a *subset* of the loaded keyspace. Equal cardinality therefore proves set equality, so a
-/// count match means no key was missed by the preload. On mismatch, scan the db's keyspace and
-/// index anything with `has_id == false` (the same per-key path the fast path skipped).
+/// Post-sweep repair for a preloaded db whose digest disagreed with the loaded set. `reconcile_db`
+/// has just stale-marked every id that maps to no live key, so the index holds no phantom; what
+/// it may still lack is a loaded key the preload missed. Scan the db's keyspace and index
+/// anything not indexed under its id (`ensure_series_indexed_by_key`, the per-key path the
+/// fast path skipped).
 ///
-/// Runtime traffic between load end and this check can legitimately skew the counts (a DEL
-/// removes a key and unindexes it; a TS.CREATE adds an id the loader never counted). That only
-/// makes the scan fire spuriously — `ensure_series_indexed_by_key` skips a key already indexed
-/// under its id, so the scan is always safe, just not free.
+/// The scan always runs here. Comparing counts first is not sound: commands that land after the
+/// preload (an AOF's command tail, or a client before this task runs) change the index without
+/// touching the loaded count, so a `TS.CREATE` can balance a missed key and hide it for good.
+/// Only a digest mismatch reaches this function (a sweep forced by expired keys skips it when
+/// the digest matched), so a clean load never scans; the cost is one keyspace scan (taking the
+/// GIL per bucket) after a load that was not clean.
 fn verify_and_repair_db(db: i32, loaded_count: u64, run: &TaskRun<'_>) {
     let indexed_count = read_indexed_count(db);
 
-    if indexed_count == loaded_count {
-        log_debug(format!(
-            "Postings index verification for db {db}: {indexed_count} indexed series match the loaded count"
-        ));
-        return;
-    }
-
-    log_warning(format!(
+    log_notice(format!(
         "Postings index verification for db {db}: {indexed_count} indexed vs {loaded_count} loaded; scanning keyspace to repair"
     ));
 

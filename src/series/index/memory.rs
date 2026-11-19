@@ -161,14 +161,16 @@ impl TimeSeriesIndex {
     /// This database's index footprint.
     ///
     /// The walk takes the postings read lock in slices of at most [`WALK_SLICE`], releasing it
-    /// in between so index writers — which run on the main thread, holding the GIL — wait at
-    /// most one slice for it. No yield is needed between slices: `std`'s current `RwLock`
-    /// implementations (futex and queue) refuse a new read lock while a writer is queued, so
-    /// re-taking it straight away parks behind the writer. `std` documents its policy as
-    /// unspecified, so this rests on the implementation, not a guarantee.
+    /// in between so index writers wait at most one slice for it. Most writers run on the main
+    /// thread holding the GIL; the tombstone drain (`tasks::stale_ids`) and the posting-list
+    /// optimizer (`tasks::optimize_indices`) take the write lock on their own threads without
+    /// it. No yield is needed between slices: `std`'s current `RwLock` implementations (futex and
+    /// queue) refuse a new read lock while a writer is queued, so re-taking it straight away
+    /// parks behind the writer. `std` documents its policy as unspecified, so this rests on the
+    /// implementation, not a guarantee.
     ///
-    /// Called with the GIL held (`INFO`), slicing changes nothing: every writer needs the GIL
-    /// first, so none can be queued on the lock.
+    /// Called with the GIL held (`INFO`), slicing still matters only for those off-GIL writers:
+    /// a main-thread writer cannot be queued on the lock while the walk holds the GIL.
     ///
     /// Off the GIL, the figures are not a snapshot: series indexed or removed while the lock is
     /// released are counted if they fall after the cursor and missed if they fall before it,
