@@ -1111,9 +1111,10 @@ mod tests {
             end: 1_000,
         };
         let range = TimestampRange::try_from(inverted).expect("start > end is not an error");
-        assert!(
-            range.is_inverted(),
-            "start > end must be tagged inverted, matching RedisTimeSeries' empty-result semantics"
+        assert_eq!(
+            range.get_timestamps(None),
+            (5_000, 1_000),
+            "start > end must survive decoding, matching RedisTimeSeries' empty-result semantics"
         );
     }
 }

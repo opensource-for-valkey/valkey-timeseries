@@ -37,7 +37,8 @@ pub enum TimestampValue {
     Now,
     /// A specific timestamp
     Specific(Timestamp),
-    /// A timestamp with a given delta(ms) from the current timestamp
+    /// An offset (ms) from the current time. As the end of a [`TimestampRange`] it is an
+    /// offset from the range's resolved start instead: see [`TimestampRange::get_timestamps`].
     Relative(i64),
 }
 
@@ -93,7 +94,9 @@ impl TryFrom<&str> for TimestampValue {
             }
         }
 
-        // Ergonomics. Support something like TS.RANGE key -6hrs -3hrs.
+        // Ergonomics. Support something like TS.RANGE key -6hrs +3hrs: a relative start is an
+        // offset from now, and a relative end an offset from the resolved start, so that
+        // range is the three hours that began six hours ago.
         //
         // The offset must carry a unit ("-6hrs"): a bare signed integer is an
         // absolute timestamp, not an offset. Reading "-1000" as "1000ms ago"
@@ -157,16 +160,22 @@ impl Display for TimestampValue {
             Latest => write!(f, "+"),
             Specific(ts) => write!(f, "{ts}"),
             Now => write!(f, "*"),
-            Relative(delta) => {
-                let human = humanize_duration_ms(*delta);
-                if delta.is_negative() {
-                    write!(f, "{human} ago")
-                } else {
-                    write!(f, "{human} from now")
-                }
-            }
+            Relative(delta) => write_offset(f, *delta, "ago", "from now"),
         }
     }
+}
+
+/// Writes `delta` as an unsigned duration followed by the word for its direction, so `-6h`
+/// reads "6h ago" rather than "-6h ago".
+fn write_offset(
+    f: &mut std::fmt::Formatter<'_>,
+    delta: i64,
+    before: &str,
+    after: &str,
+) -> std::fmt::Result {
+    let human = humanize_duration_ms(delta.saturating_abs());
+    let direction = if delta.is_negative() { before } else { after };
+    write!(f, "{human} {direction}")
 }
 
 impl From<TimestampValue> for Timestamp {
@@ -195,9 +204,15 @@ impl PartialOrd for TimestampValue {
             }
             (Relative(y), Now) => y.partial_cmp(&0i64),
             (Now, Relative(y)) => 0i64.partial_cmp(y),
-            (Specific(_), Relative(y)) => 0i64.partial_cmp(y),
+            // Both values are instants: a relative one is an offset from now, as in every
+            // other arm. (The range-end reading, an offset from the start, lives in
+            // `TimestampRange`, which knows the start.)
+            (Specific(v), Relative(delta)) => {
+                let relative = current_time_millis().saturating_add(*delta);
+                v.partial_cmp(&relative)
+            }
             (Relative(delta), Specific(y)) => {
-                let relative = current_time_millis() + *delta;
+                let relative = current_time_millis().saturating_add(*delta);
                 relative.partial_cmp(y)
             }
             (Earliest, _) => Some(Ordering::Less),
@@ -218,7 +233,8 @@ impl TimestampRange {
     /// An inverted range (start > end) is *not* an error: it selects no samples.
     /// Rejecting it would make us stricter than RedisTimeSeries, which answers
     /// every inverted-window query with an empty result (and `TS.DEL` with 0).
-    /// [`Self::is_inverted`] is the single place readers short-circuit on.
+    /// Whether a range is inverted is known only once its bounds are resolved
+    /// ([`Self::get_series_range`], [`Self::get_timestamps`]), so readers compare those.
     pub fn new(start: TimestampValue, end: TimestampValue) -> ValkeyResult<Self> {
         Ok(TimestampRange { start, end })
     }
@@ -230,12 +246,9 @@ impl TimestampRange {
         })
     }
 
-    /// True when the window can not contain a sample, so callers can skip the
-    /// fetch entirely rather than rely on every iterator handling start > end.
-    pub fn is_inverted(&self) -> bool {
-        self.start > self.end
-    }
-
+    /// Resolves the bounds against `series`: `-` and `+` are its first and last
+    /// timestamps. A relative end is an offset from the resolved start, as in
+    /// [`Self::get_timestamps`], taken before the retention clamp.
     pub fn get_series_range(
         &self,
         series: &TimeSeries,
@@ -244,13 +257,14 @@ impl TimestampRange {
     ) -> (Timestamp, Timestamp) {
         use TimestampValue::*;
 
-        // In case a retention is set shouldn't return chunks older than the retention
         let mut start_timestamp = self.start.as_series_timestamp(series, now);
         let end_timestamp = if let Relative(delta) = self.end {
-            start_timestamp.wrapping_add(delta)
+            start_timestamp.saturating_add(delta)
         } else {
             self.end.as_series_timestamp(series, now)
         };
+
+        // In case a retention is set shouldn't return chunks older than the retention
 
         if check_retention && !series.retention.is_zero() {
             let earliest = series.get_min_timestamp();
@@ -260,12 +274,18 @@ impl TimestampRange {
         (start_timestamp, end_timestamp)
     }
 
+    /// Resolves the bounds without a series: `-` is 0 and `+` the largest timestamp.
+    ///
+    /// A relative start is an offset from now, but a relative end is an offset from the
+    /// resolved start, not from now: `-6h +3h` is the three hours that began six hours ago,
+    /// and a negative end offset always gives an inverted (empty) range. The sum saturates,
+    /// as the start's does.
     pub fn get_timestamps(&self, now: Option<Timestamp>) -> (Timestamp, Timestamp) {
         use TimestampValue::*;
 
         let start_timestamp = self.start.as_timestamp(now);
         let end_timestamp = if let Relative(delta) = self.end {
-            start_timestamp.wrapping_add(delta)
+            start_timestamp.saturating_add(delta)
         } else {
             self.end.as_timestamp(now)
         };
@@ -285,7 +305,14 @@ impl TimestampRange {
 
 impl Display for TimestampRange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} to {}", self.start, self.end)
+        // A relative end is measured from the start, so it must not read "... ago".
+        write!(f, "{} to ", self.start)?;
+        match self.end {
+            TimestampValue::Relative(delta) => {
+                write_offset(f, delta, "before start", "after start")
+            }
+            end => write!(f, "{end}"),
+        }
     }
 }
 
@@ -791,7 +818,7 @@ mod tests {
         let end = TimestampValue::Specific(1000);
         let range = TimestampRange::new(start, end).expect("inverted range must be accepted");
 
-        assert!(range.is_inverted());
+        assert_eq!(range.get_timestamps(None), (2000, 1000));
     }
 
     #[test]
@@ -800,17 +827,126 @@ mod tests {
         let end = TimestampValue::Specific(-2000);
         let range = TimestampRange::new(start, end).expect("inverted range must be accepted");
 
-        assert!(range.is_inverted());
+        assert_eq!(range.get_timestamps(None), (-1000, -2000));
+    }
+
+    #[test]
+    fn test_relative_end_is_an_offset_from_the_start() {
+        const HOUR: i64 = 3_600_000;
+        let now = 100 * HOUR;
+        let range = TimestampRange::new(
+            TimestampValue::Relative(-6 * HOUR),
+            TimestampValue::Relative(3 * HOUR),
+        )
+        .unwrap();
+        assert_eq!(
+            range.get_timestamps(Some(now)),
+            (now - 6 * HOUR, now - 3 * HOUR),
+            "-6h +3h is the three hours that began six hours ago"
+        );
+
+        // A negative end offset lands before the start, so the range is empty.
+        let range = TimestampRange::new(
+            TimestampValue::Relative(-6 * HOUR),
+            TimestampValue::Relative(-3 * HOUR),
+        )
+        .unwrap();
+        let (start, end) = range.get_timestamps(Some(now));
+        assert_eq!((start, end), (now - 6 * HOUR, now - 9 * HOUR));
+        assert!(start > end);
+
+        // From `-`, the offset counts from the series' first sample.
+        let series = TimeSeries {
+            first_timestamp: 10 * HOUR,
+            last_sample: Some(Sample {
+                timestamp: 20 * HOUR,
+                value: 1.0,
+            }),
+            ..Default::default()
+        };
+        let range =
+            TimestampRange::new(TimestampValue::Earliest, TimestampValue::Relative(HOUR)).unwrap();
+        assert_eq!(
+            range.get_series_range(&series, Some(now), false),
+            (10 * HOUR, 11 * HOUR)
+        );
+    }
+
+    #[test]
+    fn test_relative_end_saturates() {
+        let range = TimestampRange::new(
+            TimestampValue::Specific(i64::MAX - 10),
+            TimestampValue::Relative(3_600_000),
+        )
+        .unwrap();
+        assert_eq!(
+            range.get_timestamps(None),
+            (i64::MAX - 10, i64::MAX),
+            "a large start plus a positive offset must not wrap to a negative end"
+        );
+
+        let series = TimeSeries::default();
+        assert_eq!(
+            range.get_series_range(&series, None, false),
+            (i64::MAX - 10, i64::MAX)
+        );
+    }
+
+    #[test]
+    fn test_relative_values_compare_as_offsets_from_now() {
+        // An hour ago is later than the epoch: a relative value is an instant, whichever
+        // side of the comparison it is on.
+        let hour_ago = TimestampValue::Relative(-3_600_000);
+        let epoch = TimestampValue::Specific(0);
+        assert_eq!(epoch.partial_cmp(&hour_ago), Some(Ordering::Less));
+        assert_eq!(hour_ago.partial_cmp(&epoch), Some(Ordering::Greater));
+    }
+
+    #[test]
+    fn test_display_names_the_anchor_of_each_offset() {
+        use crate::common::humanize::humanize_duration_ms;
+        const HOUR: i64 = 3_600_000;
+        let six = humanize_duration_ms(6 * HOUR);
+        let three = humanize_duration_ms(3 * HOUR);
+
+        assert_eq!(
+            TimestampValue::Relative(-6 * HOUR).to_string(),
+            format!("{six} ago")
+        );
+        assert_eq!(
+            TimestampValue::Relative(6 * HOUR).to_string(),
+            format!("{six} from now")
+        );
+
+        let range = TimestampRange::new(
+            TimestampValue::Relative(-6 * HOUR),
+            TimestampValue::Relative(3 * HOUR),
+        )
+        .unwrap();
+        assert_eq!(
+            range.to_string(),
+            format!("{six} ago to {three} after start")
+        );
+        let range = TimestampRange::new(
+            TimestampValue::Relative(-6 * HOUR),
+            TimestampValue::Relative(-3 * HOUR),
+        )
+        .unwrap();
+        assert_eq!(
+            range.to_string(),
+            format!("{six} ago to {three} before start")
+        );
     }
 
     #[test]
     fn test_timestamp_range_not_inverted() {
         let range = TimestampRange::from_timestamps(1000, 2000).unwrap();
-        assert!(!range.is_inverted());
+        assert_eq!(range.get_timestamps(None), (1000, 2000));
 
         let equal = TimestampRange::from_timestamps(1000, 1000).unwrap();
-        assert!(
-            !equal.is_inverted(),
+        assert_eq!(
+            equal.get_timestamps(None),
+            (1000, 1000),
             "a single-point window is not inverted"
         );
     }
