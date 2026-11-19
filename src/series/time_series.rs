@@ -1,6 +1,8 @@
 use super::chunks::utils::{filter_samples_by_value, filter_timestamp_slice};
 use super::{SampleAddResult, SampleDuplicatePolicy, TimeSeriesOptions, ValueFilter};
 use crate::common::hash::IntMap;
+use crate::common::logging::log_warning;
+use crate::common::metrics::WarningLimit;
 use crate::common::rounding::RoundingStrategy;
 use crate::common::threads::{IntoParRayon, ParMutRayon, ParRayon, request_par_threads};
 use crate::common::time::current_time_millis;
@@ -51,7 +53,20 @@ pub type SeriesRef = u64;
 /// O(1) per byte.
 pub(crate) fn seal_chunk(chunk: &mut TimeSeriesChunk) {
     if let Err(e) = chunk.optimize() {
-        logging::log_warning(format!("TSDB: Error compacting a sealed chunk: {e:?}"));
+        log_warning(format!("TSDB: Error compacting a sealed chunk: {e:?}"));
+    }
+}
+
+/// Logs, at most once per [`WarningLimit`] interval, a retention trim that removed more samples
+/// than the series counted: the count had drifted from the chunks and was recounted.
+#[cold]
+fn note_sample_count_drift(counted: usize, removed: usize) {
+    static WARNING: WarningLimit = WarningLimit::new();
+    if WARNING.due() {
+        log_warning(format!(
+            "TSDB: a retention trim removed {removed} samples from a series that counted \
+             {counted}; recounted from its chunks"
+        ));
     }
 }
 
@@ -1118,8 +1133,17 @@ impl TimeSeries {
         }
 
         // The whole chunks dropped above are gone even when the boundary trim failed, so
-        // the bookkeeping has to follow either way.
-        self.total_samples -= deleted_count;
+        // the bookkeeping has to follow either way. A count below what was removed has drifted
+        // from the chunks; recount rather than wrap (debug builds would panic on the main
+        // thread, release builds report ~`usize::MAX` samples).
+        match self.total_samples.checked_sub(deleted_count) {
+            Some(remaining) => self.total_samples = remaining,
+            None => {
+                let counted = self.total_samples;
+                self.recalculate_total_samples();
+                note_sample_count_drift(counted, deleted_count);
+            }
+        }
 
         if deleted_count > 0 {
             // Update first_timestamp and last_timestamp
@@ -1422,9 +1446,7 @@ impl TimeSeries {
         self.chunks
             .par_mut_rayon()
             .num_threads(threads)
-            .for_each(|chunk| {
-                let _ = chunk.optimize();
-            });
+            .for_each(seal_chunk);
     }
 
     #[cfg(test)]
