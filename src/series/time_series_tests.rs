@@ -208,7 +208,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify the samples were added correctly
-        let range = series.get_range(Timestamp::MIN, Timestamp::MAX);
+        let range = series.get_range(Timestamp::MIN, Timestamp::MAX).unwrap();
         assert_eq!(range.len(), 2);
 
         // Check that the large timestamp sample was added
@@ -398,7 +398,7 @@ mod tests {
         assert_eq!(series.first_timestamp, 50);
 
         // Verify samples are in chronological order
-        let samples = series.get_range(0, 400);
+        let samples = series.get_range(0, 400).unwrap();
         assert_eq!(samples.len(), 4);
         assert_eq!(samples[0].timestamp, 50);
         assert_eq!(samples[1].timestamp, 100);
@@ -426,7 +426,7 @@ mod tests {
         assert_eq!(series.len(), 4);
 
         // Verify insertion order
-        let samples = series.get_range(0, 600);
+        let samples = series.get_range(0, 600).unwrap();
         assert_eq!(samples.len(), 4);
         assert_eq!(samples[0].timestamp, 100);
         assert_eq!(samples[1].timestamp, 200);
@@ -468,7 +468,7 @@ mod tests {
         assert_eq!(series.len(), 1);
 
         // Verify the value was updated
-        let samples = series.get_range(0, 200);
+        let samples = series.get_range(0, 200).unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].value, 2.0);
 
@@ -478,7 +478,7 @@ mod tests {
         assert_eq!(series.len(), 1);
 
         // Verify the value was updated
-        let samples = series.get_range(0, 200);
+        let samples = series.get_range(0, 200).unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].value, 2.0);
 
@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(series.len(), 1);
 
         // Verify the value was updated
-        let samples = series.get_range(0, 200);
+        let samples = series.get_range(0, 200).unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].value, 12.0);
 
@@ -498,7 +498,7 @@ mod tests {
         assert_eq!(series.len(), 1);
 
         // Verify the value was NOT updated
-        let samples = series.get_range(0, 200);
+        let samples = series.get_range(0, 200).unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].value, 12.0);
     }
@@ -610,7 +610,7 @@ mod tests {
         assert_eq!(ts.first_timestamp, 100);
         assert_eq!(ts.last_timestamp(), 200);
         assert_eq!(
-            ts.get_range(0, 300),
+            ts.get_range(0, 300).unwrap(),
             vec![
                 Sample {
                     timestamp: 100,
@@ -652,7 +652,7 @@ mod tests {
         assert_eq!(ts.first_timestamp, 100);
         assert_eq!(ts.last_timestamp(), 200);
         assert_eq!(
-            ts.get_range(0, 300),
+            ts.get_range(0, 300).unwrap(),
             vec![
                 Sample {
                     timestamp: 100,
@@ -693,7 +693,7 @@ mod tests {
         assert!(results.iter().all(|r| r.is_ok()));
         assert_eq!(ts.total_samples, 4);
         assert_eq!(
-            ts.get_range(0, 500),
+            ts.get_range(0, 500).unwrap(),
             vec![
                 Sample {
                     timestamp: 100,
@@ -1343,7 +1343,7 @@ mod tests {
         assert_eq!(time_series.total_samples, 2);
 
         // Verify remaining samples are correct
-        let remaining_samples = time_series.get_range(1, 5);
+        let remaining_samples = time_series.get_range(1, 5).unwrap();
         assert_eq!(remaining_samples.len(), 2);
         assert_eq!(remaining_samples[0].timestamp, 1);
         assert_eq!(remaining_samples[1].timestamp, 5);
@@ -1454,7 +1454,7 @@ mod tests {
         let end_time = 75;
 
         // Call get_range and assert that it returns an empty vector
-        let result = time_series.get_range(start_time, end_time);
+        let result = time_series.get_range(start_time, end_time).unwrap();
         assert!(
             result.is_empty(),
             "Expected an empty vector, got {result:?}"
@@ -1472,7 +1472,7 @@ mod tests {
             time_series.add(timestamp, 1.0, None);
         }
 
-        assert!(time_series.get_range(40, 20).is_empty());
+        assert!(time_series.get_range(40, 20).unwrap().is_empty());
         assert_eq!(time_series.range_iter(40, 20).count(), 0);
         assert_eq!(time_series.remove_range(40, 20).unwrap(), 0);
         assert_eq!(time_series.iter().count(), 5);
@@ -1522,7 +1522,11 @@ mod tests {
         ];
         for (start, end) in windows {
             let got: Vec<Sample> = ts.range_iter(start, end).collect();
-            assert_eq!(got, ts.get_range(start, end), "window [{start}, {end}]");
+            assert_eq!(
+                got,
+                ts.get_range(start, end).unwrap(),
+                "window [{start}, {end}]"
+            );
         }
     }
 
@@ -1541,7 +1545,7 @@ mod tests {
         time_series.add(timestamp, sample.value, None);
 
         // Call get_range with start_time and end_time being the same and matching the sample timestamp
-        let result = time_series.get_range(timestamp, timestamp);
+        let result = time_series.get_range(timestamp, timestamp).unwrap();
 
         // Assert that the result contains exactly one sample with the expected timestamp and value
         assert_eq!(result.len(), 1);
@@ -1583,7 +1587,7 @@ mod tests {
         for start in (0..=21000).step_by(500) {
             for end in (start..=21000).step_by(500) {
                 let (lower, upper) = bounds(start, end);
-                let read = series.get_range(start, end).len();
+                let read = series.get_range(start, end).unwrap().len();
                 assert!(lower <= read && read <= upper, "{start}..={end}");
             }
         }
@@ -1613,7 +1617,7 @@ mod tests {
                 for end in (start..=21000).step_by(500) {
                     assert_eq!(
                         count(&series, start, end),
-                        Some(series.get_range(start, end).len()),
+                        Some(series.get_range(start, end).unwrap().len()),
                         "{start}..={end}"
                     );
                 }
@@ -1623,7 +1627,7 @@ mod tests {
             series.retention = Duration::from_millis(4500);
             assert_eq!(
                 count(&series, 0, 20000),
-                Some(series.get_range(0, 20000).len())
+                Some(series.get_range(0, 20000).unwrap().len())
             );
             assert_eq!(count(&series, 0, 20000), Some(5));
         }
@@ -1672,7 +1676,7 @@ mod tests {
         let end_time = 14000;
 
         // Get the range of samples
-        let result = time_series.get_range(start_time, end_time);
+        let result = time_series.get_range(start_time, end_time).unwrap();
 
         // Expected samples in the range
         let expected_samples = vec![
@@ -2071,7 +2075,7 @@ mod tests {
             assert_eq!(ts.visible_first_timestamp(), floor);
             assert_eq!(ts.iter().count(), live);
             assert_eq!(ts.iter().next().map(|s| s.timestamp), Some(floor));
-            assert_eq!(ts.get_range(0, last).len(), live);
+            assert_eq!(ts.get_range(0, last).unwrap().len(), live);
             // FILTER_BY_TS cannot reach below the floor either.
             let filtered = RangeOptions {
                 date_range: TimestampRange::from_timestamps(0, last).unwrap(),
@@ -2233,15 +2237,23 @@ mod tests {
         ] {
             for widened in [Duration::ZERO, Duration::from_millis(10_000)] {
                 let (mut lazy, mut trimmed) = lazily_and_fully_trimmed(encoding);
-                let visible = lazy.get_range(0, Timestamp::MAX);
+                let visible = lazy.get_range(0, Timestamp::MAX).unwrap();
                 assert_eq!(visible.len(), 101, "{encoding:?}");
 
                 lazy.set_retention(widened).unwrap();
                 trimmed.set_retention(widened).unwrap();
 
                 let context = format!("{encoding:?}, retention -> {widened:?}");
-                assert_eq!(lazy.get_range(0, Timestamp::MAX), visible, "{context}");
-                assert_eq!(trimmed.get_range(0, Timestamp::MAX), visible, "{context}");
+                assert_eq!(
+                    lazy.get_range(0, Timestamp::MAX).unwrap(),
+                    visible,
+                    "{context}"
+                );
+                assert_eq!(
+                    trimmed.get_range(0, Timestamp::MAX).unwrap(),
+                    visible,
+                    "{context}"
+                );
                 assert_eq!(lazy.visible_total_samples(), 101, "{context}");
                 assert_eq!(lazy.visible_first_timestamp(), 100, "{context}");
             }
@@ -2252,7 +2264,7 @@ mod tests {
     fn narrowing_retention_hides_samples_outside_the_new_window() {
         let (mut lazy, _) = lazily_and_fully_trimmed(ChunkEncoding::Chimp);
         lazy.set_retention(Duration::from_millis(10)).unwrap();
-        let range = lazy.get_range(0, Timestamp::MAX);
+        let range = lazy.get_range(0, Timestamp::MAX).unwrap();
         assert_eq!(range.len(), 11);
         assert_eq!(range[0].timestamp, 190);
         assert_eq!(lazy.visible_total_samples(), 11);
@@ -2357,7 +2369,7 @@ mod tests {
 
         assert_eq!(series.retention, Duration::from_millis(50));
         assert_eq!(series.chunks.len(), 1);
-        let range = series.get_range(0, Timestamp::MAX);
+        let range = series.get_range(0, Timestamp::MAX).unwrap();
         assert_eq!(range.len(), 51);
         assert_eq!(range[0].timestamp, 150);
         assert_eq!(series.visible_total_samples(), 51);
@@ -2389,5 +2401,72 @@ mod tests {
             assert!(plain.add_deferring_retention(ts, 1.0, None).is_ok());
         }
         assert!(!plain.has_expired_samples(), "no retention");
+    }
+
+    /// A Chimp series of `chunks` or more chunks, filled from a generator.
+    fn multi_chunk_series(chunks: usize) -> TimeSeries {
+        let mut series = TimeSeries::with_options(TimeSeriesOptions {
+            chunk_encoding: ChunkEncoding::Chimp,
+            chunk_size: Some(256),
+            ..Default::default()
+        })
+        .unwrap();
+        let data = DataGenerator::builder()
+            .start(1000)
+            .interval(Duration::from_millis(10))
+            .algorithm(ValueWorkload::StdNorm)
+            .samples(chunks * 200)
+            .build()
+            .generate();
+        for sample in data {
+            series.add(sample.timestamp, sample.value, None);
+        }
+        assert!(
+            series.chunks.len() >= chunks,
+            "{} chunks",
+            series.chunks.len()
+        );
+        series
+    }
+
+    /// A read that cannot reserve room for a chunk's samples (a stored count no allocation
+    /// holds) fails, on the one-chunk path and the parallel one. It used to answer as an empty
+    /// window, which `TS.OUTLIERS` reported as a series with no data.
+    #[test]
+    fn test_get_range_reports_a_chunk_it_cannot_read() {
+        let mut series = multi_chunk_series(3);
+        let TimeSeriesChunk::Chimp(chunk) = &mut series.chunks[0] else {
+            unreachable!()
+        };
+        *chunk.encoder.header_mut_for_test().0 = u64::MAX / 2;
+
+        let first_chunk_end = series.chunks[0].last_timestamp();
+        assert!(series.get_range(0, first_chunk_end).is_err(), "one chunk");
+        assert!(series.get_range(0, i64::MAX).is_err(), "every chunk");
+        // Chunks the read does not reach are not read.
+        let second = series.chunks[1].first_timestamp();
+        assert!(!series.get_range(second, i64::MAX).unwrap().is_empty());
+    }
+
+    /// Reads across many chunks come back in timestamp order without a re-sort: chunks are
+    /// disjoint and ascending, and the pool's `collect` keeps input order.
+    #[test]
+    fn test_multi_chunk_reads_come_back_in_order() {
+        let series = multi_chunk_series(64);
+        let all: Vec<Sample> = series.iter().collect();
+
+        assert_eq!(series.get_range(0, i64::MAX).unwrap(), all);
+        let (from, to) = (all[150].timestamp, all[all.len() - 150].timestamp);
+        let inner: Vec<Sample> = all
+            .iter()
+            .copied()
+            .filter(|s| s.timestamp >= from && s.timestamp <= to)
+            .collect();
+        assert_eq!(series.get_range(from, to).unwrap(), inner);
+
+        // Every third sample, so most chunks contribute and none contributes everything.
+        let picked: Vec<Sample> = all.iter().copied().step_by(3).collect();
+        let timestamps: Vec<Timestamp> = picked.iter().map(|s| s.timestamp).collect();
+        assert_eq!(series.samples_by_timestamps(&timestamps).unwrap(), picked);
     }
 }

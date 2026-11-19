@@ -189,7 +189,14 @@ fn process_request(
             None
         };
 
-        (series.get_range(start, end), lane_slot)
+        // A chunk the read cannot load fails the command: an empty answer would read as a
+        // window with no data.
+        let samples = series.get_range(start, end).map_err(|e| {
+            ValkeyError::String(format!(
+                "TSDB: outlier detection: cannot read the range: {e}"
+            ))
+        })?;
+        (samples, lane_slot)
     };
 
     // Detection leaves NaN and infinities out, so the shingle must fit the finite samples.

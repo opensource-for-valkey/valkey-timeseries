@@ -1,5 +1,4 @@
 use super::{SampleAddResult, SampleDuplicatePolicy, TimeSeriesOptions};
-use crate::common::hash::IntMap;
 use crate::common::logging::log_warning;
 use crate::common::metrics::WarningLimit;
 use crate::common::rounding::RoundingStrategy;
@@ -721,26 +720,26 @@ impl TimeSeries {
         merge_samples(self, samples, policy_override)
     }
 
-    /// Get the time series between given start and end time (both inclusive).
-    pub fn get_range(&self, start_time: Timestamp, end_time: Timestamp) -> Vec<Sample> {
+    /// The samples between `start_time` and `end_time` (both inclusive), oldest first.
+    ///
+    /// A chunk whose samples cannot be read fails the read. A decode error part-way through a
+    /// chunk does not: like every range read, the chunk's samples stop there and the error is
+    /// counted (`chunk_decode_errors_total`).
+    pub fn get_range(&self, start_time: Timestamp, end_time: Timestamp) -> TsdbResult<Vec<Sample>> {
         let start_time = start_time.max(self.get_min_timestamp());
         if start_time > end_time {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         if !self.overlaps(start_time, end_time) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let Some(range) = self.get_chunk_index_bounds(start_time, end_time) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let (start_index, end_index) = range;
-        let chunks = &self.chunks[start_index..=end_index];
-        let mut samples = get_range_parallel(chunks, start_time, end_time).unwrap_or_default();
-        if chunks.len() > 1 {
-            // If we have multiple chunks, we need to sort the samples by timestamp
-            samples.sort_by_key(|s| s.timestamp);
-        }
-        samples
+        // In timestamp order as read: chunks are disjoint and ascending, and the pool's
+        // `collect` keeps input order.
+        get_range_parallel(&self.chunks[start_index..=end_index], start_time, end_time)
     }
 
     /// Bounds on how many samples [`Self::get_range`] returns for this range, without decoding
@@ -825,30 +824,36 @@ impl TimeSeries {
         }
     }
 
+    /// The stored samples at `timestamps`, which must be ascending, oldest first.
     pub fn samples_by_timestamps(&self, timestamps: &[Timestamp]) -> TsdbResult<Vec<Sample>> {
         if self.is_empty() || timestamps.is_empty() {
             return Ok(vec![]);
         }
+        // The compressed chunks match against the timestamps in one forward pass.
+        debug_assert!(timestamps.is_sorted(), "timestamps out of order");
 
         struct ChunkMeta<'a> {
             chunk: &'a TimeSeriesChunk,
             timestamps: SmallVec<[Timestamp; 6]>,
         }
 
-        let mut meta_map: IntMap<usize, ChunkMeta> = Default::default();
-
+        // Ascending timestamps visit the chunks in order, so the groups come out in chunk
+        // order, and with them the samples.
+        let mut metas: Vec<ChunkMeta> = Vec::new();
+        let mut last_index = None;
         for &ts in timestamps {
             let (index, found) = get_chunk_index(&self.chunks, ts);
-            if found && index < self.chunks.len() {
-                meta_map
-                    .entry(index)
-                    .or_insert_with(|| ChunkMeta {
-                        chunk: &self.chunks[index],
-                        timestamps: SmallVec::new(),
-                    })
-                    .timestamps
-                    .push(ts);
+            if !found || index >= self.chunks.len() {
+                continue;
             }
+            if last_index != Some(index) {
+                metas.push(ChunkMeta {
+                    chunk: &self.chunks[index],
+                    timestamps: SmallVec::new(),
+                });
+                last_index = Some(index);
+            }
+            metas.last_mut().expect("pushed above").timestamps.push(ts);
         }
 
         #[inline]
@@ -856,34 +861,20 @@ impl TimeSeries {
             meta.chunk.samples_by_timestamps(&meta.timestamps)
         }
 
-        fn fetch_parallel(slice: &[ChunkMeta]) -> TsdbResult<Vec<Sample>> {
-            match slice {
-                [] => Ok(vec![]),
-                [meta] => meta_fetch(meta),
-                _ => slice
-                    .par_rayon()
-                    .num_threads(request_par_threads(
-                        slice.len(),
-                        slice.iter().map(|m| m.chunk.len()).sum(),
-                    ))
-                    .map(|meta| meta_fetch(meta))
-                    .into_fallible()
-                    .flat_map(|r| r)
-                    .collect(),
-            }
-        }
-
-        let len = meta_map.len();
-        if len == 0 {
-            Ok(vec![])
-        } else {
-            let metas = meta_map.into_values().collect::<Vec<_>>();
-            let mut samples = fetch_parallel(&metas)?;
-            if len > 1 {
-                // If we have multiple chunks, we need to sort the samples by timestamp
-                samples.sort_by_key(|s| s.timestamp);
-            }
-            Ok(samples)
+        match metas.as_slice() {
+            [] => Ok(vec![]),
+            [meta] => meta_fetch(meta),
+            // `collect` keeps input order.
+            metas => metas
+                .par_rayon()
+                .num_threads(request_par_threads(
+                    metas.len(),
+                    metas.iter().map(|m| m.chunk.len()).sum(),
+                ))
+                .map(meta_fetch)
+                .into_fallible()
+                .flat_map(|r| r)
+                .collect(),
         }
     }
 

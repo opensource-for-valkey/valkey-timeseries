@@ -586,7 +586,7 @@ fn forged_series_are_refused_when_foreign_and_kept_when_own() {
                     assert_loadable(&loaded);
                     // Visible, too: a clamp that hid samples would pass the checks above.
                     assert_eq!(
-                        loaded.get_range(0, i64::MAX),
+                        loaded.get_range(0, i64::MAX).unwrap(),
                         expected,
                         "{encoding}: {what}"
                     );
@@ -856,7 +856,11 @@ fn empty_chunks_are_dropped_on_load() {
         assert_loadable(&ts);
         for sample in base.iter() {
             let t = sample.timestamp;
-            assert_eq!(ts.get_range(t, t), vec![sample], "{encoding}: read at {t}");
+            assert_eq!(
+                ts.get_range(t, t).unwrap(),
+                vec![sample],
+                "{encoding}: read at {t}"
+            );
             assert_eq!(
                 ts.clone().remove_range(t, t).unwrap(),
                 1,
