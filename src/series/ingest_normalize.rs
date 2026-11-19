@@ -4,7 +4,7 @@
 //! Normalization is the single place where retention filtering, value rounding,
 //! in-batch duplicate rejection and the IGNORE filter are applied, so the bulk
 //! paths stay behaviorally consistent with single-sample [`TimeSeries::add`].
-use crate::common::Sample;
+use crate::common::{Sample, Timestamp};
 use crate::series::{DuplicatePolicy, SampleAddResult, TimeSeries};
 
 /// Result of pre-merge normalization shared by all bulk ingest paths.
@@ -18,20 +18,33 @@ pub(super) struct NormalizedBatch {
     /// pre-set to `TooOld` and IGNORE-filtered samples to `Ignored`; survivors hold a placeholder
     /// that the caller overwrites with the merge outcome.
     pub(super) results: Vec<SampleAddResult>,
+    /// Whether the batch repeats a timestamp. Every repeat is reported `Duplicate` here, which
+    /// is `TS.ADDBULK`'s rule; `TS.MADD` folds repeats under the duplicate policy instead, so it
+    /// applies such a batch item by item rather than merging this one.
+    pub(super) has_repeats: bool,
 }
 
-/// Per-input-index mask of in-batch duplicates in an *unsorted* batch: every occurrence of a
-/// timestamp after the first in input order. A stable index sort makes equal timestamps adjacent
-/// in input order. (In a sorted batch a repeat is just equal to its predecessor; see
-/// [`normalize_batch`], which skips this allocation then.)
-fn unsorted_in_batch_duplicates(samples: &[Sample]) -> Vec<bool> {
-    let mut duplicate = vec![false; samples.len()];
-    let mut order: Vec<usize> = (0..samples.len()).collect();
-    order.sort_by_key(|&i| samples[i].timestamp);
+/// An *unsorted* batch's `(timestamp, input index)` pairs, sorted. The index breaks ties, so
+/// equal timestamps sit together in input order: the in-batch repeats (every occurrence after
+/// the first) and the order the survivors are merged in both come from this one sort. A sorted
+/// batch needs neither (a repeat equals its predecessor), so [`normalize_batch`] skips it.
+fn unsorted_order(samples: &[Sample]) -> Vec<(Timestamp, usize)> {
+    let mut order: Vec<(Timestamp, usize)> = samples
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| (sample.timestamp, index))
+        .collect();
+    order.sort_unstable();
+    order
+}
+
+/// Per-input-index mask of the repeats in `order` (see [`unsorted_order`]).
+fn repeat_mask(order: &[(Timestamp, usize)]) -> Vec<bool> {
+    let mut repeat = vec![false; order.len()];
     for pair in order.windows(2) {
-        duplicate[pair[1]] = samples[pair[1]].timestamp == samples[pair[0]].timestamp;
+        repeat[pair[1].1] = pair[1].0 == pair[0].0;
     }
-    duplicate
+    repeat
 }
 
 /// Normalizes a batch of samples the same way single-sample [`TimeSeries::add`] does, so the
@@ -63,17 +76,26 @@ pub(super) fn normalize_batch(
     // Sorted input is the hot case (TS.ADDBULK sorts its payload; in-order TS.MADD), and costs
     // no allocations beyond the three returned vectors.
     let sorted = samples.is_sorted_by_key(|s| s.timestamp);
-    let repeats = (!sorted).then(|| unsorted_in_batch_duplicates(samples));
+    let order = (!sorted).then(|| unsorted_order(samples));
+    let repeats = order.as_deref().map(repeat_mask);
     let is_repeat = |i: usize| match &repeats {
         Some(mask) => mask[i],
         None => i > 0 && samples[i].timestamp == samples[i - 1].timestamp,
     };
+    let mut has_repeats = false;
     let dup_policy = series.sample_duplicates;
     let retention_ms = (!series.retention.is_zero()).then_some(series.retention.as_millis() as i64);
 
     let mut results = vec![SampleAddResult::Error("Unknown error"); samples.len()];
     let mut to_insert: Vec<Sample> = Vec::with_capacity(samples.len());
     let mut insert_index: Vec<usize> = Vec::with_capacity(samples.len());
+    // For unsorted input: each input index's position in `to_insert`, or `usize::MAX` for one
+    // that is not inserted, so the survivors can be put in timestamp order without a sort.
+    let mut position = if sorted {
+        Vec::new()
+    } else {
+        vec![usize::MAX; samples.len()]
+    };
 
     // The last stored sample as sequential adds would leave it: the retention floor and the
     // IGNORE comparison both read it.
@@ -82,6 +104,7 @@ pub(super) fn normalize_batch(
     for (index, sample) in samples.iter().enumerate() {
         if is_repeat(index) {
             results[index] = SampleAddResult::Duplicate;
+            has_repeats = true;
             continue;
         }
 
@@ -125,23 +148,38 @@ pub(super) fn normalize_batch(
             }
             Some(_) => {}
         }
+        if let Some(slot) = position.get_mut(index) {
+            *slot = to_insert.len();
+        }
         to_insert.push(adjusted);
         insert_index.push(index);
     }
 
     // Chunk merging needs ascending timestamps. A subsequence of a sorted batch is sorted, so
-    // only unsorted input can need this; the timestamps are unique by now, so the sort need not
-    // be stable.
-    if !sorted && !to_insert.is_sorted_by_key(|s| s.timestamp) {
-        let mut order: Vec<usize> = (0..to_insert.len()).collect();
-        order.sort_unstable_by_key(|&k| to_insert[k].timestamp);
-        to_insert = order.iter().map(|&k| to_insert[k]).collect();
-        insert_index = order.iter().map(|&k| insert_index[k]).collect();
+    // only unsorted input can need this, and its sorted order is already at hand: walk it and
+    // keep the inserted entries.
+    if let Some(order) = order
+        && !to_insert.is_sorted_by_key(|s| s.timestamp)
+    {
+        let (mut sorted_samples, mut sorted_index) = (
+            Vec::with_capacity(to_insert.len()),
+            Vec::with_capacity(to_insert.len()),
+        );
+        for (_, index) in order {
+            let at = position[index];
+            if at != usize::MAX {
+                sorted_samples.push(to_insert[at]);
+                sorted_index.push(index);
+            }
+        }
+        to_insert = sorted_samples;
+        insert_index = sorted_index;
     }
 
     NormalizedBatch {
         to_insert,
         insert_index,
         results,
+        has_repeats,
     }
 }

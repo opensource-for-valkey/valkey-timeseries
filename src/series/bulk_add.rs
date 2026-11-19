@@ -650,6 +650,7 @@ pub(super) fn merge_samples_into_series(
         to_insert,
         insert_index,
         mut results,
+        has_repeats: _,
     } = normalize_batch(series, samples, policy);
 
     if to_insert.is_empty() {
