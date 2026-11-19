@@ -374,6 +374,12 @@ pub(in crate::series::index) fn deserialize(
             // which is free for an attacker to produce. The check above bounds this one
             // allocation to 3x what it was checked against.
             key_budget.charge(key.len())?;
+            // The live index never holds a label with a NUL (`IndexKey::has_interior_nul`): one
+            // here came from an older build, and kept, it would block a later valid `a=b` that
+            // it has as a prefix. Discarding falls back to the rebuild, which leaves it out.
+            if key.has_interior_nul() {
+                return Err("label index entry with a NUL byte in its label".to_string());
+            }
 
             let bitmap = read_bitmap(buf)?;
             // `serialize` drops entries whose bitmap is empty, before and after stale masking,
@@ -898,6 +904,33 @@ mod tests {
             loaded.get_key_by_id(7).map(|k| k.as_ref().to_vec()),
             Some(b"ts:7".to_vec())
         );
+    }
+
+    /// An index an older build persisted may hold a label key with a NUL inside. The live index
+    /// never holds one (a later valid `a=b` would clash with `a=b\0c`), so the payload is
+    /// discarded, which falls back to the keyspace rebuild that skips such labels. Alone, with no
+    /// sibling to clash with, it used to decode.
+    #[test]
+    fn a_label_key_with_an_interior_nul_discards_the_index() {
+        for key in [
+            IndexKey::for_label_value("a", "b\0c"),
+            IndexKey::for_label_value("a\0b", "v"),
+        ] {
+            let mut postings = Postings::default();
+            let mut bitmap = PostingsBitmap::new();
+            bitmap.add(1);
+            postings.label_index.try_insert(key, bitmap).unwrap();
+            postings.all_postings.add(1);
+            postings
+                .id_to_key
+                .insert(1, b"k".to_vec().into_boxed_slice());
+            let mut buf = Vec::new();
+            serialize(&mut buf, &postings).unwrap();
+            let err = deserialize_standalone(&mut buf.as_slice())
+                .err()
+                .expect("a NUL label key must not decode");
+            assert!(err.contains("NUL"), "{err}");
+        }
     }
 
     /// The write path bounds neither a label value nor a key name, so neither may the decoder:

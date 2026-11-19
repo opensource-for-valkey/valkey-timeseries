@@ -316,17 +316,21 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
         assert self.ts_info("nuln:alter")["labels"] == {"a": "v"}
         assert self.client.ping()
 
-    def test_filters_naming_a_label_with_nul_are_rejected(self):
-        """DIV-0068: RTS fails to parse a filter whose label name holds a NUL, so it is a parse
-        error here too, on every command that takes FILTER. A NUL in a filter *value* parses and
-        matches nothing (RTS cuts the value at the NUL instead)."""
-        self.client.execute_command("TS.CREATE", "nulf:1", "LABELS", "a", "b")
-        for command in (("TS.QUERYINDEX",), ("TS.MGET", "FILTER"), ("TS.MRANGE", "-", "+", "FILTER"),
-                        ("TS.CARD", "FILTER")):
-            with pytest.raises(ResponseError, match="NUL"):
-                self.client.execute_command(*command, b"a\x00b=v")
-        assert self.client.execute_command("TS.QUERYINDEX", b"a=b\x00c") == []
-        assert self.client.execute_command("TS.QUERYINDEX", "a=b") == [b"nulf:1"]
+    def test_filters_holding_a_nul_are_rejected(self):
+        """DIV-0068: no label holds a NUL, so a filter holding one, in a label name or a value, is
+        a parse error on every command that takes FILTER. RTS fails to parse a NUL in a name and
+        cuts a value at the NUL; here a value is refused too, because a negated one
+        (`a!=b\\0c`) would otherwise select every series, TS.MDEL included."""
+        self.client.execute_command("TS.CREATE", "nulf:1", "LABELS", "a", "b", "host", "h")
+        self.client.execute_command("TS.CREATE", "nulf:2", "LABELS", "a", "c", "host", "h")
+        commands = (("TS.QUERYINDEX",), ("TS.MGET", "FILTER"), ("TS.MRANGE", "-", "+", "FILTER"),
+                    ("TS.CARD", "FILTER"), ("TS.MDEL", "FILTER"))
+        for matchers in ((b"a\x00b=v",), (b"a=b\x00c",), ("host=h", b"a!=b\x00c"),
+                         ("host=h", b"a!=(x,\x00)"), ('{host="h",a!="b\\x00c"}',)):
+            for command in commands:
+                with pytest.raises(ResponseError, match="NUL"):
+                    self.client.execute_command(*command, *matchers)
+        assert sorted(self.client.execute_command("TS.QUERYINDEX", "host=h")) == [b"nulf:1", b"nulf:2"]
 
     def test_option_operand_named_labels_is_not_the_keyword(self):
         """An option's operand spelled `labels` is that option's value, not the LABELS

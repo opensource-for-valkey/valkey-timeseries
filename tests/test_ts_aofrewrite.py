@@ -1,3 +1,4 @@
+import os
 import time
 from valkeytestframework.util.waiters import *
 from valkeytestframework.valkey_test_case import ValkeyAction
@@ -519,3 +520,36 @@ class TestTimeseriesAofRewrite(ValkeyTimeSeriesTestCaseBase):
 
         assert client.execute_command('DEBUG', 'LOADAOF') == b'OK'
         assert snapshot() == before
+
+    def test_aof_replay_keeps_a_legacy_nul_label_out_of_the_index(self):
+        """DIV-0068: an AOF an older build wrote may replay `TS.ALTER ... LABELS a "b\\0c"`, which
+        clients can no longer send. Its own AOF is replayed as written: the label is kept, but
+        never indexed, so it can neither break the index nor block a later valid `a=b`."""
+        client = self.client
+        client.config_set('appendonly', 'yes')
+        wait_for_equal(lambda: client.info('persistence')['aof_rewrite_in_progress'], 0, timeout=30)
+        client.execute_command('TS.CREATE', 'legacy', 'LABELS', 'a', 'x', 'host', 'h1')
+        client.execute_command('TS.ADD', 'legacy', 1000, 1)
+
+        self.server.args['appendonly'] = 'yes'
+        self.server.exit(cleanup=False, remove_nodes_conf=False)
+        aof_dir = os.path.join(self.server.cwd, self.server.args['appenddirname'])
+        incr = [f for f in os.listdir(aof_dir) if f.endswith('.incr.aof')]
+        assert len(incr) == 1, incr
+        cmd = [b'TS.ALTER', b'legacy', b'LABELS', b'a', b'b\x00c', b'host', b'h1']
+        resp = b'*%d\r\n' % len(cmd) + b''.join(b'$%d\r\n%s\r\n' % (len(x), x) for x in cmd)
+        with open(os.path.join(aof_dir, incr[0]), 'ab') as f:
+            f.write(resp)
+        self.server.start(connect_client=True)
+        assert self.server.is_alive()
+
+        info = client.execute_command('TS.INFO', 'legacy')
+        assert dict(info[info.index(b'labels') + 1]) == {b'a': b'b\x00c', b'host': b'h1'}
+        assert client.execute_command('TS.QUERYINDEX', 'host=h1') == [b'legacy']
+        assert client.execute_command('TS.QUERYINDEX', 'a=x') == []
+        assert client.execute_command('TS.QUERYINDEX', 'a=b') == []
+
+        client.execute_command('TS.CREATE', 'valid', 'LABELS', 'a', 'b')
+        assert client.execute_command('TS.QUERYINDEX', 'a=b') == [b'valid']
+        client.delete('legacy')
+        assert client.execute_command('TS.QUERYINDEX', 'a=b') == [b'valid']

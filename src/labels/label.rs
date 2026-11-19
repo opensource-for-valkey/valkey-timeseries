@@ -132,11 +132,11 @@ pub fn check_label_name(name: &[u8]) -> ValkeyResult<()> {
 /// `a=b\0c\0`, and the second insert reached undefined behavior. A name cannot cause that, but
 /// RedisTimeSeries indexes a name cut at its first NUL (`a=v` matches a series labelled `a\0b`)
 /// and fails to parse a filter that names one, so names are refused too: no label holds a NUL,
-/// and the filter parser rejects a NUL in a label name (`parse_series_selector`).
+/// and the filter parser rejects a NUL anywhere in a matcher (`parse_series_selector`).
 ///
 /// The write path checks this wherever `LABELS` or `METRIC` is parsed. A foreign load
 /// (`RESTORE`, a slot import) refuses a payload carrying one; an own load tolerates it
-/// (`normalize_series`), and the index then skips a posting that would clash.
+/// (`normalize_series`, and an own AOF's replayed commands), and the label index leaves it out.
 pub fn check_label_nul(name: &[u8], value: &[u8]) -> ValkeyResult<()> {
     if name.contains(&0) {
         return Err(ValkeyError::Str(error_consts::LABEL_NAME_CONTAINS_NUL));

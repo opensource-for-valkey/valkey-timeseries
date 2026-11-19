@@ -314,7 +314,7 @@ pub(crate) const OFF_GRID_BUCKET_REBUILT: &str =
 /// | Rounding digits outside what `DECIMAL_DIGITS`/`SIGNIFICANT_DIGITS` accept | refused | clamped to 16; zero significant digits dropped |
 /// | Negative timestamps | refused | loaded as they are |
 /// | Chunks out of order or overlapping | refused | loaded as they are |
-/// | A label name or value containing a NUL byte | refused | loaded as it is; the index skips a clashing posting |
+/// | A label name or value containing a NUL byte | refused | loaded as it is; the label index leaves it out |
 /// | A rule's aggregator state with no open bucket | cleared | cleared |
 /// | A rule's open bucket off its grid | marked `dirty`, rebuilt by the next write | marked `dirty`, rebuilt by the next write |
 ///
@@ -439,8 +439,9 @@ pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<
             "label {:?} has a NUL byte in its name or value",
             label.name()
         ))?;
-        // An older build stored it, so it is kept as written. The label index skips a posting
-        // whose key would be a prefix of another (`Postings`), so the radix tree stays sound.
+        // An older build stored it, so it is kept as written. The label index leaves it out
+        // (`IndexKey::has_interior_nul`), so it can neither break the radix tree nor block a
+        // valid key it would have as a prefix.
         repairs.tolerate(LABEL_NUL_KEPT);
     }
 

@@ -1501,7 +1501,8 @@
 # filter naming `a\0b` fails with "TSDB: failed parsing labels".
 #
 # ⚠️ `behavior`-kind: owner sign-off 2026-11-18 — rejection chosen over escaping the index key,
-# for names as well as values.
+# for names, values and filter values (the last after PR review: a negated NUL value selected
+# every series).
 
 - id: DIV-0068
   command: TS.CREATE
@@ -1513,8 +1514,8 @@
     LABELS or METRIC — TS.CREATE, TS.ALTER, and TS.ADD, TS.INCRBY, TS.DECRBY when they create the
     series — by TS.ADDBULK, and by RESTORE. RTS 8.10 stores it, but its label index cuts names
     and values at the first NUL, so `a=b` matches a series labelled `a=b\0c`. A FILTER naming a
-    label that contains a NUL is a parse error on both engines; a NUL in a filter value matches
-    nothing here and is cut at the NUL on RTS.
+    label that contains a NUL is a parse error on both engines; a NUL in a filter value is a
+    parse error here and is cut at the NUL on RTS.
   rationale: >
     Accepted (owner sign-off 2026-11-18). The label index keys `name=value` with a NUL terminator
     so that no key is a prefix of another, which its radix tree requires; a value holding a NUL
@@ -1523,9 +1524,12 @@
     query could rely on them. Escaping inside the key would keep RTS's storage behavior but not its
     truncating index, and change every index-key reader; rejecting is a visible error where RTS
     gives inconsistent answers. Stricter input, so `ts-compatibility-mode strict` does not relax
-    it. An own RDB/AOF load tolerates such a label (counted), and the index skips a posting that
-    would clash. Pinned by TestTimeSeriesBasic::test_label_values_containing_nul_are_rejected,
+    it. A filter value holding a NUL is refused rather than matched, since a negated one
+    (`a!=b\0c`) would select every series, TS.MDEL included. An own RDB/AOF load (a replayed
+    TS.ALTER too) keeps such a label, counted as tolerated, and the label index leaves it out.
+    Pinned by TestTimeSeriesBasic::test_label_values_containing_nul_are_rejected,
     TestTimeSeriesBasic::test_label_names_containing_nul_are_rejected,
-    TestTimeSeriesBasic::test_filters_naming_a_label_with_nul_are_rejected and
-    TestRestoreHostilePayloads::test_label_with_nul.
+    TestTimeSeriesBasic::test_filters_holding_a_nul_are_rejected,
+    TestRestoreHostilePayloads::test_label_with_nul and
+    TestTimeseriesAofRewrite::test_aof_replay_keeps_a_legacy_nul_label_out_of_the_index.
   since: 0.1.0

@@ -42,6 +42,11 @@ pub fn parse_series_selector(s: &str) -> ParseResult<SeriesSelector> {
     if s.trim().is_empty() {
         return Err(ParseError::EmptySeriesSelector);
     }
+    // DIV-0068: no stored label holds a NUL. A raw one is refused before parsing; one a quoted
+    // string decodes (`\x00`) is caught on the parsed matchers below.
+    if s.contains('\0') {
+        return Err(ParseError::NulInFilter);
+    }
     let selector = if let Some((label, op, value_at)) = split_rts_predicate(s) {
         let filter = parse_rts_predicate(s, label, op, value_at)?;
         SeriesSelector::with_filters(vec![filter])
@@ -54,13 +59,12 @@ pub fn parse_series_selector(s: &str) -> ParseResult<SeriesSelector> {
         cur.expect(&[Token::OpOr, Token::Eof], "series selector")?;
         selector
     };
-    // DIV-0068: no stored label name holds a NUL. A value may (it can only match nothing).
     if selector
         .groups()
         .flat_map(|group| group.iter())
-        .any(|filter| filter.label.contains('\0'))
+        .any(LabelFilter::contains_nul)
     {
-        return Err(ParseError::NulInLabelName);
+        return Err(ParseError::NulInFilter);
     }
     Ok(selector)
 }

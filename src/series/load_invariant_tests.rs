@@ -861,7 +861,7 @@ fn a_backfill_into_the_middle_of_a_chunk_keeps_it_in_budget() {
 /// No write accepts a NUL inside a label name or value: the label index's keys are NUL-terminated,
 /// so such a value can make one key a prefix of another, and RTS truncates either at the NUL. A
 /// foreign payload carrying one is refused. An own load keeps the label (an older build stored
-/// it) and tolerates it; the index then skips a posting that would break the radix tree.
+/// it) and tolerates it; the label index leaves such a label out.
 #[test]
 fn a_nul_in_a_label_is_refused_foreign_and_tolerated_own() {
     for (labels, what) in [

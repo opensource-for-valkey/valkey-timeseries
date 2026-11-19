@@ -191,7 +191,7 @@ class TestRestoreHostilePayloads(ValkeyTimeSeriesTestCaseBase):
     def test_label_with_nul(self):
         """DIV-0068: no write stores a NUL inside a label name or value (the label index's
         keys are NUL-terminated, and `b` beside `b\\0c` broke the radix tree's no-prefix
-        contract). A RESTORE carrying one is refused, even with no sibling series to clash with."""
+        contract). A RESTORE carrying one is refused, even when no other series shares the prefix."""
         client = self.client
         client.config_set("rdbcompression", "no")
         client.execute_command("TS.CREATE", "lbl", "LABELS", "host", "a", "tag", "bXc")

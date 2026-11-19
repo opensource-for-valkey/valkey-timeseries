@@ -21,19 +21,20 @@ pub(crate) struct BulkIndexEntry {
     pub label_keys: Vec<IndexKey>,
 }
 
-/// A label key that would be a prefix of another, or have one as its prefix, is left out of the
-/// index. `IndexKey` is NUL-terminated, so that needs a NUL inside a label value: no write
-/// accepts one (`check_label_nul`), and a foreign load refuses it, but an own RDB written by an
-/// older build may still carry one. blart's infallible `entry`/`insert` would reach
-/// `unwrap_unchecked` on such a key (undefined behavior), so every live insert goes through
-/// `try_entry` and the clashing posting is dropped: the series stays readable by key and by its
-/// other labels, and only a filter on that one value misses it.
-fn skip_prefix_clash(key: &[u8]) {
-    log_warning(format!(
-        "label index: skipped key {:?}, which would be a prefix of another key or have one \
-         as its prefix (a label value with a NUL byte)",
-        String::from_utf8_lossy(key)
-    ));
+/// A label holding a NUL is left out of the label index (`IndexKey::has_interior_nul`). No write
+/// accepts one and a foreign load refuses it, but an own RDB or AOF from an older build may still
+/// carry one: the series keeps the label and stays readable by key and by its other labels, and
+/// only a filter on that label misses it (a filter holding a NUL is a parse error anyway).
+/// Indexing it instead would either reach blart's `unwrap_unchecked` in `entry`/`insert`
+/// (undefined behavior) or, once inserted first, make a later valid key clash and be dropped.
+///
+/// With such keys never stored, no valid key can clash, so `try_entry` failing is unreachable;
+/// it is still handled rather than unwrapped, logged once and without the label's contents.
+fn skip_prefix_clash() {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log_warning("label index: skipped a key that clashes with another as a prefix");
+    }
 }
 
 impl Postings {
@@ -72,6 +73,9 @@ impl Postings {
         value: &str,
     ) -> bool {
         let key = IndexKey::for_label_value(label, value);
+        if key.has_interior_nul() {
+            return false;
+        }
         match self.label_index.try_entry(key) {
             Ok(ARTEntry::Occupied(mut entry)) => {
                 entry.get_mut().add(ts_id);
@@ -83,8 +87,8 @@ impl Postings {
                 entry.insert(bitmap);
                 true
             }
-            Err(e) => {
-                skip_prefix_clash(&e.byte_repr);
+            Err(_) => {
+                skip_prefix_clash();
                 false
             }
         }
@@ -154,6 +158,9 @@ impl Postings {
     }
 
     fn add_many_for_key(&mut self, key: IndexKey, ids: &[SeriesRef]) {
+        if key.has_interior_nul() {
+            return;
+        }
         match self.label_index.try_entry(key) {
             Ok(ARTEntry::Occupied(mut entry)) => entry.get_mut().add_many(ids),
             Ok(ARTEntry::Vacant(entry)) => {
@@ -161,7 +168,7 @@ impl Postings {
                 bitmap.add_many(ids);
                 entry.insert(bitmap);
             }
-            Err(e) => skip_prefix_clash(&e.byte_repr),
+            Err(_) => skip_prefix_clash(),
         }
     }
 
@@ -235,33 +242,52 @@ mod tests {
 
     type SeriesSpec = (SeriesRef, String, Vec<(String, String)>);
 
-    /// `b` and `b\0c` give the keys `a=b\0` and `a=b\0c\0`, the first a prefix of the
-    /// second. The write path refuses such a value and a foreign load refuses it, but an own
-    /// load tolerates it, so the index must keep the radix tree prefix-free by itself rather
-    /// than reach blart's `unwrap_unchecked` (undefined behavior) on the conflicting insert.
+    /// A label holding a NUL is never indexed. `b` and `b\0c` give the keys `a=b\0` and
+    /// `a=b\0c\0`, the first a prefix of the second, which blart's radix tree cannot hold. No
+    /// write accepts such a label, but an own load keeps one an older build stored; indexing it
+    /// would either reach undefined behavior or, once inserted first, block a later valid `a=b`.
     #[test]
-    fn prefix_related_label_values_are_skipped_not_inserted() {
-        for (first, second) in [("b", "b\0c"), ("b\0c", "b")] {
-            let mut postings = Postings::default();
-            assert!(postings.add_posting_for_label_value(1, "a", first));
-            // The conflicting key is skipped: no new posting list, and no abort.
-            assert!(!postings.add_posting_for_label_value(2, "a", second));
+    fn labels_with_nul_are_not_indexed_and_never_block_valid_ones() {
+        for (legacy_name, legacy_value) in [("a", "b\0c"), ("a\0b", "v"), ("a", "\0")] {
+            for legacy_first in [true, false] {
+                let what = format!("{legacy_name:?}={legacy_value:?} legacy_first={legacy_first}");
+                let mut postings = Postings::default();
+                let add_legacy = |p: &mut Postings| {
+                    assert!(
+                        !p.add_posting_for_label_value(1, legacy_name, legacy_value),
+                        "{what}"
+                    );
+                };
+                if legacy_first {
+                    add_legacy(&mut postings);
+                }
+                assert!(postings.add_posting_for_label_value(2, "a", "b"), "{what}");
+                if !legacy_first {
+                    add_legacy(&mut postings);
+                }
+                let key = IndexKey::for_label_value("a", "b");
+                let valid = postings
+                    .label_index
+                    .get(&key)
+                    .expect("valid posting indexed");
+                assert!(valid.contains(2) && !valid.contains(1), "{what}");
+                assert_eq!(postings.label_index.len(), 1, "{what}");
 
-            let key = IndexKey::for_label_value("a", first);
-            let kept = postings.label_index.get(&key).expect("first posting kept");
-            assert!(
-                kept.contains(1) && !kept.contains(2),
-                "{first:?}/{second:?}"
-            );
-            assert_eq!(postings.label_index.len(), 1, "{first:?}/{second:?}");
-
-            // The same rule on the bulk path.
-            let mut bulk = Postings::default();
-            bulk.bulk_index(vec![
-                make_bulk_entry(1, "k1", &[("a", first)]),
-                make_bulk_entry(2, "k2", &[("a", second)]),
-            ]);
-            assert_eq!(bulk.label_index.len(), 1, "bulk {first:?}/{second:?}");
+                let mut bulk = Postings::default();
+                let mut entries = vec![
+                    make_bulk_entry(1, "k1", &[(legacy_name, legacy_value)]),
+                    make_bulk_entry(2, "k2", &[("a", "b")]),
+                ];
+                if !legacy_first {
+                    entries.reverse();
+                }
+                bulk.bulk_index(entries);
+                assert_eq!(bulk.label_index.len(), 1, "bulk {what}");
+                assert!(
+                    bulk.label_index.get(&key).unwrap().contains(2),
+                    "bulk {what}"
+                );
+            }
         }
     }
 
