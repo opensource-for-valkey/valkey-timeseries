@@ -2,7 +2,7 @@ use crate::common::context::key_for_display;
 use crate::common::logging::log_warning;
 use crate::common::threads::{ParMutRayon, request_par_threads};
 use crate::common::{Sample, Timestamp};
-use crate::series::bulk_add::merge_samples_into_series;
+use crate::series::bulk_add::{merge_prepared, merge_samples_into_series, prepare_merge};
 use crate::series::{DuplicatePolicy, SampleAddResult, TimeSeries};
 use orx_parallel::Par;
 use smallvec::{SmallVec, smallvec};
@@ -97,14 +97,18 @@ pub(super) fn merge_samples(
     }
 
     let results = merge_samples_into_series(series, samples, policy_override);
-    // The samples are stored by now and a failed split only leaves a chunk oversized, so it is
-    // logged rather than returned (as in `bulk_insert_samples`): an error would make TS.MADD
-    // skip compaction, the retention trim and replication for samples the series keeps.
+    split_after_merge(series);
+    results
+}
+
+/// The samples are stored by now and a failed split only leaves a chunk oversized, so it is
+/// logged rather than returned (as in `bulk_insert_samples`): an error would make TS.MADD skip
+/// compaction, the retention trim and replication for samples the series keeps.
+fn split_after_merge(series: &mut TimeSeries) {
     if let Err(e) = series.split_chunks_if_needed() {
         let key = key_for_display(&series.key);
         log_warning(format!("TSDB: failed to split chunks for key '{key}': {e}"));
     }
-    results
 }
 
 /// Sample-equivalents one appended sample is worth in the dispatch decision
@@ -199,29 +203,29 @@ fn add_samples_internal(input: &mut PerSeriesSamples) -> SmallVec<[(usize, Sampl
         return smallvec![(index, result)];
     }
 
-    // In-batch duplicate timestamps: RTS applies each MADD item as an independent, sequential
-    // upsert under the series' duplicate policy (SUM accumulates, LAST wins, FIRST/MIN/MAX fold,
-    // BLOCK errors on the duplicate), so they must NOT be collapsed. The parallel bulk merge
-    // assumes unique timestamps per batch, so fall back to sequential single-sample add() in
-    // input order, which reproduces RTS exactly.
-    if has_in_batch_duplicate(&input.samples) {
-        return add_group_sequentially(input);
-    }
-
     // Keep the samples in INPUT order: `normalize_batch`'s retention gate is input-order
     // sensitive (it mirrors sequential TS.MADD — an item is TooOld only if it is older than the
-    // floor established by items at or before it). `merge_samples` returns results in the same
-    // order as the samples slice, and normalizes/sorts internally for grouping, so unsorted input
-    // is fully supported here.
+    // floor established by items at or before it). The merge returns results in the same order
+    // as the samples slice, and sorts internally for grouping, so unsorted input is fully
+    // supported here.
     let samples: SmallVec<[Sample; 8]> = input
         .samples
         .iter()
         .map(|s| Sample::new(s.timestamp, s.value))
         .collect();
 
-    let add_results = input
-        .series
-        .merge_samples_deferring_retention(&samples, None);
+    // Normalizing changes nothing, and it is what finds in-batch repeats (with the one sort an
+    // unsorted batch needs anyway). RTS applies each MADD item as an independent, sequential
+    // upsert under the series' duplicate policy (SUM accumulates, LAST wins, FIRST/MIN/MAX fold,
+    // BLOCK errors on the duplicate), so repeats must NOT be collapsed the way the bulk merge
+    // does: such a group falls back to sequential single-sample adds in input order, which
+    // reproduces RTS exactly.
+    let prepared = prepare_merge(input.series, &samples, None);
+    if prepared.batch.has_repeats {
+        return add_group_sequentially(input);
+    }
+    let add_results = merge_prepared(input.series, prepared);
+    split_after_merge(input.series);
 
     // Accepted samples feed batch compaction, which requires them ascending by timestamp.
     // `add_results` is parallel to `samples`, i.e. still in input order, so the order is
@@ -250,14 +254,6 @@ fn add_samples_internal(input: &mut PerSeriesSamples) -> SmallVec<[(usize, Sampl
     }
 
     result
-}
-
-/// True if two samples in the group share a timestamp (checked over a sorted copy of the
-/// timestamps; groups are small, so the O(n log n) copy is cheap and only paid for MADD).
-fn has_in_batch_duplicate(samples: &[IndexedSample]) -> bool {
-    let mut timestamps: SmallVec<[Timestamp; 8]> = samples.iter().map(|s| s.timestamp).collect();
-    timestamps.sort_unstable();
-    timestamps.windows(2).any(|w| w[0] == w[1])
 }
 
 /// Apply a group with in-batch duplicate timestamps as sequential single-sample adds, in input

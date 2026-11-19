@@ -102,6 +102,10 @@ name = "compaction_ingest"
 harness = false
 
 [[bench]]
+name = "ingest_batch"
+harness = false
+
+[[bench]]
 name = "postings"
 harness = false
 

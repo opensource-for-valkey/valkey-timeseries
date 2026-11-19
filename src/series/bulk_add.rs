@@ -640,17 +640,48 @@ pub(super) fn merge_samples_into_series(
     if samples.is_empty() {
         return Vec::new();
     }
+    let prepared = prepare_merge(series, samples, policy);
+    merge_prepared(series, prepared)
+}
 
+/// A batch normalized for [`merge_prepared`], with the duplicate policy it was normalized under.
+pub(super) struct PreparedMerge {
+    pub(super) batch: NormalizedBatch,
+    policy: Option<DuplicatePolicy>,
+}
+
+/// The first half of [`merge_samples_into_series`]: normalizes `samples` against `series`
+/// without changing it, so a caller can look at the batch (`TS.MADD` checks
+/// [`NormalizedBatch::has_repeats`]) before committing to the merge.
+pub(super) fn prepare_merge(
+    series: &TimeSeries,
+    samples: &[Sample],
+    policy: Option<DuplicatePolicy>,
+) -> PreparedMerge {
     // The one place the duplicate policy is resolved, so that a `None` override honors the
     // series' configured policy rather than the chunk merge's KeepLast default.
     let policy = Some(series.sample_duplicates.resolve_policy(policy));
-
     // Apply the same retention/rounding/IGNORE normalization as single-sample add.
-    let NormalizedBatch {
-        to_insert,
-        insert_index,
-        mut results,
-    } = normalize_batch(series, samples, policy);
+    let batch = normalize_batch(series, samples, policy);
+    PreparedMerge { batch, policy }
+}
+
+/// The second half of [`merge_samples_into_series`]: merges a batch [`prepare_merge`]
+/// normalized against this same, unchanged `series`.
+pub(super) fn merge_prepared(
+    series: &mut TimeSeries,
+    prepared: PreparedMerge,
+) -> Vec<SampleAddResult> {
+    let PreparedMerge {
+        batch:
+            NormalizedBatch {
+                to_insert,
+                insert_index,
+                mut results,
+                has_repeats: _,
+            },
+        policy,
+    } = prepared;
 
     if to_insert.is_empty() {
         return results;
@@ -959,6 +990,44 @@ mod tests {
         let mut kept: Vec<i64> = batch.to_insert.iter().map(|x| x.timestamp).collect();
         kept.sort();
         assert_eq!(kept, vec![0, 1001]);
+    }
+
+    /// The single sort of an unsorted batch gives both the repeats (every occurrence after the
+    /// first in input order) and the merge order, with each survivor still at its input index.
+    #[test]
+    fn normalize_unsorted_batch_sorts_once_for_repeats_and_order() {
+        let series = TimeSeries::default();
+        let samples = [
+            s(30, 1.0),
+            s(10, 2.0),
+            s(30, 3.0),
+            s(20, 4.0),
+            s(10, 5.0),
+            s(5, 6.0),
+        ];
+        let batch = normalize_batch(&series, &samples, None);
+        assert!(batch.has_repeats);
+        let kept: Vec<(i64, f64)> = batch
+            .to_insert
+            .iter()
+            .map(|x| (x.timestamp, x.value))
+            .collect();
+        assert_eq!(kept, vec![(5, 6.0), (10, 2.0), (20, 4.0), (30, 1.0)]);
+        assert_eq!(batch.insert_index, vec![5, 1, 3, 0]);
+        for repeat in [2, 4] {
+            assert!(matches!(batch.results[repeat], SampleAddResult::Duplicate));
+        }
+
+        let batch = normalize_batch(&series, &[s(3, 0.0), s(1, 0.0), s(2, 0.0)], None);
+        assert!(!batch.has_repeats);
+        assert_eq!(batch.insert_index, vec![1, 2, 0]);
+
+        // Sorted input takes the no-allocation path and reports repeats the same way.
+        let batch = normalize_batch(&series, &[s(1, 0.0), s(2, 0.0), s(2, 1.0)], None);
+        assert!(batch.has_repeats);
+        assert_eq!(batch.insert_index, vec![0, 1]);
+        let batch = normalize_batch(&series, &[s(1, 0.0), s(2, 0.0)], None);
+        assert!(!batch.has_repeats);
     }
 
     #[test]
