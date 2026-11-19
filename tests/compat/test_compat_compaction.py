@@ -199,6 +199,28 @@ class TestOutOfOrderWrites:
             diff.both("TS.ADD", "c:ignc:src", ts, value)
         diff("TS.RANGE", "c:ignc:dst", "-", "+")
 
+    @pytest.mark.parametrize("value", [0, 2, 100])
+    @pytest.mark.parametrize("write", ["TS.ADD", "TS.MADD"])
+    def test_backfill_republishes_a_bucket_the_destinations_ignore_dropped(
+        self, diff, write, value
+    ):
+        """Bucket 1000 (7) closes within `IGNORE 1000 10` of bucket 0 (5) and is dropped. A
+        back-fill into it recalculates it, and the recalculation is written whatever the
+        thresholds, even when it leaves the aggregate unchanged (`value` 0) or within them (2):
+        the reference publishes the bucket in all three cases."""
+        diff("TS.CREATE", "c:igb:src")
+        diff("TS.CREATE", "c:igb:dst", "DUPLICATE_POLICY", "LAST", "IGNORE", 1000, 10)
+        diff("TS.CREATERULE", "c:igb:src", "c:igb:dst", "AGGREGATION", "sum", 1000)
+        for ts, v in ((0, 5), (1000, 7), (2000, 1), (3000, 1)):
+            # Replies differ when the destination ignores a bucket (DIV-0070).
+            diff.both("TS.ADD", "c:igb:src", ts, v)
+        diff("TS.RANGE", "c:igb:dst", "-", "+")
+        if write == "TS.ADD":
+            diff("TS.ADD", "c:igb:src", 1500, value)
+        else:
+            diff("TS.MADD", "c:igb:src", 1500, value, "c:igb:src", 1600, 0)
+        diff("TS.RANGE", "c:igb:dst", "-", "+")
+
     def test_write_into_bucket_two_back(self, diff):
         _rule(diff, "c:ooo2:src", "c:ooo2:dst")
         for ts, value in [(0, 1.0), (1000, 2.0), (2000, 4.0)]:

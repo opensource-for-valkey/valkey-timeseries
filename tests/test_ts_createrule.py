@@ -821,3 +821,30 @@ class TestTSCreateRule(ValkeyTimeSeriesTestCaseBase):
         assert c.execute_command("TS.RANGE", "rtr:mid", "-", "+") == [[10, b"7"]]
         assert c.execute_command("TS.RANGE", "rtr:dst", "-", "+") == []
         assert c.execute_command("TS.RANGE", "rtr:dst", "-", "+", "LATEST") == [[10, b"7"]]
+
+    def test_retractions_at_two_levels_resync_parent_before_child(self):
+        """One back-fill batch retracts a bucket at two levels: `a@0` (its only counted sample,
+        `s@0`, is below the retention floor of 3, and NaN is not counted) and, through the NaN
+        `a@150` the batch writes, `b@100`. Both levels' resyncs must reach the bottom: `b` must
+        lose `b@0` as well, and `cc@0` must go with both. When `b` was resynced before `a`, it was
+        then left out of `a`'s resync as already visited, and kept `b@0` with `cc@0` built on it."""
+        c = self.client
+        c.execute_command("TS.CREATE", "rt2:s", "RETENTION", 1197)
+        for key in ("rt2:a", "rt2:b", "rt2:cc"):
+            c.execute_command("TS.CREATE", key)
+        c.execute_command("TS.CREATERULE", "rt2:s", "rt2:a", "AGGREGATION", "sum", 10)
+        c.execute_command("TS.CREATERULE", "rt2:a", "rt2:b", "AGGREGATION", "sum", 100)
+        c.execute_command("TS.CREATERULE", "rt2:b", "rt2:cc", "AGGREGATION", "sum", 1000)
+        for ts, value in ((0, "1"), (150, "inf"), (1050, "1"), (1110, "1"), (1200, "1")):
+            c.execute_command("TS.ADD", "rt2:s", ts, value)
+        assert c.execute_command("TS.RANGE", "rt2:b", "-", "+") == [
+            [0, b"1"], [100, b"inf"], [1000, b"1"]
+        ]
+        assert c.execute_command("TS.RANGE", "rt2:cc", "-", "+") == [[0, b"inf"]]
+
+        c.execute_command("TS.MADD", "rt2:s", 5, "nan", "rt2:s", 155, "-inf")
+        assert c.execute_command("TS.RANGE", "rt2:a", "-", "+") == [
+            [150, b"nan"], [1050, b"1"], [1110, b"1"]
+        ]
+        assert c.execute_command("TS.RANGE", "rt2:b", "-", "+") == [[1000, b"1"]]
+        assert c.execute_command("TS.RANGE", "rt2:cc", "-", "+") == []
