@@ -125,14 +125,20 @@ fn handle_update(
     // A batch that writes a rule's source and, further down, its destination is applied item by
     // item (see `handle_update_sequentially`). Every other batch merges per series, which is
     // equivalent there: each compaction cascade then writes only series outside the batch.
+    // Only series the batch writes count: one whose every item was rejected is left out of the
+    // replicated TS.MADD, so counting it would send the replica down the other path.
+    let written = |s: &SeriesSamples| s.samples.iter().any(|&i| all_inputs[i].res.is_ok());
     let members: AHashSet<&[u8]> = input_map
         .iter()
-        .filter(|(_, s)| s.series.is_some())
+        .filter(|(_, s)| written(s))
         .map(|(k, _)| k.as_slice())
         .collect();
     if batch_feeds_itself(
         ctx,
-        input_map.values().filter_map(|s| s.series.as_deref()),
+        input_map
+            .values()
+            .filter(|s| written(s))
+            .filter_map(|s| s.series.as_deref()),
         |key| members.contains(key),
     ) {
         handle_update_sequentially(ctx, input_map, all_inputs, &mut results);

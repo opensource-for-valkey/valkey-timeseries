@@ -260,6 +260,43 @@ class TestTimeSeriesReplication(ReplicationTestCase):
                     assert client.execute_command("TS.RANGE", key, "-", "+") == \
                         replica.execute_command("TS.RANGE", key, "-", "+"), key
 
+    def test_madd_rejected_items_do_not_link_the_batch(self):
+        """A series whose every TS.MADD item is rejected is not written by the batch and is
+        left out of the replicated TS.MADD, so it must not make the batch self-feeding. The
+        primary must apply the accepted items exactly as the replica (and a batch sent without
+        the rejected items) does."""
+        client = self.client
+        replica = self.replicas[0].client
+        cases = [
+            # Retention on both ends, an item outside the source's window, a late in-window one.
+            (("RETENTION", 50), ("RETENTION", 30),
+             [("src", 100, 1), ("mid", 0, "bad"), ("src", 55, 2), ("src", 120, 3), ("src", 40, 4)]),
+            # Out-of-order items into buckets the batch already closed.
+            ((), (), [("src", 30, 1), ("mid", 0, "bad"), ("src", 5, 2), ("src", 12, 3)]),
+            # In-batch duplicates, which the merge applies one by one.
+            ((), ("RETENTION", 15),
+             [("src", 10, 1), ("src", 10, 2), ("mid", "bad", 1), ("src", 25, 3), ("src", 10, 4)]),
+        ]
+        for case, (src_opts, mid_opts, items) in enumerate(cases):
+            for variant in ("mixed", "valid"):
+                p = f"rejected:{case}:{variant}:"
+                client.execute_command("TS.CREATE", p + "src", "DUPLICATE_POLICY", "LAST", *src_opts)
+                client.execute_command("TS.CREATE", p + "mid", *mid_opts)
+                client.execute_command("TS.CREATE", p + "dst")
+                client.execute_command("TS.CREATERULE", p + "src", p + "mid", "AGGREGATION", "sum", 10)
+                client.execute_command("TS.CREATERULE", p + "mid", p + "dst", "AGGREGATION", "sum", 20)
+                client.execute_command("TS.ADD", p + "src", 0, 5)
+                sent = [i for i in items if variant == "mixed" or i[0] != "mid"]
+                client.execute_command("TS.MADD", *[a for k, ts, v in sent for a in (p + k, ts, v)])
+        self.wait_for_replication()
+        for case in range(len(cases)):
+            for name in ("src", "mid", "dst"):
+                key = f"rejected:{case}:mixed:{name}"
+                got = client.execute_command("TS.RANGE", key, "-", "+")
+                assert got == client.execute_command(
+                    "TS.RANGE", f"rejected:{case}:valid:{name}", "-", "+"), key
+                assert got == replica.execute_command("TS.RANGE", key, "-", "+"), key
+
     def test_replication_ts_createrule(self):
         """Test that compaction rules replicate correctly"""
         source_key = "ts:source"

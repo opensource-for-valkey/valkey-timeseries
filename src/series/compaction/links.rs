@@ -340,6 +340,12 @@ mod tests {
             members(&["a", "b"]),
             node
         ));
+        // Checked before the later cases, which open b legitimately.
+        assert!(
+            opened.borrow().iter().all(|k| k != b"b"),
+            "a member was opened: {:?}",
+            opened.borrow()
+        );
         // a reaches c through b, which is not in the batch.
         assert!(rules_reach_a_member(
             [&b"b"[..]],
