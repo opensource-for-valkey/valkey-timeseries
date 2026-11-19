@@ -1,7 +1,7 @@
 """Integration tests for postings-index RDB aux persistence.
 
 Covers the aux payload save/load cycle, the ts-index-persist config gate, the dangling-id
-reconciliation sweep and count-verification repair scan, and the AOF/replication interactions
+reconciliation sweep and post-sweep repair scan, and the AOF/replication interactions
 called out in that document's "Interaction with other flows" section.
 """
 import os
@@ -213,7 +213,7 @@ class TestIndexPersistenceDanglingRepair(ValkeyTimeSeriesTestCaseBase):
     """Exercises the case where the aux payload names an id whose key does not load
     (RDB body corruption / a fork landing mid-write). The digest must force a
     reconciliation sweep, the dangling id must be dropped from the index, and the
-    count-verification scan must repair it so the renamed key becomes findable under its
+    post-sweep repair scan must index it so the renamed key becomes findable under its
     real name."""
 
     @property
@@ -511,6 +511,87 @@ class TestIndexPersistenceAof(ValkeyTimeSeriesTestCaseBase):
         assert client.execute_command("TS.CARD", "FILTER", "service=api") == len(keys)
         for key in keys:
             assert client.execute_command("EXISTS", key) == 1
+
+    def _aof_dir(self):
+        return os.path.join(self.server.cwd, self.server.args["appenddirname"])
+
+    def _restart_with_aof(self):
+        self.server.args["appendonly"] = "yes"
+        self.server.restart(remove_rdb=False, remove_nodes_conf=False, connect_client=True)
+        assert self.server.is_alive()
+        wait_for_true(lambda: self.server.verify_string_in_logfile("DB loaded from"))
+        assert self.server.verify_string_in_logfile(PRELOADED_LOG)
+        return self.server.get_new_client()
+
+    def test_restore_in_the_aof_tail_is_indexed(self):
+        """A RESTORE replayed from the AOF's command tail is a key the preloaded index (from the
+        RDB base) never saw, so it must be indexed; only a key the base itself loaded may skip
+        that. The tail's two TS.CREATEs balance the RESTORE and the deleted source, so a check
+        that compared counts alone after the sweep would find nothing to repair."""
+        client = self.client
+        client.config_set("appendonly", "yes")
+        wait_for_equal(lambda: client.info("persistence")["aof_rewrite_in_progress"], 0, timeout=30)
+        for i in range(3):
+            client.execute_command("TS.CREATE", f"base:{i}", "LABELS", "grp", "base")
+        client.execute_command("TS.CREATE", "src", "LABELS", "grp", "src")
+        client.execute_command("TS.ADD", "src", 1000, 1.5)
+        dump = client.dump("src")
+        self._bgrewriteaof_and_wait(client)
+
+        # The command tail, after the RDB base.
+        client.execute_command("TS.CREATE", "tail:0", "LABELS", "grp", "tail")
+        client.execute_command("TS.CREATE", "tail:1", "LABELS", "grp", "tail")
+        client.delete("src")
+        client.restore("restored", 0, dump)
+        assert client.execute_command("TS.QUERYINDEX", "grp=src") == [b"restored"]
+
+        client = self._restart_with_aof()
+        wait_for_sweep_decision(self.server)
+        assert client.execute_command("EXISTS", "restored") == 1
+        assert client.execute_command("TS.QUERYINDEX", "grp=src") == [b"restored"]
+        wait_for_equal(
+            lambda: client.execute_command("TS.CARD", "FILTER", "grp=(base,src,tail)"),
+            client.dbsize(),
+        )
+
+    def test_repair_scan_is_not_skipped_by_balanced_counts(self):
+        """After the sweep, the repair scan must look for loaded keys the preloaded index
+        missed, even when runtime traffic happens to balance the counts. Here the RDB base
+        names a key differently from its aux index (the index holds `ts:4`, the keyspace
+        `tz:4`), so the sweep drops `ts:4` and `tz:4` still needs indexing, while one TS.CREATE
+        in the command tail brings the indexed count back to the loaded count."""
+        self.server.args["rdbchecksum"] = "no"
+        self.server.restart(remove_rdb=True, remove_nodes_conf=True, connect_client=True)
+        client = self.server.get_new_client()
+        client.config_set("appendonly", "yes")
+        wait_for_equal(lambda: client.info("persistence")["aof_rewrite_in_progress"], 0, timeout=30)
+        for i in range(7):
+            client.execute_command("TS.CREATE", f"ts:{i}", "LABELS", "region", f"r{i}", "service", "api")
+        self._bgrewriteaof_and_wait(client)
+        client.execute_command("TS.CREATE", "tail:0", "LABELS", "service", "api")
+
+        self.server.exit(cleanup=False, remove_nodes_conf=False)
+        base = [f for f in os.listdir(self._aof_dir()) if f.endswith(".base.rdb")]
+        assert len(base) == 1, base
+        path = os.path.join(self._aof_dir(), base[0])
+        with open(path, "rb") as f:
+            data = bytearray(f.read())
+        at = data.find(b"ts:4")
+        assert at != -1 and data.find(b"ts:4", at + 1) == -1, "key name must appear once"
+        data[at:at + 4] = b"tz:4"
+        with open(path, "wb") as f:
+            f.write(bytes(data))
+
+        self.server.args["appendonly"] = "yes"
+        self.server.start(connect_client=True)
+        assert self.server.is_alive()
+        wait_for_true(lambda: self.server.verify_string_in_logfile("DB loaded from"))
+        client = self.server.get_new_client()
+        wait_for_log(self.server, RECONCILE_LOG)
+        wait_for_equal(
+            lambda: client.execute_command("TS.QUERYINDEX", "region=r4"), [b"tz:4"]
+        )
+        assert client.execute_command("TS.CARD", "FILTER", "service=api") == 8
 
 
 class TestIndexPersistenceReplication(ReplicationTestCase):

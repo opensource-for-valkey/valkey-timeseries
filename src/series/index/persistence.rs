@@ -574,27 +574,21 @@ fn read_indexed_count(db: i32) -> u64 {
     postings.id_to_key.len() as u64
 }
 
-/// Post-sweep verification for a preloaded db. `reconcile_db` has just established that every
-/// id remaining in `id_to_key` maps to a live key with a matching series id — i.e. the index is
-/// a *subset* of the loaded keyspace. Equal cardinality therefore proves set equality, so a
-/// count match means no key was missed by the preload. On mismatch, scan the db's keyspace and
-/// index anything with `has_id == false` (the same per-key path the fast path skipped).
+/// Post-sweep repair for a preloaded db whose digest disagreed with the loaded set. `reconcile_db`
+/// has just stale-marked every id that maps to no live key, so the index holds no phantom; what
+/// it may still lack is a loaded key the preload missed. Scan the db's keyspace and index
+/// anything not indexed under its id (`ensure_series_indexed_by_key`, the per-key path the
+/// fast path skipped).
 ///
-/// Runtime traffic between load end and this check can legitimately skew the counts (a DEL
-/// removes a key and unindexes it; a TS.CREATE adds an id the loader never counted). That only
-/// makes the scan fire spuriously — `ensure_series_indexed_by_key` skips a key already indexed
-/// under its id, so the scan is always safe, just not free.
+/// The scan always runs here. Comparing counts first is not sound: commands that land after the
+/// preload (an AOF's command tail, or a client before this task runs) change the index without
+/// touching the loaded count, so a `TS.CREATE` can balance a missed key and hide it for good.
+/// Only a digest mismatch reaches this function, so a clean load still skips the scan; the cost
+/// is one keyspace scan (taking the GIL per bucket) after a load that was not clean.
 fn verify_and_repair_db(db: i32, loaded_count: u64, run: &TaskRun<'_>) {
     let indexed_count = read_indexed_count(db);
 
-    if indexed_count == loaded_count {
-        log_debug(format!(
-            "Postings index verification for db {db}: {indexed_count} indexed series match the loaded count"
-        ));
-        return;
-    }
-
-    log_warning(format!(
+    log_notice(format!(
         "Postings index verification for db {db}: {indexed_count} indexed vs {loaded_count} loaded; scanning keyspace to repair"
     ));
 
