@@ -3,11 +3,14 @@ use crate::common::acl::KeyAccess;
 use crate::common::context::{create_key_string, notify_keyspace_event};
 use crate::common::threads::{ParMutRayon, request_par_threads};
 use crate::config::num_threads;
+use crate::error::TsdbResult;
 use crate::labels::filters::SeriesSelector;
 use crate::series::index::{PostingsBitmap, get_timeseries_index, with_timeseries_postings};
 use crate::series::{
-    SeriesGuardMut, SeriesRef, TimestampRange, resync_rules_after_removal, try_get_timeseries_mut,
+    SeriesGuardMut, SeriesRef, TimeSeries, TimestampRange, batch_feeds_itself,
+    resync_rules_after_removal, try_get_timeseries_mut,
 };
+use ahash::AHashSet;
 use blart::AsBytes;
 use croaring::bitmap64::Bitmap64Iterator;
 use orx_parallel::Par;
@@ -118,9 +121,39 @@ fn delete_range_batch(
     start_ts: Timestamp,
     end_ts: Timestamp,
 ) -> ValkeyResult<usize> {
-    let mut total_deleted = 0;
     let start_arg = ctx.create_string(start_ts.to_string());
     let end_arg = ctx.create_string(end_ts.to_string());
+    let range = RemovedRange {
+        start: start_ts,
+        end: end_ts,
+        start_arg: &start_arg,
+        end_arg: &end_arg,
+    };
+
+    // A batch holding a rule's source and, further down, its destination is applied one series
+    // at a time, in id order: remove, resync the rules, replicate. That is the order a replica
+    // replays the `TS.DEL`s in, and the source's resync rewrites destination buckets the
+    // destination's own removal must then see. Removing every range first and resyncing
+    // afterwards kept a bucket the replica deleted, and the source's cascade opened the
+    // destination while the batch still held its guard.
+    let members: AHashSet<&[u8]> = keys.iter().map(|key| key.as_slice()).collect();
+    if batch_feeds_itself(ctx, series.iter().map(|guard| guard.deref()), |key| {
+        members.contains(key)
+    }) {
+        drop(series);
+        let mut total_deleted = 0;
+        for key in keys {
+            let Ok(Some(mut guard)) = try_get_timeseries_mut(ctx, key, None) else {
+                continue;
+            };
+            let removed = guard.remove_range(start_ts, end_ts);
+            total_deleted += finish_removal(ctx, key, &mut guard, removed, &range);
+        }
+        return Ok(total_deleted);
+    }
+
+    // Otherwise each series' resync writes only series outside the batch, so the removals can
+    // run in parallel ahead of it.
     let mut series = series;
     let threads = request_par_threads(series.len(), series.iter().map(|g| g.total_samples).sum());
     let res = series
@@ -129,30 +162,49 @@ fn delete_range_batch(
         .map(|guard| guard.remove_range(start_ts, end_ts))
         .collect::<Vec<_>>();
 
-    // Run compaction after deletions
-    for (i, (deleted, ts)) in res.iter().zip(series.iter_mut()).enumerate() {
-        if let Err(err) = deleted {
+    let mut total_deleted = 0;
+    for ((removed, ts), key) in res.into_iter().zip(series.iter_mut()).zip(keys) {
+        total_deleted += finish_removal(ctx, key, ts, removed, &range);
+    }
+    Ok(total_deleted)
+}
+
+/// The range a `TS.MDEL` removes, with its replicated arguments.
+struct RemovedRange<'a> {
+    start: Timestamp,
+    end: Timestamp,
+    start_arg: &'a ValkeyString,
+    end_arg: &'a ValkeyString,
+}
+
+/// What follows one series' removal: the event, the rule resync and the replicated `TS.DEL`.
+/// Returns the number of samples removed.
+fn finish_removal(
+    ctx: &Context,
+    key: &ValkeyString,
+    series: &mut TimeSeries,
+    removed: TsdbResult<usize>,
+    range: &RemovedRange,
+) -> usize {
+    match removed {
+        Err(err) => {
             ctx.log_warning(&format!(
                 "Got error removing range from series {}: {err:?}",
-                keys[i].to_string_lossy()
+                key.to_string_lossy()
             ));
+            0
         }
-        if let Ok(deleted) = deleted {
-            if *deleted == 0 {
-                continue;
-            }
-
-            total_deleted += *deleted;
-            notify_keyspace_event(ctx, c"ts.del", &keys[i]);
+        Ok(0) => 0,
+        Ok(deleted) => {
+            notify_keyspace_event(ctx, c"ts.del", key);
             // The removal is committed: a rule failure is logged and the batch carries on, so
             // this series and every later one is still replicated.
-            resync_rules_after_removal(ctx, &keys[i], ts, start_ts, end_ts);
+            resync_rules_after_removal(ctx, key, series, range.start, range.end);
             // Propagate the resolved effect; see `delete_series_by_selectors`.
-            ctx.replicate("TS.DEL", &[&keys[i], &start_arg, &end_arg]);
+            ctx.replicate("TS.DEL", &[key, range.start_arg, range.end_arg]);
+            deleted
         }
     }
-
-    Ok(total_deleted)
 }
 
 fn fetch_series_batch<'a>(

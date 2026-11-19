@@ -207,6 +207,29 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         assert info_dict["retentionTime"] == retention_ms
         assert info_dict["totalSamples"] == 10
 
+    def test_mdel_over_a_source_and_its_destination_matches_the_replica(self):
+        """TS.MDEL replicates one `TS.DEL key start end` per series, in id order, and each one's
+        rule resync recomputes the source's edge buckets in the destination. The primary must
+        apply the same sequence: deleting every range first and resyncing afterwards rewrote
+        `dst@100` from the source and kept it, while the replica's later `TS.DEL dst` removed it."""
+        client = self.client
+        client.execute_command("TS.CREATE", "mdel:src", "LABELS", "host", "a")
+        client.execute_command("TS.CREATE", "mdel:dst", "LABELS", "host", "a")
+        client.execute_command("TS.CREATERULE", "mdel:src", "mdel:dst", "AGGREGATION", "sum", 10)
+        args = [arg for t in range(0, 201) for arg in ("mdel:src", t, 1)]
+        client.execute_command("TS.MADD", *args)
+        client.execute_command("TS.MDEL", 15, 100, "FILTER", "host=a")
+        self.wait_for_replication()
+
+        replica = self.replicas[0].client
+        for key in ("mdel:src", "mdel:dst"):
+            assert client.execute_command("TS.RANGE", key, "-", "+") == \
+                replica.execute_command("TS.RANGE", key, "-", "+"), key
+        # Applied as the replica replays it: `TS.DEL src 15 100` writes the edge buckets (10 and
+        # 100) from what is left of the source, then `TS.DEL dst 15 100` removes 20..100.
+        assert client.execute_command("TS.RANGE", "mdel:dst", 0, 130) == [
+            [0, b"10"], [10, b"5"], [110, b"10"], [120, b"10"], [130, b"10"]]
+
     def test_madd_over_a_rule_chain_is_applied_in_argument_order(self):
         """A TS.MADD that writes a rule's source and, further down the chain, its destination
         applies the items in argument order, each with its compaction. That gives the same
