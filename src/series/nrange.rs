@@ -6,6 +6,7 @@ use crate::series::TimeSeries;
 use crate::series::request_types::{NRangeOptions, RangeOptions};
 use crate::series::utils::get_timeseries;
 use smallvec::smallvec;
+use std::collections::VecDeque;
 use valkey_module::{AclPermissions, Context, ValkeyResult};
 
 /// One input key of a TS.NRANGE query: the series it names, plus its still-open compaction
@@ -119,30 +120,41 @@ fn create_key_iterator<'a>(
 
 /// Apply direction and COUNT to the joined rows.
 ///
-/// COUNT limits rows in the *requested* order, so a reverse query must reverse before
-/// truncating — taking from the (ascending) merge first would keep the oldest N and merely
-/// reverse those, returning the wrong window rather than just the wrong order. This is the
-/// same rule `collect_samples` applies to TS.MRANGE, including its one asymmetry: ascending
-/// output matches the merge order, so COUNT can stop the merge early instead of materializing
-/// every row.
+/// COUNT limits rows in the *requested* order, so a reverse query keeps the *newest* N rows —
+/// taking from the (ascending) merge first would keep the oldest N and merely reverse those,
+/// returning the wrong window rather than just the wrong order. This is the same rule
+/// `collect_samples` applies to TS.MRANGE. Ascending output matches the merge order, so COUNT
+/// stops the merge early. In reverse the merge still runs to the end, but only the last N rows
+/// are kept while it does, so memory is bounded by COUNT rather than by the range.
 fn collect_pivot_rows<I: Iterator<Item = MultiSample>>(
     iter: I,
     is_reverse: bool,
     count: Option<usize>,
 ) -> Vec<MultiSample> {
-    if !is_reverse {
-        return match count {
-            Some(count) => iter.take(count).collect(),
-            None => iter.collect(),
-        };
+    match (is_reverse, count) {
+        (false, Some(count)) => iter.take(count).collect(),
+        (false, None) => iter.collect(),
+        (true, None) => {
+            let mut rows: Vec<MultiSample> = iter.collect();
+            rows.reverse();
+            rows
+        }
+        (true, Some(count)) => {
+            if count == 0 {
+                return Vec::new();
+            }
+            // Capacity grows with the rows actually seen: COUNT alone can be far larger
+            // than the range.
+            let mut newest: VecDeque<MultiSample> = VecDeque::new();
+            for row in iter {
+                if newest.len() == count {
+                    newest.pop_front();
+                }
+                newest.push_back(row);
+            }
+            newest.into_iter().rev().collect()
+        }
     }
-
-    let mut rows: Vec<MultiSample> = iter.collect();
-    rows.reverse();
-    if let Some(count) = count {
-        rows.truncate(count);
-    }
-    rows
 }
 
 #[cfg(test)]
@@ -257,6 +269,39 @@ mod tests {
         assert_eq!(
             rows.iter().map(|r| r.timestamp).collect::<Vec<_>>(),
             vec![1000, 2000]
+        );
+    }
+
+    /// Reverse COUNT keeps the newest rows in a buffer of at most COUNT: every COUNT against
+    /// a longer, an equal and a shorter run, and COUNT 0.
+    #[test]
+    fn test_reverse_count_keeps_the_newest_rows() {
+        let rows = |n: i64| {
+            (0..n).map(|ts| MultiSample {
+                timestamp: ts,
+                values: smallvec![ts as f64],
+            })
+        };
+        let timestamps =
+            |rows: Vec<MultiSample>| rows.into_iter().map(|r| r.timestamp).collect::<Vec<_>>();
+
+        assert_eq!(
+            timestamps(collect_pivot_rows(rows(10), true, Some(3))),
+            vec![9, 8, 7]
+        );
+        assert_eq!(
+            timestamps(collect_pivot_rows(rows(3), true, Some(3))),
+            vec![2, 1, 0]
+        );
+        assert_eq!(
+            timestamps(collect_pivot_rows(rows(2), true, Some(usize::MAX))),
+            vec![1, 0]
+        );
+        assert!(collect_pivot_rows(rows(5), true, Some(0)).is_empty());
+        assert!(collect_pivot_rows(rows(0), true, Some(3)).is_empty());
+        assert_eq!(
+            timestamps(collect_pivot_rows(rows(4), true, None)),
+            vec![3, 2, 1, 0]
         );
     }
 
