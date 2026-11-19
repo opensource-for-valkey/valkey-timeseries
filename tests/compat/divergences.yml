@@ -1533,3 +1533,58 @@
     TestRestoreHostilePayloads::test_label_with_nul and
     TestTimeseriesAofRewrite::test_aof_replay_keeps_a_legacy_nul_label_out_of_the_index.
   since: 0.1.0
+
+# DIV-0069 and DIV-0070 were registered with the compaction-rollup fixes. Reference behavior was
+# observed black-box against the pinned redis:8.10 image (2026-11-19).
+#
+# ⚠️ `behavior`-kind: owner sign-off 2026-11-19 — keep our behavior and register both rather
+# than reproduce them.
+
+- id: DIV-0069
+  command: TS.CREATERULE
+  kind: behavior
+  documentation_only: true
+  description: >
+    A rule created on a source that already holds samples starts with no open bucket. On RTS 8.10,
+    a bucket of samples written before the rule that a later back-fill or TS.DEL makes the newest
+    one is never published: the next append that opens a newer bucket either folds its samples
+    into that bucket, labelled with the newer bucket's timestamp, or drops them. We publish it
+    when the append closes it, so the destination holds every bucket older than the one holding
+    the source's last sample. Reproducers: src 0:1, 5500:1; `TS.CREATERULE src dst AGGREGATION
+    sum 1000`; `TS.ADD src 5200 2`, `TS.ADD src 6100 4` — RTS reports no closed bucket and
+    `LATEST` [[6000, 7]], we report [[5000, 3]] and `LATEST` adds [6000, 4]. src 0:1, 5000:1;
+    rule; `TS.ADD src 100 2`, `TS.ADD src 4500 3`, `TS.DEL src 5000 5000`, `TS.ADD src 6000 1` —
+    RTS [[0, 3]], we [[0, 3], [4000, 3]]. A back-fill into a bucket older than the source's newest
+    one is published at once on both engines.
+  rationale: >
+    Accepted (owner sign-off 2026-11-19). RTS's result mislabels or loses a closed bucket whose
+    samples it still stores: its destination then disagrees with its own `TS.RANGE src ...
+    AGGREGATION`. Reproducing it would mean a third rule state (samples aggregated with no
+    bucket assigned) and exceptions in the open-bucket resync, to arrive at a wrong rollup —
+    the same policy as DIV-0023 and DIV-0060. Pinned by the strict xfails
+    TestRuleLifecycle::test_backfill_as_first_write_after_createrule,
+    TestRuleLifecycle::test_backfill_behind_the_open_bucket_then_tail_delete and
+    TestRuleLifecycle::test_tail_delete_reopening_a_back_filled_bucket.
+  since: 0.1.0
+
+- id: DIV-0070
+  command: TS.ADD
+  kind: behavior
+  documentation_only: true
+  description: >
+    When a write closes a compaction bucket that the destination's IGNORE thresholds drop, RTS
+    8.10 replies with the destination's last timestamp instead of the written sample's: `TS.ADD`,
+    `TS.INCRBY`/`TS.DECRBY`, and the TS.MADD item. We reply with the written sample's timestamp,
+    as for any accepted write. Stored data agrees on both engines. Reproducer: `TS.CREATE dst
+    DUPLICATE_POLICY LAST IGNORE 1000 10`, rule `sum 1000` from src, `TS.ADD src 0 5`,
+    `TS.ADD src 1000 7`, then `TS.ADD src 2000 1` replies 0 on RTS (bucket 1000 is ignored) and
+    2000 here. In a TS.MADD, a later item of the same call was also seen replying a bucket
+    timestamp (`TS.MADD src 2000 1 src 3000 1` replies [0, 2000] on RTS).
+  rationale: >
+    Accepted (owner sign-off 2026-11-19). The reply is the timestamp of the sample the client
+    wrote, which was stored; the destination's filter decides only what the rollup keeps.
+    Reproducing RTS would report a timestamp the client never wrote and hide whether the write
+    landed. Pinned by
+    TestOutOfOrderWrites::test_reply_when_the_destination_ignores_the_closing_bucket.
+  since: 0.1.0
+

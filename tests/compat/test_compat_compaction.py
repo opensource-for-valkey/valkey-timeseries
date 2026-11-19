@@ -35,13 +35,9 @@ from compat_helpers import AGGREGATORS, mk_series
 BUCKET = 1000
 
 _FOLDS_UNPUBLISHED = (
-    "reference folds the unpublished bucket into the next one; "
-    "see compaction-replication-plan.md §3.9"
-)
-_OPENS_INSTEAD_OF_PUBLISHING = (
-    "reference publishes an older back-filled bucket at once, ours keeps it open until the next "
-    "forward close (and a TS.DEL of the source's tail before then discards it); undecided, "
-    "see compaction-replication-plan.md §3.9"
+    "DIV-0069: on a rule with no open bucket, the reference never publishes the bucket of "
+    "pre-rule samples a back-fill or TS.DEL makes the newest; it folds it into the next one or "
+    "drops it"
 )
 
 
@@ -149,6 +145,81 @@ class TestOutOfOrderWrites:
         diff("TS.RANGE", "c:ooo:dst", "-", "+")
         diff("TS.ADD", "c:ooo:src", 500, 99.0)   # late arrival into [0,1000)
         _probe(diff, "c:ooo:src", "c:ooo:dst")
+
+    def test_recalculated_bucket_ignores_the_destinations_ignore(self, diff):
+        """A back-fill that changes the destination's newest bucket rewrites it, whatever the
+        destination's IGNORE thresholds: they filter writes, and a recalculation corrects one
+        already made. Recomputing bucket 2000 from 100 to 103 sits within `IGNORE 1 10` of it."""
+        diff("TS.CREATE", "c:ign:src")
+        diff("TS.CREATE", "c:ign:dst", "DUPLICATE_POLICY", "LAST", "IGNORE", 1, 10)
+        diff("TS.CREATERULE", "c:ign:src", "c:ign:dst", "AGGREGATION", "sum", 1000)
+        for ts, value in ((0, 5), (1000, 7), (2000, 100), (3000, 1), (2500, 3)):
+            # Replies differ when the destination ignores a bucket: RTS answers the source's
+            # TS.ADD with the destination's last timestamp. Only the stored result is compared.
+            diff.both("TS.ADD", "c:ign:src", ts, value)
+        diff("TS.RANGE", "c:ign:dst", "-", "+")
+
+    def test_bucket_recomputed_after_a_delete_ignores_the_destinations_ignore(self, diff):
+        """A TS.DEL inside a published bucket recomputes it, and the rewrite is not a new write
+        either: bucket 1000 goes from 25 back to 20, within `IGNORE 1000 1` of bucket 0 (20), and
+        must not vanish from the destination."""
+        diff("TS.CREATE", "c:igd:src")
+        diff("TS.CREATE", "c:igd:dst", "DUPLICATE_POLICY", "LAST", "IGNORE", 1000, 1)
+        diff("TS.CREATERULE", "c:igd:src", "c:igd:dst", "AGGREGATION", "sum", 1000)
+        for ts, value in ((0, 20), (1000, 20), (1500, 5), (2000, 1)):
+            diff.both("TS.ADD", "c:igd:src", ts, value)
+        diff("TS.RANGE", "c:igd:dst", "-", "+")
+        diff("TS.DEL", "c:igd:src", 1500, 1500)
+        diff("TS.RANGE", "c:igd:dst", "-", "+")
+
+    def test_reply_when_the_destination_ignores_the_closing_bucket(self, diff):
+        """DIV-0070: a write that closes a bucket the destination's IGNORE drops replies with
+        its own timestamp here, and with the destination's last timestamp on the reference.
+        The stored data agrees."""
+        diff("TS.CREATE", "c:igr:src")
+        diff("TS.CREATE", "c:igr:dst", "DUPLICATE_POLICY", "LAST", "IGNORE", 1000, 10)
+        diff("TS.CREATERULE", "c:igr:src", "c:igr:dst", "AGGREGATION", "sum", 1000)
+        diff("TS.ADD", "c:igr:src", 0, 5)
+        diff("TS.ADD", "c:igr:src", 1000, 7)
+        assert diff.reference.execute_command("TS.ADD", "c:igr:src", 2000, 1) == 0
+        assert diff.subject.execute_command("TS.ADD", "c:igr:src", 2000, 1) == 2000
+        diff("TS.RANGE", "c:igr:src", "-", "+")
+        diff("TS.RANGE", "c:igr:dst", "-", "+")
+
+    def test_closing_bucket_honours_the_destinations_ignore(self, diff):
+        """A bucket that closes is a new write to the destination, so the destination's IGNORE
+        applies to it as to any other: bucket 1000 (7) lands within `IGNORE 1000 10` of bucket
+        0 (5) and is dropped, on both engines."""
+        diff("TS.CREATE", "c:ignc:src")
+        diff("TS.CREATE", "c:ignc:dst", "DUPLICATE_POLICY", "LAST", "IGNORE", 1000, 10)
+        diff("TS.CREATERULE", "c:ignc:src", "c:ignc:dst", "AGGREGATION", "sum", 1000)
+        for ts, value in ((0, 5), (1000, 7), (2000, 1), (3000, 1)):
+            # Replies differ when the destination ignores a bucket: RTS answers the source's
+            # TS.ADD with the destination's last timestamp. Only the stored result is compared.
+            diff.both("TS.ADD", "c:ignc:src", ts, value)
+        diff("TS.RANGE", "c:ignc:dst", "-", "+")
+
+    @pytest.mark.parametrize("value", [0, 2, 100])
+    @pytest.mark.parametrize("write", ["TS.ADD", "TS.MADD"])
+    def test_backfill_republishes_a_bucket_the_destinations_ignore_dropped(
+        self, diff, write, value
+    ):
+        """Bucket 1000 (7) closes within `IGNORE 1000 10` of bucket 0 (5) and is dropped. A
+        back-fill into it recalculates it, and the recalculation is written whatever the
+        thresholds, even when it leaves the aggregate unchanged (`value` 0) or within them (2):
+        the reference publishes the bucket in all three cases."""
+        diff("TS.CREATE", "c:igb:src")
+        diff("TS.CREATE", "c:igb:dst", "DUPLICATE_POLICY", "LAST", "IGNORE", 1000, 10)
+        diff("TS.CREATERULE", "c:igb:src", "c:igb:dst", "AGGREGATION", "sum", 1000)
+        for ts, v in ((0, 5), (1000, 7), (2000, 1), (3000, 1)):
+            # Replies differ when the destination ignores a bucket (DIV-0070).
+            diff.both("TS.ADD", "c:igb:src", ts, v)
+        diff("TS.RANGE", "c:igb:dst", "-", "+")
+        if write == "TS.ADD":
+            diff("TS.ADD", "c:igb:src", 1500, value)
+        else:
+            diff("TS.MADD", "c:igb:src", 1500, value, "c:igb:src", 1600, 0)
+        diff("TS.RANGE", "c:igb:dst", "-", "+")
 
     def test_write_into_bucket_two_back(self, diff):
         _rule(diff, "c:ooo2:src", "c:ooo2:dst")
@@ -316,11 +387,10 @@ class TestRuleLifecycle:
         diff("TS.RANGE", "c:cbo:dst", "-", "+")
 
     @pytest.mark.parametrize("write", ["TS.ADD", "TS.MADD"])
-    @pytest.mark.xfail(strict=True, reason=_OPENS_INSTEAD_OF_PUBLISHING)
     def test_backfill_behind_the_open_bucket_is_published_at_once(self, diff, write):
-        """The §3.9 residual of the test above: right after the back-fill, a non-`LATEST` read of
-        the destination. The reference has already published bucket 0; ours holds it as the
-        rule's open bucket, so the destination is still empty."""
+        """Right after the back-fill, a non-`LATEST` read of the destination: with no open
+        bucket, a back-fill into a bucket older than the one holding the source's last sample is
+        a closed bucket, published at once (it used to be held as the rule's open bucket)."""
         diff("TS.CREATE", "c:cbp:src")
         for ts, value in ((0, 1.0), (1200, 2.0), (1500, 4.0)):
             diff("TS.ADD", "c:cbp:src", ts, value)
@@ -330,11 +400,14 @@ class TestRuleLifecycle:
         diff("TS.RANGE", "c:cbp:dst", "-", "+")
 
     @pytest.mark.parametrize("write", ["TS.ADD", "TS.MADD"])
-    @pytest.mark.xfail(strict=True, reason=_OPENS_INSTEAD_OF_PUBLISHING)
+    @pytest.mark.xfail(strict=True, reason=_FOLDS_UNPUBLISHED)
     def test_backfill_behind_the_open_bucket_then_tail_delete(self, diff, write):
         """The same back-fill, then a `TS.DEL` of the source's last sample before any forward
-        close. Ours resyncs the open bucket to the one now holding the source's last sample
-        (1000), discarding the back-filled bucket 0 it never published; the reference keeps it."""
+        close. Bucket 0 is already published on both engines, so the delete cannot discard it
+        (ours used to, while bucket 0 was held open). What still differs is bucket 1000, which
+        the delete re-opens over samples written before the rule: the forward close publishes it
+        here, while the reference never does and folds its `1200` sample into bucket 2000
+        (`LATEST` reads 18 there), as in `test_backfill_as_first_write_after_createrule`."""
         diff("TS.CREATE", "c:cbd:src")
         for ts, value in ((0, 1.0), (1200, 2.0), (1500, 4.0)):
             diff("TS.ADD", "c:cbd:src", ts, value)
@@ -344,6 +417,23 @@ class TestRuleLifecycle:
         diff("TS.DEL", "c:cbd:src", 1500, 1500)
         diff("TS.ADD", "c:cbd:src", 2000, 16.0)   # closes bucket 1000
         diff("TS.RANGE", "c:cbd:dst", "-", "+")
+
+    @pytest.mark.xfail(strict=True, reason=_FOLDS_UNPUBLISHED)
+    def test_tail_delete_reopening_a_back_filled_bucket(self, diff):
+        """DIV-0069, the dropping half: back-fills publish buckets 0 and 4000 at once, a TS.DEL of
+        the source's last sample makes 4000 the newest bucket again (so it is retracted and
+        re-opened), and the next append closes it. We publish it again; the reference drops it."""
+        diff("TS.CREATE", "c:ctd:src")
+        for ts in (0, 5000):
+            diff("TS.ADD", "c:ctd:src", ts, 1)
+        diff("TS.CREATE", "c:ctd:dst")
+        diff("TS.CREATERULE", "c:ctd:src", "c:ctd:dst", "AGGREGATION", "sum", 1000)
+        diff("TS.ADD", "c:ctd:src", 100, 2)
+        diff("TS.ADD", "c:ctd:src", 4500, 3)
+        diff("TS.RANGE", "c:ctd:dst", "-", "+")
+        diff("TS.DEL", "c:ctd:src", 5000, 5000)
+        diff("TS.ADD", "c:ctd:src", 6000, 1)
+        diff("TS.RANGE", "c:ctd:dst", "-", "+")
 
     def test_deleterule_stops_compaction_and_keeps_data(self, diff):
         _rule(diff, "c:drule:src", "c:drule:dst")

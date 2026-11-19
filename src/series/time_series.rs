@@ -290,6 +290,32 @@ impl TimeSeries {
         }
     }
 
+    /// [`Self::add`] without the destination's `IGNORE` filter, for compaction rewriting a bucket
+    /// it has already published (a back-fill, or a `TS.DEL` inside the bucket). IGNORE filters
+    /// new writes, a closing bucket included; a recalculation corrects one already made, so
+    /// RedisTimeSeries applies it whatever the thresholds. Filtered, the recomputed value was
+    /// dropped when it landed within the thresholds of the bucket it replaced or of the one
+    /// before, leaving the stale value or no bucket at all.
+    pub(crate) fn add_unfiltered(
+        &mut self,
+        ts: Timestamp,
+        value: f64,
+        dp_override: Option<DuplicatePolicy>,
+    ) -> SampleAddResult {
+        let sample = self.make_sample(ts, value);
+        if self.is_older_than_retention(ts) {
+            return SampleAddResult::TooOld;
+        }
+        let result = match self.last_sample {
+            Some(last) if ts <= last.timestamp => self.upsert_sample(sample, dp_override),
+            _ => self.add_sample_internal(sample),
+        };
+        if result.is_ok() {
+            self.apply_retention();
+        }
+        result
+    }
+
     /// Apply the retention window now.
     ///
     /// Retention is applied eagerly, matching RedisTimeSeries: a new max sample

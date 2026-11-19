@@ -800,3 +800,51 @@ class TestTSCreateRule(ValkeyTimeSeriesTestCaseBase):
         # Verify hour compaction created data. The bucket is not closed yet, so we should see the latest data
         latest = self.client.execute_command("TS.GET", hour_key, "LATEST")
         assert latest is not None, "Latest hour compaction data should exist"
+
+    def test_backfill_that_retracts_a_bucket_retracts_it_downstream(self):
+        """A back-fill can leave a bucket with no counted sample, so it is removed from the
+        destination. The destination's own rules must see that removal: `dst` aggregates `mid`,
+        and `mid@0` disappearing must take `dst@0` with it. Here the back-filled NaN is the only
+        sample of bucket 0 inside the retention window (floor 5), and NaN is not counted."""
+        c = self.client
+        c.execute_command("TS.CREATE", "rtr:src", "RETENTION", 15)
+        c.execute_command("TS.CREATE", "rtr:mid")
+        c.execute_command("TS.CREATE", "rtr:dst")
+        c.execute_command("TS.CREATERULE", "rtr:src", "rtr:mid", "AGGREGATION", "sum", 10)
+        c.execute_command("TS.CREATERULE", "rtr:mid", "rtr:dst", "AGGREGATION", "sum", 10)
+        for ts, value in ((0, 5), (10, 7), (20, 8)):
+            c.execute_command("TS.ADD", "rtr:src", ts, value)
+        assert c.execute_command("TS.RANGE", "rtr:mid", "-", "+") == [[0, b"5"], [10, b"7"]]
+        assert c.execute_command("TS.RANGE", "rtr:dst", "-", "+") == [[0, b"5"]]
+
+        c.execute_command("TS.ADD", "rtr:src", 5, "nan")
+        assert c.execute_command("TS.RANGE", "rtr:mid", "-", "+") == [[10, b"7"]]
+        assert c.execute_command("TS.RANGE", "rtr:dst", "-", "+") == []
+        assert c.execute_command("TS.RANGE", "rtr:dst", "-", "+", "LATEST") == [[10, b"7"]]
+
+    def test_retractions_at_two_levels_resync_parent_before_child(self):
+        """One back-fill batch retracts a bucket at two levels: `a@0` (its only counted sample,
+        `s@0`, is below the retention floor of 3, and NaN is not counted) and, through the NaN
+        `a@150` the batch writes, `b@100`. Both levels' resyncs must reach the bottom: `b` must
+        lose `b@0` as well, and `cc@0` must go with both. When `b` was resynced before `a`, it was
+        then left out of `a`'s resync as already visited, and kept `b@0` with `cc@0` built on it."""
+        c = self.client
+        c.execute_command("TS.CREATE", "rt2:s", "RETENTION", 1197)
+        for key in ("rt2:a", "rt2:b", "rt2:cc"):
+            c.execute_command("TS.CREATE", key)
+        c.execute_command("TS.CREATERULE", "rt2:s", "rt2:a", "AGGREGATION", "sum", 10)
+        c.execute_command("TS.CREATERULE", "rt2:a", "rt2:b", "AGGREGATION", "sum", 100)
+        c.execute_command("TS.CREATERULE", "rt2:b", "rt2:cc", "AGGREGATION", "sum", 1000)
+        for ts, value in ((0, "1"), (150, "inf"), (1050, "1"), (1110, "1"), (1200, "1")):
+            c.execute_command("TS.ADD", "rt2:s", ts, value)
+        assert c.execute_command("TS.RANGE", "rt2:b", "-", "+") == [
+            [0, b"1"], [100, b"inf"], [1000, b"1"]
+        ]
+        assert c.execute_command("TS.RANGE", "rt2:cc", "-", "+") == [[0, b"inf"]]
+
+        c.execute_command("TS.MADD", "rt2:s", 5, "nan", "rt2:s", 155, "-inf")
+        assert c.execute_command("TS.RANGE", "rt2:a", "-", "+") == [
+            [150, b"nan"], [1050, b"1"], [1110, b"1"]
+        ]
+        assert c.execute_command("TS.RANGE", "rt2:b", "-", "+") == [[1000, b"1"]]
+        assert c.execute_command("TS.RANGE", "rt2:cc", "-", "+") == []
