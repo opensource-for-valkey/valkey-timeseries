@@ -125,20 +125,24 @@ fn handle_update(
     // A batch that writes a rule's source and, further down, its destination is applied item by
     // item (see `handle_update_sequentially`). Every other batch merges per series, which is
     // equivalent there: each compaction cascade then writes only series outside the batch.
-    // Only series the batch writes count: one whose every item was rejected is left out of the
-    // replicated TS.MADD, so counting it would send the replica down the other path.
-    let written = |s: &SeriesSamples| s.samples.iter().any(|&i| all_inputs[i].res.is_ok());
+    //
+    // A series whose every item was rejected is not written and is left out of the replicated
+    // TS.MADD, so it is outside the batch here too: counting it would send the replica down the
+    // other path. Its guard is released first, because the rule walk and the cascades may open
+    // it, and the batch must hold a guard only on series it treats as members.
+    for samples in input_map.values_mut() {
+        if !samples.samples.iter().any(|&i| all_inputs[i].res.is_ok()) {
+            samples.series = None;
+        }
+    }
     let members: AHashSet<&[u8]> = input_map
         .iter()
-        .filter(|(_, s)| written(s))
+        .filter(|(_, s)| s.series.is_some())
         .map(|(k, _)| k.as_slice())
         .collect();
     if batch_feeds_itself(
         ctx,
-        input_map
-            .values()
-            .filter(|s| written(s))
-            .filter_map(|s| s.series.as_deref()),
+        input_map.values().filter_map(|s| s.series.as_deref()),
         |key| members.contains(key),
     ) {
         handle_update_sequentially(ctx, input_map, all_inputs, &mut results);
