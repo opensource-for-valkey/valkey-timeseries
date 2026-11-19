@@ -731,11 +731,15 @@ class TestTimeSeriesMRangeDeferred(ValkeyTimeSeriesTestCaseDebugMode):
                     if entry.get('cmd', '').lower() == 'ts.mrange'}
             return ids <= sent
 
+        # Readers whose connection was killed before their reply arrived: their read was still
+        # queued, running or unwritten when the kill landed.
+        cut_off = []
+
         def run(reader):
             try:
                 reader.execute_command(*query)
             except Exception:  # noqa: BLE001 - killed mid-read, as intended
-                pass
+                cut_off.append(reader)
 
         threads = [threading.Thread(target=run, args=(r,), daemon=True) for r in readers]
         for thread in threads:
@@ -752,3 +756,8 @@ class TestTimeSeriesMRangeDeferred(ValkeyTimeSeriesTestCaseDebugMode):
         result = self.client.execute_command(*query)
         assert len(result) == self.SERIES
         assert all(len(series[2]) == self.SAMPLES for series in result)
+        if not cut_off:
+            # Every read was answered before its kill landed, so the checks above did not cover
+            # a kill mid-read. Report that rather than pass; waiting for a read to be in flight
+            # is the race this test used to lose.
+            pytest.skip('every read was answered before the kill landed')
