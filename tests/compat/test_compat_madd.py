@@ -217,6 +217,30 @@ class TestCompactionInteraction:
         diff("TS.MADD", "e:comp3:src", 350, 8.0, "e:comp3:src", 150, 2.0)
         diff("TS.RANGE", "e:comp3:dst", "-", "+")
 
+    @pytest.mark.parametrize("items", [
+        # (key, ts, value) triples in argument order; "s" is the source, "d" the destination.
+        (("s", 10, 7), ("d", 0, 100)),
+        (("d", 0, 100), ("s", 10, 7)),
+        (("s", 10, 7), ("d", 0, 100), ("s", 20, 1)),
+        (("d", 0, 100), ("s", 20, 1), ("s", 10, 7)),
+        (("d", 10, 100), ("s", 13, 2), ("s", 20, 1)),
+        (("s", 5, 3), ("d", 0, 100)),
+        (("d", 0, 100), ("s", 5, 3), ("s", 10, 1)),
+    ])
+    def test_source_and_destination_in_one_call(self, diff, items):
+        """A call that writes a rule's source and its destination applies the items in argument
+        order, each with its compaction: a direct destination write after the source item that
+        closed the same bucket replaces the rolled-up value, and one before it is replaced."""
+        keys = {"s": "e:sd:src", "d": "e:sd:dst"}
+        for key in keys.values():
+            diff("TS.CREATE", key, "DUPLICATE_POLICY", "LAST")
+        diff("TS.CREATERULE", keys["s"], keys["d"], "AGGREGATION", "sum", 10)
+        diff("TS.ADD", keys["s"], 0, 5)
+        args = [arg for key, ts, value in items for arg in (keys[key], ts, value)]
+        diff("TS.MADD", *args)
+        diff("TS.RANGE", keys["s"], "-", "+")
+        diff("TS.RANGE", keys["d"], "-", "+")
+
 
 class TestMaddDivergences:
     """Pinned per-engine; see TestParserDivergences in test_compat_create.py."""

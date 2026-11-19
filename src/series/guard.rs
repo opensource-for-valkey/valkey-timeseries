@@ -53,8 +53,20 @@ pub struct SeriesGuardMut<'a> {
     pub(crate) series: &'a mut TimeSeries,
 }
 
-impl SeriesGuardMut<'_> {
-    pub fn from_key(ctx: &'_ Context, key: &ValkeyString) -> ValkeyResult<Self> {
+impl<'a> SeriesGuardMut<'a> {
+    /// The series stored under `key`, borrowed writably for as long as `ctx` lives. The guard
+    /// cannot outlive the context, so it cannot be kept past the command (or the GIL hold)
+    /// that opened it:
+    ///
+    /// ```compile_fail
+    /// use valkey_module::{Context, ValkeyString};
+    /// use valkey_timeseries::series::SeriesGuardMut;
+    ///
+    /// fn leak(ctx: &Context, key: &ValkeyString) -> SeriesGuardMut<'static> {
+    ///     SeriesGuardMut::from_key(ctx, key).unwrap()
+    /// }
+    /// ```
+    pub fn from_key(ctx: &'a Context, key: &ValkeyString) -> ValkeyResult<Self> {
         let value_key = ctx.open_key_writable(key)?;
         match value_key.get_value::<TimeSeries>(&VK_TIME_SERIES_TYPE) {
             Ok(Some(series)) => Ok(SeriesGuardMut { series }),

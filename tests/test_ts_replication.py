@@ -207,6 +207,96 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         assert info_dict["retentionTime"] == retention_ms
         assert info_dict["totalSamples"] == 10
 
+    def test_mdel_over_a_source_and_its_destination_matches_the_replica(self):
+        """TS.MDEL replicates one `TS.DEL key start end` per series, in id order, and each one's
+        rule resync recomputes the source's edge buckets in the destination. The primary must
+        apply the same sequence: deleting every range first and resyncing afterwards rewrote
+        `dst@100` from the source and kept it, while the replica's later `TS.DEL dst` removed it."""
+        client = self.client
+        client.execute_command("TS.CREATE", "mdel:src", "LABELS", "host", "a")
+        client.execute_command("TS.CREATE", "mdel:dst", "LABELS", "host", "a")
+        client.execute_command("TS.CREATERULE", "mdel:src", "mdel:dst", "AGGREGATION", "sum", 10)
+        args = [arg for t in range(0, 201) for arg in ("mdel:src", t, 1)]
+        client.execute_command("TS.MADD", *args)
+        client.execute_command("TS.MDEL", 15, 100, "FILTER", "host=a")
+        self.wait_for_replication()
+
+        replica = self.replicas[0].client
+        for key in ("mdel:src", "mdel:dst"):
+            assert client.execute_command("TS.RANGE", key, "-", "+") == \
+                replica.execute_command("TS.RANGE", key, "-", "+"), key
+        # Applied as the replica replays it: `TS.DEL src 15 100` writes the edge buckets (10 and
+        # 100) from what is left of the source, then `TS.DEL dst 15 100` removes 20..100.
+        assert client.execute_command("TS.RANGE", "mdel:dst", 0, 130) == [
+            [0, b"10"], [10, b"5"], [110, b"10"], [120, b"10"], [130, b"10"]]
+
+    def test_madd_over_a_rule_chain_is_applied_in_argument_order(self):
+        """A TS.MADD that writes a rule's source and, further down the chain, its destination
+        applies the items in argument order, each with its compaction. That gives the same
+        result every time, and the replica (which replays the same TS.MADD) the same result."""
+        client = self.client
+        replica = self.replicas[0].client
+        cases = [
+            (["src", 10, 7, "mid", 0, 100, "mid", 20, 1], [[0, b"100"], [20, b"1"]], [[0, b"100"]]),
+            (["mid", 0, 100, "src", 10, 7, "mid", 20, 1], [[0, b"5"], [20, b"1"]], [[0, b"5"]]),
+        ]
+        for run in range(10):
+            for case, (items, mid_expected, dst_expected) in enumerate(cases):
+                p = f"chain:{run}:{case}:"
+                client.execute_command("TS.CREATE", p + "src", "DUPLICATE_POLICY", "LAST")
+                client.execute_command("TS.CREATE", p + "mid", "DUPLICATE_POLICY", "LAST")
+                client.execute_command("TS.CREATE", p + "dst")
+                client.execute_command("TS.CREATERULE", p + "src", p + "mid", "AGGREGATION", "sum", 10)
+                client.execute_command("TS.CREATERULE", p + "mid", p + "dst", "AGGREGATION", "sum", 20)
+                client.execute_command("TS.ADD", p + "src", 0, 5)
+                client.execute_command("TS.MADD", *[p + a if isinstance(a, str) else a for a in items])
+                assert client.execute_command("TS.RANGE", p + "mid", "-", "+") == mid_expected, (run, case)
+                assert client.execute_command("TS.RANGE", p + "dst", "-", "+") == dst_expected, (run, case)
+        self.wait_for_replication()
+        for run in range(10):
+            for case in range(len(cases)):
+                for name in ("src", "mid", "dst"):
+                    key = f"chain:{run}:{case}:{name}"
+                    assert client.execute_command("TS.RANGE", key, "-", "+") == \
+                        replica.execute_command("TS.RANGE", key, "-", "+"), key
+
+    def test_madd_rejected_items_do_not_link_the_batch(self):
+        """A series whose every TS.MADD item is rejected is not written by the batch and is
+        left out of the replicated TS.MADD, so it must not make the batch self-feeding. The
+        primary must apply the accepted items exactly as the replica (and a batch sent without
+        the rejected items) does."""
+        client = self.client
+        replica = self.replicas[0].client
+        cases = [
+            # Retention on both ends, an item outside the source's window, a late in-window one.
+            (("RETENTION", 50), ("RETENTION", 30),
+             [("src", 100, 1), ("mid", 0, "bad"), ("src", 55, 2), ("src", 120, 3), ("src", 40, 4)]),
+            # Out-of-order items into buckets the batch already closed.
+            ((), (), [("src", 30, 1), ("mid", 0, "bad"), ("src", 5, 2), ("src", 12, 3)]),
+            # In-batch duplicates, which the merge applies one by one.
+            ((), ("RETENTION", 15),
+             [("src", 10, 1), ("src", 10, 2), ("mid", "bad", 1), ("src", 25, 3), ("src", 10, 4)]),
+        ]
+        for case, (src_opts, mid_opts, items) in enumerate(cases):
+            for variant in ("mixed", "valid"):
+                p = f"rejected:{case}:{variant}:"
+                client.execute_command("TS.CREATE", p + "src", "DUPLICATE_POLICY", "LAST", *src_opts)
+                client.execute_command("TS.CREATE", p + "mid", *mid_opts)
+                client.execute_command("TS.CREATE", p + "dst")
+                client.execute_command("TS.CREATERULE", p + "src", p + "mid", "AGGREGATION", "sum", 10)
+                client.execute_command("TS.CREATERULE", p + "mid", p + "dst", "AGGREGATION", "sum", 20)
+                client.execute_command("TS.ADD", p + "src", 0, 5)
+                sent = [i for i in items if variant == "mixed" or i[0] != "mid"]
+                client.execute_command("TS.MADD", *[a for k, ts, v in sent for a in (p + k, ts, v)])
+        self.wait_for_replication()
+        for case in range(len(cases)):
+            for name in ("src", "mid", "dst"):
+                key = f"rejected:{case}:mixed:{name}"
+                got = client.execute_command("TS.RANGE", key, "-", "+")
+                assert got == client.execute_command(
+                    "TS.RANGE", f"rejected:{case}:valid:{name}", "-", "+"), key
+                assert got == replica.execute_command("TS.RANGE", key, "-", "+"), key
+
     def test_replication_ts_createrule(self):
         """Test that compaction rules replicate correctly"""
         source_key = "ts:source"

@@ -209,6 +209,55 @@ fn walk_downstream(
     })
 }
 
+/// Whether one of a batch's rules (`dests`, the destination keys of every member's rules)
+/// leads to a member of the batch, directly or through series outside it.
+///
+/// A batch command (`TS.MADD`, `TS.MDEL`) holds a writable guard on every member while it works.
+/// If a member is downstream of another, the cascade from the upstream one would open it a second
+/// time, and the per-series phases would apply the two in an order the command does not define.
+/// Such a batch takes the sequential path instead.
+///
+/// Members are tested before they are opened and are never opened: their rules come from the
+/// guards already held, and opening one would alias its guard. Only series outside the batch
+/// are looked up. A failed lookup counts as reaching a member, since the sequential path is
+/// correct for any batch. Iterative, like [`walk_downstream`].
+fn rules_reach_a_member<'k>(
+    dests: impl IntoIterator<Item = &'k [u8]>,
+    is_member: impl Fn(&[u8]) -> bool,
+    node: impl Fn(&[u8]) -> ValkeyResult<Option<RuleNode>>,
+) -> bool {
+    let mut stack: Vec<Vec<u8>> = dests.into_iter().map(<[u8]>::to_vec).collect();
+    let mut visited: HashSet<Vec<u8>> = HashSet::new();
+    while let Some(key) = stack.pop() {
+        if is_member(&key) {
+            return true;
+        }
+        if !visited.insert(key.clone()) {
+            continue;
+        }
+        match node(&key) {
+            Ok(Some(series)) => stack.extend(series.dests),
+            Ok(None) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// [`rules_reach_a_member`] for a batch whose members are `batch` (their rules read from the
+/// guards the caller holds) and whose keys `is_member` recognizes.
+pub(crate) fn batch_feeds_itself<'a>(
+    ctx: &Context,
+    batch: impl IntoIterator<Item = &'a TimeSeries>,
+    is_member: impl Fn(&[u8]) -> bool,
+) -> bool {
+    let dests: Vec<&[u8]> = batch
+        .into_iter()
+        .flat_map(|series| series.rules.iter().map(|rule| rule.dest.key()))
+        .collect();
+    !dests.is_empty() && rules_reach_a_member(dests, is_member, |key| rule_node(ctx, key))
+}
+
 /// How many rules feed `start` from above: the length of its chain of live sources. A source
 /// is live while it still has a rule for the series below it (see [`live_source_key`]).
 fn rules_above(
@@ -269,6 +318,64 @@ mod tests {
             .iter()
             .map(|(s, d)| (s.to_string(), d.to_string()))
             .collect()
+    }
+
+    /// A batch is entangled when a rule of one member leads to another member, directly or
+    /// through series outside the batch. Members are never opened: their rules come from the
+    /// guards the batch already holds, and opening one would alias that guard.
+    #[test]
+    fn a_batch_is_entangled_when_its_rules_reach_another_member() {
+        let nodes = graph(&edges(&[("a", "b"), ("b", "c"), ("x", "y")]));
+        let opened = std::cell::RefCell::new(Vec::new());
+        let node = |key: &[u8]| {
+            opened.borrow_mut().push(key.to_vec());
+            lookup(&nodes)(key)
+        };
+        let members =
+            |set: &'static [&'static str]| move |k: &[u8]| set.iter().any(|m| m.as_bytes() == k);
+
+        // a's rule writes b, a member.
+        assert!(rules_reach_a_member(
+            [&b"b"[..]],
+            members(&["a", "b"]),
+            node
+        ));
+        // Checked before the later cases, which open b legitimately.
+        assert!(
+            opened.borrow().iter().all(|k| k != b"b"),
+            "a member was opened: {:?}",
+            opened.borrow()
+        );
+        // a reaches c through b, which is not in the batch.
+        assert!(rules_reach_a_member(
+            [&b"b"[..]],
+            members(&["a", "c"]),
+            node
+        ));
+        // Unrelated members, or a chain that stays outside the batch.
+        assert!(!rules_reach_a_member(
+            [&b"b"[..]],
+            members(&["a", "x"]),
+            node
+        ));
+        assert!(!rules_reach_a_member(
+            [&b"y"[..]],
+            members(&["x", "a"]),
+            node
+        ));
+        assert!(!rules_reach_a_member(
+            std::iter::empty::<&[u8]>(),
+            members(&["a"]),
+            node
+        ));
+        assert!(
+            opened.borrow().iter().all(|k| k != b"a" && k != b"x"),
+            "a member was opened: {:?}",
+            opened.borrow()
+        );
+        // A lookup failure counts as entangled: the safe answer is the sequential path.
+        let failing = |_: &[u8]| Err(ValkeyError::Str("boom"));
+        assert!(rules_reach_a_member([&b"b"[..]], members(&["a"]), failing));
     }
 
     /// Far deeper than any thread's stack would allow one frame per rule (a test thread's is
