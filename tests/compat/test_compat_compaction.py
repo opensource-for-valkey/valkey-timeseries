@@ -35,8 +35,9 @@ from compat_helpers import AGGREGATORS, mk_series
 BUCKET = 1000
 
 _FOLDS_UNPUBLISHED = (
-    "reference folds the unpublished bucket into the next one; "
-    "see compaction-replication-plan.md §3.9"
+    "DIV-0069: on a rule with no open bucket, the reference never publishes the bucket of "
+    "pre-rule samples a back-fill or TS.DEL makes the newest; it folds it into the next one or "
+    "drops it"
 )
 
 
@@ -170,6 +171,20 @@ class TestOutOfOrderWrites:
         diff("TS.RANGE", "c:igd:dst", "-", "+")
         diff("TS.DEL", "c:igd:src", 1500, 1500)
         diff("TS.RANGE", "c:igd:dst", "-", "+")
+
+    def test_reply_when_the_destination_ignores_the_closing_bucket(self, diff):
+        """DIV-0070: a write that closes a bucket the destination's IGNORE drops replies with
+        its own timestamp here, and with the destination's last timestamp on the reference.
+        The stored data agrees."""
+        diff("TS.CREATE", "c:igr:src")
+        diff("TS.CREATE", "c:igr:dst", "DUPLICATE_POLICY", "LAST", "IGNORE", 1000, 10)
+        diff("TS.CREATERULE", "c:igr:src", "c:igr:dst", "AGGREGATION", "sum", 1000)
+        diff("TS.ADD", "c:igr:src", 0, 5)
+        diff("TS.ADD", "c:igr:src", 1000, 7)
+        assert diff.reference.execute_command("TS.ADD", "c:igr:src", 2000, 1) == 0
+        assert diff.subject.execute_command("TS.ADD", "c:igr:src", 2000, 1) == 2000
+        diff("TS.RANGE", "c:igr:src", "-", "+")
+        diff("TS.RANGE", "c:igr:dst", "-", "+")
 
     def test_closing_bucket_honours_the_destinations_ignore(self, diff):
         """A bucket that closes is a new write to the destination, so the destination's IGNORE
@@ -380,6 +395,23 @@ class TestRuleLifecycle:
         diff("TS.DEL", "c:cbd:src", 1500, 1500)
         diff("TS.ADD", "c:cbd:src", 2000, 16.0)   # closes bucket 1000
         diff("TS.RANGE", "c:cbd:dst", "-", "+")
+
+    @pytest.mark.xfail(strict=True, reason=_FOLDS_UNPUBLISHED)
+    def test_tail_delete_reopening_a_back_filled_bucket(self, diff):
+        """DIV-0069, the dropping half: back-fills publish buckets 0 and 4000 at once, a TS.DEL of
+        the source's last sample makes 4000 the newest bucket again (so it is retracted and
+        re-opened), and the next append closes it. We publish it again; the reference drops it."""
+        diff("TS.CREATE", "c:ctd:src")
+        for ts in (0, 5000):
+            diff("TS.ADD", "c:ctd:src", ts, 1)
+        diff("TS.CREATE", "c:ctd:dst")
+        diff("TS.CREATERULE", "c:ctd:src", "c:ctd:dst", "AGGREGATION", "sum", 1000)
+        diff("TS.ADD", "c:ctd:src", 100, 2)
+        diff("TS.ADD", "c:ctd:src", 4500, 3)
+        diff("TS.RANGE", "c:ctd:dst", "-", "+")
+        diff("TS.DEL", "c:ctd:src", 5000, 5000)
+        diff("TS.ADD", "c:ctd:src", 6000, 1)
+        diff("TS.RANGE", "c:ctd:dst", "-", "+")
 
     def test_deleterule_stops_compaction_and_keeps_data(self, diff):
         _rule(diff, "c:drule:src", "c:drule:dst")
