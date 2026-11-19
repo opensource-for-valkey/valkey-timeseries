@@ -49,10 +49,10 @@ class TestTaskCadence(ValkeyTimeSeriesTestCaseDebugMode):
 
 class TestRetentionTrimTask(ValkeyTimeSeriesTestCaseDebugMode):
 
-    def trims(self):
-        stats = self.debug_metrics('task')
-        return (stats['task_retention_trim_started_total']
-                + stats['task_retention_trim_skipped_inflight_total'])
+    def completed_trims(self):
+        """Trim passes that ran to the end. Dispatches (`started` + `skipped_inflight`) would not
+        do: a dispatch skipped because a pass is still in flight scans nothing."""
+        return self.debug_metrics('task')['task_retention_trim_completed_total']
 
     def test_trim_tick_leaves_untouched_series_unmodified(self):
         """The retention trim opens a series for writing only when it has samples to drop.
@@ -70,9 +70,11 @@ class TestRetentionTrimTask(ValkeyTimeSeriesTestCaseDebugMode):
             client = self.server.get_new_client()
             client.execute_command('WATCH', key)
             watchers[key] = client
-        # Two dispatches after the WATCH: at least one full trim pass ran while it was held.
-        before = self.trims()
-        wait_for_true(lambda: self.trims() >= before + 2, timeout=30)
+        # Two completed passes after the WATCH. The first may be a pass already in flight when it
+        # was taken; the second started after that one ended, so it scanned both keys entirely
+        # while the WATCH was held.
+        before = self.completed_trims()
+        wait_for_true(lambda: self.completed_trims() >= before + 2, timeout=30)
         for key, client in watchers.items():
             client.execute_command('MULTI')
             client.execute_command('PING')
