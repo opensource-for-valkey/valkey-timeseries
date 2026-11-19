@@ -1092,6 +1092,15 @@ impl TimeSeries {
         self.trim_expired(true)
     }
 
+    /// Whether a stored sample is older than the retention floor: what [`Self::trim`] would drop.
+    /// The write path trims lazily and the floor follows the last sample, so a series can hold
+    /// such samples until the background trim reaches it.
+    pub(crate) fn has_expired_samples(&self) -> bool {
+        !self.retention.is_zero()
+            && !self.is_empty()
+            && self.first_timestamp < self.get_min_timestamp()
+    }
+
     /// Removes expired samples on the write path.
     ///
     /// Whole expired chunks go at once. A compressed head chunk that is only partly expired

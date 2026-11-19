@@ -96,7 +96,7 @@ fn trim_series(ctx: &Context, db: i32, cursor: u64) -> (usize, i32) {
         last_scanned,
         exhausted,
     } = fetch_series_batch(ctx, cursor + 1, SERIES_TRIM_BATCH_SIZE, |series| {
-        !series.retention.is_zero() && !series.is_empty()
+        series.has_expired_samples()
     });
 
     set_current_db(ctx, save_db);

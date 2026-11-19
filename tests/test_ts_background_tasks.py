@@ -45,3 +45,35 @@ class TestTaskCadence(ValkeyTimeSeriesTestCaseDebugMode):
         time.sleep(3)
         assert self.started() == before
         wait_for_true(lambda: self.started() > before, timeout=15)
+
+
+class TestRetentionTrimTask(ValkeyTimeSeriesTestCaseDebugMode):
+
+    def trims(self):
+        stats = self.debug_metrics('task')
+        return (stats['task_retention_trim_started_total']
+                + stats['task_retention_trim_skipped_inflight_total'])
+
+    def test_trim_tick_leaves_untouched_series_unmodified(self):
+        """The retention trim opens a series for writing only when it has samples to drop.
+        It used to open every series it scanned for writing, so each tick signalled every
+        series as modified: a WATCH on any of them aborted the transaction (and client-side
+        caching was told to invalidate), although nothing had changed."""
+        now = int(time.time() * 1000)
+        self.client.execute_command('TS.CREATE', 'w:retention', 'RETENTION', 10_000_000)
+        self.client.execute_command('TS.ADD', 'w:retention', now, 1)
+        self.client.execute_command('TS.CREATE', 'w:plain')
+        self.client.execute_command('TS.ADD', 'w:plain', now, 1)
+
+        watchers = {}
+        for key in ('w:retention', 'w:plain'):
+            client = self.server.get_new_client()
+            client.execute_command('WATCH', key)
+            watchers[key] = client
+        # Two dispatches after the WATCH: at least one full trim pass ran while it was held.
+        before = self.trims()
+        wait_for_true(lambda: self.trims() >= before + 2, timeout=30)
+        for key, client in watchers.items():
+            client.execute_command('MULTI')
+            client.execute_command('PING')
+            assert client.execute_command('EXEC') is not None, f"WATCH on {key} was aborted"
