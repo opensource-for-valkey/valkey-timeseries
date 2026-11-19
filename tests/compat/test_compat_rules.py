@@ -190,6 +190,25 @@ class TestRuleCreation:
         diff("TS.ADD", "g:dstdata:src", 450, 1.0)
         diff("TS.RANGE", "g:dstdata:dst", "-", "+")
 
+    def test_binary_keys_are_reported_as_given(self, diff):
+        """TS.INFO reports a rule's destination and a destination's source with the keys' own
+        bytes, in both protocols. They used to go through a lossy UTF-8 conversion, so a key
+        holding `\xfe` came back as U+FFFD and could not be passed back to any command."""
+        src, dst = b"c:bin:\xfe", b"c:bin:\xfe_dst"
+        for client in (diff.reference, diff.subject):
+            client.execute_command("TS.CREATE", src)
+            client.execute_command("TS.CREATE", dst)
+            client.execute_command("TS.CREATERULE", src, dst, "AGGREGATION", "avg", 1000)
+
+        def field(client, key, name):
+            info = client.execute_command("TS.INFO", key)
+            info = info if isinstance(info, dict) else dict(zip(info[::2], info[1::2]))
+            return info[name]
+
+        for key, name in ((src, b"rules"), (dst, b"sourceKey")):
+            assert field(diff.subject, key, name) == field(diff.reference, key, name), name
+        assert field(diff.subject, dst, b"sourceKey") == src
+
     def test_wrongtype_source_and_destination(self, diff):
         diff("SET", "g:wt:string", "hello")
         mk_series(diff, "g:wt:series")

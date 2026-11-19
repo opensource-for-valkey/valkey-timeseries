@@ -4,7 +4,7 @@ use crate::common::Timestamp;
 use crate::parser::parse_policy_duration_ms;
 use crate::series::request_types::AggregatorConfig;
 use crate::series::{CompactionRule, SeriesLink};
-use regex::RegexSet;
+use regex::bytes::RegexSet;
 use std::fmt::Display;
 use std::sync::{LazyLock, RwLock};
 use valkey_module::{ValkeyError, ValkeyResult};
@@ -23,27 +23,23 @@ impl CompactionPolicy {
     /// naming), or `{key}_{AGG}_{OP}_{value}_{bucket}[_{align}]` for a filtered aggregator
     /// (`cpu_COUNTIF_GT_5_60000`). The condition is part of the key so policies differing only
     /// by condition get distinct destinations rather than colliding on one.
-    pub fn format_key(&self, key: &str) -> String {
-        let name = self.aggregator.aggregation_name();
-        let mut result = match self.aggregator.filter() {
-            Some(filter) => format!(
-                "{key}_{}_{}",
-                name.to_ascii_uppercase(),
-                filter.key_fragment()
-            ),
-            None => format!("{key}_{}", name.to_ascii_uppercase()),
+    ///
+    /// Built from the source key's bytes, as RedisTimeSeries does: keys are binary-safe, and a
+    /// lossy conversion mapped distinct sources (`a\xfe`, `a\xff`) to one destination.
+    pub fn format_key(&self, key: impl AsRef<[u8]>) -> Vec<u8> {
+        let name = self.aggregator.aggregation_name().to_ascii_uppercase();
+        let mut suffix = match self.aggregator.filter() {
+            Some(filter) => format!("_{name}_{}", filter.key_fragment()),
+            None => format!("_{name}"),
         };
-
         if self.bucket_duration_ms > 0 {
-            let msg = format!("_{}", self.bucket_duration_ms);
-            result.push_str(&msg);
+            suffix.push_str(&format!("_{}", self.bucket_duration_ms));
         }
-
         if self.bucket_alignment > 0 {
-            let msg = format!("_{}", self.bucket_alignment);
-            result.push_str(&msg);
+            suffix.push_str(&format!("_{}", self.bucket_alignment));
         }
-
+        let mut result = key.as_ref().to_vec();
+        result.extend_from_slice(suffix.as_bytes());
         result
     }
 }
@@ -66,7 +62,7 @@ impl Display for CompactionPolicy {
 /// The rules `ts-compaction-policy` creates for one new series: one per destination key, in the
 /// order the policies are configured.
 #[derive(Debug, Default)]
-pub struct PolicyRules(Vec<(String, (CompactionRule, u64))>);
+pub struct PolicyRules(Vec<(Vec<u8>, (CompactionRule, u64))>);
 
 impl PolicyRules {
     pub fn len(&self) -> usize {
@@ -77,20 +73,34 @@ impl PolicyRules {
         self.0.is_empty()
     }
 
-    pub fn get(&self, dest_key: &str) -> Option<&(CompactionRule, u64)> {
+    pub fn get(&self, dest_key: impl AsRef<[u8]>) -> Option<&(CompactionRule, u64)> {
+        let dest_key = dest_key.as_ref();
         self.0
             .iter()
-            .find(|(key, _)| key == dest_key)
+            .find(|(key, _)| key.as_slice() == dest_key)
             .map(|(_, rule)| rule)
     }
 
-    pub fn contains_key(&self, dest_key: &str) -> bool {
+    pub fn contains_key(&self, dest_key: impl AsRef<[u8]>) -> bool {
         self.get(dest_key).is_some()
     }
 
     /// The destination keys, in rule order.
-    pub fn keys(&self) -> impl Iterator<Item = &String> {
-        self.0.iter().map(|(key, _)| key)
+    pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
+        self.0.iter().map(|(key, _)| key.as_slice())
+    }
+}
+
+impl std::ops::Index<&[u8]> for PolicyRules {
+    type Output = (CompactionRule, u64);
+
+    fn index(&self, dest_key: &[u8]) -> &Self::Output {
+        self.get(dest_key).unwrap_or_else(|| {
+            panic!(
+                "no policy rule for destination {:?}",
+                String::from_utf8_lossy(dest_key)
+            )
+        })
     }
 }
 
@@ -98,13 +108,12 @@ impl std::ops::Index<&str> for PolicyRules {
     type Output = (CompactionRule, u64);
 
     fn index(&self, dest_key: &str) -> &Self::Output {
-        self.get(dest_key)
-            .unwrap_or_else(|| panic!("no policy rule for destination {dest_key:?}"))
+        &self[dest_key.as_bytes()]
     }
 }
 
 impl IntoIterator for PolicyRules {
-    type Item = (String, (CompactionRule, u64));
+    type Item = (Vec<u8>, (CompactionRule, u64));
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -190,12 +199,13 @@ impl PolicyConfig {
 
     /// The rules a new series named `key` gets: one for each policy that applies to it, in
     /// configured order, skipping a policy whose destination an earlier one already names.
-    pub fn create_compaction_rules(&self, key: &str) -> Option<PolicyRules> {
+    pub fn create_compaction_rules(&self, key: impl AsRef<[u8]>) -> Option<PolicyRules> {
         if self.policies.is_empty() {
             return None;
         }
+        let key = key.as_ref();
         let matched = (!self.filters.is_empty()).then(|| self.filters.matches(key));
-        let mut rules: Vec<(String, (CompactionRule, u64))> = Vec::new();
+        let mut rules: Vec<(Vec<u8>, (CompactionRule, u64))> = Vec::new();
         for (policy, filter) in &self.policies {
             if let Some(index) = filter
                 && !matched.as_ref().is_some_and(|m| m.matched(*index))
@@ -207,7 +217,7 @@ impl PolicyConfig {
                 continue;
             }
             let rule = CompactionRule {
-                dest: SeriesLink::from_key(dest_key.as_bytes()),
+                dest: SeriesLink::from_key(&dest_key),
                 aggregator: policy.aggregator.create_aggregator(),
                 bucket_duration: policy.bucket_duration_ms,
                 align_timestamp: policy.bucket_alignment,
@@ -401,7 +411,7 @@ pub fn clear_compaction_policy_config() {
     config.clear();
 }
 
-pub fn create_compaction_rules_from_config(series_key: &str) -> Option<PolicyRules> {
+pub fn create_compaction_rules_from_config(series_key: &[u8]) -> Option<PolicyRules> {
     let compaction_config = COMPACTION_POLICY_CONFIG
         .read()
         .expect("Failed to acquire compaction policy config read lock");
@@ -561,19 +571,28 @@ mod tests {
     #[test]
     fn test_format_key_basic() {
         let policy = create_policy(AggregationType::Avg, 60000, 0);
-        assert_eq!(policy.format_key("temperature"), "temperature_AVG_60000");
+        assert_eq!(
+            policy.format_key("temperature"),
+            "temperature_AVG_60000".as_bytes()
+        );
     }
 
     #[test]
     fn test_format_key_with_bucket_duration() {
         let policy = create_policy(AggregationType::Sum, 30000, 0);
-        assert_eq!(policy.format_key("cpu_usage"), "cpu_usage_SUM_30000");
+        assert_eq!(
+            policy.format_key("cpu_usage"),
+            "cpu_usage_SUM_30000".as_bytes()
+        );
     }
 
     #[test]
     fn test_format_key_with_both_duration_and_alignment() {
         let policy = create_policy(AggregationType::Min, 60000, 5000);
-        assert_eq!(policy.format_key("disk_io"), "disk_io_MIN_60000_5000");
+        assert_eq!(
+            policy.format_key("disk_io"),
+            "disk_io_MIN_60000_5000".as_bytes()
+        );
     }
 
     #[test]
@@ -594,7 +613,7 @@ mod tests {
         for (aggregator, expected_name) in test_cases {
             let policy = create_policy(aggregator, 2000, 0);
             let result = policy.format_key("test");
-            assert_eq!(result, format!("test_{expected_name}_2000"));
+            assert_eq!(result, format!("test_{expected_name}_2000").into_bytes());
         }
     }
 
@@ -602,16 +621,22 @@ mod tests {
     fn test_format_key_zero_alignment() {
         // Only align_timestamp is zero
         let policy = create_policy(AggregationType::Sum, 45000, 0);
-        assert_eq!(policy.format_key("requests"), "requests_SUM_45000");
+        assert_eq!(
+            policy.format_key("requests"),
+            "requests_SUM_45000".as_bytes()
+        );
     }
 
     #[test]
     fn test_format_key_unicode_characters() {
         let policy = create_policy(AggregationType::Sum, 30000, 1000);
-        assert_eq!(policy.format_key("温度传感器"), "温度传感器_SUM_30000_1000");
+        assert_eq!(
+            policy.format_key("温度传感器"),
+            "温度传感器_SUM_30000_1000".as_bytes()
+        );
         assert_eq!(
             policy.format_key("señor_métrica"),
-            "señor_métrica_SUM_30000_1000"
+            "señor_métrica_SUM_30000_1000".as_bytes()
         );
     }
 
@@ -619,7 +644,7 @@ mod tests {
     fn test_format_key_case_insensitive_aggregator() {
         // Verify that aggregator names are always uppercase regardless of internal representation
         let policy = create_policy(AggregationType::Sum, 60000, 0);
-        let result = policy.format_key("test");
+        let result = String::from_utf8(policy.format_key("test")).unwrap();
         assert!(result.contains("SUM"));
         assert!(!result.contains("sum"));
         assert!(!result.contains("Sum"));
@@ -948,7 +973,7 @@ mod tests {
             .map(|rules| {
                 rules
                     .keys()
-                    .map(|k| String::from_utf8_lossy(k.as_ref()).into_owned())
+                    .map(|k| String::from_utf8_lossy(k).into_owned())
                     .collect()
             })
             .unwrap_or_default()
@@ -1000,6 +1025,30 @@ mod tests {
                 assert_eq!(*kept, retention, "{policy}");
             }
         }
+    }
+
+    /// Keys are binary-safe: a destination is the source's bytes plus the suffix, and a filter
+    /// matches the raw bytes. Converting lossily mapped `a\xfe` and `a\xff` to one destination.
+    #[test]
+    fn destinations_and_filters_use_the_raw_key_bytes() {
+        let mut config = PolicyConfig::new();
+        config
+            .add_policies_from_config("avg:1M:1d;max:1M:1d|^a", true)
+            .unwrap();
+        for key in [&b"a\xfe"[..], b"a\xff"] {
+            let rules = config.create_compaction_rules(key).unwrap();
+            let mut expected = vec![key.to_vec(), key.to_vec()];
+            expected[0].extend_from_slice(b"_AVG_60000");
+            expected[1].extend_from_slice(b"_MAX_60000");
+            assert_eq!(rules.keys().collect::<Vec<_>>(), expected, "{key:?}");
+            let (rule, _) = &rules[&expected[1][..]];
+            assert_eq!(rule.dest.key(), &expected[1][..]);
+        }
+        assert_eq!(
+            config.create_compaction_rules(b"b\xff").unwrap().len(),
+            1,
+            "the filter does not match"
+        );
     }
 
     /// A replacement whose filter does not compile leaves the previous policy in effect. It used
@@ -1095,7 +1144,7 @@ mod rts_grammar_parity {
         let rules = config
             .create_compaction_rules("k")
             .expect("previous policy kept");
-        assert_eq!(rules.keys().collect::<Vec<_>>(), vec!["k_MAX_60000"]);
+        assert_eq!(rules.keys().collect::<Vec<_>>(), vec![&b"k_MAX_60000"[..]]);
     }
 
     #[test]
@@ -1142,7 +1191,10 @@ mod rts_grammar_parity {
             .add_policies_from_config("countif>5:1M:1h;countif<0:1M:1h;share>=1e300:1M:1h", true)
             .expect("valid policy");
         let rules = config.create_compaction_rules("k").expect("rules");
-        let mut keys: Vec<_> = rules.keys().cloned().collect();
+        let mut keys: Vec<String> = rules
+            .keys()
+            .map(|k| String::from_utf8_lossy(k).into_owned())
+            .collect();
         keys.sort();
         // Policies differing only by condition get distinct destinations.
         assert_eq!(

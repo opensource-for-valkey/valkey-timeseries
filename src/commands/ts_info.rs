@@ -117,7 +117,7 @@ fn get_rules_state(ts: &TimeSeries) -> ValkeyValue {
                 ValkeyValue::Null
             };
             ValkeyValue::Array(vec![
-                ValkeyValue::BulkString(String::from_utf8_lossy(rule.dest.key()).into_owned()),
+                ValkeyValue::StringBuffer(rule.dest.key().to_vec()),
                 rule.bucket_start
                     .map_or(ValkeyValue::Null, ValkeyValue::Integer),
                 ValkeyValue::Integer(i64::from(rule.has_samples)),
@@ -215,7 +215,7 @@ fn get_ts_info(ctx: &Context, ts: &TimeSeries, debug: bool, key: &ValkeyString) 
     let source_key = get_source_key(ctx, ts);
     map.insert(
         "sourceKey".into(),
-        source_key.map_or(ValkeyValue::Null, ValkeyValue::from),
+        source_key.map_or(ValkeyValue::Null, ValkeyValue::BulkValkeyString),
     );
     map.insert(
         ValkeyValueKey::String("rules".to_string()),
@@ -320,7 +320,9 @@ fn get_rules_info(ctx: &Context, series: &TimeSeries, is_resp3: bool) -> ValkeyV
                 ctx.log_warning("Compaction rule has an invalid destination; omitting it");
                 return None;
             }
-            Some((dest_key.to_string_lossy(), rule))
+            // The key's own bytes: a lossy conversion turned a binary key into one no command
+            // can name.
+            Some((dest_key, rule))
         })
         .collect::<Vec<_>>();
 
@@ -329,7 +331,7 @@ fn get_rules_info(ctx: &Context, series: &TimeSeries, is_resp3: bool) -> ValkeyV
             .into_iter()
             .map(|(dest_key, x)| {
                 (
-                    ValkeyValueKey::String(dest_key.clone()),
+                    ValkeyValueKey::BulkValkeyString(dest_key),
                     ValkeyValue::Array(vec![
                         ValkeyValue::Integer(x.bucket_duration as i64),
                         ValkeyValue::SimpleString(rule_aggregator_name(x)),
@@ -345,7 +347,7 @@ fn get_rules_info(ctx: &Context, series: &TimeSeries, is_resp3: bool) -> ValkeyV
         .into_iter()
         .map(|(dest_key, x)| {
             ValkeyValue::Array(vec![
-                ValkeyValue::BulkString(dest_key.clone()),
+                ValkeyValue::BulkValkeyString(dest_key),
                 ValkeyValue::Integer(x.bucket_duration as i64),
                 ValkeyValue::SimpleString(rule_aggregator_name(x)),
                 ValkeyValue::Integer(x.align_timestamp),
@@ -356,11 +358,11 @@ fn get_rules_info(ctx: &Context, series: &TimeSeries, is_resp3: bool) -> ValkeyV
 }
 
 /// The key of the series that feeds `series`, if it still has a rule for it.
-fn get_source_key(ctx: &Context, series: &TimeSeries) -> Option<String> {
+fn get_source_key(ctx: &Context, series: &TimeSeries) -> Option<ValkeyString> {
     series.src_series.as_ref()?;
     let Some(source_key) = live_source_key(ctx, series) else {
         ctx.log_warning("Compaction source series not found");
         return None;
     };
-    Some(source_key.to_string_lossy())
+    Some(source_key)
 }

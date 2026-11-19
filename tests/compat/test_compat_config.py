@@ -406,3 +406,21 @@ class TestCompactionPolicyEffects:
             engine.client.flushall()
         subject, reference = outcomes
         assert subject == reference, policy
+
+    def test_destinations_of_binary_keys_keep_their_bytes(self, clients):
+        """A destination is the source key's bytes plus the suffix. `a\\xfe` and `a\\xff` each
+        get their own: the names used to go through a lossy UTF-8 conversion, so both mapped to
+        `a\\ufffd_AVG_60000` and the second source silently got no rule."""
+        outcomes = []
+        for engine in clients:
+            engine.client.flushall()
+            assert engine.set_outcome("ts-compaction-policy", "avg:1M:1d") == "ok"
+            for key in (b"a\xfe", b"a\xff", b"{cpu}.load"):
+                engine.client.execute_command("TS.ADD", key, 1000, 1)
+            keys = sorted(engine.client.keys("*"))
+            rules = {k: _rules_and_retentions(engine.client, k)[0]
+                     for k in (b"a\xfe", b"a\xff", b"{cpu}.load")}
+            outcomes.append((keys, rules))
+            engine.client.flushall()
+        subject, reference = outcomes
+        assert subject == reference
