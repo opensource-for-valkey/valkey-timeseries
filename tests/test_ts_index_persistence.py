@@ -21,6 +21,7 @@ DANGLING_LOG = "dangling ids marked stale"
 REPAIR_LOG = "scanning keyspace to repair"
 SKIP_SWEEP_LOG = "skipping reconciliation sweep"
 RECONCILE_LOG = "does not match the loaded set"
+EXPIRED_SWEEP_LOG = "keys expired during load; reconciling without a repair scan"
 
 
 def wait_for_log(server, needle, timeout=TEST_MAX_WAIT_TIME_SECONDS):
@@ -36,7 +37,8 @@ def wait_for_sweep_decision(server, timeout=TEST_MAX_WAIT_TIME_SECONDS):
     payload the sweep never runs and nothing is logged."""
     wait_for_true(
         lambda: server.verify_string_in_logfile(SKIP_SWEEP_LOG)
-        or server.verify_string_in_logfile(RECONCILE_LOG),
+        or server.verify_string_in_logfile(RECONCILE_LOG)
+        or server.verify_string_in_logfile(EXPIRED_SWEEP_LOG),
         timeout=timeout,
     )
 
@@ -88,7 +90,8 @@ class TestIndexPersistenceBasic(ValkeyTimeSeriesTestCaseBase):
     def test_key_expired_at_load_does_not_stay_indexed(self):
         """A primary loading an RDB deserializes a key before discarding it as expired, so the
         load digest counts it and matches the preloaded index. The sweep must still run, or
-        the expired series stays in TS.QUERYINDEX / TS.CARD indefinitely."""
+        the expired series stays in TS.QUERYINDEX / TS.CARD indefinitely. The repair scan must
+        not: with the digest matched, every loaded series is already indexed."""
         client = self.server.get_new_client()
         client.execute_command("TS.CREATE", "exp:keep", "LABELS", "exp", "yes")
         client.execute_command("TS.CREATE", "exp:gone", "LABELS", "exp", "yes")
@@ -102,9 +105,11 @@ class TestIndexPersistenceBasic(ValkeyTimeSeriesTestCaseBase):
         client.execute_command("DEBUG", "RELOAD", "NOSAVE")
 
         assert self.server.verify_string_in_logfile(PRELOADED_LOG)
+        wait_for_log(self.server, EXPIRED_SWEEP_LOG)
         wait_for_log(self.server, DANGLING_LOG)
         assert client.execute_command("TS.QUERYINDEX", "exp=yes") == [b"exp:keep"]
         assert client.execute_command("TS.CARD", "FILTER", "exp=yes") == 1
+        assert not self.server.verify_string_in_logfile(REPAIR_LOG)
 
     def test_index_preloaded_with_many_series_and_labels(self):
         """Larger/more varied index still preloads to an exactly correct state."""
