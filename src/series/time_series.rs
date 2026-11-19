@@ -454,23 +454,14 @@ impl TimeSeries {
             }
             0
         } else {
-            let (pos, found) = get_chunk_index(&self.chunks, sample.timestamp);
-            if found {
-                pos
-            } else {
-                // The timestamp falls in a *gap* between chunks — chunks need not be
-                // contiguous (a split leaves one). `get_chunk_index` reports a miss as
-                // `chunks.len()`, which is not a usable index, so resolve it here: route the
-                // sample into the chunk starting after the gap, the same rule the bulk path
-                // uses (`group_samples_by_chunk`), which keeps chunks non-overlapping.
-                // `upsert_sample` is only reached for `timestamp <= last_timestamp`, so a
-                // chunk starting after the gap always exists; the last chunk is a defensive
-                // fallback.
-                self.chunks
-                    .iter()
-                    .position(|c| c.first_timestamp() > sample.timestamp)
-                    .unwrap_or(chunks_len - 1)
-            }
+            // On a miss the timestamp falls in a *gap* between chunks — chunks need not be
+            // contiguous (a split leaves one) — and `pos` is the chunk starting after the gap:
+            // the sample goes there, the same rule the bulk path uses
+            // (`group_samples_by_chunk`), which keeps chunks non-overlapping. `upsert_sample` is
+            // only reached for `timestamp <= last_timestamp`, so that chunk always exists; the
+            // last chunk is a defensive fallback.
+            let (pos, _found) = get_chunk_index(&self.chunks, sample.timestamp);
+            pos.min(chunks_len - 1)
         };
 
         let is_last = target_idx + 1 == chunks_len;
@@ -1571,21 +1562,21 @@ pub(super) fn find_start_chunk_index(arr: &[TimeSeriesChunk], ts: Timestamp) -> 
     }
 }
 
-/// Return the index of the chunk in which the timestamp belongs. Assumes !chunks.is_empty()
+/// The chunk holding `timestamp` in its range, as `(index, true)`; on a miss, `(index, false)`
+/// where `index` is the insertion point: the first chunk starting after `timestamp`, or
+/// `chunks.len()` when every chunk ends before it. Both branches agree on that, as the binary
+/// search's `Err` does.
 fn get_chunk_index(chunks: &[TimeSeriesChunk], timestamp: Timestamp) -> (usize, bool) {
     match chunks {
         [] => (0, false),
-        _ if chunks.len() <= LINEAR_SCAN_MAX => chunks
-            .iter()
-            .enumerate()
-            .find_map(|(i, chunk)| {
-                if chunk.is_timestamp_in_range(timestamp) {
-                    Some((i, true))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or((chunks.len(), false)),
+        _ if chunks.len() <= LINEAR_SCAN_MAX => {
+            // Chunks are ordered and disjoint, so the first one that has not ended before
+            // `timestamp` either holds it or starts after it.
+            match chunks.iter().position(|c| timestamp <= c.last_timestamp()) {
+                Some(i) => (i, timestamp >= chunks[i].first_timestamp()),
+                None => (chunks.len(), false),
+            }
+        }
         _ => binary_search_chunks_by_timestamp(chunks, timestamp),
     }
 }
@@ -1833,5 +1824,75 @@ mod tests {
         assert_eq!(find_start_chunk_index(&chunks, 45), 2);
         assert_eq!(find_start_chunk_index(&chunks, 35), 2);
         assert_eq!(find_start_chunk_index(&chunks, 70), 4);
+    }
+
+    /// `get_chunk_index` reports a miss as the insertion point in both branches, which is what
+    /// lets `upsert_sample` route a gap sample without a second scan.
+    #[test]
+    fn test_get_chunk_index_linear_scan_agrees_with_binary_search() {
+        use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
+
+        // Chunks covering [0,9], [20,29], [40,49], [60,69].
+        let chunks: Vec<TimeSeriesChunk> = (0..4)
+            .map(|c| {
+                let samples: Vec<Sample> = (0..10)
+                    .map(|i| Sample {
+                        timestamp: c * 20 + i,
+                        value: i as f64,
+                    })
+                    .collect();
+                TimeSeriesChunk::Uncompressed(UncompressedChunk::new(1024, &samples))
+            })
+            .collect();
+        assert!(chunks.len() <= LINEAR_SCAN_MAX);
+
+        for ts in -5..80 {
+            assert_eq!(
+                get_chunk_index(&chunks, ts),
+                binary_search_chunks_by_timestamp(&chunks, ts),
+                "ts={ts}"
+            );
+        }
+        assert_eq!(get_chunk_index(&chunks, 45), (2, true));
+        assert_eq!(get_chunk_index(&chunks, 35), (2, false));
+        assert_eq!(get_chunk_index(&chunks, -1), (0, false));
+        assert_eq!(get_chunk_index(&chunks, 70), (4, false));
+    }
+
+    /// A back-fill into the gap a split leaves goes into the chunk after the gap, at every chunk
+    /// count, including past the linear-scan limit.
+    #[test]
+    fn test_upsert_into_a_gap_lands_in_the_next_chunk() {
+        use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
+
+        for chunk_count in [3, LINEAR_SCAN_MAX as i64 + 4] {
+            // Chunks covering [0,9], [100,109], ...
+            let chunks: Vec<TimeSeriesChunk> = (0..chunk_count)
+                .map(|c| {
+                    let samples: Vec<Sample> = (0..10)
+                        .map(|i| Sample {
+                            timestamp: c * 100 + i,
+                            value: i as f64,
+                        })
+                        .collect();
+                    TimeSeriesChunk::Uncompressed(UncompressedChunk::new(4096, &samples))
+                })
+                .collect();
+            let mut series = TimeSeries::from_chunks(chunks).unwrap();
+
+            assert!(series.add(150, 1.0, None).is_ok());
+            assert_eq!(series.chunks.len(), chunk_count as usize);
+            assert_eq!(
+                series.chunks[2].first_timestamp(),
+                150,
+                "{chunk_count} chunks"
+            );
+            assert_eq!(
+                series.chunks[1].last_timestamp(),
+                109,
+                "{chunk_count} chunks"
+            );
+            assert_eq!(series.total_samples, chunk_count as usize * 10 + 1);
+        }
     }
 }
