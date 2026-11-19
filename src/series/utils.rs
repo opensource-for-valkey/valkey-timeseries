@@ -5,9 +5,11 @@ use crate::common::context::{
 };
 use crate::common::rounding::{NO_ROUNDING_KEYWORD, RoundingStrategy};
 use crate::error_consts;
+use crate::fanout::{calculate_hash_slot, is_clustered};
 use crate::labels::{InternedLabel, Label, MetricName};
 use crate::parser::metric_name::parse_metric_name;
 use crate::series::chunks::ChunkEncoding;
+use crate::series::compaction::note_cross_slot_destination;
 use crate::series::index::{TimeSeriesIndex, get_db_index, next_timeseries_id};
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
 use crate::series::{
@@ -375,6 +377,15 @@ fn add_default_compactions(
         }
         let duration_str = bucket_duration.to_string();
         labels.push(Label::new("time_bucket", &duration_str));
+
+        // In cluster mode a destination must live in its source's slot: the source's node owns
+        // that slot and no other, so a destination named into another slot would be created
+        // where the cluster cannot reach it. A source with a hash tag (`{cpu}.load`) keeps
+        // its destinations in its slot; an untagged one's rule is skipped and counted.
+        if is_clustered(ctx) && calculate_hash_slot(&dest_key) != calculate_hash_slot(key) {
+            note_cross_slot_destination(key, &dest_key);
+            continue;
+        }
 
         let child_key = create_key_string(ctx, &dest_key);
         let options = TimeSeriesOptions {

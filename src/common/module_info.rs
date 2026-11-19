@@ -11,7 +11,7 @@
 use crate::common::humanize::bytes_to_human;
 use crate::common::metrics::{self, MetricValue, Section};
 use crate::series::index::index_memory_usage;
-use crate::series::{COMPACTION_FAILURES, COMPACTION_STATE_REBUILDS};
+use crate::series::{COMPACTION_FAILURES, COMPACTION_POLICY_SKIPS, COMPACTION_STATE_REBUILDS};
 use metered::Scalar;
 use std::sync::atomic::Ordering;
 use valkey_module::{
@@ -207,6 +207,10 @@ fn compaction_fields() -> Vec<(String, InfoValue)> {
         (
             "compaction_state_rebuilds_total".to_owned(),
             COMPACTION_STATE_REBUILDS.load(Ordering::Relaxed).into(),
+        ),
+        (
+            "compaction_policy_skipped_total".to_owned(),
+            COMPACTION_POLICY_SKIPS.load(Ordering::Relaxed).into(),
         ),
     ]
 }

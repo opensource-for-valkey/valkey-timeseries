@@ -233,6 +233,9 @@ pub(super) fn rebuild_open_bucket_as_of(
 pub static COMPACTION_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Open-bucket rebuilds of `dirty` rules (`ts_compaction_state_rebuilds_total`).
 pub static COMPACTION_STATE_REBUILDS: AtomicU64 = AtomicU64::new(0);
+/// `ts-compaction-policy` destinations not created because, in cluster mode, they would hash to
+/// another slot than their source (`ts_compaction_policy_skipped_total`).
+pub static COMPACTION_POLICY_SKIPS: AtomicU64 = AtomicU64::new(0);
 
 /// Resync `series`' rules after `[start, end]` was removed from it (stored under `key`). The
 /// removal is already committed, so a rule failure is logged rather than returned — see

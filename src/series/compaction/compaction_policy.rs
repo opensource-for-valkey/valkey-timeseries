@@ -1,11 +1,14 @@
 use crate::aggregators::AggregationType;
 use crate::commands::command_parser::{parse_inline_condition, split_aggregator_condition};
 use crate::common::Timestamp;
+use crate::common::logging::log_warning;
+use crate::common::metrics::WarningLimit;
 use crate::parser::parse_policy_duration_ms;
 use crate::series::request_types::AggregatorConfig;
-use crate::series::{CompactionRule, SeriesLink};
+use crate::series::{COMPACTION_POLICY_SKIPS, CompactionRule, SeriesLink};
 use regex::bytes::RegexSet;
 use std::fmt::Display;
+use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, RwLock};
 use valkey_module::{ValkeyError, ValkeyResult};
 
@@ -228,6 +231,25 @@ impl PolicyConfig {
             rules.push((dest_key, (rule, policy.retention_ms)));
         }
         (!rules.is_empty()).then_some(PolicyRules(rules))
+    }
+}
+
+/// Rate limit for [`note_cross_slot_destination`]'s warning.
+static CROSS_SLOT_WARNING: WarningLimit = WarningLimit::new();
+
+/// Counts a policy destination skipped because it would hash to another slot than its source,
+/// and logs at most one warning per [`WarningLimit`] interval: with untagged keys every new
+/// series would otherwise log one.
+pub(crate) fn note_cross_slot_destination(source: &[u8], dest: &[u8]) {
+    let total = COMPACTION_POLICY_SKIPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if CROSS_SLOT_WARNING.due() {
+        log_warning(format!(
+            "TSDB: ts-compaction-policy destination '{}' of '{}' hashes to another slot, so it was \
+             not created; give the source a hash tag (e.g. '{{cpu}}.load') to keep them together. \
+             {total} such destinations skipped since start (compaction_policy_skipped_total)",
+            String::from_utf8_lossy(dest),
+            String::from_utf8_lossy(source)
+        ));
     }
 }
 
