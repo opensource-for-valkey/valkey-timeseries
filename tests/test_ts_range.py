@@ -1,4 +1,5 @@
 import math
+import time
 
 import pytest
 from valkey import ResponseError
@@ -25,6 +26,41 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
 
         result = self.client.execute_command('TS.RANGE', 'ts1', 2000, 4000)
         assert result == [[2000, b'20.2'], [3000, b'30.3'], [4000, b'40.4']]
+
+    def test_relative_bounds(self):
+        """A relative start is an offset from now; a relative end, from the resolved start."""
+        hour = 3_600_000
+        now = int(time.time() * 1000)
+        samples = [now - 7 * hour, now - 5 * hour, now - 4 * hour, now - 2 * hour]
+        self.client.execute_command('TS.CREATE', 'rel')
+        for i, ts in enumerate(samples):
+            self.client.execute_command('TS.ADD', 'rel', ts, i)
+
+        def timestamps(start, end):
+            return [ts for ts, _ in self.client.execute_command('TS.RANGE', 'rel', start, end)]
+
+        # The three hours that began six hours ago.
+        assert timestamps('-6h', '+3h') == [now - 5 * hour, now - 4 * hour]
+        assert timestamps('-6h', '+') == [now - 5 * hour, now - 4 * hour, now - 2 * hour]
+        # '-' resolves to 0 on the range commands, so the end offset counts from the epoch:
+        # `- +1h` is the first hour of 1970, which holds none of these samples.
+        assert timestamps('-', '+1h') == []
+        # A negative end offset ends before the start: the range is empty, not an error.
+        assert timestamps('-6h', '-3h') == []
+        assert timestamps('-', '-1h') == []
+
+    def test_negative_end_offset_with_latest_and_retention(self):
+        """A negative end offset is empty with LATEST too, on a compaction target with
+        retention, whose open bucket starts at the window's start."""
+        self.client.execute_command('TS.CREATE', 'lat:src')
+        self.client.execute_command('TS.CREATE', 'lat:dst', 'RETENTION', 100000)
+        self.client.execute_command('TS.CREATERULE', 'lat:src', 'lat:dst', 'AGGREGATION', 'sum', 1000)
+        for ts in (1000, 1500, 2000, 2500):
+            self.client.execute_command('TS.ADD', 'lat:src', ts, 1)
+        for cmd in ('TS.RANGE', 'TS.REVRANGE'):
+            assert self.client.execute_command(cmd, 'lat:dst', 2000, 2000, 'LATEST') == [[2000, b'2']]
+            assert self.client.execute_command(cmd, 'lat:dst', 2000, '-1s', 'LATEST') == []
+            assert self.client.execute_command(cmd, 'lat:dst', 2000, 0, 'LATEST') == []
 
     def test_full_range(self):
         """Test TS.RANGE with '-' and '+'"""

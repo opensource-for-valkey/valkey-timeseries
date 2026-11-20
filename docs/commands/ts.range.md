@@ -24,14 +24,17 @@ the time series key to query.
 the start of the time range to query, inclusive. Accepts:
 - Numeric timestamp in milliseconds
 - `-` for the earliest timestamp in the series
-- Duration spec (e.g., `2h` for 2 hours ago)
+- `*` for the current time
+- An offset from the current time: a sign and a duration, e.g. `-2h` for two hours ago
 </details>
 <details open><summary><code>toTimestamp</code></summary>
 the end of the time range to query, inclusive. Accepts:
   - Numeric timestamp in milliseconds
   - `+` for the latest timestamp in the series
   - `*` for the current time
-  - Duration spec (e.g., `30m` for 30 minutes ago)
+  - An offset from `fromTimestamp`, not from the current time: a sign and a duration, e.g. `+30m`
+    for 30 minutes after the start. `-6h +3h` is the three hours that began six hours ago. A
+    negative offset ends before the start, so the range is empty. After `-` the offset counts from timestamp 0, not from the first sample, so `- +1h` is the first hour of 1970.
 </details>
 
 ## Optional Arguments

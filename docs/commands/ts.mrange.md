@@ -29,7 +29,11 @@ Start and end timestamps for the query range (inclusive).
 - Unix timestamp in milliseconds (e.g., `1609459200000`)
 - `-` for earliest available timestamp
 - `+` for latest available timestamp
-- Relative time with units (e.g., `1h`, `30m`, `7d`)
+- `*` for the current time
+- An offset, written as a sign and a duration (`-1h`, `+30m`, `-7d`). For `fromTimestamp` it is
+  measured from the current time. For `toTimestamp` it is measured from the resolved
+  `fromTimestamp`, so `-6h +3h` is the three hours that began six hours ago, and a negative
+  offset gives an empty range. After `-` the offset counts from timestamp 0, not from the first sample, so `- +1h` is the first hour of 1970.
 
 **Example:**
 
@@ -37,6 +41,7 @@ Start and end timestamps for the query range (inclusive).
 TS.MRANGE 1609459200000 1609545600000 FILTER sensor_id=12
 TS.MRANGE - + FILTER region=us-west
 TS.MRANGE -1h + FILTER metric_type=temperature
+TS.MRANGE -6h +3h FILTER metric_type=temperature
 ```
 
 ### FILTER selector...
