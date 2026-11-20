@@ -66,7 +66,8 @@ impl KeyBuffer {
             buf[total_len] = b'\0';
             KeyBuffer::Stack(buf, total_len + 1)
         } else {
-            let mut v = Vec::with_capacity(total_len);
+            // `total_len` plus the trailing NUL.
+            let mut v = Vec::with_capacity(total_len + 1);
             v.extend_from_slice(label_name.as_bytes());
             v.push(b'=');
             v.extend_from_slice(value.as_bytes());
