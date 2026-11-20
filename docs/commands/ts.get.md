@@ -16,6 +16,9 @@ TS.GET key [LATEST]
 
 **LATEST**: retrieves the latest compacted sample of the series. If the series is a compaction,
 a possibly partial bucket may be returned.
+If the source rule is dirty after a failed application or load repair, the open bucket is
+recomputed from retained source samples for this read. The saved rule remains dirty until the
+next source write rebuilds it.
 
 ## Return Value
 
@@ -54,6 +57,8 @@ Empty time series:
 ## Complexity
 
 O(1) – Constant time access to the last sample.
+With `LATEST` on a dirty compaction rule, every read until the next source write also scans the
+retained source samples in the open bucket.
 
 ## See Also
 

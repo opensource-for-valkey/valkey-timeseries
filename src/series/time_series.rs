@@ -572,7 +572,8 @@ impl TimeSeries {
     /// a chunk to many times its budget (a `TS.MADD` backfilling a whole batch into one chunk's
     /// span), and a single halving left it that way, so a stored chunk had no size bound at all.
     /// Each pass halves every oversized chunk's sample count, so the loop ends within
-    /// `log2(len)` passes; the RDB loader's chunk-size limit relies on it.
+    /// `log2(len)` passes; the RDB loader's chunk-size limit relies on it. A chunk whose stream
+    /// does not decode is left whole, as the load left it, and is not an error.
     pub(crate) fn split_chunks_if_needed(&mut self) -> TsdbResult<()> {
         // Almost every merge ends here with nothing to split: decide that with a scan
         // before entering a parallel section. After that, only the halves a pass produced
@@ -598,38 +599,50 @@ impl TimeSeries {
         };
 
         // A chunk whose split fails stays as it is, oversized, while the others are still split
-        // and kept; the error only reports that one did not.
+        // and kept; the error only reports that one did not. A chunk whose stream does not
+        // decode is not an error here: the load kept it whole on purpose (it counted it as
+        // `UNSPLITTABLE_CHUNKS_KEPT`), so failing on it would fail every later merge and defrag
+        // of the series and log each time.
         // A split re-encodes two half chunks (~thousands of samples), so a
         // handful of them is worth the pool; one is not.
+        let note_failed_split = |err: &TsdbError| {
+            if !matches!(err, TsdbError::DecodingError(_)) {
+                errored.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
         let mut new_chunks = if self.is_compressed() {
             self.chunks
                 .par_mut_rayon()
                 .num_threads(request_par_threads(to_split, to_split * SPLIT_WORK))
                 .filter(|c| c.should_split())
                 .flat_map(|chunks| {
-                    if let Ok(mut split_chunk) = chunks.split() {
-                        // `split` re-encodes both halves from scratch, so both arrive with a
-                        // doubling-grown buffer around half a chunk of data.
-                        seal_chunk(chunks);
-                        seal_chunk(&mut split_chunk);
-                        count_oversized(chunks, &split_chunk);
-                        Some(split_chunk)
-                    } else {
-                        errored.store(true, std::sync::atomic::Ordering::Relaxed);
-                        None
+                    match chunks.split() {
+                        Ok(mut split_chunk) => {
+                            // `split` re-encodes both halves from scratch, so both arrive with a
+                            // doubling-grown buffer around half a chunk of data.
+                            seal_chunk(chunks);
+                            seal_chunk(&mut split_chunk);
+                            count_oversized(chunks, &split_chunk);
+                            Some(split_chunk)
+                        }
+                        Err(err) => {
+                            note_failed_split(&err);
+                            None
+                        }
                     }
                 })
                 .collect::<Vec<_>>()
         } else {
             let mut new_chunks = Vec::with_capacity(std::cmp::max(2, self.chunks.len() / 6));
             for c in self.chunks.iter_mut().filter(|c| c.should_split()) {
-                if let Ok(mut split_chunk) = c.split() {
-                    seal_chunk(c);
-                    seal_chunk(&mut split_chunk);
-                    count_oversized(c, &split_chunk);
-                    new_chunks.push(split_chunk);
-                } else {
-                    errored.store(true, std::sync::atomic::Ordering::Relaxed);
+                match c.split() {
+                    Ok(mut split_chunk) => {
+                        seal_chunk(c);
+                        seal_chunk(&mut split_chunk);
+                        count_oversized(c, &split_chunk);
+                        new_chunks.push(split_chunk);
+                    }
+                    Err(err) => note_failed_split(&err),
                 }
             }
             new_chunks

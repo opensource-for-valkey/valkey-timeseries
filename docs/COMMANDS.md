@@ -8,6 +8,11 @@ scripts run inline, as do standalone `TS.CARD` counts without a range filter.
 Ranked label-value and metric-name searches apply `LIMIT` after ranking; equal scores or
 cardinalities are ordered by value ascending.
 
+`LATEST` on `TS.GET`, `TS.MGET`, `TS.RANGE`, `TS.REVRANGE`, `TS.MRANGE` and `TS.MREVRANGE`
+recomputes a dirty compaction rule's open bucket from retained source samples, including before
+the first write after load. Reads leave the saved rule state unchanged, so each one repeats the
+scan until the next source write.
+
 - [`TS.ADD`](commands/ts.add.md)
 - [`TS.ADDBULK`](commands/ts.addbulk.md)
 - [`TS.ALTER`](commands/ts.alter.md)

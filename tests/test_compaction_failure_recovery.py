@@ -47,6 +47,8 @@ class TestCompactionFailureRecovery(ValkeyTimeSeriesTestCaseDebugMode):
         c.execute_command("TS.ADD", "r:src", 300, 2)
         c.execute_command("DEBUG", "RELOAD")
         assert self.info_debug(c, "r:src")[b"rulesState"][0][4] == 1
+        assert c.execute_command("TS.GET", "r:dst", "LATEST") == [0, b"3"]
+        assert self.info_debug(c, "r:src")[b"rulesState"][0][4] == 1
         c.execute_command("TS.ADD", "r:src", 1000, 8)  # rebuilds (1 + 2), then closes bucket 0
         assert c.execute_command("TS.RANGE", "r:dst", "-", "+") == [[0, b"3"]]
         assert self.info_debug(c, "r:src")[b"rulesState"][0][4] == 0
@@ -62,6 +64,58 @@ class TestCompactionFailureRecovery(ValkeyTimeSeriesTestCaseDebugMode):
         c.execute_command("TS.DEL", "d:src", 300, 300)   # its resync rebuilds the open bucket
         # 1 + 4 from the source; a removal that skipped the resync would leave the stale 3.
         assert self.info_debug(c, "d:src")[b"rulesState"][0] == [b"d:dst", 0, 1, b"5", 0]
+
+    def test_latest_recovers_a_loaded_rule_with_no_saved_open_bucket(self):
+        c = self.client
+        self.make_rule("first:src", "first:dst")
+        c.execute_command("TS._DEBUG", "FAIL_NEXT_COMPACTION")
+        c.execute_command("TS.ADD", "first:src", 300, 2)
+        c.execute_command("DEBUG", "RELOAD")
+        assert c.execute_command("TS.GET", "first:dst", "LATEST") == [0, b"2"]
+        assert self.info_debug(c, "first:src")[b"rulesState"][0][4] == 1
+
+    def test_latest_omits_a_dirty_bucket_when_the_loaded_source_is_empty(self):
+        c = self.client
+        self.make_rule("empty:src", "empty:dst")
+        c.execute_command("TS.ADD", "empty:src", 0, 1)
+        c.execute_command("TS._DEBUG", "FAIL_NEXT_COMPACTION")
+        c.execute_command("TS.DEL", "empty:src", 0, 0)
+        c.execute_command("DEBUG", "RELOAD")
+        assert c.execute_command("TS.GET", "empty:dst", "LATEST") == []
+        assert c.execute_command("TS.RANGE", "empty:dst", "-", "+", "LATEST") == []
+        assert self.info_debug(c, "empty:src")[b"rulesState"][0][4] == 1
+
+    def test_latest_after_a_failed_removal_reports_the_stored_buckets(self):
+        """A failed removal leaves destination buckets a successful one would have retracted, so
+        the rebuilt open bucket can fall on or behind them. Every LATEST read then reports the
+        stored data, without a duplicate timestamp or a bucket older than the last one stored."""
+        c = self.client
+        for prefix, deleted, stored in (
+            ("same", (1500, 2500), [[0, b"3"], [1000, b"20"]]),    # rebuilt bucket 1000 = 4
+            ("older", (1000, 2500), [[0, b"3"], [1000, b"20"]]),   # rebuilt bucket 0 = 3
+        ):
+            src, dst = f"{prefix}:src", f"{prefix}:dst"
+            self.make_rule(src, dst)
+            c.execute_command("TS.ALTER", dst, "LABELS", "failed", prefix)
+            for ts, value in ((0, 1), (500, 2), (1000, 4), (1500, 16), (2500, 8)):
+                c.execute_command("TS.ADD", src, ts, value)
+            assert c.execute_command("TS.RANGE", dst, "-", "+") == stored
+
+            c.execute_command("TS._DEBUG", "FAIL_NEXT_COMPACTION")
+            c.execute_command("TS.DEL", src, *deleted)
+            assert self.info_debug(c, src)[b"rulesState"][0][4] == 1
+
+            assert c.execute_command("TS.GET", dst, "LATEST") == stored[-1], prefix
+            assert c.execute_command("TS.MGET", "LATEST", "FILTER", f"failed={prefix}") == \
+                [[dst.encode(), [], stored[-1]]], prefix
+            # Bounded and unbounded ends agree: an end past the last stored bucket once let the
+            # rebuilt one through.
+            for end in ("+", 1500, 1000):
+                assert c.execute_command("TS.RANGE", dst, "-", end, "LATEST") == stored, (prefix, end)
+                assert c.execute_command("TS.REVRANGE", dst, "-", end, "LATEST") == stored[::-1], \
+                    (prefix, end)
+            assert c.execute_command("TS.MRANGE", "-", "+", "LATEST", "FILTER", f"failed={prefix}") == \
+                [[dst.encode(), [], stored]], prefix
 
     def build_chain(self, prefix):
         """src -> A (sum, 5000 ms, first rule) and src -> B (sum, 1000 ms, second rule);

@@ -17,7 +17,7 @@ use crate::series::serialization::{
     IGNORE_CLAMPED, IGNORE_RESET, LABEL_NUL_KEPT, LoadTrust, NEGATIVE_TIMESTAMPS,
     OFF_GRID_BUCKET_REBUILT, OVERSIZED_SPLIT, RETENTION_CLAMPED, ROUNDING_CLAMPED,
     ROUNDING_DROPPED, STALE_RULE_STATE_CLEARED, STRAYS_REENCODED, UNDECODABLE_STRAYS_KEPT,
-    check_series_invariants, drop_empty_chunks, normalize_series,
+    UNSPLITTABLE_CHUNKS_KEPT, check_series_invariants, drop_empty_chunks, normalize_series,
 };
 use crate::series::{
     DuplicatePolicy, SPLIT_SLACK_DIVISOR, TimeSeries, bulk_insert_samples, defrag_series,
@@ -885,22 +885,23 @@ fn empty_chunks_are_dropped_on_load() {
     }
 }
 
+/// Leaves `chunk` a stream that claims more samples than it holds.
+fn damage(chunk: &mut TimeSeriesChunk) {
+    match chunk {
+        TimeSeriesChunk::Gorilla(c) => {
+            let half = c.encoder.bytes().len() / 2;
+            c.encoder.truncate_stream_for_test(half);
+        }
+        TimeSeriesChunk::Chimp(c) => *c.encoder.header_mut_for_test().0 *= 2,
+        TimeSeriesChunk::Uncompressed(_) => unreachable!("no stream to damage"),
+    }
+}
+
 /// A stray chunk's iterator ends at a decode error, so re-encoding what it yields would
 /// store only the readable prefix. An own load keeps such a stray as it is, and tolerates it;
 /// a decodable stray beside it is still re-encoded.
 #[test]
 fn an_undecodable_stray_is_kept_not_truncated() {
-    // A stream that claims more samples than it holds.
-    fn damage(chunk: &mut TimeSeriesChunk) {
-        match chunk {
-            TimeSeriesChunk::Gorilla(c) => {
-                let half = c.encoder.bytes().len() / 2;
-                c.encoder.truncate_stream_for_test(half);
-            }
-            TimeSeriesChunk::Chimp(c) => *c.encoder.header_mut_for_test().0 *= 2,
-            TimeSeriesChunk::Uncompressed(_) => unreachable!("no stream to damage"),
-        }
-    }
     for encoding in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
         let mut ts = loaded_base(ChunkEncoding::Uncompressed);
         let mut t = ts.chunks.last().unwrap().last_timestamp();
@@ -934,6 +935,89 @@ fn an_undecodable_stray_is_kept_not_truncated() {
         );
         assert_eq!(ts.chunks[n - 1], bad, "{encoding}: the damaged stray");
         assert_eq!(ts.total_samples, total, "{encoding}: samples dropped");
+    }
+}
+
+/// An oversized chunk splits every chunk past its budget, and a split decodes the chunk. One that
+/// does not decode (a kept stray, or a damaged chunk of the series' own encoding) once failed the
+/// split and with it the whole RDB load. An own load keeps it whole and tolerates it, and still
+/// splits the oversized chunk beside it; a foreign load is refused as before.
+#[test]
+fn an_undecodable_chunk_past_its_budget_is_kept_whole_when_splitting() {
+    for (series, damaged) in [
+        // Strays, kept by the re-encode.
+        (ChunkEncoding::Uncompressed, ChunkEncoding::Gorilla),
+        (ChunkEncoding::Uncompressed, ChunkEncoding::Chimp),
+        // Damaged chunks of the series' own encoding.
+        (ChunkEncoding::Gorilla, ChunkEncoding::Gorilla),
+        (ChunkEncoding::Chimp, ChunkEncoding::Chimp),
+    ] {
+        let what = format!("{damaged} in a {series} series");
+        let mut ts = loaded_base(series);
+        let mut t = ts.last_timestamp();
+        let mut bad = TimeSeriesChunk::new(damaged, 128);
+        for _ in 0..1000 {
+            t += 1000;
+            bad.add_sample(&Sample::new(t, t as f64 * 0.37)).unwrap();
+        }
+        damage(&mut bad);
+        assert!(bad.iter().count() < bad.len(), "{what}: still decodes");
+        assert!(bad.should_split(), "{what}: within its budget");
+        ts.chunks.push(bad.clone());
+        ts.chunks.push(oversized_chunk(series, t));
+        ts.recalculate_total_samples();
+        ts.update_first_last_timestamps();
+        let total = ts.total_samples;
+        let stored = stored_samples(&ts);
+
+        assert!(
+            normalize_series(&mut ts.clone(), LoadTrust::Foreign).is_err(),
+            "{what}: a foreign load accepted it"
+        );
+        let repairs = normalize_series(&mut ts, LoadTrust::Own)
+            .unwrap_or_else(|e| panic!("{what}: an own load refused it: {e}"));
+        assert_eq!(repairs.repaired, [OVERSIZED_SPLIT], "{what}");
+        let tolerated: &[&str] = if series == damaged {
+            &[UNSPLITTABLE_CHUNKS_KEPT]
+        } else {
+            &[UNDECODABLE_STRAYS_KEPT, UNSPLITTABLE_CHUNKS_KEPT]
+        };
+        assert_eq!(repairs.tolerated, tolerated, "{what}");
+
+        let kept: Vec<_> = ts.chunks.iter().filter(|c| **c == bad).collect();
+        assert_eq!(kept.len(), 1, "{what}: the damaged chunk was changed");
+        for (i, chunk) in ts.chunks.iter().enumerate() {
+            if *chunk != bad {
+                assert!(!chunk.should_split(), "{what}: chunk {i} unsplit");
+                assert!(chunk.size() <= MAX_LOADED_CHUNK_BYTES, "{what}: chunk {i}");
+            }
+        }
+        assert!(
+            ts.chunks
+                .windows(2)
+                .all(|w| w[0].last_timestamp() < w[1].first_timestamp()),
+            "{what}: chunks out of order"
+        );
+        assert_eq!(ts.total_samples, total, "{what}: samples dropped");
+        assert_eq!(stored_samples(&ts), stored, "{what}: samples changed");
+
+        // The merge path's split, which every later merge, bulk insert and defrag runs, leaves
+        // the kept chunk whole too, rather than failing on it each time.
+        let loaded = ts.clone();
+        ts.split_chunks_if_needed()
+            .unwrap_or_else(|e| panic!("{what}: a later split failed on the kept chunk: {e}"));
+        assert_eq!(
+            ts.chunks, loaded.chunks,
+            "{what}: a later split changed the chunks"
+        );
+        defrag_series(&mut ts)
+            .unwrap_or_else(|e| panic!("{what}: defrag failed on the kept chunk: {e}"));
+        assert_eq!(
+            ts.chunks.iter().filter(|c| **c == bad).count(),
+            1,
+            "{what}: defrag changed the damaged chunk"
+        );
+        assert_eq!(ts.total_samples, total, "{what}: defrag dropped samples");
     }
 }
 
