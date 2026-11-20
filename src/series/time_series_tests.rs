@@ -1088,6 +1088,30 @@ mod tests {
         assert_eq!(time_series.last_sample, Some(sample3));
     }
 
+    /// A sample count that has fallen behind its chunks must not wrap when the trim subtracts
+    /// what it removed: debug builds panicked on the main thread, release builds reported
+    /// ~`usize::MAX` samples. The trim recounts from the chunks instead.
+    #[test]
+    fn test_trim_recounts_a_sample_count_below_what_it_removes() {
+        for force in [true, false] {
+            let mut series = TimeSeries::new();
+            for ts in (0..400).step_by(10) {
+                series.add(ts, 1.0, None);
+            }
+            series.total_samples = 3;
+            series.retention = Duration::from_millis(100);
+
+            let result = if force {
+                series.trim()
+            } else {
+                series.trim_lazily()
+            };
+            assert!(result.unwrap() > 3, "force {force}");
+            let stored: usize = series.chunks.iter().map(|c| c.len()).sum();
+            assert_eq!(series.total_samples, stored, "force {force}");
+        }
+    }
+
     #[test]
     fn test_trim_partial_chunks() {
         // Set up a TimeSeries with chunks such that some are before the min_timestamp

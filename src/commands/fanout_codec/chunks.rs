@@ -4,7 +4,6 @@ use crate::common::logging::log_warning;
 use crate::common::{MultiSample, Sample};
 use crate::error_consts;
 use crate::labels::Label;
-use crate::series::TimeSeries;
 use crate::series::chunks::{
     Chunk, ChunkEncoding, ChunkOps, TimeSeriesChunk, samples_to_chunk_lossless,
 };
@@ -65,25 +64,6 @@ impl TryFrom<&SampleData> for TimeSeriesChunk {
 
     fn try_from(value: &SampleData) -> Result<Self, Self::Error> {
         deserialize_chunk(value)
-    }
-}
-
-impl TryFrom<&SampleData> for TimeSeries {
-    type Error = ValkeyError;
-
-    fn try_from(value: &SampleData) -> Result<Self, Self::Error> {
-        let chunk = deserialize_chunk(value)?;
-        TimeSeries::from_chunk(chunk).map_err(|e| {
-            ValkeyError::String(format!("Failed to create time series from chunk: {e}"))
-        })
-    }
-}
-
-impl TryFrom<SampleData> for TimeSeries {
-    type Error = ValkeyError;
-
-    fn try_from(value: SampleData) -> Result<Self, Self::Error> {
-        (&value).try_into()
     }
 }
 
@@ -251,6 +231,34 @@ mod tests {
         let wire: SeriesRangeResponse = result.try_into().expect("serialize");
         let back: MRangeSeriesResult = wire.try_into().expect("deserialize");
         back.data
+    }
+
+    /// A shard's uncompressed reply chunk (`UncompressedChunk::from_vec`, and the lossless
+    /// fallback) has a budget of 16 bytes a sample, outside the `CHUNK_SIZE` range for one or
+    /// two samples and past 65 536. The coordinator decodes it as a chunk, which takes any
+    /// budget; validating it as a `CHUNK_SIZE` would fail the whole reply.
+    #[test]
+    fn an_uncompressed_reply_chunk_of_any_length_roundtrips() {
+        for len in [1usize, 2, 65_537] {
+            let samples: Vec<Sample> = (0..len as i64)
+                .map(|i| Sample::new(i * 10, i as f64))
+                .collect();
+            let result = MRangeSeriesResult {
+                key: b"a".to_vec(),
+                group_label_value: Some("g".into()),
+                labels: Vec::new(),
+                sources: Vec::new(),
+                data: SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(
+                    UncompressedChunk::from_vec(samples.clone()),
+                )),
+            };
+            match roundtrip(result) {
+                SeriesResultData::Chunk(chunk) => {
+                    assert_eq!(chunk.iter().collect::<Vec<_>>(), samples, "{len} samples")
+                }
+                SeriesResultData::Rows(_) => panic!("expected a chunk"),
+            }
+        }
     }
 
     #[test]

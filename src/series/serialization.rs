@@ -295,6 +295,8 @@ pub(crate) const STRAYS_REENCODED: &str = "chunks of another encoding re-encoded
 pub(crate) const OVERSIZED_SPLIT: &str = "oversized chunks split";
 pub(crate) const CHUNK_SIZE_CLAMPED: &str = "chunk size clamped";
 pub(crate) const RETENTION_CLAMPED: &str = "retention clamped";
+pub(crate) const IGNORE_CLAMPED: &str = "IGNORE time window clamped";
+pub(crate) const IGNORE_RESET: &str = "IGNORE with an unparseable value window reset";
 pub(crate) const ROUNDING_CLAMPED: &str = "rounding digits clamped";
 pub(crate) const ROUNDING_DROPPED: &str = "rounding to zero significant digits dropped";
 pub(crate) const NEGATIVE_TIMESTAMPS: &str = "negative timestamps";
@@ -420,6 +422,29 @@ pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<
         // ten-year maximum instead would expire older data on reload.
         ts.retention = Duration::from_millis(i64::MAX as u64);
         repairs.repair(RETENTION_CLAMPED);
+    }
+
+    // The ranges `parse_ignore_options` accepts. Replication spells IGNORE out as text
+    // (`resolved_create_args`), so a value outside them would also fail on the replica.
+    let dup = &mut ts.sample_duplicates;
+    if dup.max_value_delta.is_nan() || dup.max_value_delta < 0.0 {
+        refuse(format!(
+            "IGNORE value window {} out of range",
+            dup.max_value_delta
+        ))?;
+        // Such a window never matches, so IGNORE was off: reset to what a series created
+        // without it has.
+        dup.max_time_delta = 0;
+        dup.max_value_delta = 0.0;
+        repairs.repair(IGNORE_RESET);
+    } else if dup.max_time_delta > i64::MAX as u64 {
+        refuse(format!(
+            "IGNORE time window {} ms out of range",
+            dup.max_time_delta
+        ))?;
+        // Both cover every gap between two timestamps.
+        dup.max_time_delta = i64::MAX as u64;
+        repairs.repair(IGNORE_CLAMPED);
     }
 
     if let Some(rounding) = ts.rounding
