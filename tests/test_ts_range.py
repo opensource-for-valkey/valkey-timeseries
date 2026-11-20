@@ -49,6 +49,19 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         assert timestamps('-6h', '-3h') == []
         assert timestamps('-', '-1h') == []
 
+    def test_negative_end_offset_with_latest_and_retention(self):
+        """A negative end offset is empty with LATEST too, on a compaction target with
+        retention, whose open bucket starts at the window's start."""
+        self.client.execute_command('TS.CREATE', 'lat:src')
+        self.client.execute_command('TS.CREATE', 'lat:dst', 'RETENTION', 100000)
+        self.client.execute_command('TS.CREATERULE', 'lat:src', 'lat:dst', 'AGGREGATION', 'sum', 1000)
+        for ts in (1000, 1500, 2000, 2500):
+            self.client.execute_command('TS.ADD', 'lat:src', ts, 1)
+        for cmd in ('TS.RANGE', 'TS.REVRANGE'):
+            assert self.client.execute_command(cmd, 'lat:dst', 2000, 2000, 'LATEST') == [[2000, b'2']]
+            assert self.client.execute_command(cmd, 'lat:dst', 2000, '-1s', 'LATEST') == []
+            assert self.client.execute_command(cmd, 'lat:dst', 2000, 0, 'LATEST') == []
+
     def test_full_range(self):
         """Test TS.RANGE with '-' and '+'"""
 

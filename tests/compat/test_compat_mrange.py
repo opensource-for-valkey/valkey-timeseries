@@ -301,6 +301,17 @@ class TestPerSeriesOptions:
         diff(mrange_cmd, "-", "+", "FILTER", "role=dst")
         diff(mrange_cmd, "-", "+", "LATEST", "FILTER", "role=dst")
 
+    def test_latest_on_an_inverted_window_with_retention(self, diff, mrange_cmd):
+        """An inverted window is empty, the open bucket included, on a target with retention."""
+        mk_series(diff, "latinv:src", "LABELS", "role", "invsrc")
+        mk_series(diff, "latinv:dst", "RETENTION", 100000, "LABELS", "role", "invdst")
+        diff("TS.CREATERULE", "latinv:src", "latinv:dst", "AGGREGATION", "sum", 1000)
+        # The bucket starting at 2000 stays open.
+        for ts, value in [(1000, 1.0), (1500, 2.0), (2000, 4.0), (2500, 8.0)]:
+            diff("TS.ADD", "latinv:src", ts, value)
+        diff(mrange_cmd, 2000, 2000, "LATEST", "FILTER", "role=invdst")
+        diff(mrange_cmd, 2000, 0, "LATEST", "FILTER", "role=invdst")
+
 
 class TestGroupByReduce:
     @pytest.mark.parametrize("reducer", GROUP_REDUCERS)

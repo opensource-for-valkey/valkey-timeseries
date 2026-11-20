@@ -17,12 +17,16 @@ pub(crate) fn get_range_latest_sample(
         return None;
     }
 
-    let (mut start_ts, mut end_ts) = options.date_range.get_timestamps(None);
+    let (mut start_ts, end_ts) = options.date_range.get_timestamps(None);
 
     if !series.retention.is_zero() {
-        let min_ts = series.get_min_timestamp();
-        start_ts = start_ts.max(min_ts);
-        end_ts = start_ts.max(end_ts);
+        start_ts = start_ts.max(series.get_min_timestamp());
+    }
+    // An inverted window holds nothing, the open bucket included. Raising the end to the
+    // retention floor instead made it the one-point window `[start, start]`, which returned
+    // a bucket starting there.
+    if start_ts > end_ts {
+        return None;
     }
 
     // a partial compaction sample, if it exists, is beyond the last stored sample
