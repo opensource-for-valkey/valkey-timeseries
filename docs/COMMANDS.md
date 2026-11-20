@@ -10,7 +10,8 @@ cardinalities are ordered by value ascending.
 
 `LATEST` on `TS.GET`, `TS.MGET`, `TS.RANGE`, `TS.REVRANGE`, `TS.MRANGE` and `TS.MREVRANGE`
 recomputes a dirty compaction rule's open bucket from retained source samples, including before
-the first write after load. Reads leave the saved rule state unchanged.
+the first write after load. Reads leave the saved rule state unchanged, so each one repeats the
+scan until the next source write.
 
 - [`TS.ADD`](commands/ts.add.md)
 - [`TS.ADDBULK`](commands/ts.addbulk.md)

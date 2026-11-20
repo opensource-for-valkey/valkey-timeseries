@@ -57,8 +57,8 @@ Empty time series:
 ## Complexity
 
 O(1) – Constant time access to the last sample.
-With `LATEST` on a dirty compaction rule, the read also scans the retained source samples in
-the open bucket.
+With `LATEST` on a dirty compaction rule, every read until the next source write also scans the
+retained source samples in the open bucket.
 
 ## See Also
 

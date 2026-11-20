@@ -47,7 +47,18 @@ pub(crate) fn get_latest_compaction_sample(ctx: &Context, series: &TimeSeries) -
             &mut rebuilt,
             parent.last_sample.map(|s| s.timestamp),
         );
-        (rebuilt.bucket_start?, rebuilt.aggregator)
+        let start = rebuilt.bucket_start?;
+        // An open bucket has no destination entry, and every read places it after the stored
+        // samples. One that starts at or before the destination's last sample means a failed
+        // removal left buckets it should have retracted: report the stored data, as reads
+        // without LATEST do, rather than a bucket on top of or behind it.
+        if series
+            .last_sample
+            .is_some_and(|last| start <= last.timestamp)
+        {
+            return None;
+        }
+        (start, rebuilt.aggregator)
     } else {
         (rule.bucket_start?, rule.aggregator.clone())
     };
