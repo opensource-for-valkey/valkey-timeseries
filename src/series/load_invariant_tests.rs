@@ -1000,6 +1000,24 @@ fn an_undecodable_chunk_past_its_budget_is_kept_whole_when_splitting() {
         );
         assert_eq!(ts.total_samples, total, "{what}: samples dropped");
         assert_eq!(stored_samples(&ts), stored, "{what}: samples changed");
+
+        // The merge path's split, which every later merge, bulk insert and defrag runs, leaves
+        // the kept chunk whole too, rather than failing on it each time.
+        let loaded = ts.clone();
+        ts.split_chunks_if_needed()
+            .unwrap_or_else(|e| panic!("{what}: a later split failed on the kept chunk: {e}"));
+        assert_eq!(
+            ts.chunks, loaded.chunks,
+            "{what}: a later split changed the chunks"
+        );
+        defrag_series(&mut ts)
+            .unwrap_or_else(|e| panic!("{what}: defrag failed on the kept chunk: {e}"));
+        assert_eq!(
+            ts.chunks.iter().filter(|c| **c == bad).count(),
+            1,
+            "{what}: defrag changed the damaged chunk"
+        );
+        assert_eq!(ts.total_samples, total, "{what}: defrag dropped samples");
     }
 }
 

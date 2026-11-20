@@ -587,11 +587,12 @@ fn reencode_strays(ts: &mut TimeSeries) -> Result<(usize, Vec<usize>), String> {
 /// at most `MAX_CHUNK_SIZE`, clamped before this runs), so every chunk it splits ends under
 /// `MAX_LOADED_CHUNK_BYTES`. Returns how many chunks were split and how many were kept whole.
 ///
-/// Unlike the merge path's `split_chunks_if_needed`, one chunk that does not split cannot fail
-/// the rest: a split decodes the chunk, and an own load keeps chunks whose streams stop short
-/// (`undecodable`, or any other found here). Splitting one would fail, or keep the readable
-/// prefix and lose the rest, as re-encoding it would; kept whole, it reads as any damaged
-/// own-load chunk does. Each piece is split in place, so the chunks stay in order.
+/// One chunk that does not split cannot fail the rest: a split decodes the chunk, and an own
+/// load keeps chunks whose streams stop short (`undecodable`, or any other found here).
+/// Splitting one would fail, or keep the readable prefix and lose the rest, as re-encoding it
+/// would; kept whole, it reads as any damaged own-load chunk does, and the merge path's
+/// `split_chunks_if_needed` leaves it whole too. Each piece is split in place, so the chunks
+/// stay in order.
 fn split_oversized_on_load(ts: &mut TimeSeries, undecodable: &[usize]) -> (usize, usize) {
     fn push_halves(mut chunk: TimeSeriesChunk, out: &mut Vec<TimeSeriesChunk>, kept: &mut usize) {
         if !chunk.should_split() {
