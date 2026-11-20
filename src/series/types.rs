@@ -564,7 +564,7 @@ mod tests {
         let invalid_policies = [Min, Max, Sum];
         for policy in invalid_policies {
             assert!(matches!(
-                dp.duplicate_value(ts, f64::NAN, 8.0),
+                policy.duplicate_value(ts, f64::NAN, 8.0),
                 Err(TsdbError::DuplicateSample(_))
             ));
             assert!(matches!(
