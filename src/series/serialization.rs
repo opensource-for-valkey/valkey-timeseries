@@ -521,9 +521,8 @@ pub(crate) fn normalize_series(ts: &mut TimeSeries, trust: LoadTrust) -> Result<
     Ok(repairs)
 }
 
-/// Re-encodes every chunk whose encoding is not the series' own, keeping its budget.
-/// Re-encodes every chunk not in the series' encoding, returning how many were re-encoded and
-/// how many were kept as they are.
+/// Re-encodes every chunk not in the series' encoding, keeping its budget, and returns how many
+/// were re-encoded and how many were kept as they are.
 ///
 /// A stray whose stream stops decoding before its count is kept: `iter` ends at a decode
 /// error, so re-encoding what it yields would store the readable prefix and lose the rest for
