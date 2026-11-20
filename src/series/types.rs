@@ -443,20 +443,6 @@ impl ValueFilter {
         Ok(Self { min, max })
     }
 
-    pub fn greater_than(value: f64) -> Self {
-        Self {
-            min: value,
-            max: f64::MAX,
-        }
-    }
-
-    pub fn less_than(value: f64) -> Self {
-        Self {
-            min: f64::MIN,
-            max: value,
-        }
-    }
-
     pub fn is_match(&self, value: f64) -> bool {
         value >= self.min && value <= self.max
     }
@@ -564,11 +550,11 @@ mod tests {
         let invalid_policies = [Min, Max, Sum];
         for policy in invalid_policies {
             assert!(matches!(
-                dp.duplicate_value(ts, f64::NAN, 8.0),
+                policy.duplicate_value(ts, f64::NAN, 8.0),
                 Err(TsdbError::DuplicateSample(_))
             ));
             assert!(matches!(
-                dp.duplicate_value(ts, 8.0, f64::NAN),
+                policy.duplicate_value(ts, 8.0, f64::NAN),
                 Err(TsdbError::DuplicateSample(_))
             ));
             let actual = policy.duplicate_value(ts, f64::NAN, f64::NAN).unwrap();

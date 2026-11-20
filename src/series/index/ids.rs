@@ -25,7 +25,6 @@
 //! epoch `0`. A wrap requires exhausting 2^40 (~1.1 trillion) IDs in one
 //! process lifetime; the carried epoch is as uniformly random as a fresh
 //! draw, so wrapping is harmless anyway.
-#[allow(dead_code)]
 use crate::series::TimeseriesId;
 use rand::{RngExt, rng};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,7 +42,6 @@ const COUNTER_MASK: u64 = (1 << COUNTER_BITS) - 1;
 /// generation is one wait-free `fetch_add`; a counter wrap carries into the
 /// epoch bits, so there is no epoch/counter tearing under contention.
 pub struct IdGenerator {
-    epoch: u32,
     /// The last issued ID; `fetch_add(1)` issues the next one.
     state: AtomicU64,
 }
@@ -63,7 +61,6 @@ impl IdGenerator {
     pub fn with_epoch(epoch: u64) -> Self {
         let epoch = epoch & EPOCH_MASK;
         IdGenerator {
-            epoch: (epoch as u32),
             state: AtomicU64::new(epoch << COUNTER_BITS),
         }
     }
@@ -72,7 +69,6 @@ impl IdGenerator {
     fn with_parts(epoch: u64, counter: u64) -> Self {
         let epoch = epoch & EPOCH_MASK;
         IdGenerator {
-            epoch: (epoch as u32),
             state: AtomicU64::new((epoch << COUNTER_BITS) | (counter & COUNTER_MASK)),
         }
     }
@@ -81,9 +77,11 @@ impl IdGenerator {
         self.state.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// The high bits of the packed state: the generator's epoch, until a counter wrap carries
+    /// into them.
     #[cfg(test)]
     pub fn epoch(&self) -> u32 {
-        self.epoch
+        (self.state.load(Ordering::Relaxed) >> COUNTER_BITS) as u32
     }
 
     #[cfg(test)]
@@ -120,12 +118,6 @@ pub fn extract_epoch(id: TimeseriesId) -> u32 {
 #[cfg(test)]
 pub fn extract_counter(id: TimeseriesId) -> u64 {
     id & COUNTER_MASK
-}
-
-/// The epoch of the process-wide generator: the high bits every id minted by this process shares.
-#[allow(dead_code)] // no caller yet
-pub(crate) fn epoch() -> u32 {
-    DEFAULT_GENERATOR.epoch
 }
 
 /// Draw the process-lifetime epoch. `0` is reserved (legacy dense IDs and

@@ -598,7 +598,8 @@ impl TimeSeries {
             }
         };
 
-        // todo: track error, but allow partials
+        // A chunk whose split fails stays as it is, oversized, while the others are still split
+        // and kept; the error only reports that one did not.
         // A split re-encodes two half chunks (~thousands of samples), so a
         // handful of them is worth the pool; one is not.
         let mut new_chunks = if self.is_compressed() {
@@ -1421,11 +1422,8 @@ impl TimeSeries {
         // chunk start timestamps = [10, 20, 30, 40]
         // start = 25, end = 25
         // we have a situation where start_index == end_index (2), yet samples[2] is greater than end,
-        if start_idx == end_idx {
-            // todo: get_unchecked
-            if self.chunks[start_idx].first_timestamp() > end {
-                return None;
-            }
+        if start_idx == end_idx && self.chunks[start_idx].first_timestamp() > end {
+            return None;
         }
 
         Some((start_idx, end_idx))
@@ -1497,8 +1495,7 @@ impl TimeSeries {
         for rule in self.rules.iter() {
             calc_compaction_digest(rule, digest);
         }
-
-        digest.end_sequence()
+        // The sequence is ended by the caller, the type's `digest` callback.
     }
 }
 

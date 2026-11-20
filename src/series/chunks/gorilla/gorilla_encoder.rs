@@ -255,7 +255,7 @@ impl GorillaEncoder {
         write_uvarint(buf, self.last_ts as u64);
         write_f64_le(buf, self.last_value);
 
-        // delta is verified to be > 0 when adding samples
+        // delta is verified to be >= 0 when adding samples
         write_uvarint(buf, self.timestamp_delta as u64);
 
         buf.push(self.leading_bits);

@@ -184,33 +184,17 @@ impl UncompressedChunk {
             return None;
         }
 
-        let (start_idx, _) = binary_search_samples_by_timestamp(&self.samples, start);
-        if start_idx >= len {
-            return None;
-        }
-
-        let (mut end_idx, found) = binary_search_samples_by_timestamp(&self.samples, end);
-        if !found && end_idx > 0 {
-            // if the end timestamp is not found, we need to include the previous sample
-            // to ensure that the end timestamp is included in the range.
-            let right = &self.samples[end_idx - 1];
-            if right.timestamp < end {
-                end_idx -= 1;
-            }
-        }
-
-        // imagine this scenario:
-        // sample start timestamps = [10, 20, 30, 40]
-        // start = 25, end = 25
-        // we have a situation where start_index == end_index (2), yet samples[2] is greater than end,
-        if start_idx == end_idx {
-            // todo: get_unchecked
-            if self.samples[start_idx].timestamp > end {
-                return None;
-            }
-        }
-
-        Some((start_idx, end_idx))
+        // The first sample at or after `start`, and the last at or before `end`: on a miss the
+        // insertion point is the sample after `end`, and one before it exists because `end` is
+        // not before the first sample.
+        let (start_idx, _) = get_sample_index(&self.samples, start);
+        let end_idx = match get_sample_index(&self.samples, end) {
+            (idx, true) => idx,
+            (idx, false) => idx - 1,
+        };
+        // A window between two samples (`[25, 25]` over `[10, 20, 30, 40]`) leaves `start_idx`
+        // one past `end_idx`.
+        (start_idx <= end_idx).then_some((start_idx, end_idx))
     }
 
     /// The sample count recorded in a chunk's [`ChunkOps::serialize`] output,
@@ -229,7 +213,9 @@ impl UncompressedChunk {
         write_uvarint(buf, self.samples.len() as u64);
 
         for sample in &self.samples {
-            // assume non-zero timestamps
+            // Timestamps are non-negative from every writer, so the cast is lossless and the
+            // uvarint short; a negative one (tolerated on an own load) still round-trips through
+            // the `as i64` in `deserialize_raw`, at the uvarint's full width.
             write_uvarint(buf, sample.timestamp as u64);
             write_f64_le(buf, sample.value);
         }
@@ -274,23 +260,13 @@ fn read_usize(buf: &mut &[u8]) -> TsdbResult<usize> {
     Ok(value as usize)
 }
 
-fn binary_search_samples_by_timestamp(samples: &[Sample], ts: Timestamp) -> (usize, bool) {
-    match samples.binary_search_by(|probe| match ts.cmp(&probe.timestamp) {
-        std::cmp::Ordering::Less => std::cmp::Ordering::Greater,
-        std::cmp::Ordering::Greater => std::cmp::Ordering::Less,
-        std::cmp::Ordering::Equal => std::cmp::Ordering::Equal,
-    }) {
-        Ok(pos) => (pos, true),
-        Err(pos) => (pos, false),
-    }
-}
-
 fn samples_are_strictly_increasing(samples: &[Sample]) -> bool {
     samples
         .windows(2)
         .all(|pair| pair[0].timestamp < pair[1].timestamp)
 }
 
+/// The index of the sample at `ts`, or where it would be inserted.
 fn get_sample_index(samples: &[Sample], ts: Timestamp) -> (usize, bool) {
     match samples.binary_search_by(|x| x.timestamp.cmp(&ts)) {
         Ok(pos) => (pos, true),

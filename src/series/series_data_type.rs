@@ -79,11 +79,14 @@ pub static VK_TIME_SERIES_TYPE: ValkeyType = ValkeyType::new(
 /// all keys are being removed.
 ///
 /// All interested parties should use the `is_flushing_in_process` function to check if a flush is in process.
+///
+/// The flag is advisory, so both sides use `Relaxed`: nothing is ordered by it, and it does not
+/// cover every flush-time free (see the `free` callback's note on `FLUSHALL ASYNC`).
 static IS_FLUSHING: AtomicBool = AtomicBool::new(false);
 
 #[flush_event_handler]
 fn flushed_event_handler(_ctx: &Context, flush_event: FlushSubevent) {
-    IS_FLUSHING.store(FlushSubevent::Started == flush_event, Ordering::SeqCst);
+    IS_FLUSHING.store(FlushSubevent::Started == flush_event, Ordering::Relaxed);
 }
 
 #[inline]
