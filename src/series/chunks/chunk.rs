@@ -114,7 +114,8 @@ fn parse_encoding(encoding: &str) -> Option<ChunkEncoding> {
 /// - `size()` is encoded payload bytes, what `TS.INFO DEBUG` reports as a chunk's size.
 ///   Allocation slack is excluded; `TimeSeriesChunk::memory_usage` counts it.
 /// - `max_size()` is the byte budget the chunk was created with (`CHUNK_SIZE`).
-/// - `is_full()` is `size() >= max_size()` for compressed encodings and
+/// - `is_full()` is `size() + MAX_SAMPLE_BYTES > max_size()` for compressed encodings (one
+///   more sample could cross the budget, so appends stop at or under it) and
 ///   `len() >= max_elements` for uncompressed.
 /// - `bytes_per_sample()` is `size() / len()` floored to 1 for compressed encodings, or
 ///   `SAMPLE_SIZE / 2` below [`MIN_SAMPLES_FOR_BPS_ESTIMATE`] samples; uncompressed is

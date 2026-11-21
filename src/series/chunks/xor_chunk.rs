@@ -51,6 +51,11 @@ pub trait SampleCodec: Clone + Debug + PartialEq + Hash + GetSize + Sized {
     /// every `len()`-driven loop or allocation by the size of the payload.
     const MIN_SAMPLE_BITS: usize;
 
+    /// The most bytes one `push` can add to `bytes()`, the first sample included. A chunk is
+    /// full while this much room remains (`is_full`), so appends never take it past
+    /// `max_size`. Pinned by a test on adversarial input.
+    const MAX_SAMPLE_BYTES: usize;
+
     /// An empty codec whose stream will not allocate past `max_size` (plus a few bytes of
     /// slack) while the payload stays within budget; past it, growth resumes doubling. See
     /// `BitStream::set_soft_cap`.
@@ -504,8 +509,11 @@ impl<C: SampleCodec> ChunkOps for XorChunk<C> {
         Ok(())
     }
 
+    /// Full once the next sample could take the payload past `max_size`. Filling until the
+    /// payload reached `max_size` instead ended every sealed chunk a few bytes over it, so a
+    /// 4,096-byte chunk sat in jemalloc's 5,120-byte size class: a quarter of its memory idle.
     fn is_full(&self) -> bool {
-        self.data_size() >= self.max_size
+        self.data_size() + C::MAX_SAMPLE_BYTES > self.max_size
     }
 
     fn bytes_per_sample(&self) -> usize {

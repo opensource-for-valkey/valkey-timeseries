@@ -24,6 +24,11 @@ impl SampleCodec for ChimpCompressor {
     /// The first sample is a varint timestamp plus a raw 64-bit value; every later one is at
     /// least a one-bit delta-of-delta plus a three-bit repeat.
     const MIN_SAMPLE_BITS: usize = 4;
+    /// The first sample: a varint timestamp (up to 80 bits) plus a raw value behind the
+    /// widest Elf prefix (6 + 64). Later ones: a 6 + 64-bit delta-of-delta plus a 6-bit Elf
+    /// prefix and a 5-bit plain Chimp header over 64 payload bits, 145 bits. Either fits in 19
+    /// bytes, partial trailing byte included.
+    const MAX_SAMPLE_BYTES: usize = 19;
 
     fn with_soft_cap(max_size: usize) -> Self {
         ChimpCompressor::with_soft_cap(max_size)
