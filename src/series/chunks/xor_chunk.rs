@@ -529,6 +529,39 @@ impl<C: SampleCodec> ChunkOps for XorChunk<C> {
         }
     }
 
+    /// Pushes in rounds of `room / MAX_SAMPLE_BYTES` samples, checking capacity once per round
+    /// rather than once per sample, then per sample for whatever room is left. Stops exactly
+    /// where per-sample `is_full` checks would: a round of `k` samples leaves at least
+    /// `(k - i) * MAX_SAMPLE_BYTES` bytes free after its `i`-th push, and `is_full` is false
+    /// under either rule while that much is free. Only the tail needs the checks: with
+    /// headroom it is empty, and below [`HEADROOM_MIN_CHUNK_SIZE`] it fills the last bytes.
+    fn append_until_full(&mut self, samples: &[Sample]) -> (usize, Option<TsdbError>) {
+        let mut done = 0;
+        loop {
+            let room = self.max_size.saturating_sub(self.data_size()) / C::MAX_SAMPLE_BYTES;
+            let take = room.min(samples.len() - done);
+            if take == 0 {
+                break;
+            }
+            for sample in &samples[done..done + take] {
+                if let Err(e) = push_sample(&mut self.encoder, sample) {
+                    return (done, Some(e));
+                }
+                done += 1;
+            }
+        }
+        for sample in &samples[done..] {
+            if self.is_full() {
+                break;
+            }
+            if let Err(e) = push_sample(&mut self.encoder, sample) {
+                return (done, Some(e));
+            }
+            done += 1;
+        }
+        (done, None)
+    }
+
     fn bytes_per_sample(&self) -> usize {
         let count = self.len();
         if count < MIN_SAMPLES_FOR_BPS_ESTIMATE {

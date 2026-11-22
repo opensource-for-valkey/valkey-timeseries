@@ -402,6 +402,17 @@ impl ChunkOps for UncompressedChunk {
         self.len() >= self.max_elements
     }
 
+    /// Every sample has the same size, so the room is known exactly: the prefix that fits is
+    /// copied in one `extend_from_slice`. `add_sample` fails only on a full chunk.
+    fn append_until_full(&mut self, samples: &[Sample]) -> (usize, Option<TsdbError>) {
+        let take = self
+            .max_elements
+            .saturating_sub(self.len())
+            .min(samples.len());
+        self.samples.extend_from_slice(&samples[..take]);
+        (take, None)
+    }
+
     fn bytes_per_sample(&self) -> usize {
         SAMPLE_SIZE
     }

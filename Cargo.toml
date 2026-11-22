@@ -106,6 +106,10 @@ name = "ingest_batch"
 harness = false
 
 [[bench]]
+name = "chunk_fill"
+harness = false
+
+[[bench]]
 name = "postings"
 harness = false
 
