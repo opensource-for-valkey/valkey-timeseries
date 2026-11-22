@@ -368,6 +368,7 @@ fn merge_into_existing_chunks(
 ///
 /// The fill is exact, so no chunk ends past `max_size` (see `XorChunk::is_full`). A chunk
 /// opened for a sample that then failed is left empty at the end, for the caller to drop.
+/// Each chunk is filled by one `append_until_full` call, a loop compiled per encoding.
 /// Sequential on purpose: a batch reaches past one chunk only when it carries more than a
 /// chunk of samples for one series, and encoding a chunk takes a few microseconds.
 fn fill_chunks(
@@ -380,7 +381,8 @@ fn fill_chunks(
     let mut results = Vec::with_capacity(samples.len());
     let mut stored = 0usize;
     let mut failed = None;
-    for sample in samples {
+    let mut rest = samples;
+    while !rest.is_empty() {
         if chunks.last().is_none_or(|c| c.is_full()) {
             if let Some(full) = chunks.last_mut() {
                 seal_chunk(full);
@@ -390,15 +392,15 @@ fn fill_chunks(
         let Some(chunk) = chunks.last_mut() else {
             unreachable!("a chunk was just pushed");
         };
-        match chunk.add_sample(sample) {
-            Ok(()) => {
-                results.push(SampleAddResult::Ok(*sample));
-                stored += 1;
-            }
-            Err(e) => {
-                failed.get_or_insert(e);
-                results.push(SampleAddResult::Error(error_consts::CANNOT_ADD_SAMPLE));
-            }
+        // The chunk is not full, so this stores a sample or fails on one: `rest` shrinks.
+        let (appended, error) = chunk.append_until_full(rest);
+        results.extend(rest[..appended].iter().map(|s| SampleAddResult::Ok(*s)));
+        stored += appended;
+        rest = &rest[appended..];
+        if let Some(e) = error {
+            failed.get_or_insert(e);
+            results.push(SampleAddResult::Error(error_consts::CANNOT_ADD_SAMPLE));
+            rest = &rest[1..];
         }
     }
     if let Some(e) = failed {
@@ -1495,6 +1497,38 @@ mod tests {
         let mut lens = chunk_lens(&series);
         assert_eq!(lens.pop(), Some(10), "{n}");
         lens
+    }
+
+    /// `append_until_full` stops exactly where `is_full` would have stopped single adds, and
+    /// appends nothing to a chunk that is already full.
+    #[test]
+    fn append_until_full_stops_at_is_full() {
+        let samples = run(0, 100);
+        for encoding in [
+            ChunkEncoding::Uncompressed,
+            ChunkEncoding::Chimp,
+            ChunkEncoding::Gorilla,
+        ] {
+            let mut chunk = TimeSeriesChunk::new(encoding, 96);
+            let (appended, error) = chunk.append_until_full(&samples);
+            assert!(error.is_none(), "{encoding:?}");
+            assert!(appended > 0 && appended < samples.len(), "{encoding:?}");
+            assert_eq!(chunk.len(), appended, "{encoding:?}");
+            assert!(chunk.is_full(), "{encoding:?}");
+
+            let mut single = TimeSeriesChunk::new(encoding, 96);
+            for sample in &samples {
+                if single.is_full() {
+                    break;
+                }
+                single.add_sample(sample).unwrap();
+            }
+            assert_eq!(single.len(), appended, "{encoding:?}");
+
+            let (more, error) = chunk.append_until_full(&samples[appended..]);
+            assert_eq!(more, 0, "{encoding:?}");
+            assert!(error.is_none(), "{encoding:?}");
+        }
     }
 
     #[test]
