@@ -36,6 +36,13 @@ use valkey_module::{RedisModuleIO, ValkeyError, ValkeyResult};
 /// partial read pays a few amortized regrowths instead of a worst-case speculative reserve.
 pub const PARTIAL_RANGE_RESERVE_CAP: usize = 256;
 
+/// The smallest `max_size` at which `is_full` keeps [`SampleCodec::MAX_SAMPLE_BYTES`] of
+/// headroom. Below it a chunk fills until the payload reaches `max_size`, as it did before the
+/// headroom: 19 bytes is too large a share of a small budget. Counting the allocator size
+/// class and the `TimeSeriesChunk` slot, headroom cost 1.7-1.8x the bytes per sample at 48,
+/// 1.3x at 64, 1.04-1.06x at 128-192, broke even at 256 and saved 14-16 % at 1 KiB and up.
+pub const HEADROOM_MIN_CHUNK_SIZE: usize = 256;
+
 /// A sequential sample codec: what a compressed encoding supplies to [`XorChunk`].
 pub trait SampleCodec: Clone + Debug + PartialEq + Hash + GetSize + Sized {
     /// Decodes every sample from the start of the stream, reporting errors in-band.
@@ -51,9 +58,10 @@ pub trait SampleCodec: Clone + Debug + PartialEq + Hash + GetSize + Sized {
     /// every `len()`-driven loop or allocation by the size of the payload.
     const MIN_SAMPLE_BITS: usize;
 
-    /// The most bytes one `push` can add to `bytes()`, the first sample included. A chunk is
-    /// full while this much room remains (`is_full`), so appends never take it past
-    /// `max_size`. Pinned by a test on adversarial input.
+    /// The most bytes one `push` can add to `bytes()`, the first sample included. A chunk of
+    /// at least [`HEADROOM_MIN_CHUNK_SIZE`] bytes is full while this much room remains
+    /// (`is_full`), so appends never take it past `max_size`; a smaller one ends less than
+    /// this past it. Pinned by a test on adversarial input.
     const MAX_SAMPLE_BYTES: usize;
 
     /// An empty codec whose stream will not allocate past `max_size` (plus a few bytes of
@@ -512,8 +520,13 @@ impl<C: SampleCodec> ChunkOps for XorChunk<C> {
     /// Full once the next sample could take the payload past `max_size`. Filling until the
     /// payload reached `max_size` instead ended every sealed chunk a few bytes over it, so a
     /// 4,096-byte chunk sat in jemalloc's 5,120-byte size class: a quarter of its memory idle.
+    /// Below [`HEADROOM_MIN_CHUNK_SIZE`], full once the payload reaches `max_size`.
     fn is_full(&self) -> bool {
-        self.data_size() + C::MAX_SAMPLE_BYTES > self.max_size
+        if self.max_size < HEADROOM_MIN_CHUNK_SIZE {
+            self.data_size() >= self.max_size
+        } else {
+            self.data_size() + C::MAX_SAMPLE_BYTES > self.max_size
+        }
     }
 
     fn bytes_per_sample(&self) -> usize {

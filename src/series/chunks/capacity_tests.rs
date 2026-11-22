@@ -1,11 +1,13 @@
-//! Chunk capacity: `SampleCodec::MAX_SAMPLE_BYTES` bounds every push, and a chunk filled up to
-//! `is_full` ends at or under `max_size`, so its sealed allocation stays in the allocator size
-//! class of `max_size`. Ending a few bytes over put every sealed 4,096-byte chunk in jemalloc's
-//! 5,120-byte class.
+//! Chunk capacity: `SampleCodec::MAX_SAMPLE_BYTES` bounds every push, and a chunk of at least
+//! `HEADROOM_MIN_CHUNK_SIZE` bytes filled up to `is_full` ends at or under `max_size`, so its
+//! sealed allocation stays in the allocator size class of `max_size`. Ending a few bytes over
+//! put every sealed 4,096-byte chunk in jemalloc's 5,120-byte class. Smaller chunks fill to
+//! `max_size` and end less than one sample past it.
 
 use crate::common::Sample;
 use crate::series::chunks::{
-    ChimpCompressor, ChunkOps, GorillaEncoder, MIN_CHUNK_SIZE, SampleCodec, XorChunk,
+    ChimpCompressor, ChunkOps, GorillaEncoder, HEADROOM_MIN_CHUNK_SIZE, MIN_CHUNK_SIZE,
+    SampleCodec, XorChunk,
 };
 use crate::tests::generators::{DataGenerator, ValueWorkload};
 use get_size2::GetSize;
@@ -136,17 +138,21 @@ fn fill_and_seal<C: SampleCodec>(max_size: usize, samples: &[Sample]) -> XorChun
     chunk
 }
 
+fn workload_samples(workload: ValueWorkload, max_size: usize) -> Vec<Sample> {
+    DataGenerator::builder()
+        .start(1_700_000_000_000)
+        .interval(Duration::from_millis(1000))
+        .algorithm(workload)
+        .samples(max_size * 8 + 64)
+        .seed(11)
+        .build()
+        .generate()
+}
+
 fn assert_fill_stays_in_budget<C: SampleCodec>() {
     for workload in ValueWorkload::workloads() {
-        for max_size in [MIN_CHUNK_SIZE, 1024, 4000, 4096, 8192] {
-            let samples = DataGenerator::builder()
-                .start(1_700_000_000_000)
-                .interval(Duration::from_millis(1000))
-                .algorithm(*workload)
-                .samples(max_size * 8 + 64)
-                .seed(11)
-                .build()
-                .generate();
+        for max_size in [HEADROOM_MIN_CHUNK_SIZE, 1024, 4000, 4096, 8192] {
+            let samples = workload_samples(*workload, max_size);
             let chunk = fill_and_seal::<C>(max_size, &samples);
             let what = format!("{} {} {max_size}", C::ENCODING.name(), workload.id());
             assert!(
@@ -173,6 +179,48 @@ fn chimp_chunks_fill_within_max_size() {
 #[test]
 fn gorilla_chunks_fill_within_max_size() {
     assert_fill_stays_in_budget::<GorillaEncoder>();
+}
+
+/// Under `HEADROOM_MIN_CHUNK_SIZE` the headroom would cost more samples than the size class it
+/// saves (1.7x the bytes per sample at 48), so a chunk fills until the payload reaches
+/// `max_size` and ends less than one sample past it, its allocation within the bit stream's
+/// slack.
+fn assert_small_chunks_fill_to_max_size<C: SampleCodec>() {
+    for workload in ValueWorkload::workloads() {
+        for max_size in [MIN_CHUNK_SIZE, 64, 128, HEADROOM_MIN_CHUNK_SIZE - 8] {
+            let samples = workload_samples(*workload, max_size);
+            let mut chunk = XorChunk::<C>::with_max_size(max_size);
+            for sample in &samples {
+                if chunk.is_full() {
+                    break;
+                }
+                chunk.add_sample(sample).unwrap();
+                let heap = chunk.encoder.get_heap_size();
+                // 32 is `BitStream`'s `SOFT_CAP_SLACK`: no doubling past the budget.
+                assert!(heap <= max_size + 32, "{max_size}: allocation {heap} bytes");
+            }
+            let what = format!("{} {} {max_size}", C::ENCODING.name(), workload.id());
+            let size = chunk.data_size();
+            assert!(
+                size >= max_size,
+                "{what}: sealed at {size} bytes, short of full"
+            );
+            assert!(
+                size < max_size + C::MAX_SAMPLE_BYTES,
+                "{what}: filled to {size} bytes"
+            );
+        }
+    }
+}
+
+#[test]
+fn chimp_small_chunks_fill_to_max_size() {
+    assert_small_chunks_fill_to_max_size::<ChimpCompressor>();
+}
+
+#[test]
+fn gorilla_small_chunks_fill_to_max_size() {
+    assert_small_chunks_fill_to_max_size::<GorillaEncoder>();
 }
 
 /// The active chunk too: while filling, its allocation never goes past `max_size`.

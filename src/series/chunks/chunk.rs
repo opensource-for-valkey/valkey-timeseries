@@ -116,7 +116,10 @@ fn parse_encoding(encoding: &str) -> Option<ChunkEncoding> {
 /// - `max_size()` is the byte budget the chunk was created with (`CHUNK_SIZE`).
 /// - `is_full()` is `size() + MAX_SAMPLE_BYTES > max_size()` for compressed encodings (one
 ///   more sample could cross the budget, so appends stop at or under it) and
-///   `len() >= max_elements` for uncompressed.
+///   `len() >= max_elements` for uncompressed. Compressed chunks under
+///   `HEADROOM_MIN_CHUNK_SIZE` (256) bytes are full at `size() >= max_size()` instead and
+///   may end up to `MAX_SAMPLE_BYTES - 1` over: the headroom costs more samples than the
+///   size class it saves.
 /// - `bytes_per_sample()` is `size() / len()` floored to 1 for compressed encodings, or
 ///   `SAMPLE_SIZE / 2` below [`MIN_SAMPLES_FOR_BPS_ESTIMATE`] samples; uncompressed is
 ///   always `SAMPLE_SIZE`.
