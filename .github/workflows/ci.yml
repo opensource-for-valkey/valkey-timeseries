@@ -21,8 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # The token lifts the release lookup off the shared unauthenticated API rate limit,
+      # which failed the job on busy runners.
       - name: Set up Buf
         uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Lint protobuf contracts
         run: buf lint
