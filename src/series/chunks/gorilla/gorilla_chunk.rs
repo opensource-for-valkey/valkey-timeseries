@@ -33,6 +33,13 @@ impl SampleCodec for GorillaEncoder {
     fn set_soft_cap(&mut self, max_size: usize) {
         GorillaEncoder::set_soft_cap(self, max_size)
     }
+    fn reserve_spare(&mut self, min: usize) -> usize {
+        GorillaEncoder::reserve_spare(self, min)
+    }
+    #[inline]
+    fn push_reserved(&mut self, sample: &Sample) -> std::io::Result<()> {
+        self.add_sample_r::<true>(sample)
+    }
     #[inline]
     fn push(&mut self, sample: &Sample) -> std::io::Result<()> {
         self.add_sample(sample)

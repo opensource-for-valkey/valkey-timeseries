@@ -36,6 +36,13 @@ impl SampleCodec for ChimpCompressor {
     fn set_soft_cap(&mut self, max_size: usize) {
         ChimpCompressor::set_soft_cap(self, max_size)
     }
+    fn reserve_spare(&mut self, min: usize) -> usize {
+        ChimpCompressor::reserve_spare(self, min)
+    }
+    #[inline]
+    fn push_reserved(&mut self, sample: &Sample) -> std::io::Result<()> {
+        self.add_sample_r::<true>(sample.timestamp, sample.value)
+    }
     #[inline]
     fn push(&mut self, sample: &Sample) -> std::io::Result<()> {
         self.add(*sample)

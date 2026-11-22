@@ -1500,34 +1500,38 @@ mod tests {
     }
 
     /// `append_until_full` stops exactly where `is_full` would have stopped single adds, and
-    /// appends nothing to a chunk that is already full.
+    /// appends nothing to a chunk that is already full: under `HEADROOM_MIN_CHUNK_SIZE`, where
+    /// a chunk is full at `max_size`, and at or above it, where it keeps a sample of headroom.
     #[test]
     fn append_until_full_stops_at_is_full() {
-        let samples = run(0, 100);
-        for encoding in [
-            ChunkEncoding::Uncompressed,
-            ChunkEncoding::Chimp,
-            ChunkEncoding::Gorilla,
-        ] {
-            let mut chunk = TimeSeriesChunk::new(encoding, 96);
-            let (appended, error) = chunk.append_until_full(&samples);
-            assert!(error.is_none(), "{encoding:?}");
-            assert!(appended > 0 && appended < samples.len(), "{encoding:?}");
-            assert_eq!(chunk.len(), appended, "{encoding:?}");
-            assert!(chunk.is_full(), "{encoding:?}");
+        let samples = run(0, 10_000);
+        for max_size in [96, 4096] {
+            for encoding in [
+                ChunkEncoding::Uncompressed,
+                ChunkEncoding::Chimp,
+                ChunkEncoding::Gorilla,
+            ] {
+                let what = format!("{encoding:?} {max_size}");
+                let mut chunk = TimeSeriesChunk::new(encoding, max_size);
+                let (appended, error) = chunk.append_until_full(&samples);
+                assert!(error.is_none(), "{what}");
+                assert!(appended > 0 && appended < samples.len(), "{what}");
+                assert_eq!(chunk.len(), appended, "{what}");
+                assert!(chunk.is_full(), "{what}");
 
-            let mut single = TimeSeriesChunk::new(encoding, 96);
-            for sample in &samples {
-                if single.is_full() {
-                    break;
+                let mut single = TimeSeriesChunk::new(encoding, max_size);
+                for sample in &samples {
+                    if single.is_full() {
+                        break;
+                    }
+                    single.add_sample(sample).unwrap();
                 }
-                single.add_sample(sample).unwrap();
-            }
-            assert_eq!(single.len(), appended, "{encoding:?}");
+                assert_eq!(single.len(), appended, "{what}");
 
-            let (more, error) = chunk.append_until_full(&samples[appended..]);
-            assert_eq!(more, 0, "{encoding:?}");
-            assert!(error.is_none(), "{encoding:?}");
+                let (more, error) = chunk.append_until_full(&samples[appended..]);
+                assert_eq!(more, 0, "{what}");
+                assert!(error.is_none(), "{what}");
+            }
         }
     }
 

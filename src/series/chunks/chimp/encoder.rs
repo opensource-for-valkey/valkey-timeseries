@@ -282,8 +282,20 @@ impl ChimpEnc {
     /// handing it in here lets marker, Chimp flag, leading-zero code and width go
     /// out as one write, and for most values the payload too. The bit layout is
     /// exactly what the separate writes produced.
-    #[inline]
+    #[inline(always)]
     pub fn add_value_prefixed(
+        &mut self,
+        out: &mut BitStream,
+        prefix: u64,
+        prefix_len: u32,
+        value: u64,
+    ) -> io::Result<()> {
+        self.add_value_prefixed_r::<false>(out, prefix, prefix_len, value)
+    }
+
+    /// [`add_value_prefixed`](Self::add_value_prefixed), through the reserved writes with `R`.
+    #[inline]
+    pub fn add_value_prefixed_r<const R: bool>(
         &mut self,
         out: &mut BitStream,
         prefix: u64,
@@ -294,11 +306,11 @@ impl ChimpEnc {
             self.first = false;
             self.stored_val = value;
             if prefix_len > 0 {
-                out.write_bits(prefix_len, prefix)?;
+                out.write_bits_r::<R>(prefix_len, prefix)?;
             }
-            out.write_bits(64, value)?;
+            out.write_bits_r::<R>(64, value)?;
         } else {
-            self.compress_value(out, prefix, prefix_len, value)?;
+            self.compress_value::<R>(out, prefix, prefix_len, value)?;
         }
         Ok(())
     }
@@ -315,8 +327,19 @@ impl ChimpEnc {
 
     /// [`add_repeat`](Self::add_repeat) with a caller prefix, as
     /// [`add_value_prefixed`](Self::add_value_prefixed).
-    #[inline]
+    #[inline(always)]
     pub fn add_repeat_prefixed(
+        &mut self,
+        out: &mut BitStream,
+        prefix: u64,
+        prefix_len: u32,
+    ) -> io::Result<()> {
+        self.add_repeat_prefixed_r::<false>(out, prefix, prefix_len)
+    }
+
+    /// [`add_repeat_prefixed`](Self::add_repeat_prefixed), through the reserved writes with `R`.
+    #[inline]
+    pub fn add_repeat_prefixed_r<const R: bool>(
         &mut self,
         out: &mut BitStream,
         prefix: u64,
@@ -324,13 +347,13 @@ impl ChimpEnc {
     ) -> io::Result<()> {
         debug_assert!(!self.first, "a repeat needs a preceding value");
         // The window stays: the decoder keeps it across a repeat too.
-        out.write_bits(prefix_len + 2, prefix << 2)
+        out.write_bits_r::<R>(prefix_len + 2, prefix << 2)
     }
 
     /// Write `header` (`header_len` bits, prefix already folded in) followed by the
     /// `sig`-bit `payload`, as one write when both fit in 64 bits.
     #[inline(always)]
-    fn emit(
+    fn emit<const R: bool>(
         out: &mut BitStream,
         header: u64,
         header_len: u32,
@@ -338,15 +361,15 @@ impl ChimpEnc {
         sig: u32,
     ) -> io::Result<()> {
         if header_len + sig <= 64 {
-            out.write_bits(header_len + sig, (header << sig) | payload)
+            out.write_bits_r::<R>(header_len + sig, (header << sig) | payload)
         } else {
-            out.write_bits(header_len, header)?;
-            out.write_bits(sig, payload)
+            out.write_bits_r::<R>(header_len, header)?;
+            out.write_bits_r::<R>(sig, payload)
         }
     }
 
     #[inline]
-    fn compress_value(
+    fn compress_value<const R: bool>(
         &mut self,
         out: &mut BitStream,
         prefix: u64,
@@ -356,7 +379,7 @@ impl ChimpEnc {
         let xor = self.stored_val ^ value;
         if xor == 0 {
             // The window stays, as for `add_repeat`.
-            out.write_bits(prefix_len + 2, prefix << 2)?;
+            out.write_bits_r::<R>(prefix_len + 2, prefix << 2)?;
         } else {
             let nlz = xor.leading_zeros() as i32; // 0..=63 for xor != 0
             let lz = LEADING_ROUND_ENC[nlz as usize];
@@ -424,7 +447,7 @@ impl ChimpEnc {
             );
             self.stored_lz = if reuse { slz } else { fresh_lz } as u8;
             self.stored_tz = shift as u8;
-            Self::emit(
+            Self::emit::<R>(
                 out,
                 (prefix << header_len) | header,
                 prefix_len + header_len as u32,

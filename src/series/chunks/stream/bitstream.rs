@@ -87,6 +87,24 @@ impl BitStream {
         self.soft_cap = cap;
     }
 
+    /// Grows the stream when fewer than `min` bytes are spare, then returns the spare capacity.
+    /// Growth doubles as for single writes (see `grow`), to at least `min` spare but never past
+    /// the soft cap (nor into its slack), so the allocation stays within twice the data plus
+    /// `min`. The round sizes itself from the return value, which is below `min` only when the
+    /// soft cap is.
+    pub fn reserve_spare(&mut self, min: usize) -> usize {
+        let len = self.stream.len();
+        let cap = self.stream.capacity();
+        if cap - len < min {
+            let doubled = cap.saturating_mul(2).max(8);
+            let target = doubled.max(len.saturating_add(min)).min(self.soft_cap);
+            if target > cap {
+                self.stream.reserve_exact(target - len);
+            }
+        }
+        self.stream.capacity() - len
+    }
+
     /// Reset the stream around the provided byte slice.
     pub fn reset(&mut self, stream: Vec<u8>) {
         self.stream = stream;
@@ -232,6 +250,24 @@ impl BitStream {
         self.count -= 1;
     }
 
+    /// [`write_bit_raw`](Self::write_bit_raw); with `R`, the caller has reserved the room
+    /// (see [`reserve_spare`](Self::reserve_spare)), so the growth policy is skipped.
+    #[inline(always)]
+    pub fn write_bit_r<const R: bool>(&mut self, bit: bool) {
+        if !R {
+            return self.write_bit_raw(bit);
+        }
+        if self.count == 0 {
+            self.stream.push(0);
+            self.count = 8;
+        }
+        let i = self.stream.len() - 1;
+        if bit {
+            self.stream[i] |= 1 << (self.count - 1);
+        }
+        self.count -= 1;
+    }
+
     /// Write a single bit to the stream.
     pub fn write_bit(&mut self, bit: bool) {
         self.write_bit_raw(bit);
@@ -274,6 +310,14 @@ impl BitStream {
     /// writes of 1–2 bits) nearly doubled in cost from the calls alone.
     #[inline(always)]
     pub fn write_bits(&mut self, bits: u32, value: u64) -> io::Result<()> {
+        self.write_bits_r::<false>(bits, value)
+    }
+
+    /// [`write_bits`](Self::write_bits); with `R`, the caller has reserved the room for the
+    /// 8-byte store (see [`reserve_spare`](Self::reserve_spare)), so neither the growth policy
+    /// nor the short write near the soft cap applies. Both forms produce the same bytes.
+    #[inline(always)]
+    pub fn write_bits_r<const R: bool>(&mut self, bits: u32, value: u64) -> io::Result<()> {
         let mut nbits = bits.min(64) as usize;
         if nbits == 0 {
             return Ok(());
@@ -305,7 +349,12 @@ impl BitStream {
         let nbytes = nbits.div_ceil(8);
         let len = self.stream.len();
         let bytes = u.to_be_bytes();
-        if nbytes < 8 && len.saturating_add(8) > self.soft_cap {
+        if R {
+            // Reserved: the 8-byte store fits in spare capacity within the cap, so this never
+            // reallocates. Vec still checks; skipping that bought only 2–6 % in measurement.
+            self.stream.extend_from_slice(&bytes);
+            self.stream.truncate(len + nbytes);
+        } else if nbytes < 8 && len.saturating_add(8) > self.soft_cap {
             // A short write near the cap must not reserve the temporary eight-byte
             // copy: that would grow past the cap (or double past the slack) even when
             // the committed write fits.
@@ -345,6 +394,27 @@ impl BitStream {
     pub fn write_varint(&mut self, value: i64) -> io::Result<()> {
         let n: u64 = ((value << 1) ^ (value >> 63)) as u64;
         self.write_uvarint(n)
+    }
+}
+
+/// A [`BitStream`] in a reserved round: `BitWrite` through the reserved writes
+/// (`write_bits_r::<true>`), for encoder helpers generic over `BitWrite`.
+pub(crate) struct Reserved<'a>(pub(crate) &'a mut BitStream);
+
+impl BitWrite for Reserved<'_> {
+    #[inline(always)]
+    fn write_bit(&mut self, bit: bool) -> io::Result<()> {
+        self.0.write_bit_r::<true>(bit);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn write<U>(&mut self, bits: u32, value: U) -> io::Result<()>
+    where
+        U: PrimInt,
+    {
+        self.0
+            .write_bits_r::<true>(bits, value.to_u64().expect("Invalid u64 cast"))
     }
 }
 
