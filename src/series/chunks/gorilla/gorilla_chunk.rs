@@ -21,6 +21,11 @@ impl SampleCodec for GorillaEncoder {
     /// The first sample is a varint timestamp plus a raw 64-bit value; every later one is at
     /// least a one-bit delta-of-delta plus a one-bit "same value".
     const MIN_SAMPLE_BITS: usize = 2;
+    /// The second sample: a varint delta (a non-negative `i64`, so at most 72 bits) plus a
+    /// fresh 13-bit window header over 64 payload bits, 149 bits. Later ones: a 72-bit
+    /// delta-of-delta and the same value, 149 bits. The first: a varint timestamp (up to 80
+    /// bits) and a raw `f64`, 144. Each fits in 19 bytes, partial trailing byte included.
+    const MAX_SAMPLE_BYTES: usize = 19;
 
     fn with_soft_cap(max_size: usize) -> Self {
         GorillaEncoder::with_soft_cap(max_size)

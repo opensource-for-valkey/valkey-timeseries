@@ -114,8 +114,12 @@ fn parse_encoding(encoding: &str) -> Option<ChunkEncoding> {
 /// - `size()` is encoded payload bytes, what `TS.INFO DEBUG` reports as a chunk's size.
 ///   Allocation slack is excluded; `TimeSeriesChunk::memory_usage` counts it.
 /// - `max_size()` is the byte budget the chunk was created with (`CHUNK_SIZE`).
-/// - `is_full()` is `size() >= max_size()` for compressed encodings and
-///   `len() >= max_elements` for uncompressed.
+/// - `is_full()` is `size() + MAX_SAMPLE_BYTES > max_size()` for compressed encodings (one
+///   more sample could cross the budget, so appends stop at or under it) and
+///   `len() >= max_elements` for uncompressed. Compressed chunks under
+///   `HEADROOM_MIN_CHUNK_SIZE` (256) bytes are full at `size() >= max_size()` instead and
+///   may end up to `MAX_SAMPLE_BYTES - 1` over: the headroom costs more samples than the
+///   size class it saves.
 /// - `bytes_per_sample()` is `size() / len()` floored to 1 for compressed encodings, or
 ///   `SAMPLE_SIZE / 2` below [`MIN_SAMPLES_FOR_BPS_ESTIMATE`] samples; uncompressed is
 ///   always `SAMPLE_SIZE`.
@@ -179,6 +183,23 @@ pub trait ChunkOps {
     }
 
     fn is_full(&self) -> bool;
+
+    /// Appends `samples` in order, each newer than the last, until the chunk `is_full` or a
+    /// sample fails. Returns how many were appended and the error that stopped it, if any;
+    /// the failed sample is not stored. Bulk ingest fills chunks through this
+    /// (`bulk_add::fill_chunks`): one call per chunk runs a loop compiled for its encoding,
+    /// where a dispatch through `TimeSeriesChunk` per sample cost 8-25 % on batched appends.
+    fn append_until_full(&mut self, samples: &[Sample]) -> (usize, Option<TsdbError>) {
+        for (i, sample) in samples.iter().enumerate() {
+            if self.is_full() {
+                return (i, None);
+            }
+            if let Err(e) = self.add_sample(sample) {
+                return (i, Some(e));
+            }
+        }
+        (samples.len(), None)
+    }
 
     /// Returns the average number of bytes consumed per sample in this chunk.
     ///

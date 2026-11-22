@@ -74,12 +74,15 @@ impl BitStream {
         }
     }
 
-    /// Cap the allocation at `cap` plus a few bytes of slack while the stream is within
-    /// `cap`. Growth stays geometric below the cap, and goes back to doubling above it.
+    /// Cap the allocation at `cap` while the stream fits it, and at `cap` plus a few bytes of
+    /// slack for the write that crosses it. Growth stays geometric below the cap, and goes
+    /// back to doubling past the slack.
     ///
     /// Plain `Vec` doubling left every sealed chunk holding up to twice its data: a 4 KiB
-    /// chunk crosses `max_size` on its last append and jumps to an 8 KiB allocation it
-    /// never uses, which `memory_usage` then reports. A chunk passes its `max_size` here.
+    /// chunk crossed `max_size` on its last append and jumped to an 8 KiB allocation it
+    /// never used, which `memory_usage` then reported. The slack is not free either: a
+    /// 4,096-byte cap plus slack lands in jemalloc's 5,120-byte size class, so a stream within
+    /// budget never allocates into it. A chunk passes its `max_size` here.
     pub fn set_soft_cap(&mut self, cap: usize) {
         self.soft_cap = cap;
     }
@@ -106,13 +109,15 @@ impl BitStream {
         let floor = len + need;
         let doubled = cap.saturating_mul(2).max(8);
         let capped = self.soft_cap.saturating_add(SOFT_CAP_SLACK);
-        // Within budget (slack included) the allocation stops at the cap. Only
-        // once the data itself needs more than that does doubling resume. The
-        // test is on `floor`, not `len`: a stream that lands exactly on the cap
-        // with a full trailing byte grows for its next single bit, and that
-        // must not read as "past the budget" and double.
-        let target = if floor <= capped {
-            doubled.min(capped).max(floor)
+        // Within budget the allocation stops at the cap itself; a write that
+        // crosses it takes the slack; only once the data needs more than that
+        // does doubling resume. The tests are on `floor`, not `len`: a stream
+        // that lands exactly on the cap with a full trailing byte grows for its
+        // next single bit, and that must not read as "past the budget" and double.
+        let target = if floor <= self.soft_cap {
+            doubled.min(self.soft_cap).max(floor)
+        } else if floor <= capped {
+            capped
         } else {
             doubled.max(floor)
         };
@@ -300,9 +305,10 @@ impl BitStream {
         let nbytes = nbits.div_ceil(8);
         let len = self.stream.len();
         let bytes = u.to_be_bytes();
-        if nbytes < 8 && len.saturating_add(8) > self.soft_cap.saturating_add(SOFT_CAP_SLACK) {
+        if nbytes < 8 && len.saturating_add(8) > self.soft_cap {
             // A short write near the cap must not reserve the temporary eight-byte
-            // copy: that would make `grow` double even when the committed write fits.
+            // copy: that would grow past the cap (or double past the slack) even when
+            // the committed write fits.
             self.ensure_spare(nbytes);
             self.stream.extend_from_slice(&bytes[..nbytes]);
         } else {
@@ -432,6 +438,32 @@ mod tests {
 
         assert_eq!(bs.len(), 91);
         assert!(bs.stream.capacity() <= 64 + super::SOFT_CAP_SLACK);
+    }
+
+    /// A stream that fills its cap exactly holds exactly the cap, never the slack: a 4,096-byte
+    /// chunk allocated at 4,128 bytes sat in jemalloc's 5,120-byte class. Covers a stream
+    /// regrown from an odd length (a loaded chunk), whose doubling overshoots the cap.
+    #[test]
+    fn filling_to_the_cap_never_allocates_the_slack() {
+        for start in [0usize, 9, 1500, 3000] {
+            let mut bs = BitStream::new();
+            bs.reset(vec![0; start]);
+            bs.stream.shrink_to_fit();
+            bs.set_soft_cap(4096);
+            while bs.len() + 3 <= 4096 {
+                bs.write_bits(23, 0x5a5a5a).unwrap();
+                assert!(
+                    bs.stream.capacity() <= 4096,
+                    "start {start}: capacity {} at len {}",
+                    bs.stream.capacity(),
+                    bs.len()
+                );
+            }
+            while bs.len() < 4096 {
+                bs.write_byte(0xa5);
+            }
+            assert_eq!(bs.stream.capacity(), 4096, "start {start}");
+        }
     }
 
     #[test]

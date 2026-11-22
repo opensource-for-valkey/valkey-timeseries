@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod capacity_tests;
 mod chimp;
 mod chunk;
 mod gorilla;

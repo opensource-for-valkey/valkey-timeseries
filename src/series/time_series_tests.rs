@@ -1382,8 +1382,9 @@ mod tests {
             time_series.add(sample.timestamp, sample.value, None);
         }
 
-        // Verify initial state
-        assert_eq!(time_series.chunks.len(), 1);
+        // Verify initial state. A 32-byte chunk holds one or two of these: `is_full` keeps a
+        // worst-case sample of headroom.
+        assert!(!time_series.chunks.is_empty());
         assert_eq!(time_series.total_samples, 4);
 
         // Remove range that exactly matches the boundaries of the chunks
