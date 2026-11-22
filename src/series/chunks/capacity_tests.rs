@@ -7,7 +7,7 @@
 use crate::common::Sample;
 use crate::series::chunks::{
     ChimpCompressor, ChunkOps, GorillaEncoder, HEADROOM_MIN_CHUNK_SIZE, MIN_CHUNK_SIZE,
-    SampleCodec, XorChunk,
+    ROUND_MIN_SAMPLES, SampleCodec, XorChunk,
 };
 use crate::tests::generators::{DataGenerator, ValueWorkload};
 use get_size2::GetSize;
@@ -248,4 +248,100 @@ fn filling_chunk_allocation_stays_within_max_size() {
         );
     }
     assert!(chunk.is_full());
+}
+
+/// A stream of the widest samples that never overflows its timestamps: gaps up to 2^33 and
+/// [`hostile_value`]s.
+fn hostile_samples(seed: u64, count: usize) -> Vec<Sample> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut ts: i64 = 1 << 40;
+    let mut value = 0.0;
+    (0..count)
+        .map(|_| {
+            ts += GAPS[rng.random_range(0..5)];
+            value = hostile_value(&mut rng, value);
+            Sample::new(ts, value)
+        })
+        .collect()
+}
+
+/// `append_until_full`'s reserved rounds encode what checked single pushes do: the same stop
+/// point and the same bytes, in batches that start on empty and partly filled chunks alike.
+/// They also allocate little ahead of the data: within `max_size` from
+/// `HEADROOM_MIN_CHUNK_SIZE` up, within a doubling of the data plus one minimum round, and
+/// exactly as single adds for batches too small for a round. Reserving a whole batch's worst
+/// case up front allocated a 64 KiB chunk in full for 16 KiB of data.
+fn assert_reserved_rounds_match_single_pushes<C: SampleCodec>() {
+    use ValueWorkload::*;
+    let round_room = ROUND_MIN_SAMPLES * C::MAX_SAMPLE_BYTES + 8;
+    let all = &[Constant, Drift, PeriodicQuantized, Noisy][..];
+    // 64 KiB only where whole-batch reservation went wrong (compressible data), to keep the
+    // debug-build test quick.
+    let cases: [(usize, &[ValueWorkload], &[usize]); 3] = [
+        (96, all, &[1, 3, 40, 1_000, usize::MAX]),
+        (4096, all, &[1, 3, 40, 1_000, usize::MAX]),
+        (65536, &[Constant], &[40, usize::MAX]),
+    ];
+    for (max_size, workloads, batches) in cases {
+        let mut streams: Vec<(&str, Vec<Sample>)> = workloads
+            .iter()
+            .map(|w| (w.id(), workload_samples(*w, max_size)))
+            .collect();
+        streams.push(("hostile", hostile_samples(7, max_size)));
+        for (name, samples) in &streams {
+            let mut single = XorChunk::<C>::with_max_size(max_size);
+            for sample in samples {
+                if single.is_full() {
+                    break;
+                }
+                single.add_sample(sample).unwrap();
+            }
+            for &batch in batches {
+                let what = format!("{} {name} {max_size} batch {batch}", C::ENCODING.name());
+                let mut chunk = XorChunk::<C>::with_max_size(max_size);
+                // Single adds of the same batches, for the allocation of small ones.
+                let mut mirror = XorChunk::<C>::with_max_size(max_size);
+                for part in samples.chunks(batch) {
+                    let (appended, error) = chunk.append_until_full(part);
+                    assert!(error.is_none(), "{what}");
+                    for sample in part {
+                        if mirror.is_full() {
+                            break;
+                        }
+                        mirror.add_sample(sample).unwrap();
+                    }
+                    let heap = chunk.encoder.get_heap_size();
+                    let data = chunk.data_size();
+                    if batch < ROUND_MIN_SAMPLES {
+                        let single_heap = mirror.encoder.get_heap_size();
+                        assert_eq!(heap, single_heap, "{what}: allocation at {data} bytes");
+                    }
+                    assert!(
+                        max_size < HEADROOM_MIN_CHUNK_SIZE || heap <= max_size,
+                        "{what}: allocation {heap} bytes"
+                    );
+                    assert!(
+                        heap <= 2 * (data + round_room),
+                        "{what}: allocation {heap} bytes for {data} bytes of data"
+                    );
+                    if appended < part.len() {
+                        break;
+                    }
+                }
+                assert_eq!(chunk.len(), single.len(), "{what}");
+                assert_eq!(chunk.is_full(), single.is_full(), "{what}");
+                assert!(chunk.encoder.bytes() == single.encoder.bytes(), "{what}");
+            }
+        }
+    }
+}
+
+#[test]
+fn chimp_reserved_rounds_match_single_pushes() {
+    assert_reserved_rounds_match_single_pushes::<ChimpCompressor>();
+}
+
+#[test]
+fn gorilla_reserved_rounds_match_single_pushes() {
+    assert_reserved_rounds_match_single_pushes::<GorillaEncoder>();
 }

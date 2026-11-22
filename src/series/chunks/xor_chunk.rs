@@ -43,6 +43,12 @@ pub const PARTIAL_RANGE_RESERVE_CAP: usize = 256;
 /// 1.3x at 64, 1.04-1.06x at 128-192, broke even at 256 and saved 14-16 % at 1 KiB and up.
 pub const HEADROOM_MIN_CHUNK_SIZE: usize = 256;
 
+/// The fewest samples a reserved round in [`XorChunk::append_until_full`] grows the stream
+/// for: with less spare than this many worst-case samples, the stream doubles instead of
+/// running rounds of one or two samples. A batch with fewer samples left than this skips the
+/// rounds and takes the checked path.
+pub const ROUND_MIN_SAMPLES: usize = 16;
+
 /// A sequential sample codec: what a compressed encoding supplies to [`XorChunk`].
 pub trait SampleCodec: Clone + Debug + PartialEq + Hash + GetSize + Sized {
     /// Decodes every sample from the start of the stream, reporting errors in-band.
@@ -70,6 +76,13 @@ pub trait SampleCodec: Clone + Debug + PartialEq + Hash + GetSize + Sized {
     fn with_soft_cap(max_size: usize) -> Self;
     /// Set the allocation budget of a codec loaded from storage.
     fn set_soft_cap(&mut self, max_size: usize);
+    /// Grows the stream when fewer than `min` bytes are spare, within the soft cap; returns the
+    /// spare capacity (see `BitStream::reserve_spare`).
+    fn reserve_spare(&mut self, min: usize) -> usize;
+    /// [`push`](Self::push) in a reserved round: skips the stream's growth policy, so it needs
+    /// `MAX_SAMPLE_BYTES + 8` spare bytes (every write stores a whole 8-byte word) to stay
+    /// within the allocation [`reserve_spare`](Self::reserve_spare) made. Same bytes as `push`.
+    fn push_reserved(&mut self, sample: &Sample) -> std::io::Result<()>;
     /// Append one sample, which must be newer than every sample already encoded.
     fn push(&mut self, sample: &Sample) -> std::io::Result<()>;
     fn iter(&self) -> Self::Iter<'_>;
@@ -529,23 +542,40 @@ impl<C: SampleCodec> ChunkOps for XorChunk<C> {
         }
     }
 
-    /// Pushes in rounds of `room / MAX_SAMPLE_BYTES` samples, checking capacity once per round
-    /// rather than once per sample, then per sample for whatever room is left. Stops exactly
-    /// where per-sample `is_full` checks would: a round of `k` samples leaves at least
-    /// `(k - i) * MAX_SAMPLE_BYTES` bytes free after its `i`-th push, and `is_full` is false
-    /// under either rule while that much is free. Only the tail needs the checks: with
-    /// headroom it is empty, and below [`HEADROOM_MIN_CHUNK_SIZE`] it fills the last bytes.
+    /// Pushes in reserved rounds, then per sample for whatever room is left. A round of `k`
+    /// samples makes room once, then pushes through [`SampleCodec::push_reserved`], which
+    /// skips the stream's per-write growth checks. `k` is bounded twice:
+    /// - by `max_size`: `k * MAX_SAMPLE_BYTES + 8` bytes stay free below it, so no push's
+    ///   8-byte store reaches past it, and `is_full` is false under either rule before each
+    ///   push. The stop point is exactly per-sample `is_full`'s; with headroom the tail is
+    ///   empty, and below [`HEADROOM_MIN_CHUNK_SIZE`] it fills the last bytes.
+    /// - by the spare capacity: the stream grows only once a round of [`ROUND_MIN_SAMPLES`]
+    ///   no longer fits, by doubling, so the allocation stays within twice the data plus one
+    ///   such round, and within the soft cap.
+    ///
+    /// With fewer than `ROUND_MIN_SAMPLES` samples left there is no round: a MADD's few
+    /// samples per series take the checked path, and allocate exactly as single adds do.
     fn append_until_full(&mut self, samples: &[Sample]) -> (usize, Option<TsdbError>) {
         let mut done = 0;
         loop {
-            let room = self.max_size.saturating_sub(self.data_size()) / C::MAX_SAMPLE_BYTES;
-            let take = room.min(samples.len() - done);
-            if take == 0 {
+            let left = samples.len() - done;
+            if left < ROUND_MIN_SAMPLES {
                 break;
             }
-            for sample in &samples[done..done + take] {
-                if let Err(e) = push_sample(&mut self.encoder, sample) {
-                    return (done, Some(e));
+            let fit = self.max_size.saturating_sub(self.data_size() + 8) / C::MAX_SAMPLE_BYTES;
+            let want = fit.min(left);
+            if want == 0 {
+                break;
+            }
+            let min = want.min(ROUND_MIN_SAMPLES) * C::MAX_SAMPLE_BYTES + 8;
+            let spare = self.encoder.reserve_spare(min);
+            let k = (spare.saturating_sub(8) / C::MAX_SAMPLE_BYTES).min(want);
+            if k == 0 {
+                break;
+            }
+            for sample in &samples[done..done + k] {
+                if let Err(e) = self.encoder.push_reserved(sample) {
+                    return (done, Some(push_error::<C>(sample, e)));
                 }
                 done += 1;
             }
@@ -652,6 +682,18 @@ impl<C: SampleCodec> Chunk for XorChunk<C> {
     }
 }
 
+/// The error of a failed [`SampleCodec::push_reserved`]; see `push_sample`.
+#[cold]
+fn push_error<C: SampleCodec>(sample: &Sample, e: std::io::Error) -> TsdbError {
+    log_warning(format!(
+        "{}: error adding sample: {e:?}",
+        C::ENCODING.name()
+    ));
+    TsdbError::CannotAddSample(*sample)
+}
+
+// Single adds are sensitive to how this inlines: dropping the `#[inline]` cost them 9–25 %,
+// and routing the error through `push_error` up to 10 % on Chimp. Leave it as it is.
 #[inline]
 fn push_sample<C: SampleCodec>(encoder: &mut C, sample: &Sample) -> TsdbResult {
     encoder.push(sample).map_err(|e| {

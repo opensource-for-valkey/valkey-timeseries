@@ -9,7 +9,7 @@ use crate::common::rdb::{
     rdb_save_u8, rdb_save_usize,
 };
 use crate::error::{TsdbError, TsdbResult};
-use crate::series::chunks::stream::bitstream::BitStream;
+use crate::series::chunks::stream::bitstream::{BitStream, Reserved};
 use crate::series::chunks::stream::varbit::write_varbit;
 use get_size2::{GetSize, GetSizeTracker};
 use std::ffi::c_longlong;
@@ -99,12 +99,24 @@ impl GorillaEncoder {
         self.writer.set_soft_cap(max_size);
     }
 
+    /// Makes room for a reserved round: see `BitStream::reserve_spare`.
+    pub(crate) fn reserve_spare(&mut self, min: usize) -> usize {
+        self.writer.reserve_spare(min)
+    }
+
     pub fn add_sample(&mut self, sample: &Sample) -> std::io::Result<()> {
+        self.add_sample_r::<false>(sample)
+    }
+
+    /// [`add_sample`](Self::add_sample) in a reserved round with `R`: see
+    /// `BitStream::reserve_spare`. The first two samples always take the checked writes.
+    #[inline(always)]
+    pub(crate) fn add_sample_r<const R: bool>(&mut self, sample: &Sample) -> std::io::Result<()> {
         let count = bump_count(self.num_samples)?;
         match self.num_samples {
             0 => self.write_first_sample(sample),
             1 => self.write_second_sample(sample),
-            _ => self.write_nth_sample(sample),
+            _ => self.write_nth_sample::<R>(sample),
         }?;
         self.num_samples = count;
         Ok(())
@@ -140,7 +152,7 @@ impl GorillaEncoder {
         Ok(())
     }
 
-    fn write_nth_sample(&mut self, sample: &Sample) -> std::io::Result<()> {
+    fn write_nth_sample<const R: bool>(&mut self, sample: &Sample) -> std::io::Result<()> {
         let timestamp = sample.timestamp;
         let value = sample.value;
 
@@ -151,15 +163,26 @@ impl GorillaEncoder {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "delta-of-delta overflows")
             })?;
 
-        write_varbit(&mut self.writer, delta_of_delta)?;
-
-        let (leading_bits, trailing_bits) = write_varbit_xor(
-            value,
-            self.last_value,
-            self.leading_bits,
-            self.trailing_bits,
-            &mut self.writer,
-        )?;
+        let (leading_bits, trailing_bits) = if R {
+            let w = &mut Reserved(&mut self.writer);
+            write_varbit(w, delta_of_delta)?;
+            write_varbit_xor(
+                value,
+                self.last_value,
+                self.leading_bits,
+                self.trailing_bits,
+                w,
+            )?
+        } else {
+            write_varbit(&mut self.writer, delta_of_delta)?;
+            write_varbit_xor(
+                value,
+                self.last_value,
+                self.leading_bits,
+                self.trailing_bits,
+                &mut self.writer,
+            )?
+        };
 
         self.last_ts = timestamp;
         self.last_value = value;

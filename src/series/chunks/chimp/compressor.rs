@@ -178,6 +178,11 @@ impl ChimpCompressor {
         self.writer.set_soft_cap(max_size);
     }
 
+    /// Makes room for a reserved round: see `BitStream::reserve_spare`.
+    pub(crate) fn reserve_spare(&mut self, min: usize) -> usize {
+        self.writer.reserve_spare(min)
+    }
+
     /// Number of samples added so far.
     pub fn count(&self) -> u64 {
         self.count
@@ -275,12 +280,23 @@ impl ChimpCompressor {
     /// are stored as raw bit patterns, so payload bits (a Prometheus stale
     /// marker, say) survive the round trip unchanged.
     pub fn add_sample(&mut self, timestamp: Timestamp, value: f64) -> io::Result<()> {
+        self.add_sample_r::<false>(timestamp, value)
+    }
+
+    /// [`add_sample`](Self::add_sample) in a reserved round with `R`: see
+    /// `BitStream::reserve_spare`.
+    #[inline(always)]
+    pub(crate) fn add_sample_r<const R: bool>(
+        &mut self,
+        timestamp: Timestamp,
+        value: f64,
+    ) -> io::Result<()> {
         let count = self
             .count
             .checked_add(1)
             .ok_or_else(|| io::Error::other("sample count overflows"))?;
-        self.write_timestamp(timestamp)?;
-        self.write_value(value)?;
+        self.write_timestamp::<R>(timestamp)?;
+        self.write_value::<R>(value)?;
         self.last_value = value;
         self.count = count;
         #[cfg(test)]
@@ -420,29 +436,30 @@ impl ChimpCompressor {
     ///
     /// Comparison is on the bit pattern, so `-0.0` never counts as a repeat of
     /// `0.0` and a NaN repeats only itself.
-    fn write_repeat(&mut self) -> io::Result<()> {
+    fn write_repeat<const R: bool>(&mut self) -> io::Result<()> {
         #[cfg(test)]
         {
             self.stats.repeats += 1;
         }
         // Elf case `0` folded into the Chimp flag write: one 3-bit write.
-        self.chimp.add_repeat_prefixed(&mut self.writer, 0, 1)
+        self.chimp
+            .add_repeat_prefixed_r::<R>(&mut self.writer, 0, 1)
     }
 
     /// Elf case `10`: the bit pattern stored verbatim.
     #[inline(always)]
-    fn write_raw(&mut self, v_long: u64) -> io::Result<()> {
+    fn write_raw<const R: bool>(&mut self, v_long: u64) -> io::Result<()> {
         #[cfg(test)]
         {
             self.stats.raw += 1;
         }
         self.chimp
-            .add_value_prefixed(&mut self.writer, 0b10, 2, v_long)
+            .add_value_prefixed_r::<R>(&mut self.writer, 0b10, 2, v_long)
     }
 
-    fn write_value(&mut self, v: f64) -> io::Result<()> {
+    fn write_value<const R: bool>(&mut self, v: f64) -> io::Result<()> {
         if self.count > 0 && v.to_bits() == self.last_value.to_bits() {
-            return self.write_repeat();
+            return self.write_repeat::<R>();
         }
 
         let v_long = v.to_bits();
@@ -451,7 +468,7 @@ impl ChimpCompressor {
             // Zero, the infinities and NaN have no decimal significant digits to erase.
             // Integers and short binary fractions have digits but no erasable bits (proof on
             // `is_short_dyadic`): the digit count would end in this same branch, so skip it.
-            return self.write_raw(v_long);
+            return self.write_raw::<R>(v_long);
         }
 
         let e = ((v_long >> 52) & 0x7ff) as i32;
@@ -484,7 +501,7 @@ impl ChimpCompressor {
                 && v_prime_long != self.chimp.state().stored_val
                 && try_recover(v_prime_long, self.last_alpha) == Some(v)
             {
-                return self.write_same_alpha(v_prime_long);
+                return self.write_same_alpha::<R>(v_prime_long);
             }
         }
 
@@ -494,21 +511,21 @@ impl ChimpCompressor {
         // digit count cannot handle. All of those are stored raw, losslessly.
         let alpha = match get_alpha(v) {
             Ok(alpha) if (0..=MAX_ALPHA).contains(&alpha) => alpha,
-            _ => return self.write_raw(v_long),
+            _ => return self.write_raw::<R>(v_long),
         };
         let same_alpha = alpha == self.last_alpha;
         if same_alpha && hinted {
             // The hint ran every check below for this alpha, and one failed.
-            return self.write_raw(v_long);
+            return self.write_raw::<R>(v_long);
         }
         let Some((mask, _)) = erase_mask(alpha, e) else {
-            return self.write_raw(v_long);
+            return self.write_raw::<R>(v_long);
         };
         let v_prime_long = mask & v_long;
 
         // Erase only when it is provably reversible, with the decoder's own `recover`.
         if v_prime_long == v_long || try_recover(v_prime_long, alpha) != Some(v) {
-            return self.write_raw(v_long);
+            return self.write_raw::<R>(v_long);
         }
 
         if same_alpha {
@@ -516,9 +533,9 @@ impl ChimpCompressor {
                 // Case `0` over an unchanged Chimp value is how a repeat is spelled, and
                 // this value is not one — a distinct `v` can erase onto the previous raw bit
                 // pattern. Store it raw so the decoder cannot misread it as a repeat.
-                return self.write_raw(v_long);
+                return self.write_raw::<R>(v_long);
             }
-            return self.write_same_alpha(v_prime_long);
+            return self.write_same_alpha::<R>(v_prime_long);
         }
 
         // case `11` + 4-bit alpha
@@ -531,19 +548,23 @@ impl ChimpCompressor {
             self.stats.new_alpha += 1;
         }
         self.last_alpha = alpha;
-        self.chimp
-            .add_value_prefixed(&mut self.writer, (alpha as u64) | 0x30, 6, v_prime_long)
+        self.chimp.add_value_prefixed_r::<R>(
+            &mut self.writer,
+            (alpha as u64) | 0x30,
+            6,
+            v_prime_long,
+        )
     }
 
     /// Elf case `0`: `v_prime_long` erased to `last_alpha` decimal places.
     #[inline(always)]
-    fn write_same_alpha(&mut self, v_prime_long: u64) -> io::Result<()> {
+    fn write_same_alpha<const R: bool>(&mut self, v_prime_long: u64) -> io::Result<()> {
         #[cfg(test)]
         {
             self.stats.same_alpha += 1;
         }
         self.chimp
-            .add_value_prefixed(&mut self.writer, 0, 1, v_prime_long)
+            .add_value_prefixed_r::<R>(&mut self.writer, 0, 1, v_prime_long)
     }
 
     /// Writes the timestamp of the next sample. The first is a varint; after that, the
@@ -562,7 +583,7 @@ impl ChimpCompressor {
     /// Every tier but the last is one `write_bits`: the prefix is OR-ed above the payload, so
     /// the bits `d` does not use are the prefix's. Timestamps may go backwards; the
     /// delta-of-delta is signed, so an out-of-order point costs bits but still round-trips.
-    fn write_timestamp(&mut self, timestamp: Timestamp) -> io::Result<()> {
+    fn write_timestamp<const R: bool>(&mut self, timestamp: Timestamp) -> io::Result<()> {
         if self.count == 0 {
             self.writer.write_varint(timestamp)?;
             self.first_timestamp = timestamp;
@@ -574,25 +595,25 @@ impl ChimpCompressor {
         let delta_d = new_delta.wrapping_sub(self.last_delta);
 
         if delta_d == 0 {
-            self.writer.write_bit(false);
+            self.writer.write_bit_r::<R>(false);
         } else {
             let enc = zigzag_encode(delta_d);
             // A nonzero `delta_d` zig-zags to a nonzero value, so `length` is at least 1.
             let length = 64 - enc.leading_zeros();
 
             if length <= 7 {
-                self.writer.write_bits(9, enc | (0b10 << 7))?;
+                self.writer.write_bits_r::<R>(9, enc | (0b10 << 7))?;
             } else if length <= 9 {
-                self.writer.write_bits(12, enc | (0b110 << 9))?;
+                self.writer.write_bits_r::<R>(12, enc | (0b110 << 9))?;
             } else if length <= 12 {
-                self.writer.write_bits(16, enc | (0b1110 << 12))?;
+                self.writer.write_bits_r::<R>(16, enc | (0b1110 << 12))?;
             } else if length <= 16 {
-                self.writer.write_bits(21, enc | (0b11110 << 16))?;
+                self.writer.write_bits_r::<R>(21, enc | (0b11110 << 16))?;
             } else if length <= 32 {
-                self.writer.write_bits(38, enc | (0b111110 << 32))?;
+                self.writer.write_bits_r::<R>(38, enc | (0b111110 << 32))?;
             } else {
-                self.writer.write_bits(6, 0b111111)?;
-                self.writer.write_bits(64, enc)?;
+                self.writer.write_bits_r::<R>(6, 0b111111)?;
+                self.writer.write_bits_r::<R>(64, enc)?;
             }
         }
 
