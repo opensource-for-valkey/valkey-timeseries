@@ -9,7 +9,7 @@ use crate::common::logging::log_warning;
 use crate::common::threads::ParMutRayon;
 use crate::common::{Sample, Timestamp};
 use crate::error::{TsdbError, TsdbResult};
-use crate::series::{SeriesGuardMut, TimeSeries, try_get_timeseries_mut};
+use crate::series::{SeriesGuardMut, TimeSeries, is_key_in_use, try_get_timeseries_mut};
 use orx_parallel::Par;
 use smallvec::SmallVec;
 use std::collections::HashSet;
@@ -569,6 +569,10 @@ enum Resolved<'a> {
     Open(ValkeyString, SeriesGuardMut<'a>),
     /// Keep the rule, but don't apply it now.
     Skip,
+    /// The destination exists but the server refused to open it for writing (see
+    /// [`is_key_in_use`]). Keep the rule and leave it `dirty`: this write is not applied, and
+    /// the next one rebuilds the open bucket from the source.
+    Busy,
     /// The rule no longer has a destination; remove it.
     Stale,
 }
@@ -580,6 +584,10 @@ enum Resolved<'a> {
 /// different kind of value, or now belongs to another source (the key was deleted and
 /// re-created, overwritten by `RENAME`, restored from another series' dump...) is removed:
 /// writing into it would corrupt an unrelated series.
+///
+/// A destination the server refused to open is not known to be any of those, so its rule is
+/// kept, marked `dirty` and counted as a failed application (`ts_compaction_failures_total`),
+/// as if the application had returned an error before writing anything.
 fn get_compaction_series<'a>(
     ctx: &'a Context,
     series: &mut TimeSeries,
@@ -594,11 +602,16 @@ fn get_compaction_series<'a>(
     }
 
     let mut stale: SmallVec<[usize; TEMP_VEC_LEN]> = SmallVec::new();
+    let mut busy: SmallVec<[usize; TEMP_VEC_LEN]> = SmallVec::new();
     for (index, rule) in series.rules.iter().enumerate() {
         let resolved = resolve_destination(ctx, &series.key, rule, visited, &destinations);
         let (dest_key, dest) = match resolved {
             Resolved::Open(dest_key, dest) => (Some(dest_key), Some(dest)),
             Resolved::Skip => (None, None),
+            Resolved::Busy => {
+                busy.push(index);
+                (None, None)
+            }
             Resolved::Stale => {
                 stale.push(index);
                 (None, None)
@@ -607,6 +620,8 @@ fn get_compaction_series<'a>(
         destinations.keys.push(dest_key);
         destinations.series.push(dest);
     }
+
+    mark_busy_rules(&mut series.rules, &busy);
 
     for &index in stale.iter().rev() {
         series.rules.remove(index);
@@ -639,9 +654,17 @@ fn resolve_destination<'a>(
     }
 
     let dest_key = rule.dest.to_key_string(ctx);
-    let Ok(Some(dest)) = try_get_timeseries_mut(ctx, &dest_key, None) else {
-        ctx.log_verbose("Destination series for compaction not found");
-        return Resolved::Stale;
+    let dest = match try_get_timeseries_mut(ctx, &dest_key, None) {
+        Ok(Some(dest)) => dest,
+        Err(err) if is_key_in_use(&err) => {
+            ctx.log_verbose("Compaction destination is in use; rule left dirty");
+            return Resolved::Busy;
+        }
+        // Missing, or now holds another kind of value.
+        Ok(None) | Err(_) => {
+            ctx.log_verbose("Destination series for compaction not found");
+            return Resolved::Stale;
+        }
     };
     let links_back = dest
         .src_series
@@ -652,6 +675,17 @@ fn resolve_destination<'a>(
         return Resolved::Stale;
     }
     Resolved::Open(dest_key, dest)
+}
+
+/// Leaves each rule at `indexes` `dirty` and counts it as a failed application: its destination
+/// could not be opened, so this write does not reach it.
+fn mark_busy_rules(rules: &mut [CompactionRule], indexes: &[usize]) {
+    for &index in indexes {
+        rules[index].dirty = true;
+    }
+    if !indexes.is_empty() {
+        COMPACTION_FAILURES.fetch_add(indexes.len() as u64, AtomicOrdering::Relaxed);
+    }
 }
 
 /// Announces what compaction wrote to each destination: the `ts.add:dest` keyspace event for
@@ -714,6 +748,24 @@ mod tests {
 
     fn dests(series: &TimeSeries) -> Vec<Vec<u8>> {
         series.rules.iter().map(|r| r.dest.key().to_vec()).collect()
+    }
+
+    #[test]
+    fn a_busy_destination_keeps_its_rule_dirty() {
+        let mut series = series_with_rules(&["a", "b", "c"]);
+        let failures_before = COMPACTION_FAILURES.load(AtomicOrdering::Relaxed);
+        mark_busy_rules(&mut series.rules, &[0, 2]);
+        assert_eq!(
+            dests(&series),
+            [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "a busy destination's rule is kept"
+        );
+        assert_eq!(
+            series.rules.iter().map(|r| r.dirty).collect::<Vec<_>>(),
+            [true, false, true]
+        );
+        // Other tests may count failures concurrently, so only a lower bound holds.
+        assert!(COMPACTION_FAILURES.load(AtomicOrdering::Relaxed) >= failures_before + 2);
     }
 
     #[test]

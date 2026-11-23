@@ -47,7 +47,8 @@ pub struct CompactionRule {
     pub align_timestamp: Timestamp,
     pub bucket_start: Option<Timestamp>,
     pub has_samples: bool,
-    /// Set when the rule's last application returned an error, so its open-bucket state may not
+    /// Set when the rule's last application returned an error, or could not run because the
+    /// server refused to open its destination for writing, so its open-bucket state may not
     /// reflect every sample the source stored. The next `Ingest` rebuilds the open bucket from the
     /// source first (`rebuild_open_bucket_as_of`); a `RemoveRange` rebuilds it anyway. `LATEST`
     /// reads rebuild a temporary copy without clearing the saved dirty flag. Recovery covers the
