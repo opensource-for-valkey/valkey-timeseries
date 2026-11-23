@@ -94,6 +94,9 @@ pub const MISSING_TIMESTAMP_FILTER_VALUE: &str =
     "TSDB: FILTER_BY_TS one or more arguments are missing";
 pub const TOO_MANY_TIMESTAMP_FILTER_VALUES: &str = "TSDB: too many timestamp filter values";
 pub const KEY_NOT_FOUND: &str = "TSDB: the key does not exist";
+// The server's own text for a key a forkless save holds (`VM_Call` replies `-INUSE Key is being
+// processed`), so a client sees the same error code whichever side refused the write.
+pub const KEY_IN_USE: &str = "INUSE Key is being processed";
 pub const INVALID_TIMESERIES_KEY: &str = "TSDB: the key is not a TSDB key";
 pub const KEY_READ_PERMISSION_ERROR: &str = "TSDB: key permission error";
 pub const KEY_WRITE_PERMISSION_ERROR: &str =

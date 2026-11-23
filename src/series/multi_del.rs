@@ -7,7 +7,7 @@ use crate::error::TsdbResult;
 use crate::labels::filters::SeriesSelector;
 use crate::series::index::{PostingsBitmap, get_timeseries_index, with_timeseries_postings};
 use crate::series::{
-    SeriesGuardMut, SeriesRef, TimeSeries, TimestampRange, batch_feeds_itself,
+    SeriesGuardMut, SeriesRef, TimeSeries, TimestampRange, batch_feeds_itself, is_key_in_use,
     resync_rules_after_removal, try_get_timeseries_mut,
 };
 use ahash::AHashSet;
@@ -256,6 +256,16 @@ fn fetch_series_batch<'a>(
             }
 
             match try_get_timeseries_mut(ctx, &key, None) {
+                // The series is still there; only this write is refused. Marking its id stale
+                // would drop a live series from the index. Skip it, as FILTER mode skips a key
+                // it cannot delete.
+                Err(err) if is_key_in_use(&err) => {
+                    ctx.log_warning(&format!(
+                        "multi-del: skipping key {}: in use",
+                        key.to_string_lossy()
+                    ));
+                }
+                // Missing, or now holds another kind of value.
                 Err(_) | Ok(None) => stale_ids.push(id),
                 Ok(Some(series)) => {
                     result.push(series);
