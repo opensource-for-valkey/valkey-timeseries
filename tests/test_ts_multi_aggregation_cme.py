@@ -43,9 +43,11 @@ class TestTimeSeriesMultiAggregationClustered(ValkeyTimeSeriesClusterTestCase):
     def test_mrange_cme_rejects_unbounded_filter(self):
         """A 'match everything' filter list must still carry a positive matcher.
 
-        The tests below use 'kind=~".+"' to select every series. The older idiom
-        'kind!=none' selects the same set but is a negative matcher, so a filter list
-        containing only that is rejected as an unbounded keyspace scan.
+        The tests below use 'kind=~"[a-z]+"' to select every series: every kind here is a
+        lowercase letter. 'kind!=none' selects the same set but is a negative matcher, so a
+        filter list containing only that is rejected as an unbounded keyspace scan. So is
+        'kind=~".+"': it is the presence check 'kind!=', which RedisTimeSeries does not
+        accept as a positive matcher.
         """
         self.setup_clustered_data()
         client = self.new_client_for_primary(0)
@@ -53,10 +55,13 @@ class TestTimeSeriesMultiAggregationClustered(ValkeyTimeSeriesClusterTestCase):
         self.assert_filters_rejected(
             'TS.MRANGE', '-', '+', 'AGGREGATION', 'avg', 1000,
             'FILTER', 'kind!=none', client=client)
+        self.assert_filters_rejected(
+            'TS.MRANGE', '-', '+', 'AGGREGATION', 'avg', 1000,
+            'FILTER', 'kind=~".+"', client=client)
 
-        # The bounded form selects every series, since all of them have a 'kind' label.
+        # The bounded form selects every series, since all of them have a matching 'kind'.
         result = client.execute_command(
-            'TS.MRANGE', '-', '+', 'AGGREGATION', 'avg', 1000, 'FILTER', 'kind=~".+"')
+            'TS.MRANGE', '-', '+', 'AGGREGATION', 'avg', 1000, 'FILTER', 'kind=~"[a-z]+"')
         assert len(result) == 4
 
     def test_mrange_cme_multi_aggregation_basic(self):
@@ -90,14 +95,14 @@ class TestTimeSeriesMultiAggregationClustered(ValkeyTimeSeriesClusterTestCase):
         multi = client.execute_command(
             'TS.MRANGE', '-', '+',
             'AGGREGATION', ','.join(aggregators), 1000,
-            'FILTER', 'kind=~".+"')
+            'FILTER', 'kind=~"[a-z]+"')
         multi_by_key = self.series_by_key(multi)
 
         for i, agg in enumerate(aggregators):
             single = client.execute_command(
                 'TS.MRANGE', '-', '+',
                 'AGGREGATION', agg, 1000,
-                'FILTER', 'kind=~".+"')
+                'FILTER', 'kind=~"[a-z]+"')
             single_by_key = self.series_by_key(single)
             assert multi_by_key.keys() == single_by_key.keys()
             for key, rows in single_by_key.items():
@@ -241,12 +246,12 @@ class TestTimeSeriesMultiAggregationClustered(ValkeyTimeSeriesClusterTestCase):
 
         queries = [
             ('TS.MRANGE', '-', '+', 'AGGREGATION', 'avg,max,count', 1000,
-             'FILTER', 'kind=~".+"'),
+             'FILTER', 'kind=~"[a-z]+"'),
             ('TS.MREVRANGE', '-', '+', 'AGGREGATION', 'sum,min', 1000,
              'COUNT', 2, 'FILTER', 'region=us'),
-            ('TS.MRANGE', '-', '+', 'AGGREGATION', 'avg', 1000, 'FILTER', 'kind=~".+"'),
+            ('TS.MRANGE', '-', '+', 'AGGREGATION', 'avg', 1000, 'FILTER', 'kind=~"[a-z]+"'),
             ('TS.MREVRANGE', 1000, 2500, 'AGGREGATION', 'max', 500, 'EMPTY',
-             'COUNT', 3, 'FILTER', 'kind=~".+"'),
+             'COUNT', 3, 'FILTER', 'kind=~"[a-z]+"'),
         ]
         for query in queries:
             single = 'TS.RANGE' if query[0] == 'TS.MRANGE' else 'TS.REVRANGE'

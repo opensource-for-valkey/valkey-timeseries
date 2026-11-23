@@ -182,7 +182,7 @@ fn parse_matcher(cur: &mut Cursor, outer: Option<&str>) -> ParseResult<(LabelFil
         }
         let matcher = LabelFilter {
             label: METRIC_NAME_LABEL.into(),
-            matcher: PredicateMatch::Equal(PredicateValue::String(name)),
+            matcher: PredicateMatch::equal(PredicateValue::String(name)),
         };
         return Ok((matcher, true));
     }

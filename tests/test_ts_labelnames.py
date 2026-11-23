@@ -267,9 +267,9 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         # A lone negative regex matcher is unbounded and rejected.
         self.assert_filters_rejected('TS.LABELNAMES', 'FILTER', 'node!~"node[12]"')
 
-        # Complex filter with regex: nodes that don't match the pattern. 'name=~".+"' supplies
+        # Complex filter with regex: nodes that don't match the pattern. 'name=~"[a-z]+"' supplies
         # the positive matcher, which also excludes ts8 and ts9 -- neither has a 'name' label.
-        result = self.exec_sorted_values('FILTER', 'name=~".+"', 'node!~"node[12]"')
+        result = self.exec_sorted_values('FILTER', 'name=~"[a-z]+"', 'node!~"node[12]"')
         assert result == [b'name', b'node', b'ts6', b'ts7', b'type']
 
     def test_labelnames_with_empty_database(self):

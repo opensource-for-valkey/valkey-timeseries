@@ -93,7 +93,7 @@ class TestTsQueryIndex(ValkeyTimeSeriesClusterTestCase):
         assert result == [TS3, TS4, TS7, TS8]
 
         # Query for all named metrics with type not matching 'usage'
-        result = client.execute_command('TS.QUERYINDEX', 'name=~".+"', 'type!=usage')
+        result = client.execute_command('TS.QUERYINDEX', 'name=~"[a-z]+"', 'type!=usage')
         assert result == [TS5, TS6]
 
     def test_prometheus_not_regex_matcher(self):
@@ -103,7 +103,7 @@ class TestTsQueryIndex(ValkeyTimeSeriesClusterTestCase):
         self.setup_test_data(cluster)
 
         # Negative regex matchers are unbounded on their own, so each is paired with
-        # 'type=usage' or 'name=~".+"' to bound the query.
+        # 'type=usage' or 'name=~"[a-z]+"' to bound the query.
         self.assert_filters_rejected('TS.QUERYINDEX', 'name!~"c.*"', client=client)
         self.assert_filters_rejected('TS.QUERYINDEX', 'name!~"cpu|memory"', client=client)
         self.assert_filters_rejected('TS.QUERYINDEX', 'node!~"node[12]"', client=client)
@@ -118,7 +118,7 @@ class TestTsQueryIndex(ValkeyTimeSeriesClusterTestCase):
 
         # Not matching using character class. TS8 has no 'node' label -- it would satisfy the
         # negative matcher, but it has no 'name' either, so the bounding filter excludes it.
-        result = client.execute_command('TS.QUERYINDEX', 'name=~".+"', 'node!~"node[12]"')
+        result = client.execute_command('TS.QUERYINDEX', 'name=~"[a-z]+"', 'node!~"node[12]"')
         assert result == [TS6, TS7]
 
     def test_complex_queries(self):
@@ -169,7 +169,7 @@ class TestTsQueryIndex(ValkeyTimeSeriesClusterTestCase):
         self.assert_filters_rejected('TS.QUERYINDEX', 'name=~".*"', 'type!=usage', client=client)
 
         # Find series that match regex but don't match another condition
-        result = client.execute_command('TS.QUERYINDEX', 'name=~".+"', 'type!=usage')
+        result = client.execute_command('TS.QUERYINDEX', 'name=~"[a-z]+"', 'type!=usage')
         assert result == [TS5, TS6]
 
         # Mix of equals, not equals, and regex

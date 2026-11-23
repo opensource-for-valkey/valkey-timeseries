@@ -425,12 +425,12 @@ class TestTimeSeriesLabelValues(ValkeyTimeSeriesClusterTestCase):
         cluster.execute_command('TS.CREATE', f'ts:{{{tag_b}}}:mem', 'LABELS', 'name', 'memory')
         cluster.execute_command('TS.CREATE', f'ts:{{{tag_c}}}:net', 'LABELS', 'name', 'network')
 
-        raw = client.execute_command('TS.LABELVALUES', 'name', 'HASHTAG', tag_a, 'FILTER', 'name=~".+"')
+        raw = client.execute_command('TS.LABELVALUES', 'name', 'HASHTAG', tag_a, 'FILTER', 'name=~"[a-z]+"')
         assert [item.value for item in LabelSearchResponse.parse(raw).results] == [b'cpu', b'disk']
 
         # Combining two tags on different primaries unions their values, while the
         # third primary's tag (network) stays excluded.
         raw = client.execute_command(
-            'TS.LABELVALUES', 'name', 'FILTER', 'name=~".+"', 'HASHTAG', f'{tag_a},{tag_b}'
+            'TS.LABELVALUES', 'name', 'FILTER', 'name=~"[a-z]+"', 'HASHTAG', f'{tag_a},{tag_b}'
         )
         assert [item.value for item in LabelSearchResponse.parse(raw).results] == [b'cpu', b'disk', b'memory']

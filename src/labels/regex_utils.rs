@@ -70,6 +70,14 @@ fn decompose_matcher(expr: &str, is_equal: bool) -> ParseResult<PredicateMatch> 
             PredicateMatch::MatchNone
         });
     }
+    // `.+` and its spellings: a presence check, answered without running a regex.
+    if is_any_non_empty(&inner) {
+        return Ok(if is_equal {
+            PredicateMatch::HasLabel
+        } else {
+            PredicateMatch::LacksLabel
+        });
+    }
     let decomposed = decompose_parsed(expr, &inner).map_err(invalid)?;
     Ok(decomposed_regex_to_predicate_match(
         expr, &inner, decomposed, is_equal,
@@ -132,20 +140,16 @@ fn decomposed_regex_to_predicate_match(
             }
         }
         RegexDecomposition::Literals(mut lits) => {
-            if lits.len() == 1 {
-                let literal = lits.pop().unwrap();
-                if is_equal {
-                    PredicateMatch::Equal(PredicateValue::String(literal))
-                } else {
-                    PredicateMatch::NotEqual(PredicateValue::String(literal))
-                }
+            // `=~""` is `=""`, which `equal` turns into `LacksLabel`.
+            let value = if lits.len() == 1 {
+                PredicateValue::String(lits.pop().unwrap())
             } else {
-                let value = PredicateValue::from(lits);
-                if is_equal {
-                    PredicateMatch::Equal(value)
-                } else {
-                    PredicateMatch::NotEqual(value)
-                }
+                PredicateValue::from(lits)
+            };
+            if is_equal {
+                PredicateMatch::equal(value)
+            } else {
+                PredicateMatch::not_equal(value)
             }
         }
     }
@@ -155,6 +159,12 @@ fn decomposed_regex_to_predicate_match(
 /// also `^.*$`, `(.*)`, `.*.*`, `(?s:.*)` or `.*|foo`. A pattern that does not parse is not.
 pub(crate) fn is_match_all_regex_pattern(expr: &str) -> bool {
     parse_anchored_hir(expr).is_ok_and(|inner| is_match_all(&inner))
+}
+
+/// Whether a (Go-syntax) pattern matches exactly the non-empty values, judged on its parsed
+/// tree as [`is_match_all_regex_pattern`] is: `.+`, `^.+$`, `(.+)`, `.+.*`.
+pub(crate) fn is_any_non_empty_regex_pattern(expr: &str) -> bool {
+    parse_anchored_hir(expr).is_ok_and(|inner| is_any_non_empty(&inner))
 }
 
 /// `sre` (anchors already stripped) matches every value: a `.*`, or a concatenation of them.
@@ -642,9 +652,6 @@ pub(crate) struct RegexHints {
     pub(crate) required_literals: Vec<String>,
     /// A literal the value must end with.
     pub(crate) suffix: Option<String>,
-    /// The whole pattern matches exactly the non-empty values (`.+` and its spellings), so a
-    /// match needs no regex and the planner can answer it from the label's value list.
-    pub(crate) matches_any_non_empty: bool,
 }
 
 /// [`regex_hints`] for a pattern that has not been parsed yet. A pattern that
@@ -661,10 +668,7 @@ pub(crate) fn regex_hints_for_pattern(expr: &str, prefix: Option<&str>) -> Regex
 /// `inner` starts with exactly that literal prefix; otherwise there are none.
 fn regex_hints(inner: &Hir, prefix: Option<&str>) -> RegexHints {
     let Some(prefix) = prefix else {
-        return RegexHints {
-            matches_any_non_empty: is_any_non_empty(inner),
-            ..hints_from(inner)
-        };
+        return hints_from(inner);
     };
     match extract_anchored_prefix_or_remainder(inner) {
         Some((actual, PrefixTail::Rest(remainder))) if actual == prefix => hints_from(&remainder),
@@ -676,7 +680,6 @@ fn hints_from(sre: &Hir) -> RegexHints {
     RegexHints {
         required_literals: extract_literal_sequence(sre).unwrap_or_default(),
         suffix: extract_trailing_literal_sequence(sre),
-        matches_any_non_empty: false,
     }
 }
 
@@ -1662,11 +1665,6 @@ mod test {
                 );
                 assert_eq!(parsed.suffix(), rebuilt.suffix(), "suffix for {pattern:?}");
                 assert_eq!(
-                    parsed.matches_any_non_empty(),
-                    rebuilt.matches_any_non_empty(),
-                    "any-non-empty for {pattern:?}"
-                );
-                assert_eq!(
                     parsed.required_literals(),
                     rebuilt.required_literals(),
                     "required literals for {pattern:?}"
@@ -1886,13 +1884,21 @@ mod test {
             (".?", false),
             ("(?-s:.+)", false), // `.` without newlines is not every character
         ] {
+            assert_eq!(
+                super::is_any_non_empty_regex_pattern(pattern),
+                any_non_empty,
+                "{pattern}"
+            );
             for is_equal in [true, false] {
                 let matcher = parse_regex_matcher(pattern, is_equal).unwrap();
-                let (PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re)) = &matcher
-                else {
-                    panic!("{pattern}: {matcher:?}");
-                };
-                assert_eq!(re.matches_any_non_empty(), any_non_empty, "{pattern}");
+                // `.+` and its spellings parse to the presence checks; the rest stay regexes.
+                match (&matcher, any_non_empty, is_equal) {
+                    (PredicateMatch::HasLabel, true, true)
+                    | (PredicateMatch::LacksLabel, true, false) => {}
+                    (PredicateMatch::RegexEqual(_), false, true)
+                    | (PredicateMatch::RegexNotEqual(_), false, false) => {}
+                    _ => panic!("{pattern} (is_equal: {is_equal}): {matcher:?}"),
+                }
                 // The shortcut must agree with the compiled regex on every value.
                 let direct = super::compile_regex(pattern).unwrap();
                 for v in values {

@@ -257,9 +257,9 @@ class TestTsLabelNamesCME(ValkeyTimeSeriesClusterTestCase):
         # A lone negative regex matcher is unbounded and rejected.
         self.assert_filters_rejected('TS.LABELNAMES', 'FILTER', 'node!~"node[12]"', client=client)
 
-        # Complex filter with regex: nodes that don't match the pattern. 'name=~".+"' supplies
+        # Complex filter with regex: nodes that don't match the pattern. 'name=~"[a-z]+"' supplies
         # the positive matcher, which also excludes ts8 and ts9 -- neither has a 'name' label.
-        result = exec_sorted_values(client, 'FILTER', 'name=~".+"', 'node!~"node[12]"')
+        result = exec_sorted_values(client, 'FILTER', 'name=~"[a-z]+"', 'node!~"node[12]"')
         assert result == [b'name', b'node', b'ts6', b'ts7', b'type']
 
     def tag_per_primary(self, cluster_client: ValkeyCluster):
@@ -295,10 +295,10 @@ class TestTsLabelNamesCME(ValkeyTimeSeriesClusterTestCase):
         cluster_client.execute_command('TS.CREATE', f'ts:{{{tag_b}}}:1', 'LABELS', 'name', 'disk', 'markB1', '1')
         cluster_client.execute_command('TS.CREATE', f'ts:{{{tag_c}}}:1', 'LABELS', 'name', 'network', 'markC1', '1')
 
-        assert exec_sorted_values(client, 'HASHTAG', tag_a, 'FILTER', 'name=~".+"') == [
+        assert exec_sorted_values(client, 'HASHTAG', tag_a, 'FILTER', 'name=~"[a-z]+"') == [
             b'markA1', b'markA2', b'name',
         ]
-        assert exec_sorted_values(client, 'FILTER', 'name=~".+"', 'HASHTAG', f'{tag_a},{tag_b}') == [
+        assert exec_sorted_values(client, 'FILTER', 'name=~"[a-z]+"', 'HASHTAG', f'{tag_a},{tag_b}') == [
             b'markA1', b'markA2', b'markB1', b'name',
         ]
 

@@ -168,7 +168,7 @@ where
 ///
 /// Cheap means index lookups and bitmap operations only: every filter is an `=` or `!=` on
 /// non-empty values (single or a literal list), or matches everything or nothing. A regex,
-/// `contains`, or an empty value (which means "label absent") walks every value of its label,
+/// `contains`, or a presence check (`l=""`, `l!=""`) walks every value of its label,
 /// and `^=` walks every value under its prefix, which for a short prefix can be most of them.
 /// On a high-cardinality label, that walk is the expensive part of a small read.
 /// [`SeriesSelection::All`] is a copy of the all-series bitmap, and always cheap.
@@ -199,7 +199,10 @@ fn filter_plans_cheaply(filter: &LabelFilter) -> bool {
     match &filter.matcher {
         PredicateMatch::Equal(value) | PredicateMatch::NotEqual(value) => value.requires_present(),
         PredicateMatch::MatchAll | PredicateMatch::MatchNone => true,
-        PredicateMatch::RegexEqual(_)
+        // A union of every value of the label, as for an empty `=` / `!=` value.
+        PredicateMatch::HasLabel
+        | PredicateMatch::LacksLabel
+        | PredicateMatch::RegexEqual(_)
         | PredicateMatch::RegexNotEqual(_)
         | PredicateMatch::StartsWith(_)
         | PredicateMatch::NotStartsWith(_)

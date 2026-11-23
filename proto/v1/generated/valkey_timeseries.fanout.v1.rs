@@ -457,6 +457,8 @@ pub enum MatcherOpType {
     NotContains = 8,
     MatchAll = 9,
     MatchNone = 10,
+    HasLabel = 11,
+    LacksLabel = 12,
 }
 impl MatcherOpType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -476,6 +478,8 @@ impl MatcherOpType {
             Self::NotContains => "MATCHER_OP_TYPE_NOT_CONTAINS",
             Self::MatchAll => "MATCHER_OP_TYPE_MATCH_ALL",
             Self::MatchNone => "MATCHER_OP_TYPE_MATCH_NONE",
+            Self::HasLabel => "MATCHER_OP_TYPE_HAS_LABEL",
+            Self::LacksLabel => "MATCHER_OP_TYPE_LACKS_LABEL",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -492,6 +496,8 @@ impl MatcherOpType {
             "MATCHER_OP_TYPE_NOT_CONTAINS" => Some(Self::NotContains),
             "MATCHER_OP_TYPE_MATCH_ALL" => Some(Self::MatchAll),
             "MATCHER_OP_TYPE_MATCH_NONE" => Some(Self::MatchNone),
+            "MATCHER_OP_TYPE_HAS_LABEL" => Some(Self::HasLabel),
+            "MATCHER_OP_TYPE_LACKS_LABEL" => Some(Self::LacksLabel),
             _ => None,
         }
     }

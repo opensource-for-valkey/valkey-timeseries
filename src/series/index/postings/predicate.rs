@@ -24,6 +24,8 @@ impl<'a> Terms<'a> {
             }
             PredicateMatch::MatchAll => Cow::Borrowed(self.all()),
             PredicateMatch::MatchNone => Cow::Borrowed(&*EMPTY_BITMAP),
+            PredicateMatch::HasLabel => self.postings_for_all_label_values(&filter.label),
+            PredicateMatch::LacksLabel => self.postings_without_label(&filter.label),
             PredicateMatch::RegexEqual(_) => handle_regex_equal_match(self, filter)?,
             PredicateMatch::RegexNotEqual(_) => handle_regex_not_equal_match(self, filter)?,
             PredicateMatch::StartsWith(ref prefix) => {
@@ -50,6 +52,8 @@ impl<'a> Terms<'a> {
             }
             PredicateMatch::MatchAll => Cow::Borrowed(&*EMPTY_BITMAP),
             PredicateMatch::MatchNone => Cow::Borrowed(self.all()),
+            PredicateMatch::HasLabel => self.postings_without_label(&filter.label),
+            PredicateMatch::LacksLabel => self.postings_for_all_label_values(&filter.label),
             // A series has at most one value per label, so "has the label, minus has a matching
             // value" is the series whose value doesn't match: one scan, no difference.
             PredicateMatch::StartsWith(prefix) => {
