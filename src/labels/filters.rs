@@ -217,8 +217,6 @@ pub struct RegexMatcher {
     prefix: Option<String>,
     suffix: Option<String>,
     required_literals: SmallVec<[String; 2]>,
-    /// The pattern matches exactly the non-empty values (see [`RegexHints`]).
-    any_non_empty: bool,
     /// The pattern as the user wrote it; the fan-out codec sends this, and a shard recompiles it.
     value: String,
 }
@@ -249,14 +247,7 @@ impl RegexMatcher {
             prefix,
             suffix: hints.suffix,
             required_literals: hints.required_literals.into(),
-            any_non_empty: hints.matches_any_non_empty,
         }
-    }
-
-    /// True when the pattern matches exactly the non-empty values: `.+`, `^.+$`, `(.+)`,
-    /// `.+.*` and so on. Recognized on the parsed pattern, not its text.
-    pub fn matches_any_non_empty(&self) -> bool {
-        self.any_non_empty
     }
 
     /// The pattern as written.
@@ -286,9 +277,6 @@ impl RegexMatcher {
     }
 
     pub fn is_match(&self, other: &str) -> bool {
-        if self.any_non_empty {
-            return !other.is_empty();
-        }
         if other.is_empty() {
             if self
                 .prefix
@@ -368,7 +356,6 @@ impl PartialEq for RegexMatcher {
             && self.prefix == other.prefix
             && self.suffix == other.suffix
             && self.required_literals == other.required_literals
-            && self.any_non_empty == other.any_non_empty
             && self.value == other.value
     }
 }
@@ -535,10 +522,12 @@ impl PredicateMatch {
             PredicateMatch::NotEqual(value) => value.cost(),
             PredicateMatch::MatchAll => 0,
             PredicateMatch::MatchNone => 0,
-            // One prefix scan of the label's values, unioning their postings: dearer than an
-            // exact lookup, cheaper than running a predicate on every value.
-            PredicateMatch::HasLabel => 5,
-            PredicateMatch::LacksLabel => 5,
+            // Unions the postings of every value the label has, and comes back empty only when
+            // no series carries the label at all. The planner orders matchers so an empty one
+            // returns early, so this runs after every predicate scan (regexes top out at 55),
+            // which is far more likely to select nothing on a high-cardinality label.
+            PredicateMatch::HasLabel => 60,
+            PredicateMatch::LacksLabel => 60,
             PredicateMatch::RegexEqual(re) => re.cost(),
             PredicateMatch::RegexNotEqual(re) => re.cost() + 5,
             PredicateMatch::StartsWith(value) => 10 + value.cost(),
@@ -964,6 +953,52 @@ mod tests {
         assert!(matcher.is_match("abc"));
         assert!(!matcher.is_match("xabc"));
         assert!(!matcher.is_match("abcx"));
+    }
+
+    /// A presence check unions every value's postings and is empty only when no series has
+    /// the label, so the planner must try any single-operand predicate before it.
+    #[test]
+    fn presence_checks_cost_more_than_predicate_scans() {
+        use crate::labels::regex_utils::parse_regex_matcher;
+
+        let mut predicates = vec![
+            PredicateMatch::Equal("a".into()),
+            PredicateMatch::NotEqual("a".into()),
+            PredicateMatch::StartsWith("a".into()),
+            PredicateMatch::NotStartsWith("a".into()),
+            PredicateMatch::Contains("a".into()),
+            PredicateMatch::NotContains("a".into()),
+        ];
+        for pattern in [
+            "foo.+bar",
+            "foo.+",
+            ".+bar",
+            ".*foo.*bar",
+            "a|b+c",
+            "[a-z]+",
+        ] {
+            for is_equal in [true, false] {
+                let matcher = parse_regex_matcher(pattern, is_equal).unwrap();
+                assert!(
+                    matches!(
+                        matcher,
+                        PredicateMatch::RegexEqual(_) | PredicateMatch::RegexNotEqual(_)
+                    ),
+                    "{pattern} should stay a regex: {matcher:?}"
+                );
+                predicates.push(matcher);
+            }
+        }
+        for presence in [PredicateMatch::HasLabel, PredicateMatch::LacksLabel] {
+            for predicate in &predicates {
+                assert!(
+                    presence.cost() > predicate.cost(),
+                    "{presence:?} ({}) must cost more than {predicate:?} ({})",
+                    presence.cost(),
+                    predicate.cost()
+                );
+            }
+        }
     }
 
     #[test]

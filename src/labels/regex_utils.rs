@@ -652,9 +652,6 @@ pub(crate) struct RegexHints {
     pub(crate) required_literals: Vec<String>,
     /// A literal the value must end with.
     pub(crate) suffix: Option<String>,
-    /// The whole pattern matches exactly the non-empty values (`.+` and its spellings), so a
-    /// match needs no regex and the planner can answer it from the label's value list.
-    pub(crate) matches_any_non_empty: bool,
 }
 
 /// [`regex_hints`] for a pattern that has not been parsed yet. A pattern that
@@ -671,10 +668,7 @@ pub(crate) fn regex_hints_for_pattern(expr: &str, prefix: Option<&str>) -> Regex
 /// `inner` starts with exactly that literal prefix; otherwise there are none.
 fn regex_hints(inner: &Hir, prefix: Option<&str>) -> RegexHints {
     let Some(prefix) = prefix else {
-        return RegexHints {
-            matches_any_non_empty: is_any_non_empty(inner),
-            ..hints_from(inner)
-        };
+        return hints_from(inner);
     };
     match extract_anchored_prefix_or_remainder(inner) {
         Some((actual, PrefixTail::Rest(remainder))) if actual == prefix => hints_from(&remainder),
@@ -686,7 +680,6 @@ fn hints_from(sre: &Hir) -> RegexHints {
     RegexHints {
         required_literals: extract_literal_sequence(sre).unwrap_or_default(),
         suffix: extract_trailing_literal_sequence(sre),
-        matches_any_non_empty: false,
     }
 }
 
@@ -1672,11 +1665,6 @@ mod test {
                 );
                 assert_eq!(parsed.suffix(), rebuilt.suffix(), "suffix for {pattern:?}");
                 assert_eq!(
-                    parsed.matches_any_non_empty(),
-                    rebuilt.matches_any_non_empty(),
-                    "any-non-empty for {pattern:?}"
-                );
-                assert_eq!(
                     parsed.required_literals(),
                     rebuilt.required_literals(),
                     "required literals for {pattern:?}"
@@ -1907,10 +1895,8 @@ mod test {
                 match (&matcher, any_non_empty, is_equal) {
                     (PredicateMatch::HasLabel, true, true)
                     | (PredicateMatch::LacksLabel, true, false) => {}
-                    (PredicateMatch::RegexEqual(re), false, true)
-                    | (PredicateMatch::RegexNotEqual(re), false, false) => {
-                        assert!(!re.matches_any_non_empty(), "{pattern}");
-                    }
+                    (PredicateMatch::RegexEqual(_), false, true)
+                    | (PredicateMatch::RegexNotEqual(_), false, false) => {}
                     _ => panic!("{pattern} (is_equal: {is_equal}): {matcher:?}"),
                 }
                 // The shortcut must agree with the compiled regex on every value.
