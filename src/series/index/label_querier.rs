@@ -191,6 +191,18 @@ impl<'a> Default for SearchHints<'a> {
     }
 }
 
+impl SearchHints<'_> {
+    /// Whether the results must carry their cardinality: for `INCLUDE_METADATA`, or to rank by
+    /// it. Without it, a search that has to read every value of a name to count it need not.
+    pub(crate) fn needs_cardinality(&self) -> bool {
+        self.include_meta
+            || matches!(
+                self.order_by,
+                SearchResultOrdering::CardinalityAsc | SearchResultOrdering::CardinalityDesc
+            )
+    }
+}
+
 /// SearchResult represents a single search result with its relevance score.
 #[derive(Debug, Clone, Default)]
 pub struct LabelSearchResult {
@@ -201,7 +213,8 @@ pub struct LabelSearchResult {
     pub score: f64,
 
     /// How many series carry the label name or value, or `0` where it was not computed: a
-    /// scoped search computes it only for `INCLUDE_METADATA` or a cardinality order. An
+    /// scoped search, and an unscoped name search, compute it only for `INCLUDE_METADATA` or a
+    /// cardinality order ([`SearchHints::needs_cardinality`]). An
     /// unscoped search counts every visible series in the database; a scoped one counts only
     /// the selected series, so that a cluster's per-shard counts add up to the selection's.
     pub cardinality: usize,
@@ -439,8 +452,10 @@ pub(crate) fn series_read_exceeds_inline_budget(
 /// search itself. Scoped searches use database-wide counts, so a selective query against
 /// a large database may also be sent to a worker.
 ///
-/// `label_name = None` searches names; `Some` searches that label's values. Name scans
-/// sum cardinalities across every value of each name, so even LIMIT 1 can read many entries.
+/// `label_name = None` searches names; `Some` searches that label's values. A name scan that
+/// needs cardinalities sums them across every value of each name, so even LIMIT 1 can read many
+/// entries; one that does not reads a name's first visible entry and skips the rest, but the
+/// index keeps no count of distinct names, so both are sized by the entry count.
 /// Value scans can stop after limit + 1 live entries only without SEARCH and in value order.
 ///
 /// A scoped search may pass `plan`, its selectors planned already because that was cheap
@@ -667,7 +682,8 @@ enum NameStep<'p> {
     Done,
     /// The callback asked to stop.
     Stopped,
-    /// Read on past this rejected name's values; give the lock back first if `release`.
+    /// Read on past this name's remaining values, which nothing needs: it was rejected, or
+    /// reported without a count. Give the lock back first if `release`.
     Skip { name: &'p str, release: bool },
     /// Give the lock back and resume beyond this key.
     Release(&'p [u8]),
@@ -676,6 +692,9 @@ enum NameStep<'p> {
 /// The state a name scan carries from one hold to the next.
 struct NameScan<'f, F> {
     filter: &'f dyn FuzzyFilter,
+    /// Without it an accepted name is reported, with a count of `0`, at its first visible
+    /// entry, and the rest of its values are skipped.
+    need_cardinality: bool,
     f: F,
     entries_per_hold: usize,
     read_this_hold: usize,
@@ -728,6 +747,18 @@ where
                             release: hold_full,
                         };
                     }
+                    if !self.need_cardinality {
+                        // Visible, so the name exists: its other values would only add to a
+                        // count nothing reads.
+                        self.pending = Some((score, 0));
+                        if self.emit().is_break() {
+                            return NameStep::Stopped;
+                        }
+                        return NameStep::Skip {
+                            name,
+                            release: hold_full,
+                        };
+                    }
                     self.pending = Some((score, visible));
                 } else if let Some((_, cardinality)) = self.pending.as_mut() {
                     *cardinality += visible;
@@ -741,36 +772,48 @@ where
     }
 }
 
+/// What a name scan reports, and how many entries it reads under one hold of the postings read
+/// lock.
+#[derive(Clone, Copy)]
+struct NameScanOptions<'f> {
+    filter: &'f dyn FuzzyFilter,
+    /// Sum each name's visible series count over its values; without it the count is `0` and
+    /// only a name's first visible entry is read.
+    need_cardinality: bool,
+    entries_per_hold: usize,
+}
+
 /// Hand each label name in the label index between the keys `after` and `before` (both
-/// exclusive, `None` for no bound) that `filter` accepts to `f`, with its score and the visible
-/// series count summed over its values, until `f` breaks.
+/// exclusive, `None` for no bound) that `opts.filter` accepts to `f`, with its score and, if
+/// `opts.need_cardinality`, the visible series count summed over its values (else `0`), until
+/// `f` breaks.
 ///
 /// Names come in index-key order, descending if `descending`. That is the byte order of the
 /// `name=value` keys, which is not quite the order of the names: `job2=…` sorts before `job=…`,
 /// because `2` sorts before `=`. See [`rank_label_names`] for what that costs a value-ordered
 /// search.
 ///
-/// It takes the postings read lock itself and gives it back every `entries_per_hold` entries,
-/// so it must not be called with that lock held. Giving it back costs the scan its
+/// It takes the postings read lock itself and gives it back every `opts.entries_per_hold`
+/// entries, so it must not be called with that lock held. Giving it back costs the scan its
 /// point-in-time view: an entry added behind the resume point after it was passed is not
 /// seen. A name whose entries straddle a release is still reported once, with one count summed
 /// across the holds. `f` gets each name as it is completed; the `&str` is valid only for that
 /// call.
 fn scan_label_names_in_holds<F>(
     index: &TimeSeriesIndex,
-    filter: &dyn FuzzyFilter,
+    opts: NameScanOptions<'_>,
     descending: bool,
     after: Option<&[u8]>,
     before: Option<&[u8]>,
-    entries_per_hold: usize,
     f: F,
 ) where
     F: FnMut(&str, f64, usize) -> ControlFlow<()>,
 {
     let mut scan = NameScan {
-        filter,
+        filter: opts.filter,
+        need_cardinality: opts.need_cardinality,
         f,
-        entries_per_hold: entries_per_hold.max(1),
+        entries_per_hold: opts.entries_per_hold.max(1),
         read_this_hold: 0,
         curr_name: String::new(),
         pending: None,
@@ -964,13 +1007,16 @@ where
     }
 }
 
-/// The sum of the visible cardinalities of `name`'s values, read at most `entries_per_hold` entries
-/// per hold of the postings read lock: a high-cardinality name has a million entries.
+/// The sum of the visible cardinalities of `name`'s values, or `None` if no read can see any,
+/// read at most `entries_per_hold` entries per hold of the postings read lock: a
+/// high-cardinality name has a million entries. Without `need_cardinality` it stops at the first
+/// visible value, with `Some(0)`.
 fn label_cardinality_in_holds(
     index: &TimeSeriesIndex,
     name: &str,
     entries_per_hold: usize,
-) -> usize {
+    need_cardinality: bool,
+) -> Option<usize> {
     let entries_per_hold = entries_per_hold.max(1);
     let first = first_label_key(name);
     let past = past_label_keys(name);
@@ -991,7 +1037,11 @@ fn label_cardinality_in_holds(
             .range::<[u8], _>((lower, Bound::Excluded(past.as_slice())))
             .enumerate()
         {
-            total += postings.visible_cardinality(map);
+            let visible = postings.visible_cardinality(map);
+            if visible > 0 && !need_cardinality {
+                return Some(0);
+            }
+            total += visible;
             if read + 1 == entries_per_hold {
                 stopped_at = Some(key.as_ref());
                 break;
@@ -1003,31 +1053,30 @@ fn label_cardinality_in_holds(
                 resume.extend_from_slice(key);
                 resuming = true;
             }
-            None => return total as usize,
+            None => return (total > 0).then_some(total as usize),
         }
     }
 }
 
 /// The best `limit` label names under `order` that `filter` accepts, each with the visible
-/// series count summed over its values, and whether there are more. See [`rank_label_names_in_holds`].
+/// series count summed over its values if `need_cardinality` (else `0`), and whether there are
+/// more. `order` must not be a cardinality order without `need_cardinality`. See [`rank_label_names_in_holds`].
 fn rank_label_names(
     index: &TimeSeriesIndex,
     filter: &dyn FuzzyFilter,
+    need_cardinality: bool,
     order: SearchResultOrdering,
     limit: usize,
 ) -> ValkeyResult<LabelQueryResult> {
-    index.read_without_swap(|| {
-        Ok(rank_label_names_in_holds(
-            index,
-            filter,
-            order,
-            limit,
-            LABEL_SCAN_ENTRIES_PER_HOLD,
-        ))
-    })
+    let opts = NameScanOptions {
+        filter,
+        need_cardinality,
+        entries_per_hold: LABEL_SCAN_ENTRIES_PER_HOLD,
+    };
+    index.read_without_swap(|| Ok(rank_label_names_in_holds(index, opts, order, limit)))
 }
 
-/// [`rank_label_names`] reading at most `entries_per_hold` entries per lock hold.
+/// [`rank_label_names`] with the scan's options, `opts.entries_per_hold` among them.
 ///
 /// A score or cardinality order must see every name. A value order stops the scan, as a
 /// stream would, once it has `limit + 1` names, but the scan's order is that of the index
@@ -1044,11 +1093,18 @@ fn rank_label_names(
 /// the key order and the name order alike.
 fn rank_label_names_in_holds(
     index: &TimeSeriesIndex,
-    filter: &dyn FuzzyFilter,
+    opts: NameScanOptions<'_>,
     order: SearchResultOrdering,
     limit: usize,
-    entries_per_hold: usize,
 ) -> LabelQueryResult {
+    debug_assert!(
+        opts.need_cardinality
+            || !matches!(
+                order,
+                SearchResultOrdering::CardinalityAsc | SearchResultOrdering::CardinalityDesc
+            ),
+        "a cardinality order needs the cardinalities"
+    );
     let mut top = TopK::new(order, limit);
     let offer = |top: &mut TopK, name: &str, score: f64, cardinality: usize| {
         let key = RankKey {
@@ -1072,11 +1128,10 @@ fn rank_label_names_in_holds(
         | SearchResultOrdering::CardinalityDesc => {
             scan_label_names_in_holds(
                 index,
-                filter,
+                opts,
                 false,
                 None,
                 None,
-                entries_per_hold,
                 |name, score, cardinality| {
                     offer(&mut top, name, score, cardinality);
                     ControlFlow::Continue(())
@@ -1091,11 +1146,10 @@ fn rank_label_names_in_holds(
     let mut last: Option<String> = None;
     scan_label_names_in_holds(
         index,
-        filter,
+        opts,
         descending,
         None,
         None,
-        entries_per_hold,
         |name, score, cardinality| {
             offer(&mut top, name, score, cardinality);
             if top.offered > top.limit {
@@ -1119,11 +1173,10 @@ fn rank_label_names_in_holds(
         if worst.as_bytes() < below.as_slice() {
             scan_label_names_in_holds(
                 index,
-                filter,
+                opts,
                 false,
                 Some(worst.as_bytes()),
                 Some(&below),
-                entries_per_hold,
                 |name, score, cardinality| {
                     offer(&mut top, name, score, cardinality);
                     ControlFlow::Continue(())
@@ -1142,13 +1195,18 @@ fn rank_label_names_in_holds(
             if prefix_key <= read_to {
                 continue; // Read already.
             }
-            let (accepted, score) = filter.accept(prefix);
+            let (accepted, score) = opts.filter.accept(prefix);
             if !accepted {
                 continue;
             }
-            match label_cardinality_in_holds(index, prefix, entries_per_hold) {
-                0 => {}
-                cardinality => offer(&mut top, prefix, score, cardinality),
+            let found = label_cardinality_in_holds(
+                index,
+                prefix,
+                opts.entries_per_hold,
+                opts.need_cardinality,
+            );
+            if let Some(cardinality) = found {
+                offer(&mut top, prefix, score, cardinality);
             }
         }
     }
@@ -1167,7 +1225,13 @@ fn collect_unscoped_label_names(
 ) -> ValkeyResult<LabelQueryResult> {
     let limit = normalize_limit(hints.limit);
     with_search_filter(hints, |filter| {
-        rank_label_names(index, filter, hints.order_by, limit)
+        rank_label_names(
+            index,
+            filter,
+            hints.needs_cardinality(),
+            hints.order_by,
+            limit,
+        )
     })
 }
 
@@ -1297,10 +1361,7 @@ fn collect_label_names<S: GilSource + ?Sized>(
 /// The scoped search's answer from each distinct name or value of the selection and how many
 /// selected series carry it: those the hints' filter accepts, ranked and limited.
 fn collect_counted(counts: AHashMap<String, usize>, hints: &SearchHints) -> LabelQueryResult {
-    let need_cardinality = matches!(
-        hints.order_by,
-        SearchResultOrdering::CardinalityAsc | SearchResultOrdering::CardinalityDesc
-    ) || hints.include_meta;
+    let need_cardinality = hints.needs_cardinality();
 
     with_search_filter(hints, |filter| {
         let mut result = Vec::with_capacity(counts.len());
@@ -1422,8 +1483,8 @@ impl LabelQuerier for DefaultLabelQuerier {
 #[cfg(test)]
 mod tests {
     use super::{
-        FuzzyFilter, LabelQueryResult, LabelSearchResult, NoOpSearchMatcher, SearchHints,
-        SearchResultOrdering, TimeSeriesIndex, apply_search_hints, collect_top_k,
+        FuzzyFilter, LabelQueryResult, LabelSearchResult, NameScanOptions, NoOpSearchMatcher,
+        SearchHints, SearchResultOrdering, TimeSeriesIndex, apply_search_hints, collect_top_k,
         collect_unscoped_label_names, collect_unscoped_label_values,
         collect_unscoped_label_values_in_holds, compare_search_results, label_cardinality_in_holds,
         label_search_exceeds_inline_budget, rank_label_names_in_holds, scan_label_names_in_holds,
@@ -2234,20 +2295,41 @@ mod tests {
         postings
     }
 
-    /// Every name the scan reports, in its order, with `RejectBeta`.
+    /// Every name the scan reports, in its order, with `RejectBeta`, counting cardinalities.
     fn scan_names(
         index: &TimeSeriesIndex,
         descending: bool,
         entries_per_hold: usize,
     ) -> Vec<(String, f64, usize)> {
+        scan_names_with(index, descending, entries_per_hold, true)
+    }
+
+    fn name_scan_options(
+        filter: &dyn FuzzyFilter,
+        need_cardinality: bool,
+        entries_per_hold: usize,
+    ) -> NameScanOptions<'_> {
+        NameScanOptions {
+            filter,
+            need_cardinality,
+            entries_per_hold,
+        }
+    }
+
+    /// [`scan_names`], counting cardinalities only if `need_cardinality`.
+    fn scan_names_with(
+        index: &TimeSeriesIndex,
+        descending: bool,
+        entries_per_hold: usize,
+        need_cardinality: bool,
+    ) -> Vec<(String, f64, usize)> {
         let mut names = Vec::new();
         scan_label_names_in_holds(
             index,
-            &RejectBeta,
+            name_scan_options(&RejectBeta, need_cardinality, entries_per_hold),
             descending,
             None,
             None,
-            entries_per_hold,
             |name, score, cardinality| {
                 names.push((name.to_owned(), score, cardinality));
                 ControlFlow::Continue(())
@@ -2263,12 +2345,24 @@ mod tests {
         limit: usize,
         entries_per_hold: usize,
     ) -> (Vec<String>, bool) {
+        rank_names_with(index, descending, limit, entries_per_hold, true)
+    }
+
+    /// [`rank_names`], counting cardinalities only if `need_cardinality`.
+    fn rank_names_with(
+        index: &TimeSeriesIndex,
+        descending: bool,
+        limit: usize,
+        entries_per_hold: usize,
+        need_cardinality: bool,
+    ) -> (Vec<String>, bool) {
         let order = if descending {
             SearchResultOrdering::ValueDesc
         } else {
             SearchResultOrdering::ValueAsc
         };
-        let result = rank_label_names_in_holds(index, &RejectBeta, order, limit, entries_per_hold);
+        let opts = name_scan_options(&RejectBeta, need_cardinality, entries_per_hold);
+        let result = rank_label_names_in_holds(index, opts, order, limit);
         let has_more = result.has_more;
         (values(result), has_more)
     }
@@ -2286,6 +2380,66 @@ mod tests {
 
         assert_eq!(scan_names(&index, false, usize::MAX), ascending);
         assert_eq!(scan_names(&index, true, usize::MAX), descending);
+    }
+
+    /// Without cardinalities a name scan reports the same names, each with a count of `0`.
+    #[test]
+    fn name_scan_without_cardinality_reports_the_same_names_uncounted() {
+        for postings in [
+            build_multi_value_label_postings(),
+            build_prefix_sharing_label_postings(),
+        ] {
+            let index = index_of(postings);
+            for descending in [false, true] {
+                let counted = scan_names(&index, descending, usize::MAX);
+                let uncounted: Vec<_> = counted
+                    .into_iter()
+                    .map(|(name, score, _)| (name, score, 0))
+                    .collect();
+                for entries_per_hold in [1, 2, 3, usize::MAX] {
+                    assert_eq!(
+                        scan_names_with(&index, descending, entries_per_hold, false),
+                        uncounted,
+                        "descending {descending}, {entries_per_hold} per hold"
+                    );
+                }
+                for limit in [1, 2, 3] {
+                    let counted = rank_names(&index, descending, limit, usize::MAX);
+                    for entries_per_hold in [1, 2, 3, usize::MAX] {
+                        assert_eq!(
+                            rank_names_with(&index, descending, limit, entries_per_hold, false),
+                            counted,
+                            "descending {descending}, limit {limit}, {entries_per_hold} per hold"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A scan that does not count still stops at the name the callback breaks on.
+    #[test]
+    fn name_scan_without_cardinality_stops_when_asked() {
+        let index = index_of(build_multi_value_label_postings());
+        for entries_per_hold in [1, usize::MAX] {
+            let mut names = Vec::new();
+            scan_label_names_in_holds(
+                &index,
+                name_scan_options(&RejectBeta, false, entries_per_hold),
+                false,
+                None,
+                None,
+                |name, _, _| {
+                    names.push(name.to_owned());
+                    if names.len() == 2 {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                },
+            );
+            assert_eq!(names, ["alpha", "gamma"], "{entries_per_hold} per hold");
+        }
     }
 
     /// `beta` is rejected; `beta2` shares its prefix and sorts between `beta` and `beta=…`.
@@ -2471,21 +2625,38 @@ mod tests {
                     })
                     .collect();
                 for order in all_orderings() {
+                    let counted_orders = matches!(
+                        order,
+                        SearchResultOrdering::CardinalityAsc
+                            | SearchResultOrdering::CardinalityDesc
+                    );
                     for limit in [1, 2, 3, 5, 8, 13, 40] {
                         let (expected, expected_more) = sorted_prefix(&accepted, order, limit);
-                        for entries_per_hold in [1, 3, usize::MAX] {
-                            let actual = rank_label_names_in_holds(
-                                &index,
-                                filter,
-                                order,
-                                limit,
-                                entries_per_hold,
-                            );
-                            let context = format!(
-                                "round {round}, filtered {filtered}, {order:?}, limit {limit}, {entries_per_hold} per hold"
-                            );
-                            assert_eq!(actual.results, expected, "{context}");
-                            assert_eq!(actual.has_more, expected_more, "{context}");
+                        for need_cardinality in [true, false] {
+                            if counted_orders && !need_cardinality {
+                                continue;
+                            }
+                            let expected: Vec<LabelSearchResult> = expected
+                                .iter()
+                                .map(|r| LabelSearchResult {
+                                    cardinality: if need_cardinality { r.cardinality } else { 0 },
+                                    ..r.clone()
+                                })
+                                .collect();
+                            for entries_per_hold in [1, 3, usize::MAX] {
+                                let actual = rank_label_names_in_holds(
+                                    &index,
+                                    name_scan_options(filter, need_cardinality, entries_per_hold),
+                                    order,
+                                    limit,
+                                );
+                                let context = format!(
+                                    "round {round}, filtered {filtered}, {order:?}, limit {limit}, \
+                                     counted {need_cardinality}, {entries_per_hold} per hold"
+                                );
+                                assert_eq!(actual.results, expected, "{context}");
+                                assert_eq!(actual.has_more, expected_more, "{context}");
+                            }
                         }
                     }
                 }
@@ -2539,26 +2710,39 @@ mod tests {
         postings.add_posting_for_label_value(5, "jobs", "v");
         let index = index_of(postings);
 
-        for entries_per_hold in [1, 2, usize::MAX] {
+        for (filter, mut expected) in [
+            (
+                &RejectJob as &dyn FuzzyFilter,
+                vec![" lead", "job>x", "jobs"],
+            ),
+            // An accepted name skipped once it is reported, without counting, alike.
+            (&NoOpSearchMatcher, vec![" lead", "job", "job>x", "jobs"]),
+        ] {
             for descending in [false, true] {
-                let mut names = Vec::new();
-                scan_label_names_in_holds(
-                    &index,
-                    &RejectJob,
-                    descending,
-                    None,
-                    None,
-                    entries_per_hold,
-                    |n, _, _| {
-                        names.push(n.to_owned());
-                        ControlFlow::Continue(())
-                    },
-                );
-                let mut expected = vec![" lead", "job>x", "jobs"];
                 if descending {
                     expected.reverse();
                 }
-                assert_eq!(names, expected, "{entries_per_hold} per hold");
+                for entries_per_hold in [1, 2, usize::MAX] {
+                    for need_cardinality in [true, false] {
+                        let mut names = Vec::new();
+                        scan_label_names_in_holds(
+                            &index,
+                            name_scan_options(filter, need_cardinality, entries_per_hold),
+                            descending,
+                            None,
+                            None,
+                            |n, _, _| {
+                                names.push(n.to_owned());
+                                ControlFlow::Continue(())
+                            },
+                        );
+                        assert_eq!(
+                            names, expected,
+                            "descending {descending}, counted {need_cardinality}, \
+                             {entries_per_hold} per hold"
+                        );
+                    }
+                }
             }
         }
     }
@@ -2588,7 +2772,8 @@ mod tests {
             .read_without_swap(|| {
                 attempts += 1;
                 let mut names = Vec::new();
-                scan_label_names_in_holds(&index, &RejectBeta, false, None, None, 1, |n, _, _| {
+                let opts = name_scan_options(&RejectBeta, true, 1);
+                scan_label_names_in_holds(&index, opts, false, None, None, |n, _, _| {
                     names.push(n.to_owned());
                     ControlFlow::Continue(())
                 });
@@ -2668,20 +2853,30 @@ mod tests {
 
     #[test]
     fn label_names_leave_out_what_only_hidden_series_carry() {
+        // `env=imported`, hidden, sorts before `env=local`: a scan that does not count must
+        // still read past it to find `env`.
         let index = index_with_hidden_series();
         for order_by in all_orderings() {
-            let hints = SearchHints {
-                order_by,
-                ..Default::default()
-            };
-            let result = collect_unscoped_label_names(&index, &hints).unwrap();
-            let names: Vec<(&str, usize)> = result
-                .results
-                .iter()
-                .map(|r| (r.value.as_str(), r.cardinality))
-                .sorted()
-                .collect();
-            assert_eq!(names, [("env", 1), ("job", 1)], "{order_by:?}");
+            for include_meta in [false, true] {
+                let hints = SearchHints {
+                    order_by,
+                    include_meta,
+                    ..Default::default()
+                };
+                let count = usize::from(hints.needs_cardinality());
+                let result = collect_unscoped_label_names(&index, &hints).unwrap();
+                let names: Vec<(&str, usize)> = result
+                    .results
+                    .iter()
+                    .map(|r| (r.value.as_str(), r.cardinality))
+                    .sorted()
+                    .collect();
+                assert_eq!(
+                    names,
+                    [("env", count), ("job", count)],
+                    "{order_by:?}, include_meta {include_meta}"
+                );
+            }
         }
     }
 
@@ -2713,11 +2908,16 @@ mod tests {
         // and leaves the name out when it is zero.
         let index = index_with_hidden_series();
         for entries_per_hold in [1, 2, usize::MAX] {
-            for (name, expected) in [("job", 1), ("env", 1), ("only_imported", 0)] {
+            for (name, expected) in [("job", Some(1)), ("env", Some(1)), ("only_imported", None)] {
                 assert_eq!(
-                    label_cardinality_in_holds(&index, name, entries_per_hold),
+                    label_cardinality_in_holds(&index, name, entries_per_hold, true),
                     expected,
                     "{name}, {entries_per_hold} per hold"
+                );
+                assert_eq!(
+                    label_cardinality_in_holds(&index, name, entries_per_hold, false),
+                    expected.map(|_| 0),
+                    "{name}, {entries_per_hold} per hold, uncounted"
                 );
             }
         }
@@ -2741,10 +2941,15 @@ mod tests {
     #[test]
     fn label_cardinality_is_unchanged_by_where_it_gives_the_lock_back() {
         let index = index_of(build_multi_value_label_postings());
-        for (name, expected) in [("alpha", 3), ("beta", 3), ("gamma", 2), ("missing", 0)] {
+        for (name, expected) in [
+            ("alpha", Some(3)),
+            ("beta", Some(3)),
+            ("gamma", Some(2)),
+            ("missing", None),
+        ] {
             for entries_per_hold in [1, 2, 3, usize::MAX] {
                 assert_eq!(
-                    label_cardinality_in_holds(&index, name, entries_per_hold),
+                    label_cardinality_in_holds(&index, name, entries_per_hold, true),
                     expected,
                     "{name}, {entries_per_hold} per hold"
                 );
