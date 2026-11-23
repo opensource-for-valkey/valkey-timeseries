@@ -35,11 +35,11 @@ class TestTsCardClusterCME(ValkeyTimeSeriesClusterTestCase):
         result = client.execute_command('TS.CARD', 'FILTER', 'host=server1')
         assert result == 2
 
-        # A lone negative matcher is unbounded and rejected; 'host' is on both series, so
-        # 'host=~".+"' supplies the positive matcher without excluding anything.
+        # A lone negative matcher is unbounded and rejected; both series have 'host=server1',
+        # so that supplies the positive matcher without excluding anything.
         self.assert_filters_rejected('TS.CARD', 'FILTER', 'type!=memory', client=client)
 
-        result = client.execute_command('TS.CARD', 'FILTER', 'host=~".+"', 'type!=memory')
+        result = client.execute_command('TS.CARD', 'FILTER', 'host=server1', 'type!=memory')
         assert result == 1
 
     def tag_per_primary(self, cluster_client: ValkeyCluster):
@@ -274,12 +274,16 @@ class TestTsCardClusterCME(ValkeyTimeSeriesClusterTestCase):
         result = node0.execute_command('TS.CARD', 'FILTER', 'latency{env!="dev"}')
         assert result == 2  # latency for service1 and service2 (not service3)
 
-        # 'app!=' ("has an app label") is still a negative matcher, so this list has no
-        # positive matcher and is rejected. Every series has a 'metric' label, so
-        # 'metric=~".+"' bounds the query without excluding anything.
+        # 'app!=' ("has an app label") is a presence check, not a positive matcher, so this
+        # list has none and is rejected -- as it is with 'metric=~".+"', the same check spelled
+        # as a regex. Every metric value is lowercase letters, so 'metric=~"[a-z]+"' bounds the
+        # query without excluding anything.
         self.assert_filters_rejected('TS.CARD', 'FILTER', 'app!=', 'metric!=memory', client=node0)
+        self.assert_filters_rejected(
+            'TS.CARD', 'FILTER', 'metric=~".+"', 'app!=', 'metric!=memory', client=node0)
 
-        result = node0.execute_command('TS.CARD', 'FILTER', 'metric=~".+"', 'app!=', 'metric!=memory')
+        result = node0.execute_command(
+            'TS.CARD', 'FILTER', 'metric=~"[a-z]+"', 'app!=', 'metric!=memory')
         assert result == 5  # the 5 app series; none of them is a memory metric
 
     def test_cluster_edge_cases(self):
@@ -360,9 +364,9 @@ class TestTsCardClusterCME(ValkeyTimeSeriesClusterTestCase):
         self.assert_filters_rejected(
             'TS.CARD', 'FILTER', 'service!=cache', 'region!=eu-central', client=client)
 
-        # Every series has a 'service' label, so 'service=~".+"' bounds without excluding.
+        # Every series has one of these services, so the list bounds without excluding.
         result = client.execute_command(
-            'TS.CARD', 'FILTER', 'service=~".+"', 'service!=cache', 'region!=eu-central')
+            'TS.CARD', 'FILTER', 'service=(api,db,cache)', 'service!=cache', 'region!=eu-central')
         assert result == 12  # API and DB in us-east and us-west (2 regions * 2 services * 3 instances)
 
         # Test date range filtering on large dataset

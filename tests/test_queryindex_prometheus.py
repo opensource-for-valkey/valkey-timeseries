@@ -55,9 +55,16 @@ class TestTsQueryIndex(ValkeyTimeSeriesTestCaseBase):
         result = sorted(self.client.execute_command('TS.QUERYINDEX', 'n=1', 'i='))
         assert result == [b'ts1']
 
-        # Find series with 'i' label
-        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'i=~".+"'))
-        assert result == [b'ts2', b'ts3', b'ts4', b'ts7']
+        # 'i=~".+"' means "series carrying label i" -- the same as 'i!=', which RedisTimeSeries
+        # does not accept as a positive matcher, so it is rejected on its own too.
+        self.assert_query_rejected('i=~".+"')
+        self.assert_query_rejected('i!=')
+
+        # Paired with a bounded filter, it keeps the series carrying the label.
+        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'n=1', 'i=~".+"'))
+        assert result == [b'ts2', b'ts3', b'ts4']
+        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'n=1', 'i!='))
+        assert result == [b'ts2', b'ts3', b'ts4']
 
     def test_not_equal_matching(self):
         """Test negation matching with TS.QUERYINDEX"""
@@ -89,9 +96,11 @@ class TestTsQueryIndex(ValkeyTimeSeriesTestCaseBase):
         # entirely -- it selects everything and is rejected on its own.
         self.assert_query_rejected('n=~".*"')
 
-        # Match non-empty values with .+ -- this cannot match a missing label, so it is bounded.
-        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'i=~".+"'))
-        assert result == [b'ts2', b'ts3', b'ts4', b'ts7']
+        # `.+` cannot match a missing label, but it is a presence check, like 'i!=': it narrows
+        # a bounded query rather than bounding one.
+        self.assert_query_rejected('i=~".+"')
+        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'n=~"1|2"', 'i=~".+"'))
+        assert result == [b'ts2', b'ts3', b'ts4']
 
     def test_regex_not_matching(self):
         """Test regex negation matching of TS.QUERYINDEX"""
@@ -107,7 +116,7 @@ class TestTsQueryIndex(ValkeyTimeSeriesTestCaseBase):
         assert result == []
 
         # Paired with a bounded filter they are allowed.
-        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'i=~".+"', 'n!~"^1$"'))
+        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'i=~"[a-c]"', 'n!~"^1$"'))
         assert result == [b'ts7']
 
     def test_complex_combinations(self):
@@ -205,9 +214,10 @@ class TestTsQueryIndex(ValkeyTimeSeriesTestCaseBase):
         result = sorted(self.client.execute_command('TS.QUERYINDEX', 'n=~".*"', 'i=a'))
         assert result == [b'ts2']
 
-        # Using .+ to match non-empty values only
-        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'i=~".+"'))
-        assert result == [b'ts2', b'ts3', b'ts4', b'ts7']
+        # Using .+ to match non-empty values only; on its own it is a presence check, unbounded.
+        self.assert_query_rejected('i=~".+"')
+        result = sorted(self.client.execute_command('TS.QUERYINDEX', 'i=~"[a-c]"', 'i=~".+"'))
+        assert result == [b'ts2', b'ts3', b'ts7']
 
         # Not matching anything
         result = sorted(self.client.execute_command('TS.QUERYINDEX', 'n!~".*"', 'i!~".*"'))

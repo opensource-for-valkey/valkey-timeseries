@@ -2,8 +2,9 @@
 //!
 //! Follows Prometheus's `PostingsForMatchers` strategy. Matchers are split into intersecting and
 //! subtracting sets, ordered so the intersecting ones run first (keeping the base of subtraction
-//! small and stable), and cheap matchers run before expensive ones. Degenerate regexes (`.*`,
-//! `.+`) are short-circuited before touching the index at all.
+//! small and stable), and cheap matchers run before expensive ones. Degenerate matchers
+//! (`.*`, and the presence checks `l!=""` / `l=""` however they are spelled) are answered
+//! without running a predicate over label values.
 
 use super::terms::{Terms, union_cow};
 use super::{EMPTY_BITMAP, Postings, PostingsBitmap};
@@ -46,8 +47,9 @@ impl<'a> Terms<'a> {
         sorted_matchers.sort_by_key(|&(filter, matches_empty)| (matches_empty, filter.cost()));
 
         for (filter, matches_empty) in sorted_matchers {
-            // `.*` and its spellings were turned into MatchAll / MatchNone above, when the
-            // pattern was parsed; `.+` and its spellings are recognized the same way.
+            // `.*` and its spellings were turned into MatchAll / MatchNone when the pattern was
+            // parsed; `l!=""`, `l=~".+"` and theirs into HasLabel, and `l=""`, `l!~".+"` and
+            // theirs into LacksLabel.
             match &filter.matcher {
                 PredicateMatch::MatchAll => {
                     continue;
@@ -55,22 +57,17 @@ impl<'a> Terms<'a> {
                 PredicateMatch::MatchNone => {
                     return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
                 }
-                // l=~".+": every series carrying the label, without running the regex.
-                PredicateMatch::RegexEqual(re) if re.matches_any_non_empty() => {
-                    its.push(self.postings_for_all_label_values(&filter.label));
-                }
-                // l!~".+": every series without the label.
-                PredicateMatch::RegexNotEqual(re) if re.matches_any_non_empty() => {
-                    not_its.push(self.postings_for_all_label_values(&filter.label));
-                }
-                // l!="" (or the RTS `l!=` form, or `l!=("")`): any non-empty value. Go straight
-                // to all label values rather than inverting to l="" first.
-                PredicateMatch::NotEqual(v) if v.is_absent() => {
+                // Every series carrying the label.
+                PredicateMatch::HasLabel => {
                     let it = self.postings_for_all_label_values(&filter.label);
                     if it.is_empty() {
                         return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
                     }
                     its.push(it);
+                }
+                // Every series without the label: subtract the ones carrying it.
+                PredicateMatch::LacksLabel => {
+                    not_its.push(self.postings_for_all_label_values(&filter.label));
                 }
                 // See which label must be non-empty.
                 // Optimization for a case like {l=~".", l!="1"}.
@@ -641,6 +638,52 @@ mod tests {
         }
     }
 
+    /// `HasLabel` and `LacksLabel` partition the series by the label, alone and beside other
+    /// matchers, in either order, and agree with the same filter written as `!=""` / `=""`
+    /// built without normalizing.
+    #[test]
+    fn presence_checks_partition_series_by_label() {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "env", "prod");
+        postings.add_posting_for_label_value(1, "job", "api");
+        postings.add_posting_for_label_value(2, "env", "dev");
+        postings.add_posting_for_label_value(3, "job", "api");
+        postings.add_posting_for_label_value(4, "job", "web");
+        let ids = |filters: &[LabelFilter]| {
+            let result = postings.postings_for_label_filters(filters).unwrap();
+            result.iter().collect::<Vec<_>>()
+        };
+        let has = filter("env", PredicateMatch::HasLabel);
+        let lacks = filter("env", PredicateMatch::LacksLabel);
+        let has_raw = filter("env", PredicateMatch::NotEqual(PredicateValue::from("")));
+        let lacks_raw = filter("env", PredicateMatch::Equal(PredicateValue::from("")));
+        let job_api = filter("job", PredicateMatch::Equal(PredicateValue::from("api")));
+        let missing = |matcher| filter("absent", matcher);
+        let none: Vec<u64> = vec![];
+
+        assert_eq!(ids(std::slice::from_ref(&has)), vec![1, 2]);
+        assert_eq!(ids(std::slice::from_ref(&lacks)), vec![3, 4]);
+        assert_eq!(ids(&[has.clone(), job_api.clone()]), vec![1]);
+        assert_eq!(ids(&[job_api.clone(), has.clone()]), vec![1]);
+        assert_eq!(ids(&[lacks.clone(), job_api.clone()]), vec![3]);
+        assert_eq!(ids(&[has.clone(), lacks.clone()]), none);
+        assert_eq!(ids(&[missing(PredicateMatch::HasLabel)]), none);
+        assert_eq!(
+            ids(&[missing(PredicateMatch::LacksLabel)]),
+            vec![1, 2, 3, 4]
+        );
+        for (normalized, raw) in [(&has, &has_raw), (&lacks, &lacks_raw)] {
+            assert_eq!(
+                ids(std::slice::from_ref(normalized)),
+                ids(std::slice::from_ref(raw))
+            );
+            assert_eq!(
+                ids(&[normalized.clone(), job_api.clone()]),
+                ids(&[raw.clone(), job_api.clone()])
+            );
+        }
+    }
+
     /// The parser and the fan-out decoder reject an empty label name, so the planner needs no
     /// guard for one: built directly, it reads as a label no series has.
     #[test]
@@ -654,7 +697,9 @@ mod tests {
             (PredicateMatch::Equal(PredicateValue::from("")), vec![1]),
             (PredicateMatch::NotEqual(PredicateValue::from("x")), vec![1]),
             (PredicateMatch::MatchAll, vec![1]),
+            (PredicateMatch::LacksLabel, vec![1]),
             // Rejects "": matches nothing.
+            (PredicateMatch::HasLabel, vec![]),
             (PredicateMatch::Equal(PredicateValue::from("x")), vec![]),
             (PredicateMatch::NotEqual(PredicateValue::from("")), vec![]),
         ];

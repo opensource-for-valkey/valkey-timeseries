@@ -77,7 +77,7 @@ class TestTsQueryIndex(ValkeyTimeSeriesTestCaseBase):
         assert result == [b'ts3', b'ts4', b'ts7', b'ts8']
 
         # Query for all named metrics with type not matching 'usage'
-        result = self.client.execute_command('TS.QUERYINDEX', 'name=~".+"', 'type!=usage')
+        result = self.client.execute_command('TS.QUERYINDEX', 'name=~"[a-z]+"', 'type!=usage')
         assert result == [b'ts5', b'ts6']
 
     def test_prometheus_not_regex_matcher(self):
@@ -85,7 +85,7 @@ class TestTsQueryIndex(ValkeyTimeSeriesTestCaseBase):
         self.setup_test_data(self.client)
 
         # Negative regex matchers are unbounded on their own, so each is paired with
-        # 'type=usage' (ts1-ts4, ts7, ts8) or 'name=~".+"' (ts1-ts7) to bound the query.
+        # 'type=usage' (ts1-ts4, ts7, ts8) or 'name=~"[a-z]+"' (ts1-ts7) to bound the query.
         self.assert_query_rejected('name!~"c.*"')
         self.assert_query_rejected('name!~"cpu|memory"')
         self.assert_query_rejected('node!~"node[12]"')
@@ -100,7 +100,7 @@ class TestTsQueryIndex(ValkeyTimeSeriesTestCaseBase):
 
         # Not matching using character class. ts8 has no 'node' label -- it would satisfy the
         # negative matcher, but it has no 'name' either, so the bounding filter excludes it.
-        result = self.client.execute_command('TS.QUERYINDEX', 'name=~".+"', 'node!~"node[12]"')
+        result = self.client.execute_command('TS.QUERYINDEX', 'name=~"[a-z]+"', 'node!~"node[12]"')
         assert result == [b'ts6', b'ts7']
 
     def test_complex_queries(self):
@@ -145,7 +145,7 @@ class TestTsQueryIndex(ValkeyTimeSeriesTestCaseBase):
         self.assert_query_rejected('name=~".*"', 'type!=usage')
 
         # Find series that match regex but don't match another condition
-        result = self.client.execute_command('TS.QUERYINDEX', 'name=~".+"', 'type!=usage')
+        result = self.client.execute_command('TS.QUERYINDEX', 'name=~"[a-z]+"', 'type!=usage')
         assert result == [b'ts5', b'ts6']
 
         # Mix of equals, not equals, and regex

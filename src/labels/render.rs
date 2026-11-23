@@ -24,6 +24,8 @@ pub(crate) fn write_filter(f: &mut impl Write, filter: &LabelFilter) -> fmt::Res
         PredicateMatch::NotEqual(value) => write_op_value(f, "!=", value),
         PredicateMatch::MatchAll => write!(f, "=~{}", quote_string(MATCH_ALL)),
         PredicateMatch::MatchNone => write!(f, "!~{}", quote_string(MATCH_ALL)),
+        PredicateMatch::HasLabel => write!(f, "!={}", quote_string("")),
+        PredicateMatch::LacksLabel => write!(f, "={}", quote_string("")),
         PredicateMatch::RegexEqual(re) => write!(f, "=~{}", quote_string(re.value())),
         PredicateMatch::RegexNotEqual(re) => write!(f, "!~{}", quote_string(re.value())),
         PredicateMatch::StartsWith(value) => write_op_value(f, "^=", value),
@@ -89,13 +91,11 @@ fn contains_regex(value: &PredicateValue) -> String {
 fn metric_names(group: &FilterList) -> Option<Vec<&str>> {
     let mut names: Option<Vec<&str>> = None;
     for filter in group.iter().filter(|f| f.label == METRIC_NAME_LABEL) {
-        let PredicateMatch::Equal(value) = &filter.matcher else {
-            continue;
-        };
-        let allowed = if value.is_absent() {
-            vec![""]
-        } else {
-            needles(value)
+        let allowed = match &filter.matcher {
+            PredicateMatch::LacksLabel => vec![""],
+            PredicateMatch::Equal(value) if value.is_absent() => vec![""],
+            PredicateMatch::Equal(value) => needles(value),
+            _ => continue,
         };
         names = Some(match names {
             None => allowed,
@@ -111,7 +111,7 @@ fn metric_names(group: &FilterList) -> Option<Vec<&str>> {
 fn hoistable_name(group: &FilterList) -> Option<&str> {
     let other_name_matcher = group
         .iter()
-        .any(|f| f.label == METRIC_NAME_LABEL && !matches!(f.matcher, PredicateMatch::Equal(_)));
+        .any(|f| f.label == METRIC_NAME_LABEL && !is_name_equality(f));
     if other_name_matcher {
         return None;
     }
@@ -152,7 +152,7 @@ fn write_group_items(f: &mut impl Write, group: &FilterList, hoisted: bool) -> f
         }
     }
     for filter in group.iter() {
-        if filter.label == METRIC_NAME_LABEL && matches!(filter.matcher, PredicateMatch::Equal(_)) {
+        if is_name_equality(filter) {
             continue;
         }
         separator(f, &mut first)?;
@@ -169,9 +169,17 @@ fn write_group_items(f: &mut impl Write, group: &FilterList, hoisted: bool) -> f
 
 /// Whether the group has a filter besides its `__name__` equalities.
 fn has_other_filters(group: &FilterList) -> bool {
-    group
-        .iter()
-        .any(|f| !(f.label == METRIC_NAME_LABEL && matches!(f.matcher, PredicateMatch::Equal(_))))
+    group.iter().any(|f| !is_name_equality(f))
+}
+
+/// A `__name__` equality, which [`metric_names`] folds into the group's name: `__name__="x"`,
+/// or the absent name `__name__=""`.
+fn is_name_equality(filter: &LabelFilter) -> bool {
+    filter.label == METRIC_NAME_LABEL
+        && matches!(
+            filter.matcher,
+            PredicateMatch::Equal(_) | PredicateMatch::LacksLabel
+        )
 }
 
 fn separator(f: &mut impl Write, first: &mut bool) -> fmt::Result {
@@ -343,7 +351,7 @@ mod tests {
             // Two metric-name equalities (contradictory) in one group.
             SeriesSelector::with_filters(vec![eq("__name__", "cpu"), eq("__name__", "mem")]),
             SeriesSelector::with_filters(vec![eq("__name__", "cpu"), eq("__name__", "cpu")]),
-            // The RTS `l=` / `l!=` forms.
+            // The RTS `l=` / `l!=` forms, built directly and as the presence checks they parse to.
             SeriesSelector::with_filters(vec![filter(
                 "job",
                 PredicateMatch::NotEqual(PredicateValue::Empty),
@@ -352,6 +360,20 @@ mod tests {
                 "job",
                 PredicateMatch::Equal(PredicateValue::Empty),
             )]),
+            SeriesSelector::with_filters(vec![
+                eq("job", "api"),
+                filter("env", PredicateMatch::HasLabel),
+                filter("region", PredicateMatch::LacksLabel),
+            ]),
+            // The absent metric name, alone and beside a name.
+            SeriesSelector::with_filters(vec![
+                filter("__name__", PredicateMatch::LacksLabel),
+                eq("job", "api"),
+            ]),
+            SeriesSelector::with_filters(vec![
+                eq("__name__", "cpu"),
+                filter("__name__", PredicateMatch::LacksLabel),
+            ]),
             // Substring lists, with characters that need escaping.
             SeriesSelector::with_filters(vec![filter(
                 "job",

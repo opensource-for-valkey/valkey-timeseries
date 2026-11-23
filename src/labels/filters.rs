@@ -410,7 +410,10 @@ impl HeapSize for RegexMatcher {
 impl HeapSize for PredicateMatch {
     fn heap_size(&self) -> usize {
         match self {
-            PredicateMatch::MatchAll | PredicateMatch::MatchNone => 0,
+            PredicateMatch::MatchAll
+            | PredicateMatch::MatchNone
+            | PredicateMatch::HasLabel
+            | PredicateMatch::LacksLabel => 0,
             PredicateMatch::RegexEqual(re) | PredicateMatch::RegexNotEqual(re) => re.heap_size(),
             PredicateMatch::Equal(value)
             | PredicateMatch::NotEqual(value)
@@ -428,6 +431,14 @@ pub enum PredicateMatch {
     NotEqual(PredicateValue),
     MatchAll,
     MatchNone,
+    /// The series that carry the label, with any value: `l!=""`, and every other spelling
+    /// Prometheus gives the same meaning (`l=~".+"`, `l!~""`, the RTS `l!=`). A missing label
+    /// and an empty value are the same thing, so this is "the value is not empty".
+    HasLabel,
+    /// The series without the label: `l=""`, `l=~""`, `l!~".+"`, the RTS `l=`. The
+    /// complement of [`Self::HasLabel`]; like any matcher that accepts `""`, it can only
+    /// remove series.
+    LacksLabel,
     // Boxed: a `RegexMatcher` is 168 bytes and most matchers are not regexes, so holding it
     // inline made every `LabelFilter` 200 bytes and every `SeriesSelector` over 1 KiB.
     RegexEqual(Box<RegexMatcher>),
@@ -446,6 +457,9 @@ impl PredicateMatch {
             // `l=~".*"` and `l!~".*"`, which is how they are written and rendered.
             PredicateMatch::MatchAll => MatchOp::RegexEqual,
             PredicateMatch::MatchNone => MatchOp::RegexNotEqual,
+            // `l!=""` and `l=""`, which is how they are rendered.
+            PredicateMatch::HasLabel => MatchOp::NotEqual,
+            PredicateMatch::LacksLabel => MatchOp::Equal,
             PredicateMatch::RegexEqual(_) => MatchOp::RegexEqual,
             PredicateMatch::RegexNotEqual(_) => MatchOp::RegexNotEqual,
             PredicateMatch::StartsWith(_) => MatchOp::StartsWith,
@@ -465,6 +479,8 @@ impl PredicateMatch {
             PredicateMatch::NotEqual(value) => !value.matches(other),
             PredicateMatch::MatchAll => true,
             PredicateMatch::MatchNone => false,
+            PredicateMatch::HasLabel => !other.is_empty(),
+            PredicateMatch::LacksLabel => other.is_empty(),
             PredicateMatch::RegexEqual(re) => re.is_match(other),
             PredicateMatch::RegexNotEqual(re) => !re.is_match(other),
             PredicateMatch::StartsWith(value) => value.matches_starts_with_any(other),
@@ -480,6 +496,8 @@ impl PredicateMatch {
             PredicateMatch::NotEqual(value) => PredicateMatch::Equal(value),
             PredicateMatch::MatchAll => PredicateMatch::MatchNone,
             PredicateMatch::MatchNone => PredicateMatch::MatchAll,
+            PredicateMatch::HasLabel => PredicateMatch::LacksLabel,
+            PredicateMatch::LacksLabel => PredicateMatch::HasLabel,
             PredicateMatch::RegexEqual(re) => PredicateMatch::RegexNotEqual(re),
             PredicateMatch::RegexNotEqual(re) => PredicateMatch::RegexEqual(re),
             PredicateMatch::StartsWith(p) => PredicateMatch::NotStartsWith(p),
@@ -504,6 +522,8 @@ impl PredicateMatch {
             | PredicateMatch::NotEqual(_)
             | PredicateMatch::MatchAll
             | PredicateMatch::MatchNone
+            | PredicateMatch::HasLabel
+            | PredicateMatch::LacksLabel
             | PredicateMatch::RegexEqual(_)
             | PredicateMatch::RegexNotEqual(_) => Ok(()),
         }
@@ -515,12 +535,36 @@ impl PredicateMatch {
             PredicateMatch::NotEqual(value) => value.cost(),
             PredicateMatch::MatchAll => 0,
             PredicateMatch::MatchNone => 0,
+            // One prefix scan of the label's values, unioning their postings: dearer than an
+            // exact lookup, cheaper than running a predicate on every value.
+            PredicateMatch::HasLabel => 5,
+            PredicateMatch::LacksLabel => 5,
             PredicateMatch::RegexEqual(re) => re.cost(),
             PredicateMatch::RegexNotEqual(re) => re.cost() + 5,
             PredicateMatch::StartsWith(value) => 10 + value.cost(),
             PredicateMatch::NotStartsWith(value) => 10 + value.cost(),
             PredicateMatch::Contains(value) => 20 + value.cost(),
             PredicateMatch::NotContains(value) => 25 + value.cost(),
+        }
+    }
+
+    /// `= value`, as [`Self::LacksLabel`] when `value` is the absent value
+    /// ([`PredicateValue::is_absent`]). Build equalities through this, not the variant, so
+    /// every spelling of "label absent" has one representation.
+    pub fn equal(value: PredicateValue) -> Self {
+        if value.is_absent() {
+            PredicateMatch::LacksLabel
+        } else {
+            PredicateMatch::Equal(value)
+        }
+    }
+
+    /// `!= value`, as [`Self::HasLabel`] when `value` is the absent value; see [`Self::equal`].
+    pub fn not_equal(value: PredicateValue) -> Self {
+        if value.is_absent() {
+            PredicateMatch::HasLabel
+        } else {
+            PredicateMatch::NotEqual(value)
         }
     }
 }
@@ -534,6 +578,8 @@ impl PartialEq for PredicateMatch {
             (PredicateMatch::NotEqual(v1), PredicateMatch::NotEqual(v2)) => v1 == v2,
             (PredicateMatch::MatchAll, PredicateMatch::MatchAll) => true,
             (PredicateMatch::MatchNone, PredicateMatch::MatchNone) => true,
+            (PredicateMatch::HasLabel, PredicateMatch::HasLabel) => true,
+            (PredicateMatch::LacksLabel, PredicateMatch::LacksLabel) => true,
             (PredicateMatch::RegexEqual(re1), PredicateMatch::RegexEqual(re2)) => re1 == re2,
             (PredicateMatch::RegexNotEqual(re1), PredicateMatch::RegexNotEqual(re2)) => re1 == re2,
             (PredicateMatch::StartsWith(p1), PredicateMatch::StartsWith(p2)) => p1 == p2,
@@ -574,8 +620,8 @@ impl LabelFilter {
             })
         };
         let matcher = match match_op {
-            MatchOp::Equal => PredicateMatch::Equal(value),
-            MatchOp::NotEqual => PredicateMatch::NotEqual(value),
+            MatchOp::Equal => PredicateMatch::equal(value),
+            MatchOp::NotEqual => PredicateMatch::not_equal(value),
             MatchOp::RegexEqual => parse_regex_matcher(&regex_text(&value)?, true)?,
             MatchOp::RegexNotEqual => parse_regex_matcher(&regex_text(&value)?, false)?,
             MatchOp::StartsWith => PredicateMatch::StartsWith(value),
@@ -611,21 +657,24 @@ impl LabelFilter {
                 PredicateMatch::RegexEqual(r) | PredicateMatch::RegexNotEqual(r) => {
                     r.value.contains('\0')
                 }
-                PredicateMatch::MatchAll | PredicateMatch::MatchNone => false,
+                PredicateMatch::MatchAll
+                | PredicateMatch::MatchNone
+                | PredicateMatch::HasLabel
+                | PredicateMatch::LacksLabel => false,
             }
     }
 
     pub fn equals(label: String, value: &str) -> Self {
         Self {
             label,
-            matcher: PredicateMatch::Equal(value.into()),
+            matcher: PredicateMatch::equal(value.into()),
         }
     }
 
     pub fn not_equals(label: String, value: &str) -> Self {
         Self {
             label,
-            matcher: PredicateMatch::NotEqual(value.into()),
+            matcher: PredicateMatch::not_equal(value.into()),
         }
     }
 
@@ -648,7 +697,8 @@ impl LabelFilter {
     /// A matcher written as a negation (`!=`, `!~`, `^~`, `!*=`), whose matches are found by
     /// subtracting from a base set. `MatchNone` (`l!~".*"`) is not one, though it is written with
     /// `!~`: it matches nothing, so the planner answers it directly and `is_bounded` counts it as
-    /// bounding the selector.
+    /// bounding the selector. Nor is `HasLabel` (`l!=""`), which intersects with the series
+    /// carrying the label.
     pub fn is_negative_matcher(&self) -> bool {
         matches!(
             self.matcher,
@@ -773,9 +823,18 @@ pub type OrFiltersList = Vec<FilterList>;
 
 /// See [`SeriesSelector::is_bounded`]. An empty group matches every series, so it is unbounded.
 fn filter_group_is_bounded(filters: &FilterList) -> bool {
-    filters
-        .iter()
-        .any(|f| !f.is_negative_matcher() && !f.matches_empty())
+    filters.iter().any(filter_bounds_group)
+}
+
+/// A matcher that bounds its group: one a missing label can't satisfy, and not a negation.
+///
+/// `HasLabel` is excluded although it intersects: RedisTimeSeries rejects a `FILTER` whose
+/// only matcher is `l!=`, and we keep that parity (see `validate_selector_list`). Every
+/// spelling of `HasLabel` shares the rule, `l=~".+"` included.
+fn filter_bounds_group(filter: &LabelFilter) -> bool {
+    !filter.is_negative_matcher()
+        && !filter.matches_empty()
+        && !matches!(filter.matcher, PredicateMatch::HasLabel)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -809,7 +868,8 @@ impl SeriesSelector {
     ///
     /// A filter group is bounded when it holds at least one matcher that cannot be satisfied
     /// by a missing label — i.e. one that is neither negative (`l!=v`, `l!~re`) nor
-    /// empty-matching (`l=""`, `l=~".*"`). Groups are unioned, so the selector is bounded only
+    /// empty-matching (`l=""`, `l=~".*"`) — and that is not a bare presence check (`l!=""`,
+    /// `l=~".+"`), which RedisTimeSeries does not accept as a positive matcher. Groups are unioned, so the selector is bounded only
     /// when *every* group is (and there is at least one); within a group filters are
     /// intersected, so one bounded matcher suffices.
     pub fn is_bounded(&self) -> bool {

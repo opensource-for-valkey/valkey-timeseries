@@ -28,20 +28,23 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
     def test_mrange_cme_rejects_unbounded_filter(self):
         """A 'match everything' filter list must still carry a positive matcher.
 
-        The tests below use 'sensor=~".+"' / 'region=~".+"' to select every series. The
-        older idiom 'sensor!=none' selects the same set but is a negative matcher, so a
-        filter list containing only that has nothing to intersect against but the whole
-        keyspace and is rejected.
+        The tests below use 'sensor=~"[a-z]+"' / 'region=~"[a-z]+"' to select every series:
+        every value here is lowercase letters. 'sensor!=none' selects the same set but is a
+        negative matcher, so a filter list containing only that has nothing to intersect
+        against but the whole keyspace and is rejected. So is 'sensor=~".+"': it is the
+        presence check 'sensor!=', which RedisTimeSeries does not accept as a positive matcher.
         """
         self.setup_clustered_data()
 
         client = self.new_client_for_primary(0)
         self.assert_filters_rejected('TS.MRANGE', self.start_ts, self.start_ts + 100,
                                      'FILTER', 'sensor!=none', client=client)
+        self.assert_filters_rejected('TS.MRANGE', self.start_ts, self.start_ts + 100,
+                                     'FILTER', 'sensor=~".+"', client=client)
 
-        # The bounded form selects every series, since all of them have a 'sensor' label.
+        # The bounded form selects every series, since all of them have a matching 'sensor'.
         result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
-                                        'FILTER', 'sensor=~".+"')
+                                        'FILTER', 'sensor=~"[a-z]+"')
         assert len(result) == 4
 
     def test_mrange_cme_basic(self):
@@ -80,7 +83,7 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
 
         result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
                                         'WITHLABELS',
-                                        'FILTER', 'region=~".+"',
+                                        'FILTER', 'region=~"[a-z]+"',
                                         'GROUPBY', 'region',
                                         'REDUCE', 'sum')
 
@@ -104,7 +107,7 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
                                         'AGGREGATION', 'avg', 20,
                                         'WITHLABELS',
-                                        'FILTER', 'sensor=~".+"',
+                                        'FILTER', 'sensor=~"[a-z]+"',
                                         'GROUPBY', 'sensor',
                                         'REDUCE', 'max')
 
@@ -140,7 +143,7 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         client = self.new_client_for_primary(0)
         result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
                                         'COUNT', 4,
-                                        'FILTER', 'sensor=~".+"',
+                                        'FILTER', 'sensor=~"[a-z]+"',
                                         'GROUPBY', 'region',
                                         'REDUCE', 'avg')
 
@@ -170,7 +173,7 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         client = self.new_client_for_primary(0)
         result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
                                         'SELECTED_LABELS', 'region',
-                                        'FILTER', 'sensor=~".+"')
+                                        'FILTER', 'sensor=~"[a-z]+"')
 
         assert len(result) == 4
         for series in result:
@@ -212,7 +215,7 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         result = client.execute_command(command, self.start_ts, self.start_ts + 90,
                                         'FILTER_BY_TS', self.start_ts - 500,
                                         *options,
-                                        'FILTER', 'sensor=~".+"')
+                                        'FILTER', 'sensor=~"[a-z]+"')
 
         assert sorted((series[0], series[2]) for series in result) == [
             (b'ts:{slot1}:temp1', []),
@@ -228,7 +231,7 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         client = self.new_client_for_primary(0)
         result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 90,
                                         'FILTER_BY_TS', self.start_ts - 500,
-                                        'FILTER', 'sensor=~".+"',
+                                        'FILTER', 'sensor=~"[a-z]+"',
                                         'GROUPBY', 'sensor', 'REDUCE', 'sum')
 
         assert sorted((group[0], group[2]) for group in result) == [
@@ -244,7 +247,7 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 90,
                                         'FILTER_BY_TS', self.start_ts - 500,
                                         'EXCLUDEEMPTY',
-                                        'FILTER', 'sensor=~".+"')
+                                        'FILTER', 'sensor=~"[a-z]+"')
 
         assert result == []
 
@@ -486,7 +489,7 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
 
         client = self.new_client_for_primary(0)
         result = client.execute_command('TS.MREVRANGE', self.start_ts, self.start_ts + 100,
-                                        'FILTER', 'region=~".+"',
+                                        'FILTER', 'region=~"[a-z]+"',
                                         'GROUPBY', 'sensor',
                                         'REDUCE', 'sum')
 
@@ -537,7 +540,7 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         result = client.execute_command(
             'TS.MREVRANGE', self.start_ts, self.start_ts + 100,
             'SELECTED_LABELS', 'region',
-            'FILTER', 'sensor=~".+"'
+            'FILTER', 'sensor=~"[a-z]+"'
         )
 
         assert len(result) == 4
@@ -619,20 +622,20 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         client = self.new_client_for_primary(0)
 
         result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
-                                        'FILTER', 'sensor=~".+"')
+                                        'FILTER', 'sensor=~"[a-z]+"')
         assert len(result) == 6
         empty = [series[0] for series in result if len(series[2]) == 0]
         assert sorted(empty) == [b'ts:{slot1}:temp3', b'ts:{slot2}:humid3']
 
         result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
-                                        'EXCLUDEEMPTY', 'FILTER', 'sensor=~".+"')
+                                        'EXCLUDEEMPTY', 'FILTER', 'sensor=~"[a-z]+"')
         assert [series[0] for series in result] == [
             b'ts:{slot1}:temp1', b'ts:{slot1}:temp2',
             b'ts:{slot2}:humid1', b'ts:{slot2}:humid2',
         ]
 
         result = client.execute_command('TS.MREVRANGE', self.start_ts, self.start_ts + 100,
-                                        'EXCLUDEEMPTY', 'FILTER', 'sensor=~".+"')
+                                        'EXCLUDEEMPTY', 'FILTER', 'sensor=~"[a-z]+"')
         assert len(result) == 4
         for series in result:
             timestamps = [sample[0] for sample in series[2]]
@@ -646,7 +649,7 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         for command in ('TS.MRANGE', 'TS.MREVRANGE'):
             with pytest.raises(ResponseError, match="TSDB: EXCLUDEEMPTY is not allowed with GROUPBY"):
                 client.execute_command(command, self.start_ts, self.start_ts + 100,
-                                       'EXCLUDEEMPTY', 'FILTER', 'sensor=~".+"',
+                                       'EXCLUDEEMPTY', 'FILTER', 'sensor=~"[a-z]+"',
                                        'GROUPBY', 'region', 'REDUCE', 'max')
 
     def tag_per_primary(self, cluster_client: ValkeyCluster):

@@ -64,10 +64,10 @@ class TestTimeSeriesMetricNamesCME(ValkeyTimeSeriesClusterTestCase):
         cluster.execute_command("TS.CREATE", f"ts2:{{{tag_b}}}", "METRIC", 'mem_usage_bytes{env="prod"}')
         cluster.execute_command("TS.CREATE", f"ts3:{{{tag_c}}}", "METRIC", 'cpu_idle_total{env="dev"}')
 
-        result = client.execute_command("TS.METRICNAMES", "HASHTAG", tag_a, "FILTER", 'env=~".+"')
+        result = client.execute_command("TS.METRICNAMES", "HASHTAG", tag_a, "FILTER", 'env=~"[a-z]+"')
         names = [item.value for item in LabelSearchResponse.parse(result).results]
         assert names == [b"cpu_usage_total"]
 
-        result = client.execute_command("TS.METRICNAMES", "FILTER", 'env=~".+"', "HASHTAG", f"{tag_a},{tag_c}")
+        result = client.execute_command("TS.METRICNAMES", "FILTER", 'env=~"[a-z]+"', "HASHTAG", f"{tag_a},{tag_c}")
         names = [item.value for item in LabelSearchResponse.parse(result).results]
         assert names == [b"cpu_idle_total", b"cpu_usage_total"]

@@ -215,14 +215,26 @@ mod tests {
     #[test]
     fn test_validate_selector_list_rejects_empty_and_empty_matching_filters() {
         // `l=` (label absent) and `l=~".*"` are both satisfied by a missing label, so neither
-        // narrows the search. `l=~".+"` requires a non-empty value, so it does.
-        // `l=~"foo|"` is satisfied by a missing label through its empty alternative.
-        for selector in [r#"{i=""}"#, r#"{i=~".*"}"#, r#"{i!=""}"#, r#"{i=~"foo|"}"#] {
-            assert_unbounded_alone(selector);
+        // narrows the search. `l=~"foo|"` is satisfied by a missing label through its empty
+        // alternative. A presence check (`l!=""`, and `l=~".+"`, which means the same) is not
+        // a positive matcher either: RedisTimeSeries rejects a lone `l!=`, and every spelling
+        // of it shares that rule.
+        for selector in [
+            r#"{i=""}"#,
+            r#"{i=~".*"}"#,
+            r#"{i!=""}"#,
+            r#"{i=~"foo|"}"#,
+            r#"{i=~".+"}"#,
+            r#"{i!~""}"#,
+            "i!=",
+        ] {
+            let parsed = assert_unbounded_alone(selector);
+            validate_selector_list(&[parsed]).expect_err(selector);
         }
-        let bounded = parse_series_selector(r#"{i=~".+"}"#).unwrap();
+        // Beside a positive matcher, a presence check is fine.
+        let bounded = parse_series_selector(r#"{n="1", i=~".+"}"#).unwrap();
         assert!(bounded.is_bounded());
-        validate_selector_list(&[bounded]).expect("`.+` cannot match a missing label");
+        validate_selector_list(&[bounded]).expect("`n=\"1\"` bounds the group");
     }
 
     #[test]
@@ -336,6 +348,49 @@ mod tests {
                 matchers[1].matcher
             );
         });
+    }
+
+    /// Every spelling of "has the label" and "lacks the label", in the Prometheus and RTS
+    /// forms, parses to one variant, as `.*` parses to `MatchAll`. A list mixing `""` with a
+    /// value is neither.
+    #[test]
+    fn presence_checks_normalize_in_any_spelling() {
+        // The matcher after `n="1"` (or, with no braces, the only one).
+        let parsed = |selector: &str| {
+            let parsed =
+                parse_series_selector(selector).unwrap_or_else(|e| panic!("{selector}: {e}"));
+            let SeriesSelector::And(matchers) = parsed else {
+                panic!("{selector}: expected an AND selector");
+            };
+            matchers.last().unwrap().matcher.clone()
+        };
+        for selector in [
+            r#"{n="1", l!=""}"#,
+            r#"{n="1", l=~".+"}"#,
+            r#"{n="1", l=~"^.+$"}"#,
+            r#"{n="1", l=~"(.+)"}"#,
+            r#"{n="1", l!~""}"#,
+            r#"{n="1", l!=("")}"#,
+            "l!=",
+        ] {
+            assert_eq!(parsed(selector), PredicateMatch::HasLabel, "{selector}");
+        }
+        for selector in [
+            r#"{n="1", l=""}"#,
+            r#"{n="1", l=~""}"#,
+            r#"{n="1", l=~"^$"}"#,
+            r#"{n="1", l!~".+"}"#,
+            r#"{n="1", l=("")}"#,
+            "l=",
+        ] {
+            assert_eq!(parsed(selector), PredicateMatch::LacksLabel, "{selector}");
+        }
+        for selector in [r#"{n="1", l=("", "a")}"#, r#"{n="1", l=~"a|"}"#] {
+            assert!(
+                matches!(parsed(selector), PredicateMatch::Equal(_)),
+                "{selector}"
+            );
+        }
     }
 
     #[test]

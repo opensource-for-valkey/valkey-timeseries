@@ -10,7 +10,7 @@ use crate::labels::filters::{
     FilterList, LabelFilter, OrFiltersList, PredicateMatch, PredicateValue, RegexMatcher,
     SeriesSelector, ValueList,
 };
-use crate::labels::{compile_regex, is_match_all_regex_pattern};
+use crate::labels::{compile_regex, is_any_non_empty_regex_pattern, is_match_all_regex_pattern};
 use crate::series::DateRange;
 use crate::series::request_types::MetaDateRangeFilter;
 use valkey_module::{ValkeyError, ValkeyResult};
@@ -105,6 +105,20 @@ impl From<&LabelFilter> for FanoutFilter {
                     label: source.label.clone(),
                     matcher: None,
                     op: MatcherOpType::MatchNone.into(),
+                };
+            }
+            PredicateMatch::HasLabel => {
+                return FanoutFilter {
+                    label: source.label.clone(),
+                    matcher: None,
+                    op: MatcherOpType::HasLabel.into(),
+                };
+            }
+            PredicateMatch::LacksLabel => {
+                return FanoutFilter {
+                    label: source.label.clone(),
+                    matcher: None,
+                    op: MatcherOpType::LacksLabel.into(),
                 };
             }
             PredicateMatch::RegexEqual(regex) => {
@@ -247,14 +261,17 @@ impl TryFrom<&FanoutFilter> for LabelFilter {
             ValkeyError::Str("TSDB: invalid matcher operation, cannot convert from i32")
         })?;
         let matcher = match (op, value.matcher.as_ref()) {
+            // Normalized as a parse would: an absent value is a presence check.
             (MatcherOpType::Equal, Some(Matcher::Value(predicate))) => {
-                PredicateMatch::Equal(predicate_value_from_fanout(predicate))
+                PredicateMatch::equal(predicate_value_from_fanout(predicate))
             }
             (MatcherOpType::NotEqual, Some(Matcher::Value(predicate))) => {
-                PredicateMatch::NotEqual(predicate_value_from_fanout(predicate))
+                PredicateMatch::not_equal(predicate_value_from_fanout(predicate))
             }
             (MatcherOpType::MatchAll, None) => PredicateMatch::MatchAll,
             (MatcherOpType::MatchNone, None) => PredicateMatch::MatchNone,
+            (MatcherOpType::HasLabel, None) => PredicateMatch::HasLabel,
+            (MatcherOpType::LacksLabel, None) => PredicateMatch::LacksLabel,
             (MatcherOpType::RegexEqual, Some(Matcher::Regex(regex)))
                 if is_match_all_regex_pattern(regex.regex.as_str()) =>
             {
@@ -264,6 +281,16 @@ impl TryFrom<&FanoutFilter> for LabelFilter {
                 if is_match_all_regex_pattern(regex.regex.as_str()) =>
             {
                 PredicateMatch::MatchNone
+            }
+            (MatcherOpType::RegexEqual, Some(Matcher::Regex(regex)))
+                if is_any_non_empty_regex_pattern(regex.regex.as_str()) =>
+            {
+                PredicateMatch::HasLabel
+            }
+            (MatcherOpType::RegexNotEqual, Some(Matcher::Regex(regex)))
+                if is_any_non_empty_regex_pattern(regex.regex.as_str()) =>
+            {
+                PredicateMatch::LacksLabel
             }
             (MatcherOpType::RegexEqual, Some(Matcher::Regex(regex))) => {
                 PredicateMatch::RegexEqual(Box::new(regex_matcher_from_fanout(regex)?))
@@ -344,12 +371,64 @@ mod tests {
     use crate::labels::filters::MatchOp;
 
     #[test]
+    fn test_label_filter_round_trip_for_presence_checks() {
+        for matcher in [PredicateMatch::HasLabel, PredicateMatch::LacksLabel] {
+            let case = LabelFilter {
+                label: "env".into(),
+                matcher,
+            };
+            let fanout: FanoutFilter = (&case).into();
+            assert!(fanout.matcher.is_none(), "{fanout:?}");
+            let decoded = LabelFilter::try_from(&fanout).expect("label filter should decode");
+            assert_eq!(decoded, case);
+        }
+    }
+
+    /// A peer that sends a presence check in another spelling gets the variant a parse builds.
+    #[test]
+    fn test_label_filter_decode_normalizes_presence_checks() {
+        let has = || PredicateMatch::HasLabel;
+        let lacks = || PredicateMatch::LacksLabel;
+        let regex = |pattern: &str| {
+            Matcher::Regex(FanoutRegexFilterValue {
+                regex: pattern.to_string(),
+                ..Default::default()
+            })
+        };
+        let value = |value: &PredicateValue| Matcher::Value(predicate_value_to_fanout(value));
+        let empty_list = PredicateValue::List(vec![String::new()].into());
+        let cases = [
+            (MatcherOpType::Equal, value(&PredicateValue::Empty), lacks()),
+            (
+                MatcherOpType::Equal,
+                value(&PredicateValue::from("")),
+                lacks(),
+            ),
+            (MatcherOpType::Equal, value(&empty_list), lacks()),
+            (
+                MatcherOpType::NotEqual,
+                value(&PredicateValue::Empty),
+                has(),
+            ),
+            (MatcherOpType::NotEqual, value(&empty_list), has()),
+            (MatcherOpType::RegexEqual, regex(".+"), has()),
+            (MatcherOpType::RegexEqual, regex("^(.+)$"), has()),
+            (MatcherOpType::RegexNotEqual, regex(".+"), lacks()),
+        ];
+        for (op, matcher, expected) in cases {
+            let fanout = FanoutFilter {
+                label: "env".into(),
+                op: op.into(),
+                matcher: Some(matcher),
+            };
+            let decoded = LabelFilter::try_from(&fanout).expect("label filter should decode");
+            assert_eq!(decoded.matcher, expected, "{fanout:?}");
+        }
+    }
+
+    #[test]
     fn test_label_filter_round_trip_for_equality_variants() {
         let cases = vec![
-            LabelFilter {
-                label: "env".into(),
-                matcher: PredicateMatch::Equal(PredicateValue::Empty),
-            },
             LabelFilter {
                 label: "env".into(),
                 matcher: PredicateMatch::Equal(PredicateValue::String("prod".into())),

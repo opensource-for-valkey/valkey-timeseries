@@ -48,8 +48,17 @@ label!~"regular-expression"
 ```
 
 At least one selector in the complete query must contain a positive, bounded
-matcher such as `label=value`, `label=(value1,value2)`, or a non-empty regular
-expression. A query made only from negative or unbounded matchers is rejected.
+matcher such as `label=value`, `label=(value1,value2)`, or a regular expression
+that a missing label cannot satisfy (`label=~"api|web"`). A query made only from
+negative or unbounded matchers is rejected.
+
+Presence checks select by whether a series carries a label, following Prometheus
+semantics, where a missing label and an empty value are the same thing:
+`label!=`, `label!=""`, `label=~".+"` and `label!~""` all select the series that
+carry `label`; `label=`, `label=""`, `label=~""` and `label!~".+"` select the
+series without it. They narrow a query but do not bound one: like RedisTimeSeries
+with `label!=`, a query whose only matcher is a presence check is rejected, in
+every spelling.
 
 ## Return value
 
