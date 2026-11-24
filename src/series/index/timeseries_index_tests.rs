@@ -965,4 +965,80 @@ mod tests {
             Some(&b"b"[..])
         );
     }
+
+    #[test]
+    fn a_flush_empties_the_index_it_retires() {
+        // The map frees a removed index only once a batch of them fills, so a flushed index must
+        // not keep its contents meanwhile: a reader that pinned it before the flush sees it empty.
+        // (`FLUSHALL` empties each index the same way; a unit test must not wipe every db.)
+        use crate::series::index::{TIMESERIES_INDEX, clear_timeseries_index, get_db_index};
+        const DB: i32 = 231;
+        const OTHER: i32 = 232;
+
+        for db in [DB, OTHER] {
+            let series = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
+            get_db_index(db).index_timeseries(&series, b"a");
+        }
+        let guard = TIMESERIES_INDEX.guard();
+        let retired = TIMESERIES_INDEX.get(&DB, &guard).expect("indexed");
+        let generation = retired.generation();
+        assert_eq!(retired.count(), 1);
+
+        clear_timeseries_index(DB);
+
+        assert_eq!(retired.count(), 0);
+        assert_ne!(retired.generation(), generation);
+        assert!(TIMESERIES_INDEX.get(&DB, &guard).is_none());
+        let other = TIMESERIES_INDEX
+            .get(&OTHER, &guard)
+            .map(TimeSeriesIndex::count);
+        assert_eq!(other, Some(1));
+        drop(guard);
+        clear_timeseries_index(OTHER);
+    }
+
+    #[test]
+    fn a_flushed_index_is_sized_by_everything_it_frees() {
+        // The flush drop goes off the main thread by the entries it frees, not by visible
+        // series: hidden ones (a slot import in flight) and terms are freed all the same.
+        use crate::labels::MetricName;
+        use crate::series::index::postings::Postings;
+        use crate::series::index::{FLUSH_DROP_INLINE_MAX_ENTRIES, frees_off_the_main_thread};
+        use range_set_blaze::RangeSetBlaze;
+
+        let series = |id: u64, labels: &[Label]| {
+            let mut series = TimeSeries::new();
+            series.id = id;
+            series.labels = MetricName::new(labels);
+            series
+        };
+
+        // Every series hidden by an import: none visible, all still to free.
+        let mut importing = Postings::default();
+        let total = FLUSH_DROP_INLINE_MAX_ENTRIES as u64;
+        for id in 1..=total {
+            let key = format!("{{imp}}{id}");
+            importing.index_timeseries(&series(id, &[Label::new("job", "web")]), key.as_bytes());
+        }
+        let slot = crate::fanout::calculate_hash_slot(b"{imp}");
+        let slots = RangeSetBlaze::from_iter([slot..=slot]);
+        assert_eq!(importing.hide_indexed_keys_in_slots(&slots), total);
+        assert_eq!(importing.count(), 0);
+        assert!(frees_off_the_main_thread(&[importing]));
+
+        // Few series, many terms.
+        let mut labelled = Postings::default();
+        for id in 1..=100u64 {
+            let labels: Vec<Label> = (0..100)
+                .map(|l| Label::new(&format!("l{l}"), &format!("s{id}")))
+                .collect();
+            labelled.index_timeseries(&series(id, &labels), format!("k{id}").as_bytes());
+        }
+        assert_eq!(labelled.count(), 100);
+        assert!(frees_off_the_main_thread(&[labelled]));
+
+        let mut small = Postings::default();
+        small.index_timeseries(&series(1, &[Label::new("job", "web")]), b"k1");
+        assert!(!frees_off_the_main_thread(&[small]));
+    }
 }

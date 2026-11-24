@@ -20,6 +20,7 @@ Y) rather than pinned to byte counts, which are a function of struct layout.
 """
 import pytest
 from valkeytestframework.conftest import resource_port_tracker
+from valkeytestframework.util.waiters import wait_for_true
 from common import bytes_to_human
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
 
@@ -262,6 +263,27 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
             for field in byte_fields:
                 assert info[field + "_human"] == bytes_to_human(ints[field]), field
         assert not any("interned" in k for k in filled), "interning is in ts_string_interning"
+
+    @pytest.mark.parametrize("flush", ["FLUSHALL", "FLUSHDB"])
+    def test_flush_frees_the_index(self, flush):
+        """A flushed index is freed, not held until the index map reclaims a batch of them
+        (about 30 flushes later): its posting lists were most of what `used_memory` lost."""
+        client = self.server.get_new_client()
+        before = client.info("memory")["used_memory"]
+        pipe = client.pipeline(transaction=False)
+        for i in range(20_000):
+            pipe.execute_command(
+                "TS.CREATE", f"mem:flush{i}", "LABELS",
+                "job", f"j{i % 8}", "pod", f"p{i // 40}", "uniq", f"u{i}",
+            )
+        pipe.execute()
+        added = client.info("memory")["used_memory"] - before
+
+        client.execute_command(flush, "SYNC")
+
+        # Large contents are freed on a background thread.
+        residue = lambda: client.info("memory")["used_memory"] - before
+        wait_for_true(lambda: residue() < added // 4)
 
     def test_info_reports_string_interning(self):
         client = self.server.get_new_client()

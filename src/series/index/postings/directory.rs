@@ -23,6 +23,12 @@ impl Postings {
         self.id_to_key.len() - self.hidden_ids.cardinality() as usize
     }
 
+    /// Entries freeing these postings walks one by one: every series in the directory, hidden
+    /// ones included, and every term of the label index.
+    pub(in crate::series::index) fn retained_entries(&self) -> usize {
+        self.id_to_key.len() + self.label_index.len()
+    }
+
     /// Whether the index holds no series at all, hidden ones included.
     pub(in crate::series::index) fn holds_no_series(&self) -> bool {
         self.id_to_key.is_empty()

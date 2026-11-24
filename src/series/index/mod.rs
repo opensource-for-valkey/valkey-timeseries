@@ -15,6 +15,7 @@ use std::sync::LazyLock;
 use valkey_module::{AclPermissions, Context, ValkeyResult, ValkeyString};
 
 use crate::common::hash::BuildNoHashHasher;
+use crate::common::threads::{BoundedExecutor, Capacity};
 use crate::series::index::postings::Postings;
 use crate::series::request_types::MatchFilterOptions;
 use crate::series::{SeriesGuardMut, SeriesRef, TimeSeries, try_get_timeseries_mut};
@@ -264,13 +265,47 @@ pub(in crate::series::index) fn index_series_keep_id(
 /// FLUSHDB handler, whose event context should not have its selected db mutated just to
 /// communicate which database was flushed.
 pub fn clear_timeseries_index(db: i32) {
-    TIMESERIES_INDEX.pin().remove(&db);
+    let map = TIMESERIES_INDEX.pin();
+    if let Some(index) = map.get(&db) {
+        drop_flushed_postings(vec![index.take_postings()]);
+    }
+    map.remove(&db);
 }
 
 /// Drops every database's index. Used for the `dbnum == -1` flush -- `FLUSHALL`, and the
 /// implicit flush a replica performs on a full resync.
 pub fn clear_all_timeseries_indexes() {
-    TIMESERIES_INDEX.pin().clear();
+    let map = TIMESERIES_INDEX.pin();
+    drop_flushed_postings(map.values().map(TimeSeriesIndex::take_postings).collect());
+    map.clear();
+}
+
+/// Entries (series, hidden ones included, and terms) above which a flushed index is freed off
+/// the main thread: freeing every posting list and key of a large index would stall the
+/// server, `FLUSHALL ASYNC` included.
+const FLUSH_DROP_INLINE_MAX_ENTRIES: usize = 8192;
+
+/// Frees flushed indexes one at a time, so repeated flushes never start a thread each. Nothing
+/// is refused (no queue limit): a queued index holds no more memory than it did before its
+/// flush, and refusing it would free it on the main thread instead.
+static FLUSH_DROP_EXECUTOR: BoundedExecutor =
+    BoundedExecutor::new("ts-index-drop", one_worker, Capacity::Fixed(0));
+
+fn one_worker() -> usize {
+    1
+}
+
+fn frees_off_the_main_thread(flushed: &[Postings]) -> bool {
+    let entries: usize = flushed.iter().map(Postings::retained_entries).sum();
+    entries > FLUSH_DROP_INLINE_MAX_ENTRIES
+}
+
+/// Frees the contents taken out of flushed indexes (see [`TimeSeriesIndex::take_postings`]).
+fn drop_flushed_postings(flushed: Vec<Postings>) {
+    if frees_off_the_main_thread(&flushed) {
+        // Refused only if the worker cannot start; the job, and `flushed`, are dropped here then.
+        let _ = FLUSH_DROP_EXECUTOR.try_spawn(move || drop(flushed));
+    }
 }
 
 pub fn swap_timeseries_index_dbs(from_db: i32, to_db: i32) {
