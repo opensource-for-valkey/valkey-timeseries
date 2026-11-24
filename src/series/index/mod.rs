@@ -1,6 +1,5 @@
 use std::ops::Deref;
 mod batched_querier;
-pub(crate) mod bulk_build;
 mod index_key;
 mod key_list;
 mod memory;

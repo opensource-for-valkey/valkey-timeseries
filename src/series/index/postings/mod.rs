@@ -31,7 +31,6 @@ mod terms;
 mod test_support;
 
 pub(in crate::series::index) use hidden::HiddenSet;
-pub(crate) use mutation::BulkIndexEntry;
 pub(in crate::series::index) use stale::StaleSet;
 
 use super::index_key::IndexKey;

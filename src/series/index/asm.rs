@@ -780,8 +780,7 @@ pub(super) fn register_asm_event_handler(ctx: &Context) {
 mod tests {
     use super::*;
     use crate::labels::{Label, MetricName};
-    use crate::series::index::postings::BulkIndexEntry;
-    use crate::series::index::{IndexKey, get_db_index};
+    use crate::series::index::get_db_index;
     use crate::series::{SeriesRef, TimeSeries};
     use serial_test::serial;
     use std::sync::atomic::AtomicI32;
@@ -1218,27 +1217,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_a_bulk_build_hides_keys_of_an_import_in_flight() {
-        const DB: i32 = 90;
-        let shared = slots(&[b"{k}x"]);
-        start(job(b'0'), &shared);
-        let entry = |id: SeriesRef, key: &str, value: &str| BulkIndexEntry {
-            id,
-            key: key.as_bytes().into(),
-            label_keys: vec![IndexKey::for_label_value("asm_test", value)],
-        };
-        get_db_index(DB).get_postings_mut().bulk_index(vec![
-            entry(1, "{k}1", "imported"),
-            entry(2, "{l}1", "local"),
-        ]);
-        assert_eq!(visible_values(DB), ["local"]);
-
-        complete(job(b'0'), &shared);
-        assert_eq!(visible_values(DB), ["imported", "local"]);
-    }
-
-    #[test]
-    #[serial]
     fn test_restored_imports_are_registered_and_their_slots_combined() {
         let first = slots(&[b"{n}x"]);
         let second = slots(&[b"{o}x"]);
@@ -1267,35 +1245,6 @@ mod tests {
     #[test]
     fn test_no_restored_imports_means_no_slots_to_scan() {
         assert!(register_restored_imports([]).is_empty());
-    }
-
-    #[test]
-    #[serial]
-    fn test_a_bulk_build_evicts_a_visible_series_it_hides() {
-        // `bulk_index` is documented as safe against a non-empty index, where the id may be
-        // visible already. An id must never be both visible and hidden.
-        const DB: i32 = 77;
-        let shared = slots(&[b"{v}x"]);
-        get_db_index(DB).index_timeseries(&series(1, "visible_first"), b"{v}1");
-
-        start(job(b'v'), &shared);
-        get_db_index(DB)
-            .get_postings_mut()
-            .bulk_index(vec![BulkIndexEntry {
-                id: 1,
-                key: b"{v}1".as_slice().into(),
-                label_keys: vec![IndexKey::for_label_value("asm_test", "visible_first")],
-            }]);
-
-        assert!(
-            !get_db_index(DB).get_postings().all_postings.contains(1),
-            "subtractive reads go through this set unmasked"
-        );
-        assert!(visible_values(DB).is_empty());
-
-        complete(job(b'v'), &shared);
-        assert_eq!(visible_values(DB), ["visible_first"]);
-        assert!(get_db_index(DB).get_postings().all_postings.contains(1));
     }
 
     #[test]
