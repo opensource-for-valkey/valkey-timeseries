@@ -940,6 +940,27 @@ mod tests {
     }
 
     #[test]
+    fn test_index_series_keep_id_gives_an_unassigned_id_a_fresh_one() {
+        // A corrupt RDB can carry id 0, which means "unassigned" and must never be indexed.
+        let index = TimeSeriesIndex::new();
+        let mut series = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
+        series.id = 0;
+
+        {
+            let mut postings = index.get_postings_mut();
+            index_series_keep_id(&mut postings, &mut series, b"a");
+        }
+
+        assert_ne!(series.id, 0);
+        let postings = index.get_postings();
+        assert!(postings.get_key_by_id(0).is_none());
+        assert_eq!(
+            postings.get_key_by_id(series.id).map(|k| k.as_ref()),
+            Some(&b"a"[..])
+        );
+    }
+
+    #[test]
     fn test_index_series_keep_id_remaps_an_id_owned_by_another_key() {
         // Skipping the collision would leave `b` unqueryable; indexing it under the id would
         // merge it into `a`'s postings.

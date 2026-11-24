@@ -8,8 +8,9 @@ use crate::series::index::persistence::{
     on_loading_ended, on_loading_failed, on_loading_started, should_skip_load_indexing,
 };
 use crate::series::index::{
-    clear_all_timeseries_indexes, clear_timeseries_index, get_db_index, get_timeseries_index,
-    index_loaded_series, index_series_by_key, swap_timeseries_index_dbs,
+    clear_all_timeseries_indexes, clear_timeseries_index, ensure_series_indexed_by_key,
+    get_db_index, get_timeseries_index, index_loaded_series, index_series_by_key,
+    swap_timeseries_index_dbs,
 };
 use crate::series::{relink_renamed_series, try_get_timeseries_mut};
 use std::os::raw::c_void;
@@ -132,7 +133,12 @@ fn handle_key_loaded(ctx: &Context, key: &[u8]) {
     if bulk_build::try_buffer_loaded_key(ctx, db, key) {
         return;
     }
-    index_series_by_key(ctx, key);
+    // Keep the loaded id. A fresh one would be minted in load (hash-table) order, scattering
+    // ids that were created together -- a pod's series, say -- across every bitmap container:
+    // 14x the containers and +13 % used_memory on a 1M-series fleet. Imports, RESTORE, MOVE and
+    // COPY still take fresh ids (`index_series_by_key`), since they mix foreign ids into a live
+    // index.
+    ensure_series_indexed_by_key(ctx, key);
 }
 
 /// Indexes the destination of a `COPY` command. The type `copy` callback cannot maintain the index
