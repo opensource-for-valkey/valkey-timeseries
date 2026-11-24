@@ -115,10 +115,24 @@ impl TimeSeriesIndex {
     /// Identifies which database's contents this index holds. A scan that gives the postings
     /// lock back between holds compares it before and after: if it changed, a `SWAPDB` moved
     /// another database's postings in mid-scan, and the scan must be run again rather than
-    /// return a mix of the two. A flushed database's index is replaced by a new one, which has
-    /// a generation of its own.
+    /// return a mix of the two. A flushed database's index is emptied (see [`Self::take_postings`])
+    /// and replaced by a new one, which has a generation of its own.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Empties the index and returns what it held, for retiring it (`FLUSHDB`, `FLUSHALL`).
+    ///
+    /// The index map frees a removed entry only once a whole batch of retired entries can be
+    /// reclaimed, which a flush or two never fills: the removed index would keep every posting
+    /// list of the flushed database. Taking the contents first leaves the map only an empty
+    /// shell to hold. A scan still reading the shell sees the generation change, as after a
+    /// swap.
+    pub(super) fn take_postings(&self) -> Postings {
+        let mut inner = write_lock(&self.inner);
+        let postings = std::mem::take(&mut *inner);
+        self.generation.store(next_generation(), Ordering::SeqCst);
+        postings
     }
 
     // swap the inner value with some other value

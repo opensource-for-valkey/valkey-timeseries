@@ -264,13 +264,32 @@ pub(in crate::series::index) fn index_series_keep_id(
 /// FLUSHDB handler, whose event context should not have its selected db mutated just to
 /// communicate which database was flushed.
 pub fn clear_timeseries_index(db: i32) {
-    TIMESERIES_INDEX.pin().remove(&db);
+    let map = TIMESERIES_INDEX.pin();
+    if let Some(index) = map.get(&db) {
+        drop_flushed_postings(vec![index.take_postings()]);
+    }
+    map.remove(&db);
 }
 
 /// Drops every database's index. Used for the `dbnum == -1` flush -- `FLUSHALL`, and the
 /// implicit flush a replica performs on a full resync.
 pub fn clear_all_timeseries_indexes() {
-    TIMESERIES_INDEX.pin().clear();
+    let map = TIMESERIES_INDEX.pin();
+    drop_flushed_postings(map.values().map(TimeSeriesIndex::take_postings).collect());
+    map.clear();
+}
+
+/// Series above which a flushed index is freed off the main thread: freeing every posting
+/// list and key of a large index would stall the server, `FLUSHALL ASYNC` included.
+const FLUSH_DROP_INLINE_MAX_SERIES: usize = 4096;
+
+/// Frees the contents taken out of flushed indexes (see [`TimeSeriesIndex::take_postings`]).
+fn drop_flushed_postings(flushed: Vec<Postings>) {
+    let series: usize = flushed.iter().map(Postings::count).sum();
+    if series > FLUSH_DROP_INLINE_MAX_SERIES {
+        // A thread that cannot be started drops `flushed` here instead.
+        crate::common::threads::spawn_background("ts-index-flush-drop", move || drop(flushed));
+    }
 }
 
 pub fn swap_timeseries_index_dbs(from_db: i32, to_db: i32) {

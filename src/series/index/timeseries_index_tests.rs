@@ -965,4 +965,35 @@ mod tests {
             Some(&b"b"[..])
         );
     }
+
+    #[test]
+    fn a_flush_empties_the_index_it_retires() {
+        // The map frees a removed index only once a batch of them fills, so a flushed index must
+        // not keep its contents meanwhile: a reader that pinned it before the flush sees it empty.
+        // (`FLUSHALL` empties each index the same way; a unit test must not wipe every db.)
+        use crate::series::index::{TIMESERIES_INDEX, clear_timeseries_index, get_db_index};
+        const DB: i32 = 231;
+        const OTHER: i32 = 232;
+
+        for db in [DB, OTHER] {
+            let series = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
+            get_db_index(db).index_timeseries(&series, b"a");
+        }
+        let guard = TIMESERIES_INDEX.guard();
+        let retired = TIMESERIES_INDEX.get(&DB, &guard).expect("indexed");
+        let generation = retired.generation();
+        assert_eq!(retired.count(), 1);
+
+        clear_timeseries_index(DB);
+
+        assert_eq!(retired.count(), 0);
+        assert_ne!(retired.generation(), generation);
+        assert!(TIMESERIES_INDEX.get(&DB, &guard).is_none());
+        let other = TIMESERIES_INDEX
+            .get(&OTHER, &guard)
+            .map(TimeSeriesIndex::count);
+        assert_eq!(other, Some(1));
+        drop(guard);
+        clear_timeseries_index(OTHER);
+    }
 }
