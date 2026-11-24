@@ -1,12 +1,12 @@
 use std::ops::Deref;
 mod batched_querier;
-pub(crate) mod bulk_build;
 mod index_key;
 mod key_list;
 mod memory;
 mod posting_stats;
 mod postings;
 mod querier;
+mod roaring_alloc;
 mod timeseries_index;
 
 use crate::common::context::{create_key_string, get_current_db};
@@ -26,6 +26,7 @@ pub use memory::{IndexMemory, db_index_memory_usage, index_memory_usage};
 pub use posting_stats::*;
 pub use postings::PostingsBitmap;
 pub use querier::*;
+pub(crate) use roaring_alloc::{init_croaring_allocator, roaring_heap_bytes};
 pub use timeseries_index::*;
 
 pub(crate) mod asm;
@@ -178,8 +179,9 @@ pub fn index_series_by_key(ctx: &Context, key: &[u8]) {
 }
 
 /// Like [`index_series_by_key`], but idempotent: a series already indexed under `key` is left
-/// alone, and an unindexed one keeps its id (see [`index_series_keep_id`]). For the post-load
-/// repair scan, which visits every key of a db whose index is mostly correct already.
+/// alone, and an unindexed one keeps its id (see [`index_series_keep_id`]). For keys an RDB load
+/// brings in (the `loaded` event) and the post-load repair scan, which visits every key of a db
+/// whose index is mostly correct already.
 pub(in crate::series::index) fn ensure_series_indexed_by_key(ctx: &Context, key: &[u8]) {
     with_series_for_indexing(ctx, key, index_series_keep_id);
 }
@@ -239,12 +241,16 @@ pub(in crate::series::index) fn index_loaded_series(
 /// Index a series under the id it already carries, unless `key` is already indexed under that
 /// id (then this is a no-op). An id owned by a different key is a collision, not a duplicate:
 /// the series falls back to [`index_loaded_series`] and gets a fresh id rather than being left
-/// unindexed or merged into the other series' postings.
+/// unindexed or merged into the other series' postings. So does id `0` ("unassigned"), which no
+/// generator mints but a corrupt RDB can carry.
 pub(in crate::series::index) fn index_series_keep_id(
     postings: &mut Postings,
     series: &mut TimeSeries,
     key: &[u8],
 ) {
+    if series.id == 0 {
+        return index_loaded_series(postings, series, key);
+    }
     match postings.get_key_by_id(series.id) {
         Some(owner) if owner.as_ref() == key => {
             if series.key.as_ref() != key {
@@ -320,9 +326,4 @@ pub fn mark_series_for_removal(ctx: &Context, id: SeriesRef) {
     // mark the id for removal, signal to src_series to remove it
     let index = get_timeseries_index(ctx);
     index.mark_id_as_stale(id);
-}
-
-pub(crate) fn init_croaring_allocator() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| unsafe { croaring::configure_rust_alloc() });
 }

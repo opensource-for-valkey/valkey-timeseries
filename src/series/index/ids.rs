@@ -9,7 +9,9 @@
 //!   they draw the same 24-bit epoch. A series that arrives carrying a
 //!   serialized id (slot import, `RESTORE`, `TS._RESTORE`) is given a fresh
 //!   local id as it is indexed (see `index_loaded_series`), so uniqueness only
-//!   needs to be rare-failure, not absolute.
+//!   needs to be rare-failure, not absolute. A whole-RDB load keeps its ids
+//!   (`index_series_keep_id`): they come from the few epochs of the processes
+//!   that created them, and re-minting them in load order would scatter them.
 //! - **Dense postings bitmaps**: all IDs minted by one process share their
 //!   high 24 bits and increment in the low bits, so roaring containers in
 //!   the postings index fill completely before a new one opens — the same

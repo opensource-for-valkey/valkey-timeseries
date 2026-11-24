@@ -7,12 +7,12 @@
 //! understates the module by an unbounded factor. [`index_memory_usage`] is what the module's
 //! `INFO` section reports.
 //!
-//! Everything here is measured, not estimated, wherever the underlying structure can be asked:
-//! the roaring bitmaps report their own container bytes, and byte buffers report their lengths.
-//! The two structures that cannot be asked — the adaptive radix tree holding the term dictionary
-//! and the `BTreeMap` holding the forward map — contribute their entries' bytes without their
-//! internal node overhead, so the totals are a floor rather than an exact figure. `INFO` labels
-//! them accordingly.
+//! Byte buffers report their lengths. The roaring bitmaps report their container payload, and
+//! [`bitmap_heap_size`] adds the structure around it from CRoaring's layout: per container it
+//! costs more than the payload on a sparse posting list. The two structures that cannot be
+//! asked — the adaptive radix tree holding the term dictionary and the `BTreeMap` holding the
+//! forward map — contribute their entries' bytes without their internal node overhead, so the
+//! totals are a floor rather than an exact figure. `INFO` labels them accordingly.
 
 use super::index_key::IndexKey;
 use super::postings::{KeyType, Postings, PostingsBitmap};
@@ -33,7 +33,7 @@ pub struct IndexMemory {
     pub series_count: usize,
     /// The term dictionary's keys.
     pub terms_bytes: usize,
-    /// Roaring containers backing the per-term posting lists.
+    /// The per-term posting bitmaps: container payload plus the bitmap structure around it.
     pub postings_bytes: usize,
     /// The `SeriesRef -> key` forward map.
     pub id_to_key_bytes: usize,
@@ -57,15 +57,92 @@ impl IndexMemory {
     }
 }
 
-/// Bytes the roaring containers of `bitmap` occupy.
+/// Bytes `bitmap` occupies: its containers' payload plus the structure CRoaring keeps around
+/// them (see [`roaring64_structure_bytes`]).
 ///
 /// `statistics()` walks the containers rather than the values, so this is proportional to
 /// `cardinality / 65536`, not to the cardinality itself.
 pub(super) fn bitmap_heap_size(bitmap: &PostingsBitmap) -> usize {
     let stats = bitmap.statistics();
-    (stats.n_bytes_array_containers
+    let payload = stats.n_bytes_array_containers
         + stats.n_bytes_run_containers
-        + stats.n_bytes_bitset_containers) as usize
+        + stats.n_bytes_bitset_containers;
+    payload as usize + roaring64_structure_bytes(stats.n_containers as usize)
+}
+
+// CRoaring's 64-bit bitmap (croaring-sys 5.5) keeps the high 48 bits of each value in an
+// adaptive radix tree whose leaves name a container. Every allocation goes through croaring's
+// allocator hook (`roaring_alloc.rs`), which prefixes it with its size.
+const ROARING_ALLOC_HEADER: usize = 8;
+/// `roaring64_bitmap_t`, allocated even when empty.
+const ROARING_BITMAP_BYTES: usize = 224 + ROARING_ALLOC_HEADER;
+/// The container struct, plus the header of its separately allocated payload.
+const ROARING_CONTAINER_BYTES: usize = 16 + 2 * ROARING_ALLOC_HEADER;
+/// One ART leaf per container, in a pool (as are its `containers[]` slot and typecode).
+const ROARING_LEAF_BYTES: usize = 16;
+/// ART inner nodes: (most children, bytes). A pool is allocated for each type the tree has
+/// grown through, and an outgrown node's pool is kept.
+const ROARING_NODES: [(usize, usize); 4] = [(4, 48), (16, 152), (48, 656), (256, 2056)];
+
+/// Capacity CRoaring grows a pool to for `n` entries: 2, doubling below 1024, then by a quarter.
+fn roaring_pool_capacity(n: usize) -> usize {
+    let mut capacity = 2;
+    while capacity < n {
+        capacity = if capacity < 1024 {
+            capacity * 2
+        } else {
+            capacity * 5 / 4
+        };
+    }
+    capacity
+}
+
+/// Heap bytes of a 64-bit roaring bitmap's structure, excluding container payload, for one
+/// holding `containers` containers.
+///
+/// Counted from CRoaring's growth rules. Against an allocator that counts bytes it is exact
+/// for array containers in trees of up to 256 containers whose ids share their high bytes (one
+/// inner level); a bitset container's aligned payload costs 24 bytes more. Not counted: the
+/// allocator's size classes (about a fifth more on a sparse index), slots freed by removals and
+/// not yet reused, array capacity beyond the cardinality (`shrink_to_fit` in the optimizer trims
+/// it), and the extra levels that ids of several epochs add.
+///
+/// Pools are counted at the capacity growth leaves them. The optimizer's `shrink_to_fit` trims
+/// them to size, so a list it has just visited reads high (by up to ~40 % on the sparse shapes
+/// measured). A list removals have emptied reads low until the optimizer reaches it, by as much
+/// as the removals freed in the estimate but not yet in the heap: no bound holds there.
+/// `statistics()` cannot tell these states apart. `INFO ts_index_roaring_bytes` is CRoaring's
+/// exact heap, process-wide.
+///
+/// The structure is what separates a dense posting list from a scattered one of the same
+/// cardinality: 40 series spread over 14 containers cost ~1.6 KiB, packed into one ~0.4 KiB.
+fn roaring64_structure_bytes(containers: usize) -> usize {
+    if containers == 0 {
+        return ROARING_BITMAP_BYTES;
+    }
+    let pool = |entries: usize, bytes: usize| entries * bytes + ROARING_ALLOC_HEADER;
+    let slots = roaring_pool_capacity(containers);
+    let mut total = ROARING_BITMAP_BYTES
+        + pool(slots, 8)
+        + pool(slots, 1)
+        + pool(slots, ROARING_LEAF_BYTES)
+        + containers * ROARING_CONTAINER_BYTES;
+    if containers > 1 {
+        // One inner node holds the leaves, past 256 containers one node256 per 256 (the node
+        // above those is not counted). Growing through the smaller types left their pools.
+        for &(children, bytes) in &ROARING_NODES {
+            let nodes = if children == 256 {
+                containers.div_ceil(256)
+            } else {
+                1
+            };
+            total += pool(roaring_pool_capacity(nodes), bytes);
+            if containers <= children {
+                break;
+            }
+        }
+    }
+    total
 }
 
 /// The longest one slice of a walk holds the postings read lock. The walk releases the lock
@@ -216,6 +293,65 @@ mod tests {
     use super::*;
     use crate::labels::{Label, MetricName};
     use crate::series::TimeSeries;
+
+    /// `containers` array containers of `per_container` values each, in consecutive 64 Ki blocks
+    /// of one epoch (the shape a single process's ids take).
+    fn spread_bitmap(containers: u64, per_container: u64) -> PostingsBitmap {
+        const EPOCH: u64 = 0xA5_B4C3 << 40;
+        let mut bitmap = PostingsBitmap::new();
+        for block in 0..containers {
+            for i in 0..per_container {
+                bitmap.add(EPOCH + block * 65536 + i * 7);
+            }
+        }
+        bitmap
+    }
+
+    #[test]
+    fn bitmap_heap_size_matches_counted_allocations() {
+        // Bytes a counting global allocator saw CRoaring allocate (croaring 2.9 / croaring-sys
+        // 5.5, exact-capacity arrays as after `shrink_to_fit`), by containers and values each.
+        // The steps at 5 and 17 containers are the ART growing into node16 and node48.
+        let measured = [
+            (0, 0, 232),
+            (1, 1, 340),
+            (1, 40, 418),
+            (2, 1, 478),
+            (4, 3, 612),
+            (5, 1, 1042),
+            (8, 9, 1272),
+            (16, 40, 2864),
+            (17, 1, 3370),
+            (64, 3, 10144),
+        ];
+        for (containers, per_container, bytes) in measured {
+            let bitmap = spread_bitmap(containers, per_container);
+            assert_eq!(
+                bitmap_heap_size(&bitmap),
+                bytes,
+                "{containers} containers of {per_container}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scattered_posting_list_costs_more_than_a_packed_one() {
+        // The same 40 ids, packed into one container or spread over 14: the payload is equal,
+        // so only the structure tells them apart.
+        let packed = spread_bitmap(1, 40);
+        let mut scattered = PostingsBitmap::new();
+        for i in 0..40u64 {
+            scattered.add((0xA5_B4C3 << 40) + (i % 14) * 65536 + i);
+        }
+        assert_eq!(packed.cardinality(), scattered.cardinality());
+        assert_eq!(scattered.statistics().n_containers, 14);
+        assert!(
+            bitmap_heap_size(&scattered) > 3 * bitmap_heap_size(&packed),
+            "{} vs {}",
+            bitmap_heap_size(&scattered),
+            bitmap_heap_size(&packed)
+        );
+    }
 
     /// An index body of `n` series, each with a shared and a unique label: `n + 1` terms.
     fn postings(n: u64) -> Postings {

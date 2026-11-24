@@ -263,7 +263,6 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
             'ts-num-threads',
             'ts-fanout-command-timeout',
             'ts-cluster-map-expiration-ms',
-            'ts-index-build-max-memory',
             'ts-outliers-max-samples',
             'ts-index-persist',
             'debug-mode',
@@ -951,7 +950,10 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
 
     def test_alldbs_matches_info_ts_index(self):
         client = self.server.get_new_client()
-        assert self.index_memory(client, 'ALLDBS')['totalBytes'] == 0
+        empty = self.index_memory(client, 'ALLDBS')
+        # An index with no series holds only its empty bookkeeping bitmaps.
+        assert empty['series'] == 0 and empty['terms'] == 0
+        assert empty['totalBytes'] == empty['bookkeepingBytes']
 
         self.populate(client, 0, 50)
         self.populate(client, 1, 20)

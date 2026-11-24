@@ -236,7 +236,10 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
         client = self.server.get_new_client()
         empty = self._info_ints(client)
         assert empty, "the module publishes no ts_index INFO section"
-        assert empty["ts_index_bytes"] == 0
+        # An index with no series holds only its empty bookkeeping bitmaps.
+        assert empty["ts_index_series"] == 0 and empty["ts_index_terms"] == 0
+        assert empty["ts_index_postings_bytes"] == 0
+        assert empty["ts_index_bytes"] == empty["ts_index_bookkeeping_bytes"]
 
         for i in range(200):
             client.execute_command(
@@ -284,6 +287,24 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
         # Large contents are freed on a background thread.
         residue = lambda: client.info("memory")["used_memory"] - before
         wait_for_true(lambda: residue() < added // 4)
+
+    def test_info_reports_the_roaring_heap(self):
+        """`ts_index_roaring_bytes` is CRoaring's heap, counted by its allocator."""
+        client = self.server.get_new_client()
+        before = self._info_ints(client)["ts_index_roaring_bytes"]
+
+        for i in range(200):
+            client.execute_command("TS.CREATE", f"mem:roar{i}", "LABELS", "uniq", f"series_{i}")
+
+        # Every series has a bitmap of its own, and an empty one is already 232 bytes.
+        filled = self._info_ints(client)["ts_index_roaring_bytes"]
+        assert filled - before >= 200 * 232, (before, filled)
+
+        # A flush frees the flushed index's bitmaps (a small one on the spot).
+        client.execute_command("FLUSHALL", "SYNC")
+        wait_for_true(
+            lambda: self._info_ints(client)["ts_index_roaring_bytes"] <= filled - 200 * 232
+        )
 
     def test_info_reports_string_interning(self):
         client = self.server.get_new_client()

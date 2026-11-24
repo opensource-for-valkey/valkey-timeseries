@@ -2808,6 +2808,7 @@ name = "valkey-timeseries"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "allocator-api2 0.4.0",
  "arc-swap",
  "blart",
  "bon",

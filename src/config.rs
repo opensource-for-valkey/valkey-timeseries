@@ -71,9 +71,6 @@ pub const RETENTION_POLICY_MAX: i64 = 10 * ONE_YEAR_MS; // 10 years
 /// The default compaction policy: no automatic downsampling rules.
 pub(crate) const DEFAULT_COMPACTION_POLICY: &str = "";
 
-pub const INDEX_BUILD_MAX_MEMORY_MIN: i64 = 0; // 0 = unlimited
-pub const INDEX_BUILD_MAX_MEMORY_MAX: i64 = i64::MAX;
-pub const INDEX_BUILD_MAX_MEMORY_DEFAULT: i64 = 256 * 1024 * 1024; // 256 MiB
 pub const OUTLIERS_MAX_SAMPLES_MIN: i64 = 1_000;
 pub const OUTLIERS_MAX_SAMPLES_MAX: i64 = i64::MAX;
 pub const OUTLIERS_MAX_SAMPLES_DEFAULT: i64 = 1_000_000;
@@ -473,17 +470,6 @@ pub fn is_index_persist_enabled() -> bool {
     INDEX_PERSIST.load(Ordering::Relaxed)
 }
 
-/// Cap on the transient buffer used by the sorted bulk index build during RDB/replication
-/// loads (`ts-index-build-max-memory`, bytes, 0 = unlimited; default 256MiB). The buffer holds `(id, key, label-keys)`
-/// tuples at exactly the moment the loading dataset's own footprint peaks, so it must be
-/// bounded: crossing the cap drains the buffer with one sorted bulk build and degrades to
-/// per-key indexing for the remainder of the load window (`bulk_build.rs`).
-pub static INDEX_BUILD_MAX_MEMORY: AtomicI64 = AtomicI64::new(INDEX_BUILD_MAX_MEMORY_DEFAULT);
-
-pub fn index_build_max_memory() -> i64 {
-    INDEX_BUILD_MAX_MEMORY.load(Ordering::Relaxed)
-}
-
 /// The most samples one `TS.OUTLIERS` request may read (`ts-outliers-max-samples`). Checked
 /// once, before the range is read, so a request already admitted is unaffected by lowering it.
 pub static OUTLIERS_MAX_SAMPLES: AtomicI64 = AtomicI64::new(OUTLIERS_MAX_SAMPLES_DEFAULT);
@@ -802,10 +788,6 @@ fn read_cluster_map_expiration() -> ConfigValue {
     ConfigValue::DurationMs(CLUSTER_MAP_EXPIRATION_MS.load(Ordering::Relaxed) as i64)
 }
 
-fn read_index_build_max_memory() -> ConfigValue {
-    ConfigValue::Integer(index_build_max_memory())
-}
-
 fn read_outliers_max_samples() -> ConfigValue {
     ConfigValue::Integer(OUTLIERS_MAX_SAMPLES.load(Ordering::Relaxed))
 }
@@ -1053,21 +1035,6 @@ pub static CONFIGS: &[ConfigDesc] = &[
         },
     },
     ConfigDesc {
-        name: "ts-index-build-max-memory",
-        read: read_index_build_max_memory,
-        kind: ConfigType::Integer,
-        default: ConfigValue::Integer(INDEX_BUILD_MAX_MEMORY_DEFAULT),
-        min: Some(ConfigValue::Integer(INDEX_BUILD_MAX_MEMORY_MIN)),
-        max: Some(ConfigValue::Integer(INDEX_BUILD_MAX_MEMORY_MAX)),
-        flags: ConfigurationFlags::DEFAULT,
-        description: "Cap in bytes on the transient buffer used by the bulk index build during \
-                      RDB/replication load (0 = unlimited)",
-        storage: ConfigStorage::I64 {
-            cell: || &INDEX_BUILD_MAX_MEMORY,
-            validate: None,
-        },
-    },
-    ConfigDesc {
         name: "ts-outliers-max-samples",
         read: read_outliers_max_samples,
         kind: ConfigType::Integer,
@@ -1306,7 +1273,6 @@ mod tests {
         ("ts-num-threads", "4"),
         ("ts-fanout-command-timeout", "5000"),
         ("ts-cluster-map-expiration-ms", "750"),
-        ("ts-index-build-max-memory", "268435456"),
         ("ts-outliers-max-samples", "1000000"),
         ("ts-index-persist", "yes"),
         ("debug-mode", "no"),

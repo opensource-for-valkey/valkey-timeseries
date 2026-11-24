@@ -1,6 +1,6 @@
 //! Shared fixtures for the `postings` submodule tests.
 
-use super::{BulkIndexEntry, IndexKey, Postings};
+use super::Postings;
 use crate::labels::{Label, MetricName};
 use crate::series::{SeriesRef, TimeSeries};
 
@@ -13,17 +13,6 @@ pub(super) fn make_series(id: SeriesRef, labels: &[(&str, &str)]) -> TimeSeries 
         .collect();
     series.labels = MetricName::new(&labels);
     series
-}
-
-pub(super) fn make_bulk_entry(id: SeriesRef, key: &str, labels: &[(&str, &str)]) -> BulkIndexEntry {
-    BulkIndexEntry {
-        id,
-        key: key.as_bytes().to_vec().into_boxed_slice(),
-        label_keys: labels
-            .iter()
-            .map(|(name, value)| IndexKey::for_label_value(name, value))
-            .collect(),
-    }
 }
 
 /// Asserts the two indexes are structurally identical (same label keys, same posting-list

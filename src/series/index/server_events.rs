@@ -3,13 +3,13 @@
 use crate::common::context::{create_key_string, get_current_db, register_server_event_handler};
 use crate::common::sync::lock;
 use crate::series::index::asm::{reconcile_imports_after_load, register_asm_event_handler};
-use crate::series::index::bulk_build;
 use crate::series::index::persistence::{
     on_loading_ended, on_loading_failed, on_loading_started, should_skip_load_indexing,
 };
 use crate::series::index::{
-    clear_all_timeseries_indexes, clear_timeseries_index, get_db_index, get_timeseries_index,
-    index_loaded_series, index_series_by_key, swap_timeseries_index_dbs,
+    clear_all_timeseries_indexes, clear_timeseries_index, ensure_series_indexed_by_key,
+    get_db_index, get_timeseries_index, index_loaded_series, index_series_by_key,
+    swap_timeseries_index_dbs,
 };
 use crate::series::{relink_renamed_series, try_get_timeseries_mut};
 use std::os::raw::c_void;
@@ -43,30 +43,18 @@ fn __persistence_event_handler(ctx: &Context, persistence_event: PersistenceSube
 #[loading_event_handler]
 fn __loading_event_handler(ctx: &Context, loading_event: LoadingSubevent) {
     match loading_event {
-        LoadingSubevent::RdbStarted | LoadingSubevent::ReplStarted => {
+        LoadingSubevent::RdbStarted
+        | LoadingSubevent::ReplStarted
+        | LoadingSubevent::AofStarted => {
             on_loading_started();
-            bulk_build::on_load_started(false);
-        }
-        LoadingSubevent::AofStarted => {
-            on_loading_started();
-            // AOF loads keep the per-key indexing path (see bulk_build.rs module docs).
-            bulk_build::on_load_started(true);
         }
         LoadingSubevent::Ended => {
-            // Drain the bulk-build buffer first (synchronous — the index must be complete
-            // before serving resumes); the aux-preload reconciliation sweep then runs in the
-            // background for dbs that took the preload fast path instead.
-            bulk_build::on_load_ended();
-            // After the bulk build (so the keys it indexed can be hidden) and before the
-            // reconciliation sweep, so that whatever the sweep re-indexes is hidden by the
-            // now-registered import.
+            // Before the reconciliation sweep, so that whatever the sweep re-indexes is hidden
+            // by the now-registered import.
             reconcile_imports_after_load(ctx);
             on_loading_ended(load_keys_expired(ctx));
         }
-        LoadingSubevent::Failed => {
-            bulk_build::on_load_failed();
-            on_loading_failed();
-        }
+        LoadingSubevent::Failed => on_loading_failed(),
     }
 }
 
@@ -125,14 +113,12 @@ fn handle_key_loaded(ctx: &Context, key: &[u8]) {
     if should_skip_load_indexing(db) {
         return;
     }
-    // Fallback (bulk_build.rs): during an RDB/replication load window whose index was
-    // not preloaded, buffer the series for one sorted bulk build at load end instead of paying
-    // per-label ART inserts per key. Falls through when buffering is inactive for this window
-    // (AOF load, memory cap crossed).
-    if bulk_build::try_buffer_loaded_key(ctx, db, key) {
-        return;
-    }
-    index_series_by_key(ctx, key);
+    // Keep the loaded id. A fresh one would be minted in load (hash-table) order, scattering
+    // ids that were created together -- a pod's series, say -- across every bitmap container:
+    // 14x the containers and +13 % used_memory on a 1M-series fleet. Imports, RESTORE, MOVE and
+    // COPY still take fresh ids (`index_series_by_key`), since they mix foreign ids into a live
+    // index.
+    ensure_series_indexed_by_key(ctx, key);
 }
 
 /// Indexes the destination of a `COPY` command. The type `copy` callback cannot maintain the index
