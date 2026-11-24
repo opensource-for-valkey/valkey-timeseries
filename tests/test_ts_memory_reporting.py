@@ -236,7 +236,10 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
         client = self.server.get_new_client()
         empty = self._info_ints(client)
         assert empty, "the module publishes no ts_index INFO section"
-        assert empty["ts_index_bytes"] == 0
+        # An index with no series holds only its empty bookkeeping bitmaps.
+        assert empty["ts_index_series"] == 0 and empty["ts_index_terms"] == 0
+        assert empty["ts_index_postings_bytes"] == 0
+        assert empty["ts_index_bytes"] == empty["ts_index_bookkeeping_bytes"]
 
         for i in range(200):
             client.execute_command(
