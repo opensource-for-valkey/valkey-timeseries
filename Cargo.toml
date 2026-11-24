@@ -10,6 +10,7 @@ description = "A Timeseries data type for Valkey"
 
 [dependencies]
 ahash = { version = "0.8", features = ["std"] }
+allocator-api2 = "0.4"
 arc-swap = "1.9"
 blart = "0.6"
 bon = { version = "3.10.3", optional = true }
@@ -170,7 +171,7 @@ path = "tools/benchmark_dataset.rs"
 required-features = ["test-utils", "enable-system-alloc"]
 
 [features]
-default = ["min-valkey-compatibility-version-8-0", "croaring/alloc"]
+default = ["min-valkey-compatibility-version-8-0"]
 enable-system-alloc = ["valkey-module/enable-system-alloc"]
 min-valkey-compatibility-version-8-0 = ["valkey-module/min-valkey-compatibility-version-8-0"]
 use-redismodule-api = [] # We don't support this feature flag which is why it is empty.

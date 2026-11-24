@@ -71,8 +71,8 @@ pub(super) fn bitmap_heap_size(bitmap: &PostingsBitmap) -> usize {
 }
 
 // CRoaring's 64-bit bitmap (croaring-sys 5.5) keeps the high 48 bits of each value in an
-// adaptive radix tree whose leaves name a container. Every allocation goes through
-// `croaring::configure_rust_alloc`, which prefixes it with its size.
+// adaptive radix tree whose leaves name a container. Every allocation goes through croaring's
+// allocator hook (`roaring_alloc.rs`), which prefixes it with its size.
 const ROARING_ALLOC_HEADER: usize = 8;
 /// `roaring64_bitmap_t`, allocated even when empty.
 const ROARING_BITMAP_BYTES: usize = 224 + ROARING_ALLOC_HEADER;
@@ -106,6 +106,11 @@ fn roaring_pool_capacity(n: usize) -> usize {
 /// allocator's size classes (about a fifth more on a sparse index), slots freed by removals and
 /// not yet reused, array capacity beyond the cardinality (`shrink_to_fit` in the optimizer trims
 /// it), and the extra levels that ids of several epochs add.
+///
+/// Pools are counted at the capacity growth leaves them. The optimizer's `shrink_to_fit` trims
+/// them to size, so a list it has just visited reads high (up to ~40 % on sparse lists), and
+/// one emptied by removals it has not reached yet reads low (~50 %). `statistics()` cannot tell
+/// these states apart. `INFO ts_index_roaring_bytes` is CRoaring's exact heap, process-wide.
 ///
 /// The structure is what separates a dense posting list from a scattered one of the same
 /// cardinality: 40 series spread over 14 containers cost ~1.6 KiB, packed into one ~0.4 KiB.

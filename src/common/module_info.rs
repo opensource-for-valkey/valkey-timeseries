@@ -10,7 +10,7 @@
 
 use crate::common::humanize::bytes_to_human;
 use crate::common::metrics::{self, MetricValue, Section};
-use crate::series::index::index_memory_usage;
+use crate::series::index::{index_memory_usage, roaring_heap_bytes};
 use crate::series::{COMPACTION_FAILURES, COMPACTION_POLICY_SKIPS, COMPACTION_STATE_REBUILDS};
 use metered::Scalar;
 use std::sync::atomic::Ordering;
@@ -188,6 +188,15 @@ fn index_fields() -> Vec<(String, InfoValue)> {
         fields.push((name.to_owned(), (bytes as u64).into()));
         fields.push((format!("{name}_human"), bytes_to_human(bytes as u64).into()));
     }
+    // Not one of the parts: CRoaring's whole heap, counted by its allocator. Exact and
+    // process-wide, where `index_postings_bytes` is a per-db estimate from the bitmaps' shape;
+    // it also holds the bitmaps queries build while they run.
+    let roaring = roaring_heap_bytes() as u64;
+    fields.push(("index_roaring_bytes".to_owned(), roaring.into()));
+    fields.push((
+        "index_roaring_bytes_human".to_owned(),
+        bytes_to_human(roaring).into(),
+    ));
     for (name, count) in [
         ("index_terms", index.term_count),
         ("index_series", index.series_count),

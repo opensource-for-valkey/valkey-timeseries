@@ -6,6 +6,7 @@ mod memory;
 mod posting_stats;
 mod postings;
 mod querier;
+mod roaring_alloc;
 mod timeseries_index;
 
 use crate::common::context::{create_key_string, get_current_db};
@@ -25,6 +26,7 @@ pub use memory::{IndexMemory, db_index_memory_usage, index_memory_usage};
 pub use posting_stats::*;
 pub use postings::PostingsBitmap;
 pub use querier::*;
+pub(crate) use roaring_alloc::{init_croaring_allocator, roaring_heap_bytes};
 pub use timeseries_index::*;
 
 pub(crate) mod asm;
@@ -324,9 +326,4 @@ pub fn mark_series_for_removal(ctx: &Context, id: SeriesRef) {
     // mark the id for removal, signal to src_series to remove it
     let index = get_timeseries_index(ctx);
     index.mark_id_as_stale(id);
-}
-
-pub(crate) fn init_croaring_allocator() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| unsafe { croaring::configure_rust_alloc() });
 }
