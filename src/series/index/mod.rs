@@ -15,6 +15,7 @@ use std::sync::LazyLock;
 use valkey_module::{AclPermissions, Context, ValkeyResult, ValkeyString};
 
 use crate::common::hash::BuildNoHashHasher;
+use crate::common::threads::{BoundedExecutor, Capacity};
 use crate::series::index::postings::Postings;
 use crate::series::request_types::MatchFilterOptions;
 use crate::series::{SeriesGuardMut, SeriesRef, TimeSeries, try_get_timeseries_mut};
@@ -279,16 +280,31 @@ pub fn clear_all_timeseries_indexes() {
     map.clear();
 }
 
-/// Series above which a flushed index is freed off the main thread: freeing every posting
-/// list and key of a large index would stall the server, `FLUSHALL ASYNC` included.
-const FLUSH_DROP_INLINE_MAX_SERIES: usize = 4096;
+/// Entries (series, hidden ones included, and terms) above which a flushed index is freed off
+/// the main thread: freeing every posting list and key of a large index would stall the
+/// server, `FLUSHALL ASYNC` included.
+const FLUSH_DROP_INLINE_MAX_ENTRIES: usize = 8192;
+
+/// Frees flushed indexes one at a time, so repeated flushes never start a thread each. Nothing
+/// is refused (no queue limit): a queued index holds no more memory than it did before its
+/// flush, and refusing it would free it on the main thread instead.
+static FLUSH_DROP_EXECUTOR: BoundedExecutor =
+    BoundedExecutor::new("ts-index-drop", one_worker, Capacity::Fixed(0));
+
+fn one_worker() -> usize {
+    1
+}
+
+fn frees_off_the_main_thread(flushed: &[Postings]) -> bool {
+    let entries: usize = flushed.iter().map(Postings::retained_entries).sum();
+    entries > FLUSH_DROP_INLINE_MAX_ENTRIES
+}
 
 /// Frees the contents taken out of flushed indexes (see [`TimeSeriesIndex::take_postings`]).
 fn drop_flushed_postings(flushed: Vec<Postings>) {
-    let series: usize = flushed.iter().map(Postings::count).sum();
-    if series > FLUSH_DROP_INLINE_MAX_SERIES {
-        // A thread that cannot be started drops `flushed` here instead.
-        crate::common::threads::spawn_background("ts-index-flush-drop", move || drop(flushed));
+    if frees_off_the_main_thread(&flushed) {
+        // Refused only if the worker cannot start; the job, and `flushed`, are dropped here then.
+        let _ = FLUSH_DROP_EXECUTOR.try_spawn(move || drop(flushed));
     }
 }
 
