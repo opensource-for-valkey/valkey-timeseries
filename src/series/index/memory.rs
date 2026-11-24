@@ -108,9 +108,11 @@ fn roaring_pool_capacity(n: usize) -> usize {
 /// it), and the extra levels that ids of several epochs add.
 ///
 /// Pools are counted at the capacity growth leaves them. The optimizer's `shrink_to_fit` trims
-/// them to size, so a list it has just visited reads high (up to ~40 % on sparse lists), and
-/// one emptied by removals it has not reached yet reads low (~50 %). `statistics()` cannot tell
-/// these states apart. `INFO ts_index_roaring_bytes` is CRoaring's exact heap, process-wide.
+/// them to size, so a list it has just visited reads high (by up to ~40 % on the sparse shapes
+/// measured). A list removals have emptied reads low until the optimizer reaches it, by as much
+/// as the removals freed in the estimate but not yet in the heap: no bound holds there.
+/// `statistics()` cannot tell these states apart. `INFO ts_index_roaring_bytes` is CRoaring's
+/// exact heap, process-wide.
 ///
 /// The structure is what separates a dense posting list from a scattered one of the same
 /// cardinality: 40 series spread over 14 containers cost ~1.6 KiB, packed into one ~0.4 KiB.

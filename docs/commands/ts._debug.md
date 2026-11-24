@@ -43,7 +43,7 @@ TS._DEBUG <subcommand> [arguments]</subcommand>
 | `HELP`            | Display available subcommands and brief descriptions    |
 | `METRICS`         | Report this node's module metrics, or reset them        |
 | `STRINGPOOLSTATS` | Report statistics for the global string interning pool  |
-| `INDEXMEMORY`     | Report the label index's heap footprint (fields as in `INFO ts_index`; each `*Bytes` field is followed by a `*BytesHuman` string such as `1.21M`). `postingsBytes` is estimated from each bitmap's shape and can be off by up to ~40 %; `INFO ts_index` also reports `ts_index_roaring_bytes`, the exact process-wide heap of all posting bitmaps, including those queries hold while running |
+| `INDEXMEMORY`     | Report the label index's heap footprint (fields as in `INFO ts_index`; each `*Bytes` field is followed by a `*BytesHuman` string such as `1.21M`). `postingsBytes` is an approximation from each bitmap's shape, not a measurement: it reads high on lists the optimizer has just shrunk, reads low after removals until the optimizer compacts the lists they emptied, and does not count allocator size classes or the extra tree levels ids from several epochs add. For the exact figure, `INFO ts_index` reports `ts_index_roaring_bytes`, the process-wide heap of all posting bitmaps, including those queries hold while running |
 | `INFLIGHT`        | List this node's fan-out requests still waiting on peers |
 | `PEER_REQUESTS`   | Count, or list with `VERBOSE`, the fan-out requests this node is serving for peers (cluster mode only) |
 | `QUERYINDEX`      | Query this node's local index only, without cluster fan-out |
