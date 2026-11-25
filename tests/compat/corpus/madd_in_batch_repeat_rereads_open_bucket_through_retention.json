@@ -1,0 +1,26 @@
+{
+  "description": "A TS.MADD repeat of a timestamp the same batch appended re-reads the open compaction bucket through the retention window in force at that moment, as an upsert does: a sample that has expired by then leaves the bucket (max 0 -> -1, min 5 -> 7, count 2 -> 1), and so does the bucket a later item of the batch closes.",
+  "origin": "fuzzer shrink 2026-11-25",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:k0", "RETENTION", "1000", "ENCODING", "COMPRESSED", "CHUNK_SIZE", "128", "DUPLICATE_POLICY", "LAST", "LABELS", "metric", "cpu", "host", "h1"],
+    ["TS.CREATE", "fz:rollup", "LABELS", "metric", "cpu", "host", "h1"],
+    ["TS.CREATERULE", "fz:k0", "fz:rollup", "AGGREGATION", "max", "2000"],
+    ["TS.ADD", "fz:k0", "0", "0"],
+    ["TS.MADD", "fz:k0", "1001", "0", "fz:k0", "1001", "-1"],
+    ["TS.GET", "fz:rollup", "LATEST"],
+    ["TS.CREATE", "fz:k1", "RETENTION", "1000", "DUPLICATE_POLICY", "FIRST"],
+    ["TS.CREATE", "fz:k1:min"],
+    ["TS.CREATERULE", "fz:k1", "fz:k1:min", "AGGREGATION", "min", "2000"],
+    ["TS.ADD", "fz:k1", "0", "5"],
+    ["TS.MADD", "fz:k1", "1001", "7", "fz:k1", "1001", "3"],
+    ["TS.RANGE", "fz:k1:min", "-", "+", "LATEST"],
+    ["TS.CREATE", "fz:k2", "RETENTION", "1000", "DUPLICATE_POLICY", "LAST"],
+    ["TS.CREATE", "fz:k2:count"],
+    ["TS.CREATERULE", "fz:k2", "fz:k2:count", "AGGREGATION", "count", "2000"],
+    ["TS.ADD", "fz:k2", "0", "5"],
+    ["TS.MADD", "fz:k2", "1001", "7", "fz:k2", "1001", "8", "fz:k2", "2100", "1"],
+    ["TS.RANGE", "fz:k2:count", "-", "+"],
+    ["TS.RANGE", "fz:k2:count", "-", "+", "LATEST"]
+  ]
+}
