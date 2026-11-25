@@ -235,9 +235,11 @@ fn handle_mixed_batch_compaction(
                     // drops the expired samples the aggregator has already counted:
                     // `RETENTION 1000`, max/2000, `TS.ADD k 0 0` then `TS.MADD k 1001 0 k 1001 -1`
                     // leaves the open bucket at -1 on RTS, not 0. Any accepted repeat does this,
-                    // FIRST included, whether or not the stored value changed.
+                    // FIRST included, whether or not the stored value changed. A counter also
+                    // re-reads the baseline it carries in from before the bucket, which the floor
+                    // can drop even when it lies below the bucket's start.
                     let floor = floor_at(retention, max);
-                    if floor > bucket_start {
+                    if floor > bucket_start || ctx.rule.aggregator.carries_baseline() {
                         refolded.push((bucket_start, floor));
                     }
                 }
@@ -339,7 +341,17 @@ fn handle_mixed_batch_compaction(
             recalculate_current_bucket(ctx, bucket_start, bucket_last, min_ts)?;
         } else {
             recalculate_bucket(ctx, bucket_start, bucket_last, min_ts, null_ts_filter)?;
-            refresh_successor(ctx, bucket_last, min_ts)?;
+            // The successor was already recalculated in this pass if it holds a back-fill or a
+            // refold of its own, at a floor at least as high: re-reading it at this older
+            // bucket's floor would count again a sample that floor dropped. Sequentially its
+            // last recalculation is the later one, so the higher floor wins.
+            let successor_floor = |start: Timestamp| match buckets
+                .binary_search_by_key(&start, |(bucket, _)| *bucket)
+            {
+                Ok(idx) => min_ts.max(buckets[idx].1),
+                Err(_) => min_ts,
+            };
+            refresh_successor(ctx, bucket_last, successor_floor)?;
         }
     }
 
@@ -388,7 +400,7 @@ fn handle_sample_compaction(ctx: &mut CompactionContext, sample: Sample) -> Tsdb
                 min_ts,
                 null_ts_filter,
             )?;
-            refresh_successor(ctx, bucket_last, min_ts)?;
+            refresh_successor(ctx, bucket_last, |_| min_ts)?;
         }
     }
 
@@ -519,7 +531,7 @@ fn handle_compaction_range_removal(
             let to = span_end.min(open_start - 1);
             recompute_closed_buckets(ctx, first_bucket_start, to)?;
             let min_ts = ctx.parent.get_min_timestamp();
-            if let Some((_, successor_last)) = refresh_successor(ctx, to, min_ts)? {
+            if let Some((_, successor_last)) = refresh_successor(ctx, to, |_| min_ts)? {
                 ctx.rewritten = Some((first_bucket_start, span_end.max(successor_last)));
             }
         }
@@ -677,10 +689,12 @@ pub(super) fn begin_bucket(
 /// With no counted sample after the bucket, an open bucket past it still carries the baseline the
 /// rewrite may have changed — it holds only NaNs, which `first_value_after` skips — so it is
 /// re-aggregated too.
+///
+/// `min_ts` gives the retention floor to read the successor through, from its start.
 fn refresh_successor(
     ctx: &mut CompactionContext,
     bucket_last: Timestamp,
-    min_ts: Timestamp,
+    min_ts: impl Fn(Timestamp) -> Timestamp,
 ) -> TsdbResult<Option<(Timestamp, Timestamp)>> {
     if !ctx.rule.aggregator.carries_baseline() {
         return Ok(None);
@@ -694,6 +708,7 @@ fn refresh_successor(
         None => return Ok(None),
     };
     let last = ctx.rule.bucket_last(start);
+    let min_ts = min_ts(start);
     match start.cmp(&open) {
         Ordering::Less => {
             recalculate_bucket(ctx, start, last, min_ts, null_ts_filter)?;
@@ -1136,6 +1151,110 @@ mod tests {
             "0 expired before the repeat re-read bucket 0"
         );
         assert_eq!(rule.bucket_start, Some(2000));
+    }
+
+    /// A rule's destination samples and open-bucket state ([`dest_samples`], [`open_state`]).
+    type RuleOutcome = (
+        Vec<(Timestamp, u64)>,
+        (Option<Timestamp>, bool, Option<u64>),
+    );
+
+    /// What one rule leaves after `pre` and then `items`, written either as single adds or with
+    /// `items` as one TS.MADD batch: the destination and the open bucket.
+    fn ingest_counter_case(
+        agg: AggregationType,
+        retention_ms: u64,
+        pre: &[(Timestamp, f64)],
+        items: &[(Timestamp, f64)],
+        as_batch: bool,
+    ) -> RuleOutcome {
+        let mut parent = TimeSeries {
+            retention: std::time::Duration::from_millis(retention_ms),
+            ..Default::default()
+        };
+        let mut dest = TimeSeries::new();
+        let mut rule = fresh_rule(agg, 2000);
+        let mut add_one = |parent: &mut TimeSeries, dest: &mut TimeSeries, (ts, v)| {
+            let prev = parent.last_sample.map(|s| s.timestamp);
+            parent.add_deferring_retention(ts, v, Some(DuplicatePolicy::KeepLast));
+            let stored = parent.get_sample(ts).unwrap().unwrap();
+            ingest_batch_of_one(parent, dest, &mut rule, stored, prev);
+        };
+        for &item in pre {
+            add_one(&mut parent, &mut dest, item);
+        }
+        if as_batch {
+            let prev = parent.last_sample.map(|s| s.timestamp);
+            for &(ts, v) in items {
+                parent.add_deferring_retention(ts, v, Some(DuplicatePolicy::KeepLast));
+            }
+            let mut touched: Vec<Timestamp> = items.iter().map(|(ts, _)| *ts).collect();
+            touched.sort_unstable();
+            touched.dedup();
+            let stored: Vec<Sample> = touched
+                .iter()
+                .map(|ts| parent.get_sample(*ts).unwrap().unwrap())
+                .collect();
+            let order: Vec<Timestamp> = items.iter().map(|(ts, _)| *ts).collect();
+            ingest_madd(&parent, &mut dest, &mut rule, &stored, prev, &order);
+        } else {
+            for &item in items {
+                add_one(&mut parent, &mut dest, item);
+            }
+        }
+        (dest_samples(&dest), open_state(&rule))
+    }
+
+    /// Regression (review): refreshing a recalculated bucket's successor must not read it at a
+    /// lower retention floor than the batch already applied to it. With `RETENTION 1000`, the
+    /// back-fill at 2500 re-reads open bucket 2000 above 2001; bucket 0's refresh then re-read it
+    /// above 1 and counted the expired 2000 again (`increase` 18 or 19, sequentially 5). The
+    /// second batch reaches it through a back-fill instead of an in-batch repeat.
+    #[test]
+    fn successor_refresh_keeps_the_highest_floor_of_the_batch() {
+        let batches: [&[(Timestamp, f64)]; 2] = [
+            &[
+                (1001, 1.0),
+                (1001, 2.0),
+                (2000, 10.0),
+                (3001, 20.0),
+                (2500, 15.0),
+            ],
+            &[
+                (1001, 1.0),
+                (500, 5.0),
+                (2000, 10.0),
+                (3001, 20.0),
+                (2500, 15.0),
+            ],
+        ];
+        for agg in [AggregationType::Increase, AggregationType::Rate] {
+            for items in batches {
+                let pre = [(0, 0.0)];
+                let batch = ingest_counter_case(agg, 1000, &pre, items, true);
+                let sequential = ingest_counter_case(agg, 1000, &pre, items, false);
+                assert_eq!(batch, sequential, "{agg:?} {items:?}");
+            }
+        }
+    }
+
+    /// A counter re-reads the baseline it carries into the open bucket on an in-batch repeat,
+    /// even where the floor lies below the bucket's start: `RETENTION 1000`, baseline 2700, and
+    /// repeats at 4500 put the floor at 3500, so bucket 4000 starts without it, as sequential
+    /// adds leave it.
+    #[test]
+    fn in_batch_repeat_rereads_a_counter_baseline() {
+        for agg in [
+            AggregationType::IRate,
+            AggregationType::Increase,
+            AggregationType::Rate,
+        ] {
+            let pre = [(2700, 0.0)];
+            let items = [(4500, 22.0), (4500, 7.0), (4500, 22.0)];
+            let batch = ingest_counter_case(agg, 1000, &pre, &items, true);
+            let sequential = ingest_counter_case(agg, 1000, &pre, &items, false);
+            assert_eq!(batch, sequential, "{agg:?}");
+        }
     }
 
     /// Regression (oracle shrink): a back-fill that turns a published bucket's aggregate into NaN
