@@ -93,7 +93,7 @@ struct RunArgs {
     subject: String,
     #[arg(long)]
     reference: String,
-    /// Pinned reference versions as <server>:<module>, e.g. 8.10.0:81000.
+    /// Pinned reference versions as <server>:<module>, e.g. 8.12.0:81200.
     /// Required unless --self-check.
     #[arg(long)]
     reference_pin: Option<String>,

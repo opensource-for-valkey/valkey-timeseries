@@ -710,7 +710,7 @@
     subject equivalent. It selects the wire protocol spoken between nodes by
     libmr, the MapReduce layer RTS uses to fan TS.MRANGE/TS.MGET/TS.QUERYINDEX
     out across cluster shards. New in the 8.8 reference bump (absent from the
-    previous 8.6 pin); still present, unchanged, on the 8.10 pin.
+    previous 8.6 pin); still present, unchanged, on the 8.10 and 8.12 pins.
   rationale: >
     Accepted (reference bump 2026-07-23): configures an RTS-internal transport
     this engine does not have. Cross-shard fan-out here is not libmr-based, so
@@ -731,7 +731,7 @@
     (validated to 1..16) and resizes its pool. This is a change in the
     reference, not in this engine: RTS 8.6, the previous-previous pin, rejected
     the same CONFIG SET as immutable exactly as we do; the mutability change
-    landed at the 8.6 -> 8.8 bump and is unchanged on 8.10.
+    landed at the 8.6 -> 8.8 bump and is unchanged on 8.10 and 8.12.
   rationale: >
     Accepted (reference bump 2026-07-23, §5.3 sign-off): the config sizes the
     module's global rayon thread pool, which is built once at load and shared by

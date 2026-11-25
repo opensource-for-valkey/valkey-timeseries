@@ -11,7 +11,7 @@ incompatible with that license.
 
 **You MUST NOT consult, fetch, vendor, copy, or port RedisTimeSeries source or test code**, and must
 not reproduce it from memory. Derive compatibility behavior only from public command documentation
-and black-box observation of a running reference server. Running the pinned `redis:8.10` image as a
+and black-box observation of a running reference server. Running the pinned `redis:8.12` image as a
 test target is fine; its source is off-limits. Details: [tests/compat/README.md](tests/compat/README.md).
 
 ## Common commands
@@ -130,7 +130,7 @@ Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src
   (`crate::tests::generators`) for fixtures rather than hand-rolled loops.
 - Integration: Python pytest under `tests/` (`test_ts_*.py`, `*_cme.py` = cluster-mode variants),
   driven by `./build.sh`.
-- Compatibility harness (`tests/compat/`): diffs every reply against a pinned `redis:8.10` reference
+- Compatibility harness (`tests/compat/`): diffs every reply against a pinned `redis:8.12` reference
   server, RESP2 + RESP3. Excluded from a plain `./build.sh`; opt in with `RTS_COMPAT=1` or
   `./build.sh compat`. Intentional mismatches go in `divergences.yml` as XFAIL-DIVERGENT — "reference
   errors, subject succeeds" always hard-fails and can't be registered away.

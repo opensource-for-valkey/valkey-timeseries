@@ -240,7 +240,7 @@ A small number of divergences share a specific and uniquely dangerous shape: **b
 | Value | Behavior |
 | ----- | -------- |
 | `extended` (default) | Valkey TimeSeries semantics. |
-| `strict` | On the divergences listed below, resolve the command the way RedisTimeSeries 8.10 resolves it. |
+| `strict` | On the divergences listed below, resolve the command the way RedisTimeSeries 8.12 resolves it. |
 
 ```
 CONFIG SET ts-compatibility-mode strict
