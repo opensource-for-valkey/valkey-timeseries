@@ -1,7 +1,7 @@
 # Differential fuzzer regression corpus
 
 Each `*.json` file here is a minimal command sequence that must stay
-byte-identical to RedisTimeSeries 8.10. `test_compat_corpus.py` replays every
+byte-identical to RedisTimeSeries 8.12. `test_compat_corpus.py` replays every
 file through the `diff` client under RESP2 and RESP3; a regression that reopens
 the underlying bug fails as a plain mismatch.
 
@@ -21,6 +21,7 @@ Two sources feed this directory:
   "description": "one line: what this pins",
   "origin": "manual reproducer" | "fuzzer shrink 2026-07-16",
   "expect_divergence": null,
+  "compat_mode": "strict",
   "commands": [
     ["TS.CREATE", "fz:k0", "..."],
     ["TS.ADD", "fz:k0", "0", "1.5"]
@@ -35,6 +36,10 @@ Two sources feed this directory:
   `divergences.yml`; the replay tolerates it via the registry, and the field
   documents *which* divergence the case rides on. Leave it `null` for a case
   that must diff perfectly clean.
+- `compat_mode` is optional. Set it to `strict` for a case that only agrees
+  under `ts-compatibility-mode strict` (the mode the fuzzer runs the subject
+  in); the replay switches the subject for that case and restores it after.
+  Omit it for the default `extended` mode.
 
 ## Adding a case
 

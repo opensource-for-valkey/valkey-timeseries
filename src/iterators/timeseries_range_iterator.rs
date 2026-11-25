@@ -1,4 +1,5 @@
 use crate::common::{MultiSample, Sample};
+use crate::config::is_strict_rts_compat;
 use crate::iterators::{create_range_iterator, create_row_iterator};
 use crate::series::request_types::RangeOptions;
 use crate::series::{TimeSeries, get_latest_compaction_sample};
@@ -45,6 +46,40 @@ pub(crate) fn get_range_latest_sample(
     } else {
         None
     }
+}
+
+/// Whether RedisTimeSeries answers this read of `series` with no samples at all, a reverse
+/// `LATEST` quirk that `ts-compatibility-mode strict` reproduces (DIV-0030/DIV-0031).
+///
+/// Observed black-box: when a reverse, aggregated `LATEST` read of a compaction destination
+/// ends past the destination's last stored sample but before its still-open bucket, RTS
+/// replies with no samples, the in-range closed buckets included. It is the one case
+/// [`get_range_latest_sample`] drops the open bucket for lying past the range end. `EMPTY`
+/// changes the symptom rather than removing it, so it is not reproduced. A `FILTER_BY_VALUE`
+/// without `FILTER_BY_TS` and a GROUPBY member do not show it at all; callers keep grouped
+/// reads out.
+///
+/// `reply_reverse` is the order the client sees, which a cluster shard can stream against.
+pub(crate) fn rts_reverse_latest_empties_series(
+    ctx: &Context,
+    series: &TimeSeries,
+    options: &RangeOptions,
+    reply_reverse: bool,
+) -> bool {
+    if !reply_reverse || !options.latest || !series.is_compaction() || !is_strict_rts_compat() {
+        return false;
+    }
+    if options.aggregation.as_ref().is_none_or(|a| a.report_empty) {
+        return false;
+    }
+    if options.value_filter.is_some() && options.timestamp_filter.is_none() {
+        return false;
+    }
+    let (start, end) = options.date_range.get_timestamps(None);
+    if start > end || end <= series.last_timestamp() {
+        return false;
+    }
+    get_latest_compaction_sample(ctx, series).is_some_and(|open| open.timestamp > end)
 }
 
 /// An iterator over a TimeSeries based on RangeOptions.

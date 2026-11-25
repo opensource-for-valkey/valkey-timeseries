@@ -14,7 +14,7 @@ harness measures, how a run proceeds, how to run one, and how to read the result
 
 The suite measures **application-visible** throughput, latency and memory of the whole
 server + module stack, as seen by a client over RESP. It compares stacks: a result
-cannot separate the module's cost from its host server's (Valkey 9.x vs Redis 8.10).
+cannot separate the module's cost from its host server's (Valkey 9.x vs Redis 8.12).
 
 Performance parity is **not** part of the [compatibility contract](../../COMPATIBILITY.md).
 These numbers point to where the work should go. They are not a pass/fail gate.
@@ -31,7 +31,7 @@ The suite sits beside the existing internal tools rather than replacing them:
 
 The reference is a **black box** reached only over the network. The harness, its
 scenarios and its oracles come from public command documentation and from observing
-the pinned `redis:8.10` image. RedisTimeSeries source, tests and benchmark code are
+the pinned `redis:8.12` image. RedisTimeSeries source, tests and benchmark code are
 never consulted or ported (see [tests/compat/README.md](../../tests/compat/README.md)).
 
 ---

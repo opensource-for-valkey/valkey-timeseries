@@ -297,7 +297,7 @@ CONFIG GET ts-compatibility-mode
 | Value | Behavior |
 |---|---|
 | `extended` (default) | valkey-timeseries semantics |
-| `strict` | Resolve the gated cases the way RedisTimeSeries 8.10 resolves them |
+| `strict` | Resolve the gated cases the way RedisTimeSeries 8.12 resolves them |
 
 Settable at runtime and at startup, fully reversible, and applies only to subsequent
 commands — it rewrites no stored state, so switching either direction is safe.
@@ -307,6 +307,7 @@ commands — it rewrites no stored state, so switching either direction is safe.
 | Case | `extended` | `strict` |
 |---|---|---|
 | A repeated option on the range family (e.g. `COUNT 5 COUNT 2`, duplicated `AGGREGATION` / `FILTER` / `GROUPBY` / …) | **Last** occurrence wins | **First** occurrence wins |
+| `TS.REVRANGE` / `TS.MREVRANGE` (without `GROUPBY`) with `LATEST` and `AGGREGATION` on a compaction destination, the range ending after its last stored bucket but before its open one, without `EMPTY`, and without `FILTER_BY_VALUE` unless `FILTER_BY_TS` is also given | The in-range closed buckets | No samples, as RedisTimeSeries replies (`EXCLUDEEMPTY` then drops the series) |
 
 **What it does not gate:** the numeric divergences above; the last sample reported for a
 compaction destination whose *older* bucket was back-filled (DIV-0023). Without `LATEST`,

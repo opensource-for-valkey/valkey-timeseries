@@ -614,10 +614,23 @@
 # direction reverse (forward TS.MRANGE agrees), plus LATEST, plus AGGREGATION, plus an end
 # bound below the open bucket's start (`- 500` and `- +` agree).
 #
-# Reviewed decision: do NOT match. Our reply is the same set the forward query returns and
-# the same the non-LATEST reverse returns; RTS's contradicts both of its own — the DIV-0023
-# pattern, where we decline to reproduce an engine disagreeing with itself. Registered per
-# command because registry matching is per-command.
+# Exact window, re-probed on redis:8.12 (2026-11-25): the reply is empty when the end lies
+# strictly between the destination's last *stored* timestamp and the open bucket's
+# (`last < end < open`); `end == last` and `end == open` both agree. It holds for every
+# aggregator, a multi-aggregator list, BUCKETTIMESTAMP, ALIGN (query or rule), COUNT,
+# FILTER_BY_TS, WITHLABELS/SELECTED_LABELS, and a destination holding direct writes. Two
+# things avoid it: FILTER_BY_VALUE without FILTER_BY_TS, and GROUPBY (members are read
+# ascending). On TS.MREVRANGE the emptied series is then dropped by EXCLUDEEMPTY.
+#
+# Reviewed decision, `extended` (default): do NOT match. Our reply is the same set the
+# forward query returns and the same the non-LATEST reverse returns; RTS's contradicts both
+# of its own — the DIV-0023 pattern. Gated under `strict` (2026-11-25, owner request): unlike
+# DIV-0023 the trigger is decided by stored state alone (last stored timestamp, the open
+# bucket, the range end), so `strict` reproduces the empty reply exactly
+# (`rts_reverse_latest_empties_series` in src/iterators/timeseries_range_iterator.rs), pinned
+# by TestStrictReverseLatestAggregation and
+# corpus/mrevrange_latest_destination_excludeempty_strict.json. These entries therefore fire
+# only in `extended`. Registered per command because registry matching is per-command.
 #
 # ⚠️ Scoping: each entry requires the *reference* side to be an empty row set
 # (`reference=[] subject=...`, a `shape` delta). The dangerous direction — subject returns
@@ -626,8 +639,8 @@
 # two commands, which is an accepted-input-superset class §5.2 would normally hard-fail;
 # the pinning test below is what keeps that from going unnoticed.
 #
-# ⚠️ Second symptom, same path (Tier C fuzzer, 2026-08-01): add `EMPTY` and "returns
-# nothing" becomes "returns everything twice" — RTS replies with the window's buckets as an
+# ⚠️ Second symptom, same path (Tier C fuzzer, 2026-08-01) — NOT gated under `strict`: add
+# `EMPTY` and "returns nothing" becomes "returns everything twice" — RTS replies with the window's buckets as an
 # all-NaN run followed by the same buckets carrying their values, ten rows for a five-bucket
 # window, even where the range reaches past the open bucket and the plain reverse+LATEST read
 # agrees. Our reply is the forward one reversed. Not matched either: the delta is a row-count
@@ -643,10 +656,12 @@
   kind: behavior
   description: >
     Reverse + LATEST + AGGREGATION on a compaction destination, with the range ending
-    before the open bucket: RTS returns an empty reply, dropping the closed bucket inside
-    the range; we return it, matching our own forward reply.
-  rationale: RTS contradicts its own forward and non-LATEST replies; matching it would mean
-    dropping in-range data (see DIV-0023 for the same reasoning)
+    past the last stored bucket but before the open one: RTS returns an empty reply,
+    dropping the closed buckets inside the range; we return them, matching our own forward
+    reply. Under `ts-compatibility-mode strict` we return the empty reply too.
+  rationale: RTS contradicts its own forward and non-LATEST replies, so the default mode
+    does not drop in-range data (see DIV-0023 for the same reasoning); the trigger depends
+    on stored state only, so `strict` reproduces it
   since: 0.1.0
   details_regex: '^\$: reference=\[\] subject=\[\[.*\(length 0 vs \d+\)$'
 
@@ -655,8 +670,11 @@
   kind: behavior
   description: >
     Reverse + LATEST + AGGREGATION on a compaction destination, with the range ending
-    before the open bucket: RTS returns an empty sample list for that series, dropping the
-    closed bucket inside the range; we return it, matching our own forward reply.
+    past the last stored bucket but before the open one: RTS returns an empty sample list
+    for that series (which EXCLUDEEMPTY then drops), dropping the closed buckets inside the
+    range; we return them, matching our own forward reply. Under
+    `ts-compatibility-mode strict` we return the empty list too. GROUPBY is unaffected on
+    both engines.
   rationale: see DIV-0030
   since: 0.1.0
   details_regex: '^\$(?:\[\d+\]\[2\]|\.[^\[]+\[2\]): reference=\[\] subject=\[\[.*\(length 0 vs \d+\)$'
@@ -710,7 +728,7 @@
     subject equivalent. It selects the wire protocol spoken between nodes by
     libmr, the MapReduce layer RTS uses to fan TS.MRANGE/TS.MGET/TS.QUERYINDEX
     out across cluster shards. New in the 8.8 reference bump (absent from the
-    previous 8.6 pin); still present, unchanged, on the 8.10 pin.
+    previous 8.6 pin); still present, unchanged, on the 8.10 and 8.12 pins.
   rationale: >
     Accepted (reference bump 2026-07-23): configures an RTS-internal transport
     this engine does not have. Cross-shard fan-out here is not libmr-based, so
@@ -731,7 +749,7 @@
     (validated to 1..16) and resizes its pool. This is a change in the
     reference, not in this engine: RTS 8.6, the previous-previous pin, rejected
     the same CONFIG SET as immutable exactly as we do; the mutability change
-    landed at the 8.6 -> 8.8 bump and is unchanged on 8.10.
+    landed at the 8.6 -> 8.8 bump and is unchanged on 8.10 and 8.12.
   rationale: >
     Accepted (reference bump 2026-07-23, §5.3 sign-off): the config sizes the
     module's global rayon thread pool, which is built once at load and shared by

@@ -1,7 +1,7 @@
-# RedisTimeSeries 8.10 Compatibility Test Plan
+# RedisTimeSeries 8.12 Compatibility Test Plan
 
 **Status:** Draft
-**Reference implementation:** the official Redis release of RedisTimeSeries as shipped in Redis Open Source 8.10 (`redis:8.10` Docker image, pinned by digest)
+**Reference implementation:** the official Redis release of RedisTimeSeries as shipped in Redis Open Source 8.12 (`redis:8.12` Docker image, pinned by digest)
 **Owner:** TBD
 
 valkey-timeseries advertises a *superset* of the RedisTimeSeries API. This plan defines what
@@ -13,7 +13,7 @@ today checks that behavior *against* RedisTimeSeries. This plan closes that gap.
 
 ## 1. Compatibility contract
 
-"Consistent with RedisTimeSeries 8.10" is decomposed into five testable layers, from strictest to
+"Consistent with RedisTimeSeries 8.12" is decomposed into five testable layers, from strictest to
 loosest:
 
 | Layer | Contract | Verification |
@@ -79,7 +79,7 @@ Also out of scope: performance parity, memory-usage parity (`TS.INFO memoryUsage
 
 ## 3. Reference environment
 
-- **Reference:** the official Redis release — the `redis:8.10` Docker image (timeseries is bundled
+- **Reference:** the official Redis release — the `redis:8.12` Docker image (timeseries is bundled
   in Redis Open Source 8.x). Pin the exact digest in the compose file; bumping the digest is a
   reviewed change accompanied by a changelog scan of the corresponding RedisTimeSeries release
   notes.
@@ -167,8 +167,8 @@ Applied to both sides before comparison:
 2. **Maps:** RESP3 maps and RESP2 flattened name/value arrays (`TS.INFO`, `MRANGE` label sets)
    compare as unordered dicts.
 3. **TS.INFO superset:** extra fields we emit are allowed and reported (not failed); *missing* or
-   value-mismatched RTS 8.10 fields fail. RTS 8.10 baseline field list is frozen in
-   `tests/compat/info-fields-8.10.yml`.
+   value-mismatched RTS 8.12 fields fail. RTS 8.12 baseline field list is frozen in
+   `tests/compat/info-fields-8.12.yml`.
 4. **MRANGE/MGET ordering:** RTS makes no cross-series order guarantee; sort by key before
    comparison. *Within* a series, sample order must match exactly.
 5. **Nondeterministic values** (`memoryUsage`, `chunkSize`-dependent chunk counts under different
@@ -195,7 +195,7 @@ build renders into a public "Compatibility" page:
   command: TS.INFO
   kind: reply-superset          # reply-superset | error-text | behavior | config-name | unsupported
   description: >
-    TS.INFO returns additional fields (…) beyond the RTS 8.10 set.
+    TS.INFO returns additional fields (…) beyond the RTS 8.12 set.
   rationale: extension metadata
   since: 0.x.0
 ```
@@ -225,7 +225,7 @@ value/duplicated/case-insensitivity), **key states** (missing key, WRONGTYPE, em
 | `TS.READ` | cursor forms (literal, `-`, `+`, `$`) and one-time resolution; `$` at `i64::MAX` (empty, no overflow); inclusive lower bound; MAX_COUNT truncation and the unbounded default; either option order; the arity-vs-`TSDB:` failure split (duplicated/malformed → wrong-arity, out-of-range values → `TSDB:`); `min_count > max_count` rejected before key access; BLOCK — immediate satisfaction, threshold wakeup, partial and empty timeout snapshots, key removal → empty array, blocking on a missing key, no sample consumption across readers; deny-blocking ordering (data when satisfied even inside MULTI/EVAL, error only when it would have to wait) |
 | `TS.GET` | empty series reply shape; LATEST semantics on compaction target with open bucket |
 | `TS.MGET` | filter matrix; WITHLABELS/SELECTED_LABELS; empty-series entries |
-| `TS.INFO` | field-by-field vs frozen 8.10 baseline; DEBUG variant (chunk list: presence/shape, not byte counts); after ALTER/CREATERULE/DEL mutations |
+| `TS.INFO` | field-by-field vs frozen 8.12 baseline; DEBUG variant (chunk list: presence/shape, not byte counts); after ALTER/CREATERULE/DEL mutations |
 | `TS.QUERYINDEX` | filter matrix; result ordering (normalize); no-match empty array; requires-non-empty-matcher error |
 | `TS.QUERYLABELS` | `LABELS`/`VALUES` subtype; FILTER matrix and no-FILTER (all series); absent-label empty result; no-match empty; RESP3 set reply (order-normalized); unknown-subtype/missing-label/FILTER errors |
 

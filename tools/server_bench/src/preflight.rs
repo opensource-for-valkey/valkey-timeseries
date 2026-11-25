@@ -27,7 +27,7 @@ pub struct ReferencePin {
 }
 
 impl ReferencePin {
-    /// `8.10.0:81000`
+    /// `8.12.0:81200`
     pub fn parse(s: &str) -> Result<Self> {
         let Some((server, module)) = s.split_once(':') else {
             bail!("reference pin must look like <server-version>:<module-version>, got {s:?}");

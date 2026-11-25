@@ -62,7 +62,7 @@ the manifest and on stderr.
 server_bench dry-run      --scenario F [--fixture DIR]
 server_bench fixture-args --scenario F
 server_bench preflight    --scenario F --fixture DIR --out DIR --subject URL --reference URL
-                          (--reference-pin 8.10.0:81000 | --self-check)
+                          (--reference-pin 8.12.0:81200 | --self-check)
                           [--subject-owned] [--reference-owned] [--module-path P] [--repo-root P]
                           [--trials N] [--read-duration-seconds S] [--note k=v]...
 server_bench run          (same arguments) — preflight, then every case's paired trials

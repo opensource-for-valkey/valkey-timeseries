@@ -240,7 +240,7 @@ A small number of divergences share a specific and uniquely dangerous shape: **b
 | Value | Behavior |
 | ----- | -------- |
 | `extended` (default) | Valkey TimeSeries semantics. |
-| `strict` | On the divergences listed below, resolve the command the way RedisTimeSeries 8.10 resolves it. |
+| `strict` | On the divergences listed below, resolve the command the way RedisTimeSeries 8.12 resolves it. |
 
 ```
 CONFIG SET ts-compatibility-mode strict
@@ -265,7 +265,11 @@ The same reasoning excludes the reverse direction. Where Valkey TimeSeries is *s
 | ---------- | -------------------- | -------- |
 | A repeated option on the range family — `TS.RANGE`, `TS.REVRANGE`, `TS.MRANGE`, `TS.MREVRANGE` (e.g. `COUNT 5 COUNT 2`, or a duplicated `AGGREGATION` / `FILTER` / `FILTER_BY_TS` / `FILTER_BY_VALUE` / `GROUPBY` / `SELECTED_LABELS`) | The **last** occurrence wins. | The **first** occurrence wins, as in RedisTimeSeries. |
 
+| A reverse, aggregated `LATEST` read of a compaction destination — `TS.REVRANGE`, or a series of `TS.MREVRANGE` without `GROUPBY` — whose range ends after the destination's last stored bucket but before its still-open one, without `EMPTY`, and without a `FILTER_BY_VALUE` unless `FILTER_BY_TS` is also given (DIV-0030/DIV-0031) | The closed buckets inside the range, as the forward query returns them. | No samples, as in RedisTimeSeries; `EXCLUDEEMPTY` then drops the series. |
+
 Both engines accept a duplicated option and neither errors, so the only difference is which silent resolution applies — the defining shape of this class. A query builder that appends an option twice is the realistic way to reach it. The duplicate's operands are still parsed in both modes, so a malformed operand remains an error either way.
+
+The reverse `LATEST` case is a RedisTimeSeries inconsistency rather than a second intended behavior: its own forward query, and its own reverse query without `LATEST`, both return the buckets. `extended` keeps them. `strict` reproduces the empty reply because what triggers it is decided by the stored data alone, so it can be matched exactly. RedisTimeSeries shows a different symptom with `EMPTY` (the bucket run repeated), and that one is not reproduced in either mode.
 
 ### Divergences that qualify but are not yet gated
 

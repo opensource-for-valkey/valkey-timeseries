@@ -1,4 +1,4 @@
-"""Configuration parity with RedisTimeSeries 8.10 (test plan §7.1).
+"""Configuration parity with RedisTimeSeries 8.12 (test plan §7.1).
 
 Diffs the `ts-*` config surface between the two engines: names, defaults,
 mutability (CONFIG SET accept/reject), and value validation — including the
@@ -26,7 +26,7 @@ import pytest
 import valkey
 from valkey.exceptions import ResponseError
 
-# The complete RTS 8.10 ts-* surface with its defaults, observed black-box
+# The complete RTS 8.12 ts-* surface with its defaults, observed black-box
 # against the pinned reference image (values as CONFIG GET reports them).
 RTS_CONFIG_DEFAULTS = {
     "ts-retention-policy": "0",

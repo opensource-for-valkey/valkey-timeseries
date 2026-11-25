@@ -2,7 +2,7 @@
 
 Each `corpus/*.json` file is a minimal command sequence — either a fuzzer shrink
 or a hand-written reproducer of a fixed bug — that must stay byte-identical to
-RedisTimeSeries 8.10. Every file is replayed through the `diff` fixture under both
+RedisTimeSeries 8.12. Every file is replayed through the `diff` fixture under both
 RESP versions, so a regression that reopens the bug fails here as a plain
 mismatch. A file whose only remaining delta is an intentional divergence is
 tolerated via the registry (its `expect_divergence` id documents which one).
@@ -17,6 +17,7 @@ Corpus file schema:
     "description": "one line: what this pins",
     "origin":      "manual reproducer" | "fuzzer shrink YYYY-MM-DD",
     "expect_divergence": "DIV-00xx" | null,   # optional; documents a registered delta
+    "compat_mode": "strict",                  # optional; the subject's ts-compatibility-mode
     "commands": [ ["TS.CREATE", "fz:k0", ...], ["TS.ADD", ...], ... ]
   }
 
@@ -26,6 +27,7 @@ observation (see tests/compat/README.md).
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import os
@@ -47,18 +49,37 @@ def _load_cases():
 
 _CASES = _load_cases()
 
+_COMPAT_MODE = "ts.ts-compatibility-mode"
+
+
+@contextlib.contextmanager
+def _subject_compat_mode(client, mode):
+    """Replay with the subject in `mode`, restoring its previous value afterwards: the
+    subject server is session-scoped, so a leaked mode would change every later test."""
+    if mode is None:
+        yield
+        return
+    current = client.execute_command("CONFIG", "GET", _COMPAT_MODE)
+    previous = next(iter(current.values())) if isinstance(current, dict) else current[1]
+    client.execute_command("CONFIG", "SET", _COMPAT_MODE, mode)
+    try:
+        yield
+    finally:
+        client.execute_command("CONFIG", "SET", _COMPAT_MODE, previous)
+
 
 @pytest.mark.skipif(not _CASES, reason="no corpus files present")
 @pytest.mark.parametrize("spec", _CASES)
 def test_corpus_reproducer(diff, spec):
     commands = spec["commands"]
     assert commands, f"empty corpus case: {spec.get('description')!r}"
-    for args in commands:
-        # A command that errors identically on both engines is a matching error,
-        # not a regression; the DiffClient re-raises the subject's ResponseError
-        # only after confirming the reference errored too. A genuine divergence
-        # raises CompatMismatch (AssertionError), which is not caught here.
-        try:
-            diff.execute_command(*args)
-        except ResponseError:
-            pass
+    with _subject_compat_mode(diff.subject, spec.get("compat_mode")):
+        for args in commands:
+            # A command that errors identically on both engines is a matching error,
+            # not a regression; the DiffClient re-raises the subject's ResponseError
+            # only after confirming the reference errored too. A genuine divergence
+            # raises CompatMismatch (AssertionError), which is not caught here.
+            try:
+                diff.execute_command(*args)
+            except ResponseError:
+                pass

@@ -3,7 +3,7 @@
 # reference_server.sh — provision, start and stop the RedisTimeSeries compatibility
 # reference server. Sourceable; used by build.sh and fuzz.sh.
 #
-# See docs/rts-compat-build-integration-plan.md. The digest-pinned redis:8.10 image in
+# See docs/rts-compat-build-integration-plan.md. The digest-pinned redis:8.12 image in
 # docker-compose.compat.yml is the canonical reference artifact (§3); the native binary
 # is a secondary artifact that must track it and is only chosen automatically once an
 # equivalence run has been recorded for the pin (§3.1).
@@ -67,8 +67,8 @@ _compat_ref_compose() {
 # --- pin -------------------------------------------------------------------
 # Must track the image pinned in docker-compose.compat.yml. Bump both together, in
 # one reviewed change recorded in docs/plans/rts-reference-bumps.md.
-COMPAT_REFERENCE_VERSION="${COMPAT_REFERENCE_VERSION:-8.10.0}"
-COMPAT_REFERENCE_MODULE_VERSION="${COMPAT_REFERENCE_MODULE_VERSION:-81000}"
+COMPAT_REFERENCE_VERSION="${COMPAT_REFERENCE_VERSION:-8.12.0}"
+COMPAT_REFERENCE_MODULE_VERSION="${COMPAT_REFERENCE_MODULE_VERSION:-81200}"
 
 # The pin for which a §3.1 equivalence run (native binary vs. the pinned image) has
 # been recorded in docs/plans/rts-reference-bumps.md. While this does not match
@@ -107,7 +107,7 @@ _compat_ref_redact_url() {
 # ---------------------------------------------------------------------------
 # supported distro/arch matrix
 #
-# SHA256s read from the packages.redis.io `Packages` index on 2026-08-01. Note that
+# SHA256s read from the packages.redis.io `Packages` index on 2026-11-24. Note that
 # the index also carries a `redis-server-dbgsym` stanza per dist/arch: these come from
 # the exact `Filename:` entries, not a `Package: redis-server` prefix match.
 #
@@ -119,12 +119,12 @@ _compat_ref_redact_url() {
 # ---------------------------------------------------------------------------
 _compat_ref_matrix_entry() {  # $1=distro $2=arch -> "<sha256> <status>"
     case "$COMPAT_REFERENCE_VERSION/$1/$2" in
-        8.10.0/jammy/amd64)    echo "5266da6ed3464b076d5081a38932adfe3639a8720971d6327c90c050923772d1 candidate" ;;
-        8.10.0/jammy/arm64)    echo "f1d6d41b64e3e73862a7c5e938c001a91f6cb98ea3cb9f7e04b0c3c87d13c85b candidate" ;;
-        8.10.0/noble/amd64)    echo "e4b63451e64d102d26c1a423627a701fe4fed35fab1715c667215b610cca2ee7 candidate" ;;
-        8.10.0/noble/arm64)    echo "9f5e93ba8306d410af6fe3afc55ef277b0b3053380e86614b580644534b0edec candidate" ;;
-        8.10.0/bookworm/amd64) echo "6c4dfd72159f128830c427be8b93cfab4f6112f515d2571d14386b4148e4d89e candidate" ;;
-        8.10.0/bookworm/arm64) echo "d07036679d319799322e8e7434a5c7b3e65249ab4e11260b9f826d6172ebd700 candidate" ;;
+        8.12.0/jammy/amd64)    echo "db5ff8f69f98b8c12564e65c1b218c74c58da5cb08fd02d097ec4ffc13ccb0ee candidate" ;;
+        8.12.0/jammy/arm64)    echo "0d164950f6001940ce077b7c76aa903110f6f689bca9b2d4e138e450b1863fe3 candidate" ;;
+        8.12.0/noble/amd64)    echo "4484ec06b282f5f3039ed1de97afc3c11f07babb46674d429b08d5c850f9dc40 candidate" ;;
+        8.12.0/noble/arm64)    echo "425175441e51bb5bf11b7f8207551d215afe0eb9dd8f4ed6d9f3d8aad88202bf candidate" ;;
+        8.12.0/bookworm/amd64) echo "8fe6a672f56e07c69d56e32fe6f9e6c29cdbe69e19fd2583bec3c244ca1a3511 candidate" ;;
+        8.12.0/bookworm/arm64) echo "fa9c110c9d478d8936fc186bae93651f690eeff8a5aac56a7c2fb1b479d1f9a9 candidate" ;;
         *) return 1 ;;
     esac
 }
@@ -153,7 +153,7 @@ _compat_ref_detect_arch() {
 }
 
 _compat_ref_deb_url() {  # $1=distro $2=arch
-    printf 'https://packages.redis.io/deb/pool/%s/r/re/redis-server_%s-1rl2~%s1_%s.deb' \
+    printf 'https://packages.redis.io/deb/pool/%s/r/re/redis-server_%s-1rl1~%s1_%s.deb' \
         "$1" "$COMPAT_REFERENCE_VERSION" "$1" "$2"
 }
 
@@ -397,7 +397,7 @@ PY
 }
 
 # A silent upstream change would quietly reinterpret every version-named claim in
-# divergences.yml and info-fields-8.10.yml, so a mismatch is fatal, not a warning.
+# divergences.yml and info-fields-8.12.yml, so a mismatch is fatal, not a warning.
 _compat_ref_validate_pin() {  # $1=url
     "${COMPAT_REF_PY[@]}" - "$1" "$COMPAT_REFERENCE_VERSION" "$COMPAT_REFERENCE_MODULE_VERSION" <<'PY'
 import sys
@@ -440,7 +440,7 @@ if got_module != want_module:
 if problems:
     print("reference pin mismatch: " + "; ".join(problems), file=sys.stderr)
     print(
-        "The registry claims in tests/compat/divergences.yml and info-fields-8.10.yml\n"
+        "The registry claims in tests/compat/divergences.yml and info-fields-8.12.yml\n"
         "were probed against the pinned reference; re-probe them before moving the pin\n"
         "(docs/plans/rts-reference-bumps.md).",
         file=sys.stderr,
