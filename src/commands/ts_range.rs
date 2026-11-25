@@ -2,6 +2,7 @@ use crate::commands::command_parser::parse_range_options;
 use crate::common::replies::{reply_with_multi_samples, reply_with_samples};
 use crate::iterators::{
     TimeSeriesRangeIterator, TimeSeriesRangeRowIterator, get_range_latest_sample,
+    rts_reverse_latest_empties_series,
 };
 use crate::series::get_timeseries;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
@@ -69,6 +70,10 @@ fn range_internal(ctx: &Context, args: Vec<ValkeyString>, is_reverse: bool) -> V
     // server has already refused a denied key before this handler ran. The
     // per-request user resolve was 2–3 % of a small range read.
     let series = get_timeseries(ctx, &key, None)?;
+
+    if rts_reverse_latest_empties_series(ctx, &series, &options, is_reverse) {
+        return Ok(ValkeyValue::Array(Vec::new()));
+    }
 
     let latest = get_range_latest_sample(ctx, &series, &options);
 

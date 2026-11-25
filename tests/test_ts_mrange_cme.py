@@ -602,6 +602,53 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
             elif 'ts:{slot2}:dst_rev' in key:
                 assert series[2][0][1] == b'30'
 
+    def test_mrevrange_cme_strict_latest_empties_destination(self):
+        """DIV-0031 under `ts-compatibility-mode strict`, answered across shards.
+
+        Each shard decides for its own destinations: one whose range ends after its last
+        stored bucket but before its open one gets no samples, as RedisTimeSeries replies,
+        so EXCLUDEEMPTY drops it. GROUPBY members keep their buckets on both engines.
+        """
+        cluster_client = self.new_cluster_client()
+        for tag in ("slot1", "slot2"):
+            src, dst = f"ts:{{{tag}}}:sl_src", f"ts:{{{tag}}}:sl_dst"
+            cluster_client.execute_command("TS.CREATE", src, "LABELS", "kind", "sl_src")
+            cluster_client.execute_command("TS.CREATE", dst, "LABELS", "kind", "sl_dst")
+            cluster_client.execute_command("TS.CREATERULE", src, dst, "AGGREGATION", "avg", 500)
+            for ts in (0, 500, 1000, 1600):  # stored buckets 0 and 500; open bucket 1500
+                cluster_client.execute_command("TS.ADD", src, ts, 1)
+
+        primaries = [self.new_client_for_primary(i) for i in range(len(self.replication_groups))]
+        query = ("TS.MREVRANGE", "-", 1200, "LATEST", "AGGREGATION", "avg", 500)
+        try:
+            for primary in primaries:
+                primary.execute_command("CONFIG", "SET", "ts.ts-compatibility-mode", "strict")
+            client = primaries[0]
+
+            result = client.execute_command(*query, "FILTER", "kind=sl_dst")
+            assert len(result) == 2
+            assert all(series[2] == [] for series in result), result
+
+            assert client.execute_command(*query, "EXCLUDEEMPTY", "FILTER", "kind=sl_dst") == []
+
+            grouped = client.execute_command(
+                *query, "FILTER", "kind=sl_dst", "GROUPBY", "kind", "REDUCE", "count"
+            )
+            assert [row[0] for row in grouped[0][2]] == [1000, 500, 0], grouped
+
+            # The range end at the last stored bucket is outside the window.
+            at_last = client.execute_command(
+                "TS.MREVRANGE", "-", 1000, "LATEST", "AGGREGATION", "avg", 500,
+                "FILTER", "kind=sl_dst",
+            )
+            assert all([row[0] for row in s[2]] == [1000, 500, 0] for s in at_last), at_last
+        finally:
+            for primary in primaries:
+                primary.execute_command("CONFIG", "SET", "ts.ts-compatibility-mode", "extended")
+
+        result = client.execute_command(*query, "FILTER", "kind=sl_dst")
+        assert all([row[0] for row in s[2]] == [1000, 500, 0] for s in result), result
+
     def test_mrange_cme_exclude_empty(self):
         """EXCLUDEEMPTY drops empty series regardless of which shard owns them.
 

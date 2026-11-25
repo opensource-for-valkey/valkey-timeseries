@@ -16,6 +16,7 @@ pub(crate) use sample_merge_iterator::SampleMergeIterator;
 pub(crate) use sample_reducer::SampleReducer;
 pub(crate) use timeseries_range_iterator::{
     TimeSeriesRangeIterator, TimeSeriesRangeRowIterator, get_range_latest_sample,
+    rts_reverse_latest_empties_series,
 };
 pub use timestamp_filter_iterator::TimestampFilterIterator;
 pub(crate) use utils::{

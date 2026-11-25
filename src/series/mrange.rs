@@ -16,7 +16,7 @@ use crate::iterators::{
     create_range_tail_iterator_from_snapshot, create_row_iterator, create_row_iterator_for_reply,
     create_row_iterator_from_base, create_row_iterator_from_snapshot, create_row_tail_iterator,
     create_row_tail_iterator_from_snapshot, get_range_latest_sample, range_empty_fill_bounds,
-    range_tail_empty_fill_bounds,
+    range_tail_empty_fill_bounds, rts_reverse_latest_empties_series,
 };
 use crate::labels::Label;
 use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk, samples_to_chunk_lossless};
@@ -36,6 +36,8 @@ struct MRangeSeriesMeta<'a> {
     source_key: Vec<u8>,
     latest: Option<Sample>,
     group_label_value: Option<String>,
+    /// RTS answers this series with no samples ([`rts_empties`]); never set under GROUPBY.
+    rts_empty: bool,
 }
 
 /// One member series of a GROUPBY group, wherever its samples are read from: the live
@@ -222,6 +224,7 @@ pub(crate) fn process_mrange_group_partials(
         .map(|(guard, key)| MRangeSeriesMeta {
             series: guard,
             source_key: key.as_slice().to_vec(),
+            rts_empty: false,
             group_label_value: None,
             latest: get_latest(&options.range, ctx, guard),
         })
@@ -395,6 +398,7 @@ pub(crate) fn process_mrange_query(
         .map(|(guard, key)| MRangeSeriesMeta {
             series: guard,
             source_key: key.as_slice().to_vec(),
+            rts_empty: rts_empties(ctx, guard, &options),
             group_label_value: None,
             latest: {
                 // This is done upfront to enable parallel series processing below
@@ -485,6 +489,18 @@ fn process_mrange(
 fn get_latest(options: &RangeOptions, ctx: &Context, series: &TimeSeries) -> Option<Sample> {
     get_range_latest_sample(ctx, series, options)
         .filter(|s| options.value_filter.is_none_or(|vf| vf.is_match(s.value)))
+}
+
+/// [`rts_reverse_latest_empties_series`] for one series of `options`. GROUPBY reads are not
+/// affected on RTS: a group's members are read ascending whatever the reply's order.
+fn rts_empties(ctx: &Context, series: &TimeSeries, options: &MRangeOptions) -> bool {
+    options.grouping.is_none()
+        && rts_reverse_latest_empties_series(
+            ctx,
+            series,
+            &options.range,
+            options.is_reverse || options.reply_reverse,
+        )
 }
 
 fn create_iter<'a>(
@@ -617,7 +633,9 @@ fn handle_non_grouped(
         // aggregation push-down a shard produces these rows too; they ship
         // as per-column chunks (SeriesRangeResponse.columns), so the
         // clustered path is valid here.
-        let data = if is_multi {
+        let data = if meta.rts_empty {
+            empty_result_data(is_multi)
+        } else if is_multi {
             let reply_reverse = options.is_reverse || options.reply_reverse;
             let iter = match limit {
                 Some(SampleLimit::Tail(count)) => create_row_tail_iterator(
@@ -689,6 +707,15 @@ fn handle_non_grouped(
             .num_threads(threads)
             .map(answer_one)
             .collect()
+    }
+}
+
+/// A series' reply with no samples, in the shape its query yields.
+fn empty_result_data(is_multi: bool) -> SeriesResultData {
+    if is_multi {
+        SeriesResultData::Rows(Vec::new())
+    } else {
+        SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(UncompressedChunk::default()))
     }
 }
 
@@ -1337,6 +1364,8 @@ pub struct SnapshotSeries {
     pub empty_fill: EmptyFillBounds,
     /// The GROUPBY label's value, collected for the coordinator on a shard.
     pub group_label_value: Option<String>,
+    /// RTS answers this series with no samples ([`rts_empties`]); never set under GROUPBY.
+    pub rts_empty: bool,
 }
 
 /// Whether a snapshot can stand in for the series: `FILTER_BY_TS` needs the
@@ -1422,6 +1451,7 @@ pub(crate) fn local_mrange_query<R>(
             .map(|(guard, key)| MRangeSeriesMeta {
                 series: guard,
                 source_key: key.as_slice().to_vec(),
+                rts_empty: rts_empties(ctx, guard, options),
                 group_label_value: None,
                 latest: get_latest(&options.range, ctx, guard),
             })
@@ -1484,7 +1514,9 @@ fn snapshot_series(
         .filter(|(guard, _)| takes_part(guard, options))
         .map(|(guard, key)| {
             let latest = get_latest(&options.range, ctx, guard);
-            snapshot_one(guard, key.as_slice().to_vec(), latest, options, limit)
+            let mut snapshot = snapshot_one(guard, key.as_slice().to_vec(), latest, options, limit);
+            snapshot.rts_empty = rts_empties(ctx, guard, options);
+            snapshot
         })
         .collect()
 }
@@ -1523,6 +1555,7 @@ fn snapshot_one(
             }
             _ => range_empty_fill_bounds(series, &options.range, options.is_reverse, reply_reverse),
         },
+        rts_empty: false,
         group_label_value: options
             .grouping
             .as_ref()
@@ -1721,6 +1754,20 @@ fn decode_snapshot(
     limit: Option<SampleLimit>,
     compress: bool,
 ) -> MRangeSeriesResult {
+    if s.rts_empty {
+        let is_multi = options
+            .range
+            .aggregation
+            .as_ref()
+            .is_some_and(|a| a.is_multi());
+        return MRangeSeriesResult {
+            group_label_value: s.group_label_value,
+            key: s.key,
+            labels: s.labels,
+            sources: Vec::new(),
+            data: empty_result_data(is_multi),
+        };
+    }
     // Multi-aggregation yields rows, aggregated ascending and reversed at the end, as
     // `create_row_iterator` does on the live series. Rows ship as per-column chunks, so
     // `compress` does not apply.
@@ -1849,6 +1896,7 @@ mod tests {
             series,
             source_key: key.into(),
             latest: None,
+            rts_empty: false,
             group_label_value: group.map(String::from),
         }
     }
@@ -2380,6 +2428,7 @@ mod tests {
                                     options.is_reverse,
                                     options.is_reverse,
                                 ),
+                                rts_empty: false,
                                 group_label_value: None,
                             }
                         })
@@ -2466,6 +2515,7 @@ mod tests {
                                         options.is_reverse,
                                         options.is_reverse || options.reply_reverse,
                                     ),
+                                    rts_empty: false,
                                     group_label_value: Some((*group).into()),
                                 })
                                 .collect()
@@ -2537,6 +2587,7 @@ mod tests {
             snapshot: s1.snapshot_range(start, end),
             latest: None,
             empty_fill: Default::default(),
+            rts_empty: false,
             group_label_value: None,
         }];
         let result = decode_shard_snapshots(snapshots, &options, None, true, &|| true);
@@ -2711,6 +2762,7 @@ mod tests {
                                     false,
                                     false,
                                 ),
+                                rts_empty: false,
                                 group_label_value: group.map(String::from),
                             })
                             .collect();
@@ -2875,6 +2927,7 @@ mod tests {
                                         series,
                                         source_key: (*key).into(),
                                         latest: latest.filter(|_| !series.is_empty()),
+                                        rts_empty: false,
                                         group_label_value: None,
                                     })
                                     .collect();
@@ -2938,6 +2991,7 @@ mod tests {
                                 false,
                                 false,
                             ),
+                            rts_empty: false,
                             group_label_value: Some("x".into()),
                         }
                     })
@@ -3174,6 +3228,7 @@ mod tests {
                                     series,
                                     source_key: (*key).into(),
                                     latest: latest_of(series),
+                                    rts_empty: false,
                                     group_label_value: group.map(String::from),
                                 })
                                 .collect();

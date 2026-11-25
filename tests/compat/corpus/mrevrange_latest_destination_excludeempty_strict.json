@@ -1,0 +1,18 @@
+{
+  "description": "Under ts-compatibility-mode strict, a reverse aggregated LATEST read of a compaction destination whose range ends past its last stored bucket but before the open one returns no samples for it, as RTS does (DIV-0031), so EXCLUDEEMPTY drops the destination from the reply.",
+  "origin": "fuzzer shrink 2026-11-24",
+  "expect_divergence": null,
+  "compat_mode": "strict",
+  "commands": [
+    ["TS.CREATE", "fz:k0", "RETENTION", "0", "ENCODING", "COMPRESSED", "CHUNK_SIZE", "128", "DUPLICATE_POLICY", "BLOCK", "LABELS", "metric", "cpu", "host", "h1"],
+    ["TS.CREATE", "fz:k1", "RETENTION", "0", "ENCODING", "COMPRESSED", "CHUNK_SIZE", "128", "DUPLICATE_POLICY", "BLOCK", "LABELS", "metric", "cpu", "host", "h1"],
+    ["TS.CREATE", "fz:k2", "RETENTION", "0", "ENCODING", "COMPRESSED", "CHUNK_SIZE", "128", "DUPLICATE_POLICY", "BLOCK", "LABELS", "metric", "cpu", "host", "h1"],
+    ["TS.CREATE", "fz:rollup", "LABELS", "metric", "cpu", "host", "h1"],
+    ["TS.CREATERULE", "fz:k0", "fz:rollup", "AGGREGATION", "std.p", "500"],
+    ["TS.ADD", "fz:k0", "0", "0"],
+    ["TS.ADD", "fz:k0", "500", "0"],
+    ["TS.MREVRANGE", "0", "1", "LATEST", "AGGREGATION", "avg", "500", "EXCLUDEEMPTY", "FILTER", "metric=cpu"],
+    ["TS.MREVRANGE", "0", "1", "LATEST", "AGGREGATION", "avg", "500", "FILTER", "metric=cpu"],
+    ["TS.REVRANGE", "fz:rollup", "0", "1", "LATEST", "AGGREGATION", "avg", "500"]
+  ]
+}

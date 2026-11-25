@@ -927,3 +927,90 @@ class TestReverseLatestAggregationOnDestination:
         diff("TS.RANGE", "c:edst", 0, 2001, "LATEST", "AGGREGATION", "avg", 500, "EMPTY")
         # Dropping LATEST agrees too, so EMPTY alone is not the trigger.
         diff("TS.REVRANGE", "c:edst", 0, 2001, "AGGREGATION", "avg", 500, "EMPTY")
+
+
+class TestStrictReverseLatestAggregation:
+    """DIV-0030/0031 under `ts-compatibility-mode strict`: we reply as RTS does.
+
+    Observed black-box on the reference: a reverse, aggregated LATEST read of a compaction
+    destination comes back with no samples whenever its end lies past the destination's
+    last stored sample but before the still-open bucket. Every case here is diffed, so the
+    boundaries are pinned on both sides: one millisecond either way of that window, and
+    each option that does or does not change it, must agree exactly.
+
+    EMPTY is left out: it turns the empty reply into a duplicated bucket run (see
+    TestReverseLatestAggregationOnDestination), which strict does not reproduce.
+    """
+
+    @staticmethod
+    def _destination(client):
+        """Stored buckets at 0, 500 and 1000; the open bucket is at 1500."""
+        client.execute_command("TS.CREATE", "c:sr:src", "LABELS", "grp", "sr", "n", "src")
+        client.execute_command("TS.CREATE", "c:sr:dst", "LABELS", "grp", "sr", "n", "dst")
+        client.execute_command(
+            "TS.CREATERULE", "c:sr:src", "c:sr:dst", "AGGREGATION", "avg", 500
+        )
+        for ts, value in ((0, 1), (100, 3), (500, 5), (700, 7), (1000, 9), (1600, 11)):
+            client.execute_command("TS.ADD", "c:sr:src", ts, value)
+
+    @pytest.fixture
+    def destination(self, strict_subject):
+        self._destination(strict_subject.reference)
+        self._destination(strict_subject.subject)
+        return strict_subject
+
+    @pytest.mark.parametrize("end", [999, 1000, 1001, 1200, 1499, 1500, 1501, "+"])
+    @pytest.mark.parametrize(
+        "options",
+        [
+            ("AGGREGATION", "avg", 500),
+            ("AGGREGATION", "avg", 250),
+            ("AGGREGATION", "count", 1000),
+            ("AGGREGATION", "avg,max", 500),
+            ("AGGREGATION", "avg", 500, "BUCKETTIMESTAMP", "mid"),
+            ("ALIGN", 100, "AGGREGATION", "avg", 500),
+            ("COUNT", 1, "AGGREGATION", "avg", 500),
+            ("FILTER_BY_TS", 0, 1000, "AGGREGATION", "avg", 500),
+            ("FILTER_BY_VALUE", 0, 100, "AGGREGATION", "avg", 500),
+            ("FILTER_BY_TS", 0, 1000, "FILTER_BY_VALUE", 0, 100, "AGGREGATION", "avg", 500),
+            (),
+        ],
+        ids=lambda o: "-".join(map(str, o)) or "raw",
+    )
+    def test_revrange(self, destination, end, options):
+        destination("TS.REVRANGE", "c:sr:dst", "-", end, "LATEST", *options)
+        destination("TS.REVRANGE", "c:sr:dst", 600, end, "LATEST", *options)
+
+    @pytest.mark.parametrize("end", [1000, 1200, 1500])
+    @pytest.mark.parametrize(
+        "options",
+        [
+            ("AGGREGATION", "avg", 500),
+            ("AGGREGATION", "avg,max", 500),
+            ("WITHLABELS", "AGGREGATION", "avg", 500),
+            ("SELECTED_LABELS", "n", "AGGREGATION", "avg", 500),
+            ("COUNT", 1, "AGGREGATION", "avg", 500),
+            # The fuzzer's case: the emptied destination is then excluded as RTS excludes it.
+            ("AGGREGATION", "avg", 500, "EXCLUDEEMPTY"),
+            ("AGGREGATION", "avg,max", 500, "EXCLUDEEMPTY"),
+        ],
+        ids=lambda o: "-".join(map(str, o)),
+    )
+    def test_mrevrange(self, destination, end, options):
+        destination("TS.MREVRANGE", "-", end, "LATEST", *options, "FILTER", "grp=sr")
+
+    @pytest.mark.parametrize("reducer", ["sum", "count", "max"])
+    def test_groupby_members_keep_their_buckets(self, destination, reducer):
+        """A GROUPBY member is read ascending on RTS too, so its buckets count."""
+        destination(
+            "TS.MREVRANGE", "-", 1200, "LATEST", "AGGREGATION", "avg", 500,
+            "FILTER", "grp=sr", "GROUPBY", "grp", "REDUCE", reducer,
+        )
+
+    def test_extended_mode_keeps_the_in_range_buckets(self, diff):
+        """The default mode still answers with the buckets (DIV-0030)."""
+        self._destination(diff.subject)
+        reply = diff.subject.execute_command(
+            "TS.REVRANGE", "c:sr:dst", "-", 1200, "LATEST", "AGGREGATION", "avg", 500
+        )
+        assert [row[0] for row in reply] == [1000, 500, 0], reply
