@@ -39,6 +39,7 @@ pub(crate) mod persistence;
 mod postings_query_tests;
 pub mod search_expr;
 pub(crate) mod server_events;
+pub mod string_filters;
 #[cfg(test)]
 mod timeseries_index_tests;
 

@@ -20,7 +20,7 @@ use super::{
     compile, parse, validate,
 };
 use crate::series::index::{
-    StringFilter, LabelSearchResult, SearchHints, SearchResultOrdering, apply_search_hints,
+    LabelSearchResult, SearchHints, SearchResultOrdering, StringFilter, apply_search_hints,
 };
 use proptest::prelude::*;
 use std::collections::HashMap;
@@ -68,7 +68,8 @@ impl StringFilter for CountingFilter {
     }
 }
 
-type Factory<'a> = Box<dyn FnMut(&str, bool) -> Result<Box<dyn StringFilter>, TermFilterError> + 'a>;
+type Factory<'a> =
+    Box<dyn FnMut(&str, bool) -> Result<Box<dyn StringFilter>, TermFilterError> + 'a>;
 
 /// Term filters that match by substring and score from `scores`, where a missing term
 /// scores 0.

@@ -16,8 +16,8 @@
 
 use super::postings::Postings;
 use super::{
-    DEFAULT_SERIES_BATCH_SIZE, StringFilter, IndexKey, NoOpSearchMatcher, PostingsBitmap,
-    SeriesCursor, SeriesSelection, TimeSeriesIndex, for_each_planned_series, get_db_index,
+    DEFAULT_SERIES_BATCH_SIZE, IndexKey, NoOpSearchMatcher, PostingsBitmap, SeriesCursor,
+    SeriesSelection, StringFilter, TimeSeriesIndex, for_each_planned_series, get_db_index,
     read_planned,
 };
 use crate::common::acl::check_metadata_permissions;
@@ -1483,8 +1483,8 @@ impl LabelQuerier for DefaultLabelQuerier {
 #[cfg(test)]
 mod tests {
     use super::{
-        StringFilter, LabelQueryResult, LabelSearchResult, NameScanOptions, NoOpSearchMatcher,
-        SearchHints, SearchResultOrdering, TimeSeriesIndex, apply_search_hints, collect_top_k,
+        LabelQueryResult, LabelSearchResult, NameScanOptions, NoOpSearchMatcher, SearchHints,
+        SearchResultOrdering, StringFilter, TimeSeriesIndex, apply_search_hints, collect_top_k,
         collect_unscoped_label_names, collect_unscoped_label_values,
         collect_unscoped_label_values_in_holds, compare_search_results, label_cardinality_in_holds,
         label_search_exceeds_inline_budget, rank_label_names_in_holds, scan_label_names_in_holds,

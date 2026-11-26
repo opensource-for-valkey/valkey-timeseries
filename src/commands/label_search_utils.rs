@@ -16,11 +16,10 @@ use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, FanoutTarget, is_clustered};
 use crate::parser::series_selector::parse_series_selector;
 use crate::series::index::{
-    DefaultLabelQuerier, FuzzyAlgorithm, StringFilter, LabelNameSearchFilter, LabelQuerier,
-    LabelQueryResult, SEARCH_RESULT_DEFAULT_LIMIT, SEARCH_RESULT_LIMIT_MAX, SearchHints,
-    SearchResultOrdering, SelectHints, SeriesCursor, SortBy, check_label_query_permissions,
-    get_db_index, label_search_exceeds_inline_budget, label_search_selection, normalize_limit,
-    plan_if_cheap,
+    DefaultLabelQuerier, FuzzyAlgorithm, LabelNameSearchFilter, LabelQuerier, LabelQueryResult,
+    SEARCH_RESULT_DEFAULT_LIMIT, SEARCH_RESULT_LIMIT_MAX, SearchHints, SearchResultOrdering,
+    SelectHints, SeriesCursor, SortBy, StringFilter, check_label_query_permissions, get_db_index,
+    label_search_exceeds_inline_budget, label_search_selection, normalize_limit, plan_if_cheap,
 };
 use crate::series::request_types::MatchFilterOptions;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};

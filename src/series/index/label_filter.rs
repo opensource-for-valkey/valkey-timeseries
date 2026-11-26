@@ -4,7 +4,7 @@ use std::fmt::Display;
 
 /// `value` lowercased, borrowed when lowercasing would not change it: label names and values
 /// are usually lowercase ASCII already, and a filter sees every candidate of a scan.
-fn to_lowercase_cow(value: &str) -> Cow<'_, str> {
+pub(crate) fn to_lowercase_cow(value: &str) -> Cow<'_, str> {
     if value.is_ascii() && !value.bytes().any(|b| b.is_ascii_uppercase()) {
         Cow::Borrowed(value)
     } else {
@@ -55,6 +55,12 @@ pub trait StringFilter: Send + Sync {
     /// Returns (accepted, score) where score is used for relevance ranking.
     /// Score should be in range [0.0, 1.0] where 1.0 is perfect match.
     fn accept(&self, value: &str) -> (bool, f64);
+}
+
+impl<T: StringFilter + ?Sized> StringFilter for Box<T> {
+    fn accept(&self, value: &str) -> (bool, f64) {
+        (**self).accept(value)
+    }
 }
 
 #[derive(Default)]
@@ -233,7 +239,7 @@ impl StringFilter for LabelNameSearchFilter {
 #[cfg(test)]
 mod tests {
     use super::{
-        FuzzyAlgorithm, StringFilter, LabelNameSearchFilter, SimilarityFilter, to_lowercase_cow,
+        FuzzyAlgorithm, LabelNameSearchFilter, SimilarityFilter, StringFilter, to_lowercase_cow,
     };
     use std::borrow::Cow;
 
