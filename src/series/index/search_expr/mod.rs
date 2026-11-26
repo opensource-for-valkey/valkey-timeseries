@@ -11,25 +11,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Boolean search expressions that combine terms with `NOT`, `AND`, `OR`, and parentheses.
+//! Boolean search expressions that combine terms with `NOT`, `AND`, `OR`, and parentheses,
+//! and compile them into [`FuzzyFilter`](crate::series::index::FuzzyFilter)s.
 //!
 //! Ported from Prometheus `util/searchexpr`.
 
+mod compiler;
+#[cfg(test)]
+mod compiler_tests;
 mod parser;
 #[cfg(test)]
 mod parser_tests;
 
+pub use compiler::{CompiledFilter, TermFilterError, compile, validate};
 pub use parser::{Expr, parse};
 
 pub(crate) const MAX_EXPRESSION_BYTES: usize = 4096;
 pub(crate) const MAX_EXPRESSION_TERMS: usize = 32;
 pub(crate) const MAX_EXPRESSION_NESTING_DEPTH: usize = 16;
 
-/// An error parsing a search expression.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// An error parsing or compiling a search expression.
+#[derive(Debug, thiserror::Error)]
 pub enum SearchExprError {
     #[error("search expression: {0}")]
     Invalid(String),
+    /// The term filter factory refused a term.
+    #[error("search expression: compile term {term:?}: {source}")]
+    TermFilter {
+        term: String,
+        #[source]
+        source: TermFilterError,
+    },
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> SearchExprError {
