@@ -10,6 +10,7 @@
 
 mod build;
 mod combining;
+pub(crate) mod label_filter;
 pub mod search_expr;
 mod term;
 mod wrapping;

@@ -32,7 +32,6 @@ pub use timeseries_index::*;
 pub(crate) mod asm;
 mod ids;
 mod key_buffer;
-mod label_filter;
 mod label_querier;
 pub(crate) mod persistence;
 #[cfg(test)]
@@ -43,8 +42,8 @@ pub mod string_filters;
 mod timeseries_index_tests;
 
 pub use ids::next_timeseries_id;
-pub(crate) use label_filter::*;
 pub use label_querier::*;
+pub(crate) use string_filters::label_filter::*;
 
 /// Map from db to TimeseriesIndex
 pub type TimeSeriesIndexMap = HashMap<i32, TimeSeriesIndex, BuildNoHashHasher<i32>>;
