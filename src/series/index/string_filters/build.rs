@@ -12,18 +12,22 @@
 // limitations under the License.
 
 // Ported from Prometheus `web/api/v1/search.go` (buildSearchFilter, buildSearchExprFilter,
-// newSearchTermFilter, wrapSearchFilter, filterChainHasExpensiveScoring) at 03bfb64967.
+// newSearchTermFilter, wrapSearchFilter) at 03bfb64967.
 
 //! Build the filter of a label search from its terms or its search expression.
 //!
 //! `fuzz_threshold` is in `[0.0, 1.0]`; upstream takes a percentage. Upstream knows two
 //! algorithms and treats anything but subsequence as Jaro-Winkler; [`FuzzyAlgorithm::NoOp`]
 //! builds the substring-only term filter that Jaro-Winkler builds at a zero threshold.
+//!
+//! Upstream also wraps filters that score at a non-trivial cost in a memo cache, because a
+//! value reaches its filter once per TSDB block. Here a search sees each distinct value about
+//! once, so every lookup would miss: the builders leave the cache out.
 
 use super::search_expr::{Expr, SearchExprError, compile};
 use super::{
-    CaseFoldingFilter, ContainsFilter, JaroWinklerFilter, MemoizingFilter, OrFilter,
-    OrSearchesFilter, SubsequenceFilter, SubstringFilter,
+    CaseFoldingFilter, ContainsFilter, JaroWinklerFilter, OrFilter, OrSearchesFilter,
+    SubsequenceFilter, SubstringFilter,
 };
 use crate::series::index::{FuzzyAlgorithm, StringFilter};
 use std::convert::Infallible;
@@ -32,11 +36,7 @@ use std::convert::Infallible;
 /// Empty terms are skipped; with no other terms there is no filter.
 ///
 /// For a case-insensitive search the terms are lowercased here and the filter is wrapped in a
-/// [`CaseFoldingFilter`], so each value is lowercased once. When a term filter scores at a
-/// non-trivial cost (subsequence, or Jaro-Winkler above a zero threshold) the filter is wrapped
-/// in a [`MemoizingFilter`], so a value that reaches it more than once in a search is scored
-/// once. Substring-only filters skip the cache: substring scoring is already linear in the
-/// value, and a lookup would only add to it.
+/// [`CaseFoldingFilter`], so each value is lowercased once.
 pub fn build_search_filter<S: AsRef<str>>(
     searches: &[S],
     fuzz_threshold: f64,
@@ -56,18 +56,13 @@ pub fn build_search_filter<S: AsRef<str>>(
         1 => filters.pop().expect("one filter"),
         _ => Box::new(OrSearchesFilter::new(filters)),
     };
-    Some(wrap_search_filter(
-        combined,
-        fuzz_threshold,
-        algorithm,
-        case_sensitive,
-    ))
+    Some(wrap_search_filter(combined, case_sensitive))
 }
 
 /// Compiles a search expression into the filter of a search. Positive terms get the filter of
 /// a [`build_search_filter`] term. Negated terms match literally, because a fuzzy match would
 /// also exclude values that do not contain the term; their filter computes no score, since
-/// [`compile`] ignores it. The case folding and caching of [`build_search_filter`] apply.
+/// [`compile`] ignores it. The case folding of [`build_search_filter`] applies.
 pub fn build_search_expr_filter(
     expr: &Expr,
     fuzz_threshold: f64,
@@ -83,12 +78,7 @@ pub fn build_search_expr_filter(
         };
         Ok::<_, Infallible>(filter)
     })?;
-    Ok(wrap_search_filter(
-        Box::new(filter),
-        fuzz_threshold,
-        algorithm,
-        case_sensitive,
-    ))
+    Ok(wrap_search_filter(Box::new(filter), case_sensitive))
 }
 
 fn fold_case(term: &str, case_sensitive: bool) -> String {
@@ -120,33 +110,15 @@ fn new_search_term_filter(
     }
 }
 
-/// Adds the case folding and caching wrappers that [`build_search_filter`] documents.
+/// Adds the case folding that [`build_search_filter`] documents.
 fn wrap_search_filter(
     filter: Box<dyn StringFilter>,
-    fuzz_threshold: f64,
-    algorithm: FuzzyAlgorithm,
     case_sensitive: bool,
 ) -> Box<dyn StringFilter> {
-    let filter: Box<dyn StringFilter> = if case_sensitive {
+    if case_sensitive {
         filter
     } else {
         Box::new(CaseFoldingFilter::new(filter))
-    };
-    if has_expensive_scoring(fuzz_threshold, algorithm) {
-        Box::new(MemoizingFilter::new(filter))
-    } else {
-        filter
-    }
-}
-
-/// Whether the term filters [`new_search_term_filter`] builds score at a cost that a cache
-/// repays.
-fn has_expensive_scoring(fuzz_threshold: f64, algorithm: FuzzyAlgorithm) -> bool {
-    match algorithm {
-        FuzzyAlgorithm::Subsequence => true,
-        // Jaro-Winkler only runs above a zero threshold; below it the filter is substring-only.
-        FuzzyAlgorithm::JaroWinkler => fuzz_threshold > 0.0,
-        FuzzyAlgorithm::NoOp => false,
     }
 }
 
@@ -223,8 +195,6 @@ mod tests {
         let fuzzy = JaroWinklerFilter::new("metric", 0.8).accept("metirc");
         assert!(fuzzy.0);
         assert_eq!(filter.accept("metirc"), fuzzy);
-        // Twice, so the second answer comes from the cache.
-        assert_eq!(filter.accept("metirc"), fuzzy);
     }
 
     #[test]
@@ -254,14 +224,6 @@ mod tests {
 
         let sensitive = search(&["CPU"], 0.0, JW);
         assert_eq!(sensitive.accept("cpu"), (false, 0.0));
-    }
-
-    #[test]
-    fn expensive_scoring_follows_the_term_filters() {
-        assert!(has_expensive_scoring(0.0, SUBSEQ));
-        assert!(has_expensive_scoring(0.5, JW));
-        assert!(!has_expensive_scoring(0.0, JW));
-        assert!(!has_expensive_scoring(0.5, FuzzyAlgorithm::NoOp));
     }
 
     #[test]

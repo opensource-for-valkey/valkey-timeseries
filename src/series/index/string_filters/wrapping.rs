@@ -59,8 +59,9 @@ struct MemoCache {
 }
 
 /// Caches the inner filter's `(accepted, score)` for each distinct value, so a value that
-/// reaches the filter more than once in a search is scored once. Meant as the outermost wrapper
-/// of a search filter.
+/// reaches the filter more than once in a search is scored once. It pays only where values
+/// repeat: the label search builders leave it out, because a search sees each distinct value
+/// about once and every lookup would miss.
 ///
 /// Once the cache holds [`MEMOIZING_FILTER_MAX_ENTRIES`] values or
 /// [`MEMOIZING_FILTER_MAX_BYTES`] bytes, misses go to the inner filter without being cached.
