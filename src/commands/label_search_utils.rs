@@ -16,7 +16,7 @@ use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, FanoutTarget, is_clustered};
 use crate::parser::series_selector::parse_series_selector;
 use crate::series::index::{
-    DefaultLabelQuerier, FuzzyAlgorithm, FuzzyFilter, LabelNameSearchFilter, LabelQuerier,
+    DefaultLabelQuerier, FuzzyAlgorithm, StringFilter, LabelNameSearchFilter, LabelQuerier,
     LabelQueryResult, SEARCH_RESULT_DEFAULT_LIMIT, SEARCH_RESULT_LIMIT_MAX, SearchHints,
     SearchResultOrdering, SelectHints, SeriesCursor, SortBy, check_label_query_permissions,
     get_db_index, label_search_exceeds_inline_budget, label_search_selection, normalize_limit,
@@ -71,7 +71,7 @@ impl LabelNameSearchArgs {
                 self.fuzzy_algorithm,
                 self.fuzzy_threshold,
                 !self.ignore_case,
-            )) as Box<dyn FuzzyFilter>)
+            )) as Box<dyn StringFilter>)
         };
 
         Ok(SearchHints {

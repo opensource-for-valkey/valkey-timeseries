@@ -51,7 +51,7 @@ impl Display for FuzzyAlgorithm {
 }
 
 /// Filter determines whether a value should be included in results.
-pub trait FuzzyFilter: Send + Sync {
+pub trait StringFilter: Send + Sync {
     /// Returns (accepted, score) where score is used for relevance ranking.
     /// Score should be in range [0.0, 1.0] where 1.0 is perfect match.
     fn accept(&self, value: &str) -> (bool, f64);
@@ -60,7 +60,7 @@ pub trait FuzzyFilter: Send + Sync {
 #[derive(Default)]
 pub struct NoOpSearchMatcher;
 
-impl FuzzyFilter for NoOpSearchMatcher {
+impl StringFilter for NoOpSearchMatcher {
     fn accept(&self, _value: &str) -> (bool, f64) {
         (true, 1.0)
     }
@@ -132,7 +132,7 @@ impl SimilarityFilter {
     }
 }
 
-impl FuzzyFilter for SimilarityFilter {
+impl StringFilter for SimilarityFilter {
     fn accept(&self, value: &str) -> (bool, f64) {
         let candidate = if self.case_sensitive {
             Cow::Borrowed(value)
@@ -195,7 +195,7 @@ impl LabelNameSearchFilter {
     }
 }
 
-impl FuzzyFilter for LabelNameSearchFilter {
+impl StringFilter for LabelNameSearchFilter {
     fn accept(&self, value: &str) -> (bool, f64) {
         // If no fuzzy filters were created (FUZZY_THRESHOLD == 0.0)
         // perform a simple substring/prefix containment check using
@@ -233,7 +233,7 @@ impl FuzzyFilter for LabelNameSearchFilter {
 #[cfg(test)]
 mod tests {
     use super::{
-        FuzzyAlgorithm, FuzzyFilter, LabelNameSearchFilter, SimilarityFilter, to_lowercase_cow,
+        FuzzyAlgorithm, StringFilter, LabelNameSearchFilter, SimilarityFilter, to_lowercase_cow,
     };
     use std::borrow::Cow;
 

@@ -20,7 +20,7 @@ use super::{
     compile, parse, validate,
 };
 use crate::series::index::{
-    FuzzyFilter, LabelSearchResult, SearchHints, SearchResultOrdering, apply_search_hints,
+    StringFilter, LabelSearchResult, SearchHints, SearchResultOrdering, apply_search_hints,
 };
 use proptest::prelude::*;
 use std::collections::HashMap;
@@ -36,7 +36,7 @@ struct ContainsFilter {
     score: f64,
 }
 
-impl FuzzyFilter for ContainsFilter {
+impl StringFilter for ContainsFilter {
     fn accept(&self, value: &str) -> (bool, f64) {
         if value.contains(&self.term) {
             (true, self.score)
@@ -56,7 +56,7 @@ struct CountingFilter {
     term: String,
 }
 
-impl FuzzyFilter for CountingFilter {
+impl StringFilter for CountingFilter {
     fn accept(&self, _value: &str) -> (bool, f64) {
         *self
             .calls
@@ -68,7 +68,7 @@ impl FuzzyFilter for CountingFilter {
     }
 }
 
-type Factory<'a> = Box<dyn FnMut(&str, bool) -> Result<Box<dyn FuzzyFilter>, TermFilterError> + 'a>;
+type Factory<'a> = Box<dyn FnMut(&str, bool) -> Result<Box<dyn StringFilter>, TermFilterError> + 'a>;
 
 /// Term filters that match by substring and score from `scores`, where a missing term
 /// scores 0.
@@ -452,7 +452,7 @@ fn counting_factory(
     calls: &Calls,
     accept: impl Fn(&str) -> bool,
     score: impl Fn(&str) -> f64,
-) -> impl FnMut(&str, bool) -> Result<Box<dyn FuzzyFilter>, TermFilterError> {
+) -> impl FnMut(&str, bool) -> Result<Box<dyn StringFilter>, TermFilterError> {
     move |term, _| {
         Ok(Box::new(CountingFilter {
             accepted: accept(term),
@@ -634,7 +634,7 @@ fn compile_reports_effective_term_polarity() {
         Ok::<_, TermFilterError>(Box::new(ContainsFilter {
             term: term.to_string(),
             score: 1.0,
-        }) as Box<dyn FuzzyFilter>)
+        }) as Box<dyn StringFilter>)
     })
     .unwrap();
     let want: HashMap<String, bool> = [
@@ -654,7 +654,7 @@ fn compile_reports_effective_term_polarity() {
 #[error("factory failed")]
 struct FactoryFailed;
 
-fn failing_on_bar(term: &str, _: bool) -> Result<Box<dyn FuzzyFilter>, FactoryFailed> {
+fn failing_on_bar(term: &str, _: bool) -> Result<Box<dyn StringFilter>, FactoryFailed> {
     if term == "bar" {
         return Err(FactoryFailed);
     }
@@ -861,7 +861,7 @@ fn check_against_oracles(expr: &Expr) {
         Ok::<_, TermFilterError>(Box::new(ContainsFilter {
             term: term.to_string(),
             score: 0.5,
-        }) as Box<dyn FuzzyFilter>)
+        }) as Box<dyn StringFilter>)
     })
     .unwrap();
     for value in ORACLE_VALUES {

@@ -16,7 +16,7 @@
 
 use super::postings::Postings;
 use super::{
-    DEFAULT_SERIES_BATCH_SIZE, FuzzyFilter, IndexKey, NoOpSearchMatcher, PostingsBitmap,
+    DEFAULT_SERIES_BATCH_SIZE, StringFilter, IndexKey, NoOpSearchMatcher, PostingsBitmap,
     SeriesCursor, SeriesSelection, TimeSeriesIndex, for_each_planned_series, get_db_index,
     read_planned,
 };
@@ -168,7 +168,7 @@ pub const SEARCH_RESULT_DEFAULT_LIMIT: usize = 100;
 /// SearchHints configures search operations with filtering and scoring.
 pub struct SearchHints<'a> {
     /// Filter determines which values to include and their relevance scores.
-    pub filter: Option<Box<dyn FuzzyFilter + 'a>>,
+    pub filter: Option<Box<dyn StringFilter + 'a>>,
 
     /// Maximum number of results to return: `0` means [`SEARCH_RESULT_DEFAULT_LIMIT`], and
     /// anything above [`SEARCH_RESULT_LIMIT_MAX`] is capped to it ([`normalize_limit`]).
@@ -413,7 +413,7 @@ fn select_best(
 
 /// Runs `f` with the hints' filter, or without `SEARCH` one that accepts everything with a
 /// score of 1 and never looks at the candidate.
-fn with_search_filter<R>(hints: &SearchHints, f: impl FnOnce(&dyn FuzzyFilter) -> R) -> R {
+fn with_search_filter<R>(hints: &SearchHints, f: impl FnOnce(&dyn StringFilter) -> R) -> R {
     match &hints.filter {
         Some(filter) => f(filter.as_ref()),
         None => f(&NoOpSearchMatcher),
@@ -691,7 +691,7 @@ enum NameStep<'p> {
 
 /// The state a name scan carries from one hold to the next.
 struct NameScan<'f, F> {
-    filter: &'f dyn FuzzyFilter,
+    filter: &'f dyn StringFilter,
     /// Without it an accepted name is reported, with a count of `0`, at its first visible
     /// entry, and the rest of its values are skipped.
     need_cardinality: bool,
@@ -776,7 +776,7 @@ where
 /// lock.
 #[derive(Clone, Copy)]
 struct NameScanOptions<'f> {
-    filter: &'f dyn FuzzyFilter,
+    filter: &'f dyn StringFilter,
     /// Sum each name's visible series count over its values; without it the count is `0` and
     /// only a name's first visible entry is read.
     need_cardinality: bool,
@@ -1063,7 +1063,7 @@ fn label_cardinality_in_holds(
 /// more. `order` must not be a cardinality order without `need_cardinality`. See [`rank_label_names_in_holds`].
 fn rank_label_names(
     index: &TimeSeriesIndex,
-    filter: &dyn FuzzyFilter,
+    filter: &dyn StringFilter,
     need_cardinality: bool,
     order: SearchResultOrdering,
     limit: usize,
@@ -1483,7 +1483,7 @@ impl LabelQuerier for DefaultLabelQuerier {
 #[cfg(test)]
 mod tests {
     use super::{
-        FuzzyFilter, LabelQueryResult, LabelSearchResult, NameScanOptions, NoOpSearchMatcher,
+        StringFilter, LabelQueryResult, LabelSearchResult, NameScanOptions, NoOpSearchMatcher,
         SearchHints, SearchResultOrdering, TimeSeriesIndex, apply_search_hints, collect_top_k,
         collect_unscoped_label_names, collect_unscoped_label_values,
         collect_unscoped_label_values_in_holds, compare_search_results, label_cardinality_in_holds,
@@ -1528,7 +1528,7 @@ mod tests {
 
     struct StaticScoreFilter;
 
-    impl FuzzyFilter for StaticScoreFilter {
+    impl StringFilter for StaticScoreFilter {
         fn accept(&self, value: &str) -> (bool, f64) {
             match value {
                 "us-east" => (true, 0.9),
@@ -1541,7 +1541,7 @@ mod tests {
 
     struct StaticNameScoreFilter;
 
-    impl FuzzyFilter for StaticNameScoreFilter {
+    impl StringFilter for StaticNameScoreFilter {
         fn accept(&self, value: &str) -> (bool, f64) {
             match value {
                 "alpha" => (true, 0.9),
@@ -2274,7 +2274,7 @@ mod tests {
     /// Accepts every name but `beta`, scoring each by its length.
     struct RejectBeta;
 
-    impl FuzzyFilter for RejectBeta {
+    impl StringFilter for RejectBeta {
         fn accept(&self, value: &str) -> (bool, f64) {
             (value != "beta", value.len() as f64)
         }
@@ -2305,7 +2305,7 @@ mod tests {
     }
 
     fn name_scan_options(
-        filter: &dyn FuzzyFilter,
+        filter: &dyn StringFilter,
         need_cardinality: bool,
         entries_per_hold: usize,
     ) -> NameScanOptions<'_> {
@@ -2561,7 +2561,7 @@ mod tests {
     /// Rejects names containing `b`; scores by the first byte.
     struct RejectB;
 
-    impl FuzzyFilter for RejectB {
+    impl StringFilter for RejectB {
         fn accept(&self, value: &str) -> (bool, f64) {
             (!value.contains('b'), value.as_bytes()[0] as f64 / 256.0)
         }
@@ -2608,7 +2608,7 @@ mod tests {
             }
             let index = index_of(postings);
             for filtered in [false, true] {
-                let filter: &dyn FuzzyFilter = if filtered {
+                let filter: &dyn StringFilter = if filtered {
                     &RejectB
                 } else {
                     &NoOpSearchMatcher
@@ -2692,7 +2692,7 @@ mod tests {
 
     struct RejectJob;
 
-    impl FuzzyFilter for RejectJob {
+    impl StringFilter for RejectJob {
         fn accept(&self, value: &str) -> (bool, f64) {
             (value != "job", 1.0)
         }
@@ -2712,7 +2712,7 @@ mod tests {
 
         for (filter, mut expected) in [
             (
-                &RejectJob as &dyn FuzzyFilter,
+                &RejectJob as &dyn StringFilter,
                 vec![" lead", "job>x", "jobs"],
             ),
             // An accepted name skipped once it is reported, without counting, alike.
@@ -2814,7 +2814,7 @@ mod tests {
                 for filtered in [false, true] {
                     let hints = || SearchHints {
                         filter: filtered
-                            .then(|| Box::new(StaticScoreFilter) as Box<dyn FuzzyFilter>),
+                            .then(|| Box::new(StaticScoreFilter) as Box<dyn StringFilter>),
                         limit,
                         order_by,
                         include_meta: true,

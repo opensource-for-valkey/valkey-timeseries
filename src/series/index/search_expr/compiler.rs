@@ -14,7 +14,7 @@
 // Ported from Prometheus `util/searchexpr/compiler.go`.
 
 use super::{Expr, MAX_EXPRESSION_NESTING_DEPTH, MAX_EXPRESSION_TERMS, SearchExprError, invalid};
-use crate::series::index::FuzzyFilter;
+use crate::series::index::StringFilter;
 
 /// The deepest parsed AST has one term below 31 binary nodes and 16 `NOT` nodes.
 pub(super) const MAX_COMPILED_EXPRESSION_DEPTH: usize =
@@ -34,7 +34,7 @@ pub type TermFilterError = Box<dyn std::error::Error + Send + Sync>;
 /// terms do not add to a path's score.
 pub fn compile<F, E>(expr: &Expr, mut new_term_filter: F) -> Result<CompiledFilter, SearchExprError>
 where
-    F: FnMut(&str, bool) -> Result<Box<dyn FuzzyFilter>, E>,
+    F: FnMut(&str, bool) -> Result<Box<dyn StringFilter>, E>,
     E: Into<TermFilterError>,
 {
     validate(expr)?;
@@ -81,7 +81,7 @@ pub struct CompiledFilter {
     pub(super) root: Scalar,
 }
 
-impl FuzzyFilter for CompiledFilter {
+impl StringFilter for CompiledFilter {
     fn accept(&self, value: &str) -> (bool, f64) {
         let result = self.root.evaluate(value);
         if !result.accepted {
@@ -96,7 +96,7 @@ impl FuzzyFilter for CompiledFilter {
 /// accepting path has the same positive-term count, or only ORs enclose the subtree.
 pub(super) enum Scalar {
     Term {
-        filter: Box<dyn FuzzyFilter>,
+        filter: Box<dyn StringFilter>,
         negated: bool,
     },
     And(Box<Scalar>, Box<Scalar>),
@@ -428,7 +428,7 @@ fn compile_node<F, E>(
     new_term_filter: &mut F,
 ) -> Result<CompiledNode, SearchExprError>
 where
-    F: FnMut(&str, bool) -> Result<Box<dyn FuzzyFilter>, E>,
+    F: FnMut(&str, bool) -> Result<Box<dyn StringFilter>, E>,
     E: Into<TermFilterError>,
 {
     match expr {
@@ -467,7 +467,7 @@ fn compile_conjunction<F, E>(
     new_term_filter: &mut F,
 ) -> Result<CompiledNode, SearchExprError>
 where
-    F: FnMut(&str, bool) -> Result<Box<dyn FuzzyFilter>, E>,
+    F: FnMut(&str, bool) -> Result<Box<dyn StringFilter>, E>,
     E: Into<TermFilterError>,
 {
     let left = compile_node(left, negated, true, new_term_filter)?;
@@ -507,7 +507,7 @@ fn compile_disjunction<F, E>(
     new_term_filter: &mut F,
 ) -> Result<CompiledNode, SearchExprError>
 where
-    F: FnMut(&str, bool) -> Result<Box<dyn FuzzyFilter>, E>,
+    F: FnMut(&str, bool) -> Result<Box<dyn StringFilter>, E>,
     E: Into<TermFilterError>,
 {
     let left = compile_node(left, negated, in_and, new_term_filter)?;
