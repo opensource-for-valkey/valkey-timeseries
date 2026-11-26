@@ -37,6 +37,7 @@ mod label_querier;
 pub(crate) mod persistence;
 #[cfg(test)]
 mod postings_query_tests;
+pub mod search_expr;
 pub(crate) mod server_events;
 #[cfg(test)]
 mod timeseries_index_tests;
