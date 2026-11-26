@@ -23,7 +23,7 @@ pub(super) const MAX_COMPILED_EXPRESSION_DEPTH: usize =
 /// The error a term filter factory may return.
 pub type TermFilterError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Validates `expr` and converts it into a [`FuzzyFilter`].
+/// Validates `expr` and converts it into a [`StringFilter`].
 ///
 /// `new_term_filter(term, negated)` returns the filter for one term. The filter must match the
 /// term itself, because the compiled filter applies the negation; `negated` is true when the

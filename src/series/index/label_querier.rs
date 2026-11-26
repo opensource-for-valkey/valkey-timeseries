@@ -346,7 +346,7 @@ impl SearchResultOrdering {
     /// The one ranking rule every label search uses: `Less` means `a` comes first.
     ///
     /// A total order: score and cardinality ties fall back to the value, ascending, and scores
-    /// compare by [`f64::total_cmp`], so even a NaN from a [`FuzzyFilter`] has one place and
+    /// compare by [`f64::total_cmp`], so even a NaN from a [`StringFilter`] has one place and
     /// cannot make a sort panic.
     fn compare(self, a: RankKey<'_>, b: RankKey<'_>) -> Ordering {
         let by_value = || a.value.cmp(b.value);

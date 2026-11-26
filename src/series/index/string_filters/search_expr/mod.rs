@@ -12,7 +12,7 @@
 // limitations under the License.
 
 //! Boolean search expressions that combine terms with `NOT`, `AND`, `OR`, and parentheses,
-//! and compile them into [`FuzzyFilter`](crate::series::index::FuzzyFilter)s.
+//! and compile them into [`StringFilter`](crate::series::index::StringFilter)s.
 //!
 //! Ported from Prometheus `util/searchexpr`.
 

@@ -8,6 +8,7 @@
 //! Ported from Prometheus `web/api/v1/search_filters.go`.
 
 mod combining;
+pub mod search_expr;
 mod wrapping;
 
 pub use combining::{ChainFilter, OrFilter, OrSearchesFilter};
