@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Ported from Prometheus `web/api/v1/search_filters.go` (ChainFilter, orFilter).
+// Ported from Prometheus `web/api/v1/search_filters.go` (ChainFilter, orSearchesFilter, orFilter).
 
 //! Filters that combine other filters.
 
@@ -47,6 +47,43 @@ impl StringFilter for ChainFilter {
             }
         }
         (true, max_score)
+    }
+}
+
+/// Accepts a value if any filter accepts it, scoring it with the best score among the filters
+/// that accept it; a rejecting filter's score is ignored. Stops at the first perfect (1.0)
+/// score. Upstream uses it to OR the per-term filters of a multi-term search.
+///
+/// Unlike [`ChainFilter`], with no filters it accepts nothing.
+#[derive(Default)]
+pub struct OrSearchesFilter {
+    filters: Vec<Box<dyn StringFilter>>,
+}
+
+impl OrSearchesFilter {
+    pub fn new(filters: Vec<Box<dyn StringFilter>>) -> Self {
+        Self { filters }
+    }
+}
+
+impl StringFilter for OrSearchesFilter {
+    fn accept(&self, value: &str) -> (bool, f64) {
+        let mut max_score = 0.0_f64;
+        let mut accepted = false;
+        for filter in &self.filters {
+            let (ok, score) = filter.accept(value);
+            if !ok {
+                continue;
+            }
+            accepted = true;
+            if score > max_score {
+                max_score = score;
+            }
+            if max_score >= 1.0 {
+                return (true, max_score);
+            }
+        }
+        (accepted, max_score)
     }
 }
 
@@ -165,6 +202,54 @@ mod tests {
     fn chain_score_is_zero_when_every_filter_scores_zero() {
         let chain = ChainFilter::new(vec![scoring("a", 0.0), scoring("b", 0.0)]);
         assert_eq!(chain.accept("ab"), (true, 0.0));
+    }
+
+    #[test]
+    fn empty_or_searches_accepts_nothing() {
+        assert_eq!(OrSearchesFilter::default().accept("anything"), (false, 0.0));
+    }
+
+    #[test]
+    fn or_searches_scores_the_best_accepting_filter() {
+        let or = OrSearchesFilter::new(vec![
+            scoring("node", 0.4),
+            scoring("cpu", 0.9),
+            scoring("disk", 0.6),
+        ]);
+        assert_eq!(or.accept("node_cpu"), (true, 0.9));
+        assert_eq!(or.accept("node_memory"), (true, 0.4));
+        assert_eq!(or.accept("network"), (false, 0.0));
+    }
+
+    #[test]
+    fn or_searches_ignores_the_scores_of_rejecting_filters() {
+        let rejecting = Box::new(Scoring {
+            query: "cpu",
+            score: 1.0,
+            reject_score: 0.9,
+            calls: Arc::default(),
+        });
+        let or = OrSearchesFilter::new(vec![rejecting, scoring("mem", 0.2)]);
+        assert_eq!(or.accept("memory"), (true, 0.2));
+        assert_eq!(or.accept("disk"), (false, 0.0));
+    }
+
+    #[test]
+    fn or_searches_stops_at_a_perfect_score() {
+        let (after, calls) = counted("cpu", 0.5);
+        let or = OrSearchesFilter::new(vec![scoring("node", 0.3), scoring("cpu", 1.0), after]);
+        assert_eq!(or.accept("node_cpu"), (true, 1.0));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        // Below a perfect score every filter is tried.
+        assert_eq!(or.accept("node"), (true, 0.3));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn or_searches_accepts_with_a_zero_score() {
+        let or = OrSearchesFilter::new(vec![scoring("a", 0.0)]);
+        assert_eq!(or.accept("a"), (true, 0.0));
     }
 
     #[test]

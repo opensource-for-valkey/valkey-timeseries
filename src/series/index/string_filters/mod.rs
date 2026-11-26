@@ -10,7 +10,7 @@
 mod combining;
 mod wrapping;
 
-pub use combining::{ChainFilter, OrFilter};
+pub use combining::{ChainFilter, OrFilter, OrSearchesFilter};
 pub use wrapping::{
     CaseFoldingFilter, MEMOIZING_FILTER_MAX_BYTES, MEMOIZING_FILTER_MAX_ENTRIES, MemoizingFilter,
 };
