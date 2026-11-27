@@ -5,7 +5,7 @@
 ```
 TS.LABELVALUES label
   [FILTER_BY_RANGE [NOT] fromTimestamp toTimestamp]
-  [SEARCH term [term ...]]
+  [SEARCH term [term ...] | SEARCH_EXPR expression]
   [FUZZY_THRESHOLD threshold]
   [FUZZY_ALGORITHM jarowinkler|subsequence]
   [INCLUDE_METADATA]
@@ -43,6 +43,14 @@ standalone server and does not filter label values or series keys.
 
 ### Notes
 
+- `SEARCH` terms are ORed together.
+- `SEARCH_EXPR` takes one boolean search expression in place of `SEARCH` terms (the two are mutually exclusive):
+  terms combined with `AND`, `OR`, `NOT` and parentheses, for example `"cpu AND NOT (idle OR steal)"`. `NOT` binds
+  tighter than `AND`, which binds tighter than `OR`. Operators are case-insensitive; a double-quoted term such as
+  `"and"` is searched for literally. Positive terms match as `SEARCH` terms do, honouring `FUZZY_ALGORITHM`,
+  `FUZZY_THRESHOLD` and `IGNORE_CASE`; negated terms match as plain substrings. Every accepting path must require a
+  positive term, so `NOT cpu` alone is refused. A match scores the best mean of its positive terms' scores. An
+  expression is limited to 4096 bytes, 32 terms and 16 levels of nesting.
 - `SORTBY score DESC` and `SORTBY cardinality DESC` select the highest-ranked values before
   applying `LIMIT`. Equal scores or cardinalities are ordered by value ascending.
 - A value's `cardinality` (reported with `INCLUDE_METADATA`, and ranked by `SORTBY cardinality`) is the number of

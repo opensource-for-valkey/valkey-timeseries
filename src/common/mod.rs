@@ -16,6 +16,7 @@ pub mod pool;
 pub mod rdb;
 pub mod replies;
 pub mod rounding;
+pub mod search_expr;
 pub mod string_interner;
 pub mod strings;
 pub mod sync;

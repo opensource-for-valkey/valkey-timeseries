@@ -10,12 +10,13 @@ use crate::commands::label_search_utils::{
     reply_with_label_search_result,
 };
 use crate::common::replies::ReplyContext;
+use crate::common::strings::filter::FuzzyAlgorithm;
 use crate::fanout::{
     FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
 };
 use crate::series::index::{
-    FuzzyAlgorithm, LabelSearchResult as IndexLabelSearchResult, SEARCH_RESULT_LIMIT_MAX,
-    SearchHints, SearchResultOrdering, apply_search_hints,
+    LabelSearchResult as IndexLabelSearchResult, SEARCH_RESULT_LIMIT_MAX, SearchHints,
+    SearchResultOrdering, apply_search_hints,
 };
 use crate::series::request_types::MatchFilterOptions;
 use ahash::AHashMap;
@@ -113,6 +114,7 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
             search_type,
             label,
             search_terms: req.search_terms,
+            search_expr: req.search_expr,
             fuzzy_threshold: req.fuzz_threshold,
             fuzzy_algorithm: fuzz_algorithm,
             ignore_case: req.ignore_case,
@@ -175,6 +177,7 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
             request_type: self.args.search_type.into(),
             label,
             search_terms: self.args.search_terms.clone(),
+            search_expr: self.args.search_expr.clone(),
             fuzz_threshold: self.args.fuzzy_threshold,
             fuzz_algorithm,
             ignore_case: self.args.ignore_case,

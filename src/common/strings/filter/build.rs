@@ -24,12 +24,12 @@
 //! value reaches its filter once per TSDB block. Here a search sees each distinct value about
 //! once, so every lookup would miss: the builders leave the cache out.
 
-use super::search_expr::{Expr, SearchExprError, compile};
-use super::{
-    CaseFoldingFilter, ContainsFilter, JaroWinklerFilter, OrFilter, OrSearchesFilter,
-    SubsequenceFilter, SubstringFilter,
-};
-use crate::series::index::{FuzzyAlgorithm, StringFilter};
+use super::combining::{OrFilter, OrSearchesFilter};
+use super::term::{ContainsFilter, JaroWinklerFilter, SubsequenceFilter, SubstringFilter};
+use super::types::StringFilter;
+use super::wrapping::CaseFoldingFilter;
+use crate::common::search_expr::{Expr, SearchExprError, compile};
+use crate::common::strings::filter::FuzzyAlgorithm;
 use std::convert::Infallible;
 
 /// Builds the filter of a search for `searches`, accepting values that match any of them.
@@ -124,8 +124,8 @@ fn wrap_search_filter(
 
 #[cfg(test)]
 mod tests {
-    use super::super::search_expr::parse;
     use super::*;
+    use crate::common::search_expr::parse;
 
     const JW: FuzzyAlgorithm = FuzzyAlgorithm::JaroWinkler;
     const SUBSEQ: FuzzyAlgorithm = FuzzyAlgorithm::Subsequence;

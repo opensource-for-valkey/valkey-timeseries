@@ -39,6 +39,11 @@ like `jarowinkler` or `subsequence`, and tune how strict the match should be wit
 Users frequently mistype metric names or only remember parts of a label (e.g., typing "mem" when searching for "
 memory_usage"). Fuzzy matching provides highly relevant autocomplete suggestions instantly.
 
+To combine terms with boolean logic instead, pass one `SEARCH_EXPR` in place of `SEARCH`, for example
+`TS.METRICNAMES SEARCH_EXPR "cpu AND NOT (idle OR steal)"`. Terms combine with `AND`, `OR`, `NOT` and parentheses;
+positive terms match with the same fuzzy settings as `SEARCH` terms, negated ones as plain substrings, and every
+accepting path must require a positive term.
+
 #### Supported Algorithms
 
 * **Jaro-Winkler (`jarowinkler`)**: Specifically designed for short strings like names and labels. It measures the edit
@@ -77,7 +82,7 @@ All discovery commands share a similar syntax profile:
 
 ```text
 TS.<COMMAND> [label]
-  [SEARCH term [term ...]]
+  [SEARCH term [term ...] | SEARCH_EXPR expression]
   [FUZZY_THRESHOLD threshold]
   [FUZZY_ALGORITHM jarowinkler|subsequence]
   [IGNORE_CASE]

@@ -37,13 +37,11 @@ pub(crate) mod persistence;
 #[cfg(test)]
 mod postings_query_tests;
 pub(crate) mod server_events;
-pub mod string_filters;
 #[cfg(test)]
 mod timeseries_index_tests;
 
 pub use ids::next_timeseries_id;
 pub use label_querier::*;
-pub(crate) use string_filters::label_filter::*;
 
 /// Map from db to TimeseriesIndex
 pub type TimeSeriesIndexMap = HashMap<i32, TimeSeriesIndex, BuildNoHashHasher<i32>>;

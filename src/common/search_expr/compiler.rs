@@ -14,7 +14,7 @@
 // Ported from Prometheus `util/searchexpr/compiler.go`.
 
 use super::{Expr, MAX_EXPRESSION_NESTING_DEPTH, MAX_EXPRESSION_TERMS, SearchExprError, invalid};
-use crate::series::index::StringFilter;
+use crate::common::strings::filter::StringFilter;
 
 /// The deepest parsed AST has one term below 31 binary nodes and 16 `NOT` nodes.
 pub(super) const MAX_COMPILED_EXPRESSION_DEPTH: usize =

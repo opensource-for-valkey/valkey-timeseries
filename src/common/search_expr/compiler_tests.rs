@@ -14,13 +14,15 @@
 // Ported from Prometheus `util/searchexpr/compiler_test.go`. Its nil, unknown-node and
 // pointer-node cases have no counterpart: `Expr` is a closed enum of owned nodes.
 
-use super::compiler::{CompiledFilter, MAX_COMPILED_EXPRESSION_DEPTH, Scalar};
+use super::compiler::{CompiledFilter, MAX_COMPILED_EXPRESSION_DEPTH, Scalar, validate};
+use super::parser::parse;
 use super::{
     Expr, MAX_EXPRESSION_NESTING_DEPTH, MAX_EXPRESSION_TERMS, SearchExprError, TermFilterError,
-    compile, parse, validate,
+    compile,
 };
+use crate::common::strings::filter::StringFilter;
 use crate::series::index::{
-    LabelSearchResult, SearchHints, SearchResultOrdering, StringFilter, apply_search_hints,
+    LabelSearchResult, SearchHints, SearchResultOrdering, apply_search_hints,
 };
 use proptest::prelude::*;
 use std::collections::HashMap;

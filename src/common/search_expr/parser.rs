@@ -33,6 +33,7 @@ pub enum Expr {
 }
 
 impl Expr {
+    #[allow(dead_code)]
     pub fn term(value: impl Into<String>) -> Self {
         Expr::Term(value.into())
     }
@@ -48,6 +49,17 @@ impl Expr {
     #[allow(clippy::should_implement_trait)]
     pub fn not(expr: Expr) -> Self {
         Expr::Not(Box::new(expr))
+    }
+
+    /// The number of terms in the expression, negated ones included.
+    pub fn term_count(&self) -> usize {
+        match self {
+            Expr::Term(_) => 1,
+            Expr::And(left, right) | Expr::Or(left, right) => {
+                left.term_count() + right.term_count()
+            }
+            Expr::Not(expr) => expr.term_count(),
+        }
     }
 }
 

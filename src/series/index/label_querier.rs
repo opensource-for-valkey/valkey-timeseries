@@ -16,12 +16,12 @@
 
 use super::postings::Postings;
 use super::{
-    DEFAULT_SERIES_BATCH_SIZE, IndexKey, NoOpSearchMatcher, PostingsBitmap, SeriesCursor,
-    SeriesSelection, StringFilter, TimeSeriesIndex, for_each_planned_series, get_db_index,
-    read_planned,
+    DEFAULT_SERIES_BATCH_SIZE, IndexKey, PostingsBitmap, SeriesCursor, SeriesSelection,
+    TimeSeriesIndex, for_each_planned_series, get_db_index, read_planned,
 };
 use crate::common::acl::check_metadata_permissions;
 use crate::common::constants::METRIC_NAME_LABEL;
+use crate::common::strings::filter::{NoOpSearchMatcher, StringFilter};
 use crate::common::threads::GilSource;
 use crate::error::{TsdbError, TsdbResult};
 use crate::labels::filters::SeriesSelector;

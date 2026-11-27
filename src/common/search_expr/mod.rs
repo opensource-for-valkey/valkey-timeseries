@@ -12,7 +12,7 @@
 // limitations under the License.
 
 //! Boolean search expressions that combine terms with `NOT`, `AND`, `OR`, and parentheses,
-//! and compile them into [`StringFilter`](crate::series::index::StringFilter)s.
+//! and compile them into [`StringFilter`](crate::common::strings::filter::StringFilter)s.
 //!
 //! Ported from Prometheus `util/searchexpr`.
 
@@ -23,8 +23,8 @@ mod parser;
 #[cfg(test)]
 mod parser_tests;
 
-pub use compiler::{CompiledFilter, TermFilterError, compile, validate};
-pub use parser::{Expr, parse};
+pub(crate) use compiler::{TermFilterError, compile, validate};
+pub(crate) use parser::{Expr, parse};
 
 pub(crate) const MAX_EXPRESSION_BYTES: usize = 4096;
 pub(crate) const MAX_EXPRESSION_TERMS: usize = 32;

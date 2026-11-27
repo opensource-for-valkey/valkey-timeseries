@@ -17,51 +17,31 @@
 //! Filters that match one search term. Each matches the term and the value in their literal
 //! case; see the [module docs](super) for case-insensitive search.
 
-use crate::common::strings::{JaroWinklerMatcher, SubsequenceMatcher};
-use crate::series::index::StringFilter;
+use super::StringFilter;
+use crate::common::strings::similarity::{
+    JaroWinklerMatcher, SubsequenceMatcher, SubstringMatcher,
+};
 
 /// Accepts values containing the query. A prefix match scores 1.0; any other match scores in
 /// `[0.1, 1.0)`, higher the earlier it starts. An empty query accepts everything with 1.0.
+/// Scoring is [`SubstringMatcher::score`].
 pub struct SubstringFilter {
-    query: String,
+    matcher: SubstringMatcher,
 }
 
 impl SubstringFilter {
     pub fn new(query: impl Into<String>) -> Self {
         Self {
-            query: query.into(),
+            matcher: SubstringMatcher::new(query),
         }
     }
 }
 
 impl StringFilter for SubstringFilter {
-    /// The match position is counted in characters, not bytes, so a match at character 1 of a
-    /// multi-byte value scores the same as one at byte 1 of an ASCII value. ASCII values skip
-    /// the character count.
     fn accept(&self, value: &str) -> (bool, f64) {
-        if self.query.is_empty() {
-            return (true, 1.0);
-        }
-        let Some(idx) = value.find(self.query.as_str()) else {
-            return (false, 0.0);
-        };
-        if idx == 0 {
-            return (true, 1.0);
-        }
-        // The whole value must be ASCII: a multi-byte character after the match would make
-        // the byte length overcount characters and inflate the score.
-        let (pos, max_pos) = if self.query.is_ascii() && value.is_ascii() {
-            (idx, value.len() - self.query.len())
-        } else {
-            let pos = value[..idx].chars().count();
-            let max_pos = value.chars().count() - self.query.chars().count();
-            (pos, max_pos)
-        };
-        if max_pos == 0 {
-            // Unreachable: equal character counts force a match at 0, handled above.
-            return (true, 1.0);
-        }
-        (true, 1.0 - 0.9 * pos as f64 / max_pos as f64)
+        // Every match scores at least `SUBSTRING_MIN_MATCH_SCORE`; only a miss scores 0.
+        let score = self.matcher.score(value);
+        (score > 0.0, score)
     }
 }
 

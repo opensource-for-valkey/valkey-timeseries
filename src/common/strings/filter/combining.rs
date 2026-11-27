@@ -15,17 +15,19 @@
 
 //! Filters that combine other filters.
 
-use crate::series::index::StringFilter;
+use super::StringFilter;
 
 /// Accepts a value only if every filter accepts it, scoring it with the best (highest) of their
 /// scores so that the ranking reflects the strongest matching dimension. With no filters it
 /// accepts everything with a score of 1.0.
 #[derive(Default)]
+#[allow(dead_code)]
 pub struct ChainFilter {
     filters: Vec<Box<dyn StringFilter>>,
 }
 
 impl ChainFilter {
+    #[allow(dead_code)]
     pub fn new(filters: Vec<Box<dyn StringFilter>>) -> Self {
         Self { filters }
     }

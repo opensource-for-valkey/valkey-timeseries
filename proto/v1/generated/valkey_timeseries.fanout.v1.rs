@@ -568,21 +568,24 @@ pub struct LabelSearchRequest {
     pub label: ::prost::alloc::string::String,
     #[prost(string, repeated, tag = "3")]
     pub search_terms: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(double, tag = "4")]
+    /// A boolean search expression; empty for none. Exclusive with search_terms.
+    #[prost(string, tag = "4")]
+    pub search_expr: ::prost::alloc::string::String,
+    #[prost(double, tag = "5")]
     pub fuzz_threshold: f64,
-    #[prost(enumeration = "FuzzySearchAlgorithm", tag = "5")]
+    #[prost(enumeration = "FuzzySearchAlgorithm", tag = "6")]
     pub fuzz_algorithm: i32,
-    #[prost(bool, tag = "6")]
-    pub ignore_case: bool,
     #[prost(bool, tag = "7")]
+    pub ignore_case: bool,
+    #[prost(bool, tag = "8")]
     pub include_metadata: bool,
-    #[prost(message, optional, tag = "8")]
+    #[prost(message, optional, tag = "9")]
     pub range: ::core::option::Option<MetaDateRangeFilter>,
-    #[prost(message, repeated, tag = "9")]
+    #[prost(message, repeated, tag = "10")]
     pub filters: ::prost::alloc::vec::Vec<SeriesSelector>,
-    #[prost(enumeration = "LabelResultsSortOrder", tag = "10")]
+    #[prost(enumeration = "LabelResultsSortOrder", tag = "11")]
     pub sort_order: i32,
-    #[prost(uint32, tag = "11")]
+    #[prost(uint32, tag = "12")]
     pub limit: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]

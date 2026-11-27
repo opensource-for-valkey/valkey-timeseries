@@ -5,21 +5,26 @@ use crate::commands::command_parser::{
 use crate::commands::fanout_codec::LabelSearchType;
 use crate::commands::ts_label_search_fanout_command::LabelSearchFanoutCommand;
 use crate::commands::utils::get_multi_command_targets;
-use crate::common::SortDir;
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::common::context::get_current_db;
 use crate::common::replies::{
     reply_with_array, reply_with_bool, reply_with_bulk_string, reply_with_integer, reply_with_map,
 };
 use crate::common::threads::GilSource;
+use crate::common::{SortDir, search_expr};
 use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, FanoutTarget, is_clustered};
 use crate::parser::series_selector::parse_series_selector;
+
+use crate::common::search_expr::Expr;
+use crate::common::strings::filter::{
+    FuzzyAlgorithm, build_search_expr_filter, build_search_filter,
+};
 use crate::series::index::{
-    DefaultLabelQuerier, FuzzyAlgorithm, LabelNameSearchFilter, LabelQuerier, LabelQueryResult,
-    SEARCH_RESULT_DEFAULT_LIMIT, SEARCH_RESULT_LIMIT_MAX, SearchHints, SearchResultOrdering,
-    SelectHints, SeriesCursor, SortBy, StringFilter, check_label_query_permissions, get_db_index,
-    label_search_exceeds_inline_budget, label_search_selection, normalize_limit, plan_if_cheap,
+    DefaultLabelQuerier, LabelQuerier, LabelQueryResult, SEARCH_RESULT_DEFAULT_LIMIT,
+    SEARCH_RESULT_LIMIT_MAX, SearchHints, SearchResultOrdering, SelectHints, SeriesCursor, SortBy,
+    check_label_query_permissions, get_db_index, label_search_exceeds_inline_budget,
+    label_search_selection, normalize_limit, plan_if_cheap,
 };
 use crate::series::request_types::MatchFilterOptions;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
@@ -29,6 +34,9 @@ pub(crate) struct LabelNameSearchArgs {
     pub(crate) search_type: LabelSearchType,
     pub(crate) label: Option<String>,
     pub(crate) search_terms: Vec<String>,
+    /// A boolean search expression (`SEARCH_EXPR`), or empty for none. Exclusive with
+    /// `search_terms`.
+    pub(crate) search_expr: String,
     pub(crate) fuzzy_threshold: f64,
     pub(crate) fuzzy_algorithm: FuzzyAlgorithm,
     pub(crate) ignore_case: bool,
@@ -45,6 +53,7 @@ impl Default for LabelNameSearchArgs {
             search_type: LabelSearchType::Name,
             label: None,
             search_terms: Vec::new(),
+            search_expr: String::new(),
             fuzzy_threshold: 0.0,
             fuzzy_algorithm: FuzzyAlgorithm::JaroWinkler,
             ignore_case: false,
@@ -62,15 +71,26 @@ impl LabelNameSearchArgs {
 
         let limit = self.get_limit();
 
-        let filter = if self.search_terms.is_empty() {
+        let filter = if !self.search_expr.is_empty() {
+            let expr = parse_search_expr(&self.search_expr)?;
+            Some(
+                build_search_expr_filter(
+                    &expr,
+                    self.fuzzy_threshold,
+                    self.fuzzy_algorithm,
+                    !self.ignore_case,
+                )
+                .map_err(search_expr_error)?,
+            )
+        } else if self.search_terms.is_empty() {
             None
         } else {
-            Some(Box::new(LabelNameSearchFilter::new(
-                self.search_terms.clone(),
-                self.fuzzy_algorithm,
+            build_search_filter(
+                &self.search_terms,
                 self.fuzzy_threshold,
+                self.fuzzy_algorithm,
                 !self.ignore_case,
-            )) as Box<dyn StringFilter>)
+            )
         };
 
         Ok(SearchHints {
@@ -88,13 +108,46 @@ impl LabelNameSearchArgs {
     }
 
     pub fn validate(&self) -> ValkeyResult<()> {
+        if !self.search_expr.is_empty() && !self.search_terms.is_empty() {
+            return Err(ValkeyError::Str(SEARCH_AND_SEARCH_EXPR_EXCLUSIVE));
+        }
         Ok(())
     }
+
+    /// Whether the search has `SEARCH` terms or a `SEARCH_EXPR`.
+    fn has_search(&self) -> bool {
+        !self.search_terms.is_empty() || !self.search_expr.is_empty()
+    }
+
+    /// How many terms each candidate may be scored against: the `SEARCH` terms, or the terms
+    /// of the `SEARCH_EXPR`.
+    fn search_term_count(&self) -> usize {
+        if self.search_expr.is_empty() {
+            self.search_terms.len()
+        } else {
+            search_expr::parse(&self.search_expr).map_or(1, |expr| expr.term_count())
+        }
+    }
+}
+
+const SEARCH_AND_SEARCH_EXPR_EXCLUSIVE: &str =
+    "TSDB: SEARCH and SEARCH_EXPR are mutually exclusive";
+
+fn search_expr_error(err: search_expr::SearchExprError) -> ValkeyError {
+    ValkeyError::String(format!("TSDB: {err}"))
+}
+
+/// Parses a `SEARCH_EXPR` and checks that it compiles.
+fn parse_search_expr(input: &str) -> ValkeyResult<Expr> {
+    let expr = search_expr::parse(input).map_err(search_expr_error)?;
+    search_expr::validate(&expr).map_err(search_expr_error)?;
+    Ok(expr)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LabelNameSearchToken {
     Search,
+    SearchExpr,
     FuzzyThreshold,
     FuzzyAlgorithm,
     IgnoreCase,
@@ -111,6 +164,7 @@ fn parse_label_name_search_token(value: &[u8]) -> Option<LabelNameSearchToken> {
         value,
         LabelNameSearchToken,
         "search" => LabelNameSearchToken::Search,
+        "search_expr" => LabelNameSearchToken::SearchExpr,
         "fuzzy_threshold" => LabelNameSearchToken::FuzzyThreshold,
         "fuzzy_algo" => LabelNameSearchToken::FuzzyAlgorithm,
         "fuzzy_algorithm" => LabelNameSearchToken::FuzzyAlgorithm,
@@ -183,6 +237,9 @@ pub(super) fn parse_label_name_search_args(
         };
         match token {
             LabelNameSearchToken::Search => {
+                if !parsed.search_expr.is_empty() {
+                    return Err(ValkeyError::Str(SEARCH_AND_SEARCH_EXPR_EXCLUSIVE));
+                }
                 let mut saw_term = false;
                 while let Some(next) = args.peek() {
                     if is_search_token(next.as_slice()) {
@@ -195,6 +252,21 @@ pub(super) fn parse_label_name_search_args(
                 if !saw_term {
                     return Err(ValkeyError::Str("TSDB: missing SEARCH value"));
                 }
+            }
+            LabelNameSearchToken::SearchExpr => {
+                if !parsed.search_terms.is_empty() {
+                    return Err(ValkeyError::Str(SEARCH_AND_SEARCH_EXPR_EXCLUSIVE));
+                }
+                if !parsed.search_expr.is_empty() {
+                    return Err(ValkeyError::Str("TSDB: SEARCH_EXPR may be given only once"));
+                }
+                let value = args
+                    .next_arg()
+                    .map_err(|_| ValkeyError::Str("TSDB: missing SEARCH_EXPR value"))?
+                    .to_string_lossy();
+                // Refused here rather than on each shard, before a cluster search fans out.
+                parse_search_expr(&value)?;
+                parsed.search_expr = value;
             }
             LabelNameSearchToken::FuzzyThreshold => {
                 let value = args.next_str()?;
@@ -278,7 +350,7 @@ pub(super) fn parse_label_name_search_args(
 
     if !sorting_specified {
         // if the user specified a search term but didn't specify sorting, we default to sorting by relevance score
-        if !parsed.search_terms.is_empty() {
+        if parsed.has_search() {
             parsed.sort_order = SearchResultOrdering::ScoreDesc;
         } else {
             // otherwise, we default to sorting by value ascending
@@ -287,7 +359,7 @@ pub(super) fn parse_label_name_search_args(
     }
 
     if !algo_specified {
-        if !parsed.search_terms.is_empty() {
+        if parsed.has_search() {
             // if the user specified search terms but didn't specify an algorithm, we default to JaroWinkler
             parsed.fuzzy_algorithm = FuzzyAlgorithm::JaroWinkler;
         } else {
@@ -499,7 +571,7 @@ fn should_run_in_background(
     // `hints.filter` is the one source of "has SEARCH": the probe's stop-after rule reads it
     // too, so the two cannot disagree.
     let search_terms = if hints.filter.is_some() {
-        parsed.search_terms.len().max(1)
+        parsed.search_term_count().max(1)
     } else {
         0
     };
@@ -569,6 +641,67 @@ mod tests {
                 .is_none()
         );
         clear_timeseries_index(DB);
+    }
+
+    fn expr_args(expr: &str) -> LabelNameSearchArgs {
+        LabelNameSearchArgs {
+            search_expr: expr.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn search_expr_compiles_into_the_hints_filter() {
+        let hints = expr_args("cpu AND NOT idle").build_search_hints().unwrap();
+        let filter = hints.filter.expect("a filter");
+        assert!(filter.accept("node_cpu_seconds").0);
+        assert!(!filter.accept("node_cpu_idle").0);
+        assert!(!filter.accept("memory").0);
+    }
+
+    #[test]
+    fn search_expr_honours_ignore_case() {
+        let mut args = expr_args("CPU OR Memory");
+        assert!(
+            !args
+                .build_search_hints()
+                .unwrap()
+                .filter
+                .unwrap()
+                .accept("node_cpu")
+                .0
+        );
+        args.ignore_case = true;
+        let filter = args.build_search_hints().unwrap().filter.unwrap();
+        assert!(filter.accept("node_cpu").0);
+        assert!(filter.accept("MEMORY_bytes").0);
+    }
+
+    #[test]
+    fn search_expr_is_exclusive_with_search_terms() {
+        let mut args = expr_args("cpu");
+        args.search_terms = vec!["node".to_string()];
+        assert!(args.build_search_hints().is_err());
+    }
+
+    #[test]
+    fn invalid_search_expr_is_refused() {
+        for input in ["NOT cpu", "cpu AND", "(cpu"] {
+            assert!(expr_args(input).build_search_hints().is_err(), "{input:?}");
+        }
+        // An empty `search_expr` field means none, but `SEARCH_EXPR ""` is refused.
+        assert!(parse_search_expr("").is_err());
+    }
+
+    #[test]
+    fn search_term_count_counts_expression_terms() {
+        assert_eq!(expr_args("a AND (b OR NOT c)").search_term_count(), 3);
+        let terms = LabelNameSearchArgs {
+            search_terms: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        assert_eq!(terms.search_term_count(), 2);
+        assert_eq!(LabelNameSearchArgs::default().search_term_count(), 0);
     }
 
     #[test]

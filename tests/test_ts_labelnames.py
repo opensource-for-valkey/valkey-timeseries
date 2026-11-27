@@ -627,3 +627,60 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         values = LabelSearchResponse.parse(self.client.execute_command(
             'TS.LABELVALUES', 'job', 'FILTER', 'pick=yes', 'INCLUDE_METADATA'))
         assert [(lv.value, lv.cardinality) for lv in values.results] == [(b'api', 1)]
+
+    # -------------------------------------------------------------------------
+    # Search expression tests
+    # -------------------------------------------------------------------------
+
+    def test_labelnames_search_expr_and_not(self):
+        """SEARCH_EXPR combines terms with AND/OR/NOT."""
+        self.setup_fuzzy_test_data(self.client)
+
+        result = self._exec_fuzzy('SEARCH_EXPR', 'node AND NOT id', 'SORTBY', 'value')
+        assert [lv.value for lv in result.results] == [b'node']
+
+        result = self._exec_fuzzy('SEARCH_EXPR', '(node OR team) AND NOT id', 'SORTBY', 'value')
+        assert [lv.value for lv in result.results] == [b'node', b'team']
+
+        result = self._exec_fuzzy('SEARCH_EXPR', 'met AND NOT (metric OR meta)', 'SORTBY', 'value')
+        assert result.results == []
+
+    def test_labelnames_search_expr_defaults_to_score_order(self):
+        """Without SORTBY, a SEARCH_EXPR orders by relevance score, as SEARCH does."""
+        self.setup_fuzzy_test_data(self.client)
+
+        result = self._exec_fuzzy('SEARCH_EXPR', 'metric OR meta', 'INCLUDE_METADATA')
+        scores = [lv.score for lv in result.results]
+        assert scores == sorted(scores, reverse=True)
+        assert {lv.value for lv in result.results} == {b'metric', b'metrics', b'meta'}
+
+    def test_labelnames_search_expr_ignore_case(self):
+        self.setup_fuzzy_test_data(self.client)
+
+        result = self._exec_fuzzy('SEARCH_EXPR', 'NODE AND NOT ID', 'SORTBY', 'value')
+        assert result.results == []
+
+        result = self._exec_fuzzy('SEARCH_EXPR', 'NODE AND NOT ID', 'IGNORE_CASE', 'SORTBY', 'value')
+        assert [lv.value for lv in result.results] == [b'node']
+
+    def test_labelnames_search_expr_errors(self):
+        self.setup_fuzzy_test_data(self.client)
+
+        exclusive = 'TSDB: SEARCH and SEARCH_EXPR are mutually exclusive'
+        for args in (
+                ('SEARCH', 'node', 'SEARCH_EXPR', 'type'),
+                ('SEARCH_EXPR', 'type', 'SEARCH', 'node'),
+        ):
+            with pytest.raises(Exception, match=exclusive):
+                self.client.execute_command('TS.LABELNAMES', *args)
+
+        with pytest.raises(Exception, match='may be given only once'):
+            self.client.execute_command('TS.LABELNAMES', 'SEARCH_EXPR', 'a', 'SEARCH_EXPR', 'b')
+
+        with pytest.raises(Exception, match='missing SEARCH_EXPR value'):
+            self.client.execute_command('TS.LABELNAMES', 'SEARCH_EXPR')
+
+        # Every accepting path must require a positive term.
+        for expr in ('NOT node', 'node AND', '(node', ''):
+            with pytest.raises(Exception, match='search expression'):
+                self.client.execute_command('TS.LABELNAMES', 'SEARCH_EXPR', expr)
