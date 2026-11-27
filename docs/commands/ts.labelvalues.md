@@ -51,6 +51,11 @@ standalone server and does not filter label values or series keys.
   `FUZZY_THRESHOLD` and `IGNORE_CASE`; negated terms match as plain substrings. Every accepting path must require a
   positive term, so `NOT cpu` alone is refused. A match scores the best mean of its positive terms' scores. An
   expression is limited to 4096 bytes, 32 terms and 16 levels of nesting.
+- `FUZZY_THRESHOLD` accepts `[0.0, 1.0]` and defaults to `0.0`. With `jarowinkler`, a value that contains a
+  term always matches, and a threshold above `0.0` also accepts values whose Jaro-Winkler similarity to the term
+  reaches it. With `subsequence`, a value that starts with a term always matches, and others must contain the term's
+  characters in order and score at least the threshold. A threshold of `1.0` is not an exact match. See
+  [Label and Metric Discovery](../topics/label-discovery.md).
 - `SORTBY score DESC` and `SORTBY cardinality DESC` select the highest-ranked values before
   applying `LIMIT`. Equal scores or cardinalities are ordered by value ascending.
 - A value's `cardinality` (reported with `INCLUDE_METADATA`, and ranked by `SORTBY cardinality`) is the number of

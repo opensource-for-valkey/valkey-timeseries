@@ -27,7 +27,11 @@ TS.LABELNAMES
   positive term, so `NOT cpu` alone is refused. A match scores the best mean of its positive terms' scores. An
   expression is limited to 4096 bytes, 32 terms and 16 levels of nesting.
 - `FUZZY_ALGORITHM` the fuzzy matching algorithm. Accepts `jarowinkler` and `subsequence`. Defaults to `jarowinkler`.
-- `FUZZY_THRESHOLD` accepts `[0.0, 1.0]`.
+- `FUZZY_THRESHOLD` accepts `[0.0, 1.0]` and defaults to `0.0`. With `jarowinkler`, a value that contains a
+  term always matches, and a threshold above `0.0` also accepts values whose Jaro-Winkler similarity to the term
+  reaches it. With `subsequence`, a value that starts with a term always matches, and others must contain the term's
+  characters in order and score at least the threshold. A threshold of `1.0` is not an exact match. See
+  [Label and Metric Discovery](../topics/label-discovery.md).
 - `IGNORE_CASE` toggle case sensitivity in string matching. Defaults to `false`.
 - `INCLUDE_METADATA` include to return `score` and `cardinality` in addition to label names.
 - `SORTBY` determine how matching metrics should be sorted in the response.
@@ -52,7 +56,6 @@ TS.LABELNAMES
   A background search is not a snapshot: it can observe changes made while it runs. When the
   workers' queue is full, the search fails with `TSDB: label search: too many queued jobs (limit 256)`.
 - `SEARCH` terms are ORed together.
-- `FUZZY_THRESHOLD` accepts `[0.0, 1.0]`.
 - `SORTBY score` currently supports `DESC` only.
 - `SORTBY value` orders by the label names themselves: `job` comes before `job2`.
 - A label name's `cardinality` (reported with `INCLUDE_METADATA`, and ranked by `SORTBY cardinality`) is the

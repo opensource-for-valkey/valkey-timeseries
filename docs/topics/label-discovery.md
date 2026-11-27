@@ -53,8 +53,17 @@ accepting path must require a positive term.
   in the target string in the same relative order, but not necessarily contiguously). For example, searching `nde` would
   match `node`. This is useful for "fuzzy" shorthand typing.
 
-The `FUZZY_THRESHOLD` (ranging from `0.0` to `1.0`) controls the sensitivity. A threshold of `1.0` requires an exact
-match (or perfect similarity), while lower values allow for increasing degrees of fuzziness.
+How a term matches depends on the algorithm and on `FUZZY_THRESHOLD` (`0.0` to `1.0`, default `0.0`):
+
+* `jarowinkler`: a value that contains the term always matches, scoring `1.0` when it starts with the term and less the
+  later the term occurs (down to `0.1`). With a threshold above `0.0`, a value that does not contain the term also
+  matches when its Jaro-Winkler similarity to the term is at least the threshold, and scores that similarity. At `0.0`,
+  only values that contain the term match.
+* `subsequence`: a value that starts with the term always matches, scoring `1.0`. Any other value must contain the
+  term's characters in order and have a subsequence score of at least the threshold. At `0.0`, any such value matches.
+
+The threshold only narrows the fuzzy matches. `1.0` is not an exact match: a value that contains the term
+(`jarowinkler`) or starts with it (`subsequence`) matches at any threshold.
 
 ### 3. Relevance Sorting
 

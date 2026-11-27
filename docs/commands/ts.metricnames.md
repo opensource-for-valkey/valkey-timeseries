@@ -27,7 +27,11 @@ TS.METRICNAMES
   positive term, so `NOT cpu` alone is refused. A match scores the best mean of its positive terms' scores. An
   expression is limited to 4096 bytes, 32 terms and 16 levels of nesting.
 - `FUZZY_ALGORITHM` accepts `jarowinkler` and `subsequence`. Defaults to `jarowinkler`.
-- `FUZZY_THRESHOLD` accepts `[0.0, 1.0]`.
+- `FUZZY_THRESHOLD` accepts `[0.0, 1.0]` and defaults to `0.0`. With `jarowinkler`, a value that contains a
+  term always matches, and a threshold above `0.0` also accepts values whose Jaro-Winkler similarity to the term
+  reaches it. With `subsequence`, a value that starts with a term always matches, and others must contain the term's
+  characters in order and score at least the threshold. A threshold of `1.0` is not an exact match. See
+  [Label and Metric Discovery](../topics/label-discovery.md).
 - `IGNORE_CASE` toggles case sensitivity in string matching. Defaults to `false`.
 - `INCLUDE_METADATA` include to return `score` and `cardinality` in addition to label names.
 - `SORTBY` specify the sort order of the results.
