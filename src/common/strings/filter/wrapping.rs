@@ -17,12 +17,23 @@
 use super::StringFilter;
 use std::borrow::Cow;
 
-/// Case folds `value`, borrowing it when it holds no uppercase character.
+/// Case folds `value`, borrowing it when lowercasing would leave it unchanged.
+///
+/// `char::is_uppercase` is not enough to decide that: titlecase letters such as `ǅ` lowercase
+/// (to `ǆ`) without being uppercase. The one context-sensitive mapping, final sigma, only
+/// applies to `Σ`, which is uppercase, so a per-character check agrees with `str::to_lowercase`.
 pub(super) fn case_fold(value: &str) -> Cow<'_, str> {
-    if value.chars().any(char::is_uppercase) {
-        Cow::Owned(value.to_lowercase())
+    let unchanged = if value.is_ascii() {
+        !value.bytes().any(|b| b.is_ascii_uppercase())
     } else {
+        value
+            .chars()
+            .all(|c| c.to_lowercase().eq(std::iter::once(c)))
+    };
+    if unchanged {
         Cow::Borrowed(value)
+    } else {
+        Cow::Owned(value.to_lowercase())
     }
 }
 
@@ -94,6 +105,25 @@ mod tests {
         let filter = CaseFoldingFilter::new(Recording::default());
         filter.accept("ÄRGER");
         assert_eq!(*filter.inner.0.lock().unwrap(), "ärger");
+    }
+
+    #[test]
+    fn case_folding_folds_titlecase_letters() {
+        // `ǅ` (U+01C5) is titlecase, not uppercase, yet lowercases to `ǆ`.
+        assert!(!'ǅ'.is_uppercase());
+        let filter = CaseFoldingFilter::new(Counting::new("ǆ"));
+        assert_eq!(filter.accept("xǅ"), (true, 1.0));
+        assert_eq!(filter.accept("ᾈ"), (false, 0.0));
+        assert_eq!(case_fold("ᾈ"), "ᾀ");
+    }
+
+    #[test]
+    fn case_folding_borrows_values_that_lowercasing_leaves_unchanged() {
+        assert!(matches!(case_fold("node_cpu"), Cow::Borrowed(_)));
+        assert!(matches!(case_fold("ärger"), Cow::Borrowed(_)));
+        assert!(matches!(case_fold(""), Cow::Borrowed(_)));
+        assert!(matches!(case_fold("Node"), Cow::Owned(_)));
+        assert!(matches!(case_fold("ǅ"), Cow::Owned(_)));
     }
 
     #[test]
