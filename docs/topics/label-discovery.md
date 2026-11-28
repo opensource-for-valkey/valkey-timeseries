@@ -76,8 +76,9 @@ parentheses, so a single request can require several terms and exclude others:
 TS.METRICNAMES SEARCH_EXPR "cpu AND NOT (idle OR steal)"
 ```
 
-This returns metric names that contain `cpu` but neither `idle` nor `steal`, such as `node_cpu_seconds_total`, while
-leaving out `node_cpu_idle_seconds`.
+This returns metric names that match `cpu` but contain neither `idle` nor `steal`, such as `node_cpu_seconds_total`,
+while leaving out `node_cpu_idle_seconds`. With the default `subsequence` algorithm, `cpu` need not be contiguous, so
+`compute_usage_total` matches too. Add `FUZZY_ALGORITHM jarowinkler` to match only names that contain `cpu`.
 
 #### Syntax
 
@@ -169,11 +170,12 @@ TS.METRICNAMES SEARCH cpu IGNORE_CASE FUZZY_ALGORITHM jarowinkler SORTBY score D
 
 ### Excluding Noise with a Boolean Expression
 
-A user wants CPU metrics but not the idle or steal counters, which would otherwise crowd the top of the list. The
-expression requires `cpu` and excludes both, case-insensitively:
+A user wants CPU metrics but not the idle or steal counters, which would otherwise fill much of the list. The
+expression requires names that contain `cpu` and excludes both, case-insensitively. `FUZZY_ALGORITHM jarowinkler`
+keeps `cpu` contiguous; the default `subsequence` would also accept names such as `compute_usage_total`:
 
 ```text
-TS.METRICNAMES SEARCH_EXPR "cpu AND NOT (idle OR steal)" IGNORE_CASE LIMIT 20
+TS.METRICNAMES SEARCH_EXPR "cpu AND NOT (idle OR steal)" FUZZY_ALGORITHM jarowinkler IGNORE_CASE LIMIT 20
 ```
 
 ### Drill-down by Environment
