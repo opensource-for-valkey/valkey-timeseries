@@ -80,7 +80,8 @@ message LabelSearchRequest {
   repeated string search_terms = 3;
   // A boolean search expression; empty for none. Exclusive with search_terms.
   string search_expr = 4;
-  double fuzz_threshold = 5;
+  // FUZZY_THRESHOLD as a whole percentage in [0, 100].
+  uint32 fuzz_threshold = 5;
   FuzzySearchAlgorithm fuzz_algorithm = 6;
   bool ignore_case = 7;
   bool include_metadata = 8;

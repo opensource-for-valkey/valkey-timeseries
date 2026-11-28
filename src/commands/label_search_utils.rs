@@ -37,7 +37,9 @@ pub(crate) struct LabelNameSearchArgs {
     /// A boolean search expression (`SEARCH_EXPR`), or empty for none. Exclusive with
     /// `search_terms`.
     pub(crate) search_expr: String,
-    pub(crate) fuzzy_threshold: f64,
+    /// `FUZZY_THRESHOLD` as a whole percentage in `[0, 100]`, as Prometheus takes it. The term
+    /// filters normalize it to `[0.0, 1.0]`, the scale of the scores they return.
+    pub(crate) fuzzy_threshold: u8,
     pub(crate) fuzzy_algorithm: FuzzyAlgorithm,
     pub(crate) ignore_case: bool,
     pub(crate) include_metadata: bool,
@@ -54,7 +56,7 @@ impl Default for LabelNameSearchArgs {
             label: None,
             search_terms: Vec::new(),
             search_expr: String::new(),
-            fuzzy_threshold: 0.0,
+            fuzzy_threshold: 0,
             fuzzy_algorithm: FuzzyAlgorithm::JaroWinkler,
             ignore_case: false,
             include_metadata: false,
@@ -115,6 +117,9 @@ impl LabelNameSearchArgs {
         if self.search_terms.len() > MAX_SEARCH_TERMS {
             return Err(too_many_search_terms());
         }
+        if self.fuzzy_threshold > MAX_FUZZY_THRESHOLD {
+            return Err(ValkeyError::Str(FUZZY_THRESHOLD_RANGE));
+        }
         Ok(())
     }
 
@@ -141,6 +146,12 @@ const SEARCH_AND_SEARCH_EXPR_EXCLUSIVE: &str =
 /// adds a filter that every candidate is scored against, so the count bounds per-value work.
 /// The same cap as a `SEARCH_EXPR`'s terms, and as Prometheus's `search[]` terms.
 pub(crate) const MAX_SEARCH_TERMS: usize = search_expr::MAX_EXPRESSION_TERMS;
+
+/// The largest `FUZZY_THRESHOLD`: it is a whole percentage.
+pub(crate) const MAX_FUZZY_THRESHOLD: u8 = 100;
+
+pub(crate) const FUZZY_THRESHOLD_RANGE: &str =
+    "TSDB: FUZZY_THRESHOLD must be a whole number in [0..100]";
 
 fn too_many_search_terms() -> ValkeyError {
     ValkeyError::String(format!(
@@ -288,15 +299,11 @@ pub(super) fn parse_label_name_search_args(
             }
             LabelNameSearchToken::FuzzyThreshold => {
                 let value = args.next_str()?;
-                let threshold = value.parse::<f64>().map_err(|_| {
-                    ValkeyError::Str("TSDB: FUZZY_THRESHOLD must be a number in [0.0..1.0]")
-                })?;
-                if !(0.0..=1.0).contains(&threshold) {
-                    return Err(ValkeyError::Str(
-                        "TSDB: FUZZY_THRESHOLD must be in [0.0..1.0]",
-                    ));
-                }
-                parsed.fuzzy_threshold = threshold;
+                parsed.fuzzy_threshold = value
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|&threshold| threshold <= MAX_FUZZY_THRESHOLD)
+                    .ok_or(ValkeyError::Str(FUZZY_THRESHOLD_RANGE))?;
             }
             LabelNameSearchToken::FuzzyAlgorithm => {
                 let value = args.next_str()?;
@@ -717,6 +724,26 @@ mod tests {
         };
         assert!(terms(MAX_SEARCH_TERMS).build_search_hints().is_ok());
         assert!(terms(MAX_SEARCH_TERMS + 1).build_search_hints().is_err());
+    }
+
+    #[test]
+    fn fuzzy_threshold_is_a_whole_percentage() {
+        let with_threshold = |fuzzy_threshold: u8| LabelNameSearchArgs {
+            search_terms: vec!["metric".into()],
+            fuzzy_threshold,
+            ..Default::default()
+        };
+        assert!(
+            with_threshold(MAX_FUZZY_THRESHOLD)
+                .build_search_hints()
+                .is_ok()
+        );
+        // A fan-out request is checked as well: shards do not trust the coordinator's parse.
+        assert!(
+            with_threshold(MAX_FUZZY_THRESHOLD + 1)
+                .build_search_hints()
+                .is_err()
+        );
     }
 
     #[test]

@@ -51,17 +51,20 @@ rather than accept any of them, use a [boolean search expression](#3-boolean-sea
   in the target string in the same relative order, but not necessarily contiguously). For example, searching `nde` would
   match `node`. This is useful for "fuzzy" shorthand typing.
 
-How a term matches depends on the algorithm and on `FUZZY_THRESHOLD` (`0.0` to `1.0`, default `0.0`):
+How a term matches depends on the algorithm and on `FUZZY_THRESHOLD`, a whole percentage from `0` to `100` (default
+`0`), as in the Prometheus search API. Scores are always between `0.0` and `1.0`, and a threshold of `N` requires a
+fuzzy score of at least `N / 100`: `80` requires `0.8`.
 
 * `jarowinkler`: a value that contains the term always matches, scoring `1.0` when it starts with the term and less the
-  later the term occurs (down to `0.1`). With a threshold above `0.0`, a value that does not contain the term also
-  matches when its Jaro-Winkler similarity to the term is at least the threshold, and scores that similarity. At `0.0`,
+  later the term occurs (down to `0.1`). With a threshold above `0`, a value that does not contain the term also
+  matches when its Jaro-Winkler similarity to the term is at least the threshold, and scores that similarity. At `0`,
   only values that contain the term match.
 * `subsequence`: a value that starts with the term always matches, scoring `1.0`. Any other value must contain the
-  term's characters in order and have a subsequence score of at least the threshold. At `0.0`, any such value matches.
+  term's characters in order and have a subsequence score of at least the threshold. At `0`, any such value matches.
 
-The threshold only narrows the fuzzy matches. `1.0` is not an exact match: a value that contains the term
-(`jarowinkler`) or starts with it (`subsequence`) matches at any threshold.
+The threshold only narrows the fuzzy matches. `100` is not an exact match: a value that contains the term
+(`jarowinkler`) or starts with it (`subsequence`) matches at any threshold. A threshold that is not a whole number in
+that range, such as `0.8` or `101`, fails with `TSDB: FUZZY_THRESHOLD must be a whole number in [0..100]`.
 
 ### 3. Boolean Search Expressions
 

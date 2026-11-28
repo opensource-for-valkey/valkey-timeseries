@@ -419,17 +419,17 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         """A high FUZZ_THRESHOLD should restrict results to very close matches."""
         self.setup_fuzzy_test_data(self.client)
 
-        # threshold=0.99 should only accept near-perfect matches for 'metric'
+        # threshold=99 should only accept near-perfect matches for 'metric'
         result_strict = self._exec_fuzzy(
             'SEARCH', 'metric',
-            'FUZZY_THRESHOLD', '0.99',
+            'FUZZY_THRESHOLD', '99',
         )
         values_strict = {lv.value for lv in result_strict.results}
 
         # A lenient threshold should return more results
         result_lenient = self._exec_fuzzy(
             'SEARCH', 'metric',
-            'FUZZY_THRESHOLD', '0.5',
+            'FUZZY_THRESHOLD', '50',
         )
         values_lenient = {lv.value for lv in result_lenient.results}
 
@@ -446,7 +446,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         result = self._exec_fuzzy(
             'SEARCH', 'metirc',
             'FUZZY_ALGORITHM', 'jarowinkler',
-            'FUZZY_THRESHOLD', '0.5',
+            'FUZZY_THRESHOLD', '50',
         )
         values = [lv.value for lv in result.results]
         assert b'metric' in values or b'metrics' in values, (
@@ -462,12 +462,31 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         result = self._exec_fuzzy(
             'SEARCH', 'nde',
             'FUZZY_ALGORITHM', 'subsequence',
-            'FUZZY_THRESHOLD', '0.3',
+            'FUZZY_THRESHOLD', '30',
         )
         values = [lv.value for lv in result.results]
         assert any(v in values for v in [b'node', b'node_id']), (
             f"Expected 'node' or 'node_id' in subsequence results, got {values}"
         )
+
+    def test_labelnames_fuzzy_threshold_is_a_whole_percentage(self):
+        """FUZZY_THRESHOLD takes a whole percentage in [0, 100]; scores stay in [0.0, 1.0]."""
+        self.setup_fuzzy_test_data(self.client)
+
+        for threshold in ('0', '80', '100'):
+            result = self._exec_fuzzy(
+                'SEARCH', 'metric', 'FUZZY_THRESHOLD', threshold, 'INCLUDE_METADATA',
+            )
+            assert result.results, threshold
+            for lv in result.results:
+                assert 0.0 <= lv.score <= 1.0, (threshold, lv.value, lv.score)
+
+        out_of_range = r'TSDB: FUZZY_THRESHOLD must be a whole number in \[0\.\.100\]'
+        for threshold in ('0.5', '1.0', '101', '-1', 'high'):
+            with pytest.raises(Exception, match=out_of_range):
+                self.client.execute_command(
+                    'TS.LABELNAMES', 'SEARCH', 'metric', 'FUZZY_THRESHOLD', threshold,
+                )
 
     def test_labelnames_caps_search_terms(self):
         """A request may carry at most 32 SEARCH terms, counted across repeated SEARCH keywords."""
@@ -494,7 +513,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
             with pytest.raises(Exception, match=f'Unknown fuzzy algorithm: {algorithm}'):
                 self.client.execute_command(
                     'TS.LABELNAMES', 'SEARCH', 'node',
-                    'FUZZY_ALGORITHM', algorithm, 'FUZZY_THRESHOLD', '0.5',
+                    'FUZZY_ALGORITHM', algorithm, 'FUZZY_THRESHOLD', '50',
                 )
         # Without a search, the algorithm is still parsed and refused.
         with pytest.raises(Exception, match='Unknown fuzzy algorithm: noop'):
@@ -506,12 +525,12 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
 
         result_no_ignore = self._exec_fuzzy(
             'SEARCH', 'NODE',
-            'FUZZY_THRESHOLD', '0.9',
+            'FUZZY_THRESHOLD', '90',
         )
         result_ignore = self._exec_fuzzy(
             'SEARCH', 'NODE',
             'IGNORE_CASE', 
-            'FUZZY_THRESHOLD', '0.9',
+            'FUZZY_THRESHOLD', '90',
         )
         values_ignore = [lv.value for lv in result_ignore.results]
         values_no_ignore = [lv.value for lv in result_no_ignore.results]
@@ -531,7 +550,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
 
         result = self._exec_fuzzy(
             'SEARCH', 'me',
-            'FUZZY_THRESHOLD', '0.3',
+            'FUZZY_THRESHOLD', '30',
             'SORTBY', 'value', 'ASC',
         )
         values = [lv.value for lv in result.results]
@@ -545,7 +564,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
 
         result = self._exec_fuzzy(
             'SEARCH', 'me',
-            'FUZZY_THRESHOLD', '0.3',
+            'FUZZY_THRESHOLD', '30',
             'SORTBY', 'value', 'DESC',
         )
         values = [lv.value for lv in result.results]
@@ -559,7 +578,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
 
         result = self._exec_fuzzy(
             'SEARCH', 'n',
-            'FUZZY_THRESHOLD', '0.1',
+            'FUZZY_THRESHOLD', '10',
             'SORTBY', 'cardinality', 'ASC',
             'INCLUDE_METADATA',
         )
@@ -575,7 +594,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         # Only fts2 has env=staging; its label names are metrics, node_id, team, env
         result = self._exec_fuzzy(
             'SEARCH', 'node',
-            'FUZZY_THRESHOLD', '0.5',
+            'FUZZY_THRESHOLD', '50',
             'FILTER', 'env=staging',
         )
         values = [lv.value for lv in result.results]
@@ -594,7 +613,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
 
         result = self._exec_fuzzy(
             'SEARCH', 'e',
-            'FUZZY_THRESHOLD', '0.1',
+            'FUZZY_THRESHOLD', '10',
             'LIMIT', '2',
         )
         assert len(result.results) <= 2, (
@@ -609,7 +628,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         # high threshold
         result = self._exec_fuzzy(
             'SEARCH', 'zzzzzzzzz',
-            'FUZZY_THRESHOLD', '0.99',
+            'FUZZY_THRESHOLD', '99',
         )
         assert result.results == [], (
             f"Expected empty results for nonsense term, got {result.results}"
@@ -622,7 +641,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         # 'node' matches node/node_id; 'type' matches type
         result = self._exec_fuzzy(
             'SEARCH', 'node', 'type',
-            'FUZZY_THRESHOLD', '0.8',
+            'FUZZY_THRESHOLD', '80',
             'SORTBY', 'value', 'ASC',
         )
         values = [lv.value for lv in result.results]

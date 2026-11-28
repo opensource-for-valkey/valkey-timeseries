@@ -5,7 +5,7 @@ use valkey_module::{Context, ValkeyResult, ValkeyString};
 acl_categories!(TS_METRICNAMES, "ts.metricnames", "read timeseries");
 /// TS.METRICNAMES
 /// [SEARCH term [term...]]
-/// [FUZZY_THRESHOLD 0.0..1.0]
+/// [FUZZY_THRESHOLD 0..100]
 /// [FUZZY_ALGORITHM jarowinkler|subsequence]
 /// [IGNORE_CASE]
 /// [INCLUDE_METADATA]

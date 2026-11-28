@@ -6,8 +6,8 @@ use crate::commands::fanout_codec::{
     FuzzySearchAlgorithm, LabelSearchResult as FanoutLabelSearchResult, LabelSearchType,
 };
 use crate::commands::label_search_utils::{
-    LabelNameSearchArgs, label_search_targets, process_label_search_request,
-    reply_with_label_search_result,
+    FUZZY_THRESHOLD_RANGE, LabelNameSearchArgs, MAX_FUZZY_THRESHOLD, label_search_targets,
+    process_label_search_request, reply_with_label_search_result,
 };
 use crate::common::replies::ReplyContext;
 use crate::common::strings::filter::FuzzyAlgorithm;
@@ -55,11 +55,10 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
         ctx: &FanoutContext,
         req: LabelSearchRequest,
     ) -> ValkeyResult<LabelSearchResponse> {
-        if req.fuzz_threshold > 1.0 {
-            return Err(ValkeyError::Str(
-                "TSDB: FUZZY_THRESHOLD must be in [0.0..1.0]",
-            ));
-        }
+        let fuzzy_threshold = u8::try_from(req.fuzz_threshold)
+            .ok()
+            .filter(|&threshold| threshold <= MAX_FUZZY_THRESHOLD)
+            .ok_or(ValkeyError::Str(FUZZY_THRESHOLD_RANGE))?;
 
         let search_type = LabelSearchType::try_from(req.request_type)
             .map_err(|_| ValkeyError::Str("TSDB: invalid label search request type"))?;
@@ -115,7 +114,7 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
             label,
             search_terms: req.search_terms,
             search_expr: req.search_expr,
-            fuzzy_threshold: req.fuzz_threshold,
+            fuzzy_threshold,
             fuzzy_algorithm: fuzz_algorithm,
             ignore_case: req.ignore_case,
             // include_score was removed as a user option; shards always return plain values.
@@ -178,7 +177,7 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
             label,
             search_terms: self.args.search_terms.clone(),
             search_expr: self.args.search_expr.clone(),
-            fuzz_threshold: self.args.fuzzy_threshold,
+            fuzz_threshold: u32::from(self.args.fuzzy_threshold),
             fuzz_algorithm,
             ignore_case: self.args.ignore_case,
             range: self.args.series_filter.date_range.map(Into::into),

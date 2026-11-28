@@ -571,8 +571,9 @@ pub struct LabelSearchRequest {
     /// A boolean search expression; empty for none. Exclusive with search_terms.
     #[prost(string, tag = "4")]
     pub search_expr: ::prost::alloc::string::String,
-    #[prost(double, tag = "5")]
-    pub fuzz_threshold: f64,
+    /// FUZZY_THRESHOLD as a whole percentage in \[0, 100\].
+    #[prost(uint32, tag = "5")]
+    pub fuzz_threshold: u32,
     #[prost(enumeration = "FuzzySearchAlgorithm", tag = "6")]
     pub fuzz_algorithm: i32,
     #[prost(bool, tag = "7")]

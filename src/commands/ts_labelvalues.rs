@@ -8,7 +8,7 @@ use valkey_module::{Context, ValkeyResult, ValkeyString};
 acl_categories!(TS_LABELVALUES, "ts.labelvalues", "read timeseries");
 /// TS.LABELVALUES label
 /// [SEARCH term [term...]]
-/// [FUZZY_THRESHOLD 0.0..1.0]
+/// [FUZZY_THRESHOLD 0..100]
 /// [FUZZY_ALGORITHM jarowinkler|subsequence]
 /// [IGNORE_CASE]
 /// [INCLUDE_METADATA]
