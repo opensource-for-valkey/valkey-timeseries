@@ -2,6 +2,9 @@
 
 Searches metric names (`__name__` label values) with substring and optional fuzzy matching.
 
+For a guide to searching, fuzzy matching and boolean search expressions shared by `TS.LABELNAMES`,
+`TS.LABELVALUES` and `TS.METRICNAMES`, see [Label and Metric Discovery](../topics/label-discovery.md).
+
 ```text
 TS.METRICNAMES
   [SEARCH term [term ...] | SEARCH_EXPR expression]
@@ -18,14 +21,16 @@ TS.METRICNAMES
 
 ### Optional Arguments
 
-- `SEARCH` terms are ORed together.
+- `SEARCH` terms are ORed together. A request may carry at most 32 terms, counting every `SEARCH`; more fail with
+  `TSDB: too many SEARCH terms (maximum 32)`.
 - `SEARCH_EXPR` takes one boolean search expression in place of `SEARCH` terms (the two are mutually exclusive):
   terms combined with `AND`, `OR`, `NOT` and parentheses, for example `"cpu AND NOT (idle OR steal)"`. `NOT` binds
   tighter than `AND`, which binds tighter than `OR`. Operators are case-insensitive; a double-quoted term such as
   `"and"` is searched for literally. Positive terms match as `SEARCH` terms do, honouring `FUZZY_ALGORITHM`,
   `FUZZY_THRESHOLD` and `IGNORE_CASE`; negated terms match as plain substrings. Every accepting path must require a
   positive term, so `NOT cpu` alone is refused. A match scores the best mean of its positive terms' scores. An
-  expression is limited to 4096 bytes, 32 terms and 16 levels of nesting.
+  expression is limited to 4096 bytes, 32 terms and 16 levels of nesting. See
+  [Boolean Search Expressions](../topics/label-discovery.md#3-boolean-search-expressions).
 - `FUZZY_ALGORITHM` accepts `jarowinkler` and `subsequence`. Defaults to `jarowinkler`.
 - `FUZZY_THRESHOLD` accepts `[0.0, 1.0]` and defaults to `0.0`. With `jarowinkler`, a value that contains a
   term always matches, and a threshold above `0.0` also accepts values whose Jaro-Winkler similarity to the term

@@ -34,15 +34,13 @@ This eliminates the need to download unnecessary label data to the client just t
 
 ### 2. Fuzzy Matching and Typo Tolerance
 
-The `SEARCH` argument allows you to provide one or more search terms. You can enable fuzzy matching using algorithms
-like `jarowinkler` or `subsequence`, and tune how strict the match should be with `FUZZY_THRESHOLD`.
-Users frequently mistype metric names or only remember parts of a label (e.g., typing "mem" when searching for "
-memory_usage"). Fuzzy matching provides highly relevant autocomplete suggestions instantly.
+The `SEARCH` argument takes one or more search terms, and a value matches if it matches any of them. You can enable
+fuzzy matching using algorithms like `jarowinkler` or `subsequence`, and tune how strict the match should be with
+`FUZZY_THRESHOLD`. Users frequently mistype metric names or only remember parts of a label (e.g., typing "mem" when
+searching for "memory_usage"). Fuzzy matching provides highly relevant autocomplete suggestions instantly.
 
-To combine terms with boolean logic instead, pass one `SEARCH_EXPR` in place of `SEARCH`, for example
-`TS.METRICNAMES SEARCH_EXPR "cpu AND NOT (idle OR steal)"`. Terms combine with `AND`, `OR`, `NOT` and parentheses;
-positive terms match with the same fuzzy settings as `SEARCH` terms, negated ones as plain substrings, and every
-accepting path must require a positive term.
+A request may carry at most 32 `SEARCH` terms, counting every `SEARCH` keyword in it. To require or exclude terms
+rather than accept any of them, use a [boolean search expression](#3-boolean-search-expressions) instead.
 
 #### Supported Algorithms
 
@@ -65,21 +63,69 @@ How a term matches depends on the algorithm and on `FUZZY_THRESHOLD` (`0.0` to `
 The threshold only narrows the fuzzy matches. `1.0` is not an exact match: a value that contains the term
 (`jarowinkler`) or starts with it (`subsequence`) matches at any threshold.
 
-### 3. Relevance Sorting
+### 3. Boolean Search Expressions
+
+`SEARCH_EXPR` takes one expression in place of `SEARCH` terms. It combines terms with `AND`, `OR`, `NOT` and
+parentheses, so a single request can require several terms and exclude others:
+
+```text
+TS.METRICNAMES SEARCH_EXPR "cpu AND NOT (idle OR steal)"
+```
+
+This returns metric names that contain `cpu` but neither `idle` nor `steal`, such as `node_cpu_seconds_total`, while
+leaving out `node_cpu_idle_seconds`.
+
+#### Syntax
+
+* `NOT` binds more tightly than `AND`, which binds more tightly than `OR`: `a OR b AND NOT c` means `a OR (b AND (NOT
+  c))`. Use parentheses to group terms differently.
+* Operators are case-insensitive: `and`, `And` and `AND` are the same operator.
+* Every pair of terms needs an operator between them. There is no implied `AND`, so `cpu idle` is an error; write
+  `cpu AND idle`.
+* Quote a term to search for text that would otherwise be read as an operator or split at a space, such as `"and"` or
+  `"node cpu"`. Inside quotes, `\"` and `\\` are the only escapes.
+* The whole expression is a single command argument, so quote it as your client requires, as in the example above.
+
+#### Matching
+
+* Positive terms match the way `SEARCH` terms do, honouring `FUZZY_ALGORITHM`, `FUZZY_THRESHOLD` and `IGNORE_CASE`.
+* Negated terms match as plain substrings, honouring `IGNORE_CASE` only. A fuzzy `NOT` would also exclude values that
+  merely resemble the term.
+* Every way an expression can accept a value must require at least one positive term. An expression that could accept
+  a value on negations alone is refused, for example `NOT cpu` or `cpu OR NOT idle`.
+
+#### Scoring
+
+A match scores the mean of the scores of the positive terms it matched. When an `OR` leaves more than one way to
+match, the value gets the best of those means. Negated terms do not contribute to the score.
+
+#### Limits and errors
+
+* An expression is limited to 4096 bytes, 32 terms and 16 levels of nesting, where each `NOT` and each parenthesised
+  group adds one level.
+* `SEARCH` and `SEARCH_EXPR` are mutually exclusive, and `SEARCH_EXPR` may be given only once. An empty expression is
+  refused.
+* An invalid expression fails with an error that starts with `TSDB: search expression:` and gives the byte position of
+  the problem, for example `TSDB: search expression: unterminated quoted term at position 4`.
+* In a cluster, the coordinator checks the expression before fanning out, so an invalid expression fails once instead
+  of on every shard.
+
+### 4. Relevance Sorting
 
 Results can be sorted alphabetically (`value`), by occurrence (`cardinality`), or by how well they matched the search
-terms (`score`).
+terms (`score`). Without `SORTBY`, a request with `SEARCH` or `SEARCH_EXPR` sorts by `score`, best first, and any
+other request sorts by `value`.
 When building drill-down menus or autocomplete fields, the most relevant or most frequently used labels should appear at
 the top.
 
-### 4. Rich Metadata
+### 5. Rich Metadata
 
 By including the `INCLUDE_METADATA` flag, the commands return not just the string names, but also the relevance
 `score` and the `cardinality` (the number of times that label/value appears).
 UI clients and AI/ML query assistants can use this metadata to make informed decisions about which queries to run next
 or how to render exploration paths.
 
-### 5. Cluster-Aware Fanout
+### 6. Cluster-Aware Fanout
 
 In a Valkey cluster, these commands automatically fan out to all nodes. The coordinator node merges the results,
 recalculates global cardinalities, and applies the final sorts and limits before returning a unified response to the
@@ -113,6 +159,15 @@ case-insensitively, sorting the best matches first:
 
 ```text
 TS.METRICNAMES SEARCH cpu IGNORE_CASE FUZZY_ALGORITHM jarowinkler SORTBY score DESC LIMIT 5
+```
+
+### Excluding Noise with a Boolean Expression
+
+A user wants CPU metrics but not the idle or steal counters, which would otherwise crowd the top of the list. The
+expression requires `cpu` and excludes both, case-insensitively:
+
+```text
+TS.METRICNAMES SEARCH_EXPR "cpu AND NOT (idle OR steal)" IGNORE_CASE LIMIT 20
 ```
 
 ### Drill-down by Environment
