@@ -17,6 +17,7 @@ well as provide a superset of the _RedisTimeSeries_ API.
 - Configurable data retention period
 - Configurable encoding
 - Single sample and range queries
+- Time-weighted average (`twa`) range aggregation in `TS.RANGE`, `TS.REVRANGE`, `TS.NRANGE` and `TS.NREVRANGE`
 - Supports [Metadata](https://prometheus.io/docs/prometheus/latest/querying/api/#querying-metadata) like queries
 - Advanced [Label and Metric Discovery](docs/topics/label-discovery.md) with fuzzy matching, boolean search expressions (`SEARCH_EXPR`), server-side filtering, and result limits applied after ranking
 - Anomaly detection using multiple algorithms, including [ZScore](https://en.wikipedia.org/wiki/Standard_score), [IQR](https://en.wikipedia.org/wiki/Interquartile_range), [MAD](https://crispinagar.github.io/blogs/mad-anomaly-detection.html), and [Random Cut Forest](https://christianalexander.com/2023/08/06/random-cut-forests-in-elixir/)

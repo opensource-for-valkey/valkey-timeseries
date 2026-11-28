@@ -40,7 +40,7 @@ the end of the time range to query, inclusive. Accepts:
 ## Optional Arguments
 
 <details open><summary><code>LATEST</code></summary>
-When querying a compaction, return the latest bucket value even if the bucket is not yet closed. This is in addition to the regular range results. 
+When querying a compaction, return the latest bucket value even if the bucket is not yet closed. This is in addition to the regular range results. With `AGGREGATION twa`, the open bucket brackets the buckets next to it, but it does not fill gaps and it does not extend `EMPTY` rows.
 </details>
 <details open><summary><code>FILTER_BY_TS timestamp ...</code></summary>
 Include only samples at the specified timestamp(s). Multiple timestamps can be provided. Applied before aggregation.
@@ -110,6 +110,34 @@ Control bucket alignment:
 | `range`    | Difference between max and min | `NaN`              |
 | `first`    | Earliest sample value          | —                  |
 | `last`     | Latest sample value            | —                  |
+| `twa`      | Time-weighted mean of interpolated samples | See [below](#time-weighted-average) |
+
+### Time-weighted average
+
+`twa` joins real samples with straight lines, clips those lines to the bucket
+and to the query interval, and divides the area under them by the time they
+cover. Samples outside the query can contribute. `FILTER_BY_TS` and
+`FILTER_BY_VALUE` apply to those samples too. A zero-width interval returns its
+interpolated value or its actual sample value.
+
+To find those samples, `twa` reads outward from each side of the query interval
+until it finds two real samples that pass the filters. If a filter rejects the
+samples near the interval, or a long run of NaNs sits next to it, that read can
+cover the whole history of the series on that side.
+
+NaNs inside a bucket that has real samples are skipped. A NaN from a preceding
+NaN-only bucket, or a raw NaN that closes the bucket, stops interpolation on that
+side. A reverse query can therefore return different `twa` values.
+
+With `EMPTY`, a bucket without samples uses the nearest real samples around it.
+With a real sample on each side, the line between them is averaged. With a real
+sample on one side only, two real samples at that edge hold the nearest value for
+half their spacing (rounded down). A bucket that overlaps that extension returns
+the held value. Otherwise the bucket returns NaN. A NaN-only bucket follows the
+same rule when another column, such as `countnan`, causes its row to be returned.
+
+`twa` can be one of several aggregators in a list. Adding `twa` does not change
+the values of the other columns.
 
 ### Statistical Aggregators
 
@@ -275,6 +303,19 @@ TS.RANGE cpu:utilization 1609459200000 1609545600000 AGGREGATION countif>90,sumi
 - **invalid BUCKETTIMESTAMP** — Invalid bucket timestamp option
 - **invalid ALIGN** — Invalid alignment parameter
 - **invalid bucketDuration** — Bucket duration must be a positive integer
+
+## Complexity
+
+O(n/m + k) where:
+
+- n = number of samples in the series
+- m = number of samples per chunk
+- k = number of samples read
+
+Without `twa`, k is the number of samples in the range. With `twa`, k also counts the
+samples read outside the range to find the nearest real samples that pass the filters (see
+[Time-weighted average](#time-weighted-average)). That read stops at the second such sample on
+each side, or at the end of the series, so it is not limited by the range.
 
 ---
 

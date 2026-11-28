@@ -11,11 +11,17 @@ mod handlers;
 mod handlers_tests;
 mod kahan;
 mod partial_reducer;
+mod twa;
+mod twa_rows;
+#[cfg(test)]
+mod twa_rows_tests;
 
 pub use aggregate_iterator::*;
 pub use filtered::*;
 pub use handlers::*;
 pub use partial_reducer::*;
+pub use twa::*;
+pub use twa_rows::*;
 
 #[derive(Debug, Default, PartialEq, Clone, Copy, Eq)]
 pub enum BucketTimestamp {
@@ -164,6 +170,7 @@ pub enum AggregationType {
     SumIf = 20,
     VarP = 21,
     VarS = 22,
+    Twa = 23,
 }
 
 impl AggregationType {
@@ -192,6 +199,7 @@ impl AggregationType {
             AggregationType::Rate => "rate",
             AggregationType::VarS => "var.s",
             AggregationType::VarP => "var.p",
+            AggregationType::Twa => "twa",
         }
     }
 
@@ -268,7 +276,8 @@ impl AggregationType {
             | AggregationType::Last
             | AggregationType::Rate
             | AggregationType::IRate
-            | AggregationType::Increase => ReducerSupport::Invalid,
+            | AggregationType::Increase
+            | AggregationType::Twa => ReducerSupport::Invalid,
         }
     }
 }
@@ -306,6 +315,7 @@ impl TryFrom<&str> for AggregationType {
             "std.p" => AggregationType::StdP,
             "sum" => AggregationType::Sum,
             "sumif" => AggregationType::SumIf,
+            "twa" => AggregationType::Twa,
             "var.s" => AggregationType::VarS,
             "var.p" => AggregationType::VarP,
         )
@@ -530,6 +540,7 @@ mod tests {
         assert_eq!(AggregationType::StdP.name(), "std.p");
         assert_eq!(AggregationType::VarS.name(), "var.s");
         assert_eq!(AggregationType::VarP.name(), "var.p");
+        assert_eq!(AggregationType::Twa.name(), "twa");
     }
 
     #[test]
@@ -626,6 +637,10 @@ mod tests {
             AggregationType::try_from("var.p").unwrap(),
             AggregationType::VarP
         );
+        assert_eq!(
+            AggregationType::try_from("twa").unwrap(),
+            AggregationType::Twa
+        );
     }
 
     #[test]
@@ -633,7 +648,7 @@ mod tests {
         assert!(AggregationType::try_from("invalid").is_err());
     }
 
-    const ALL_AGGREGATION_TYPES: [AggregationType; 23] = [
+    const ALL_AGGREGATION_TYPES: [AggregationType; 24] = [
         AggregationType::All,
         AggregationType::Any,
         AggregationType::Avg,
@@ -657,6 +672,7 @@ mod tests {
         AggregationType::SumIf,
         AggregationType::VarP,
         AggregationType::VarS,
+        AggregationType::Twa,
     ];
 
     #[test]
@@ -665,8 +681,18 @@ mod tests {
             let byte = u8::from(*aggregation);
             // The persisted values: declaration order, pinned by explicit discriminants.
             assert_eq!(byte as usize, discriminant, "{aggregation:?}");
-            assert_eq!(AggregationType::try_from(byte).unwrap(), *aggregation);
+            if *aggregation != AggregationType::Twa {
+                assert_eq!(AggregationType::try_from(byte).unwrap(), *aggregation);
+            }
         }
+    }
+
+    #[test]
+    fn the_twa_tag_fails_to_load() {
+        let byte = u8::from(AggregationType::Twa);
+        assert_eq!(byte, 23);
+        let error = AggregationType::try_from(byte).unwrap_err();
+        assert_eq!(error.to_string(), "TSDB: invalid AGGREGATION value");
     }
 
     #[test]

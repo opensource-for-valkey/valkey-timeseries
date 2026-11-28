@@ -1,6 +1,6 @@
 use crate::aggregators::{AggregationHandler, AggregationType, Aggregator, BucketTimestamp};
 use crate::common::{MultiSample, Sample, Timestamp};
-use crate::series::request_types::{AggregationOptions, MAX_AGGREGATIONS};
+use crate::series::request_types::{AggregationOptions, AggregatorConfig, MAX_AGGREGATIONS};
 use smallvec::SmallVec;
 use std::collections::VecDeque;
 
@@ -40,14 +40,29 @@ impl EmptyBucketRun {
 
     /// Jump ahead so that at most `keep` buckets remain, without generating the ones skipped.
     fn skip_to_last(&mut self, keep: usize, bucket_duration: u64) {
-        let duration = bucket_duration as i128;
-        let span = self.end_exclusive as i128 - self.next_bucket as i128;
-        let remaining = (span + duration - 1) / duration;
-        let surplus = remaining - keep as i128;
-        if surplus > 0 {
-            self.next_bucket = (self.next_bucket as i128 + surplus * duration) as Timestamp;
-        }
+        let start = run_start_keeping_last(
+            self.next_bucket,
+            i128::from(self.end_exclusive),
+            keep,
+            bucket_duration,
+        );
+        self.next_bucket = start as Timestamp;
     }
+}
+
+/// Where a run of consecutive buckets that starts at `next` and ends before `end_exclusive`
+/// begins once its head is skipped so that at most `keep` buckets remain.
+pub(crate) fn run_start_keeping_last(
+    next: Timestamp,
+    end_exclusive: i128,
+    keep: usize,
+    width: u64,
+) -> i128 {
+    let width = i128::from(width);
+    let next = i128::from(next);
+    let remaining = (end_exclusive - next + width - 1) / width;
+    let surplus = (remaining - keep as i128).max(0);
+    next + surplus * width
 }
 
 /// EMPTY's fill for `last`: unlike every other aggregator's it is not a constant, because a gap
@@ -67,7 +82,7 @@ impl EmptyBucketRun {
 ///   scan held when it got there: the value of the next bucket in time, so it is left unresolved
 ///   for [`MultiAggregateIterator`] to fill once that bucket exists.
 #[derive(Debug)]
-struct LastCarry {
+pub(crate) struct LastCarry {
     /// Which output columns are `last`. They all see the same samples, so one held value serves.
     columns: SmallVec<[bool; 2]>,
     held: f64,
@@ -81,7 +96,7 @@ struct LastCarry {
 }
 
 impl LastCarry {
-    fn new(options: &AggregationOptions) -> Option<Self> {
+    pub(crate) fn new(options: &AggregationOptions) -> Option<Self> {
         if !options.report_empty {
             return None;
         }
@@ -101,14 +116,20 @@ impl LastCarry {
         })
     }
 
-    fn start_leading_run(&mut self, seed: f64) {
+    /// Takes the parts of `empty_fill` that describe the series outside the stream.
+    pub(crate) fn set_fill(&mut self, empty_fill: &EmptyFillBounds) {
+        self.lookback = empty_fill.carry_lookback;
+        self.reverse = empty_fill.carry_reverse;
+    }
+
+    pub(crate) fn start_leading_run(&mut self, seed: f64) {
         self.seed = seed;
         if !self.reverse {
             self.held = seed;
         }
     }
 
-    fn apply_to_bucket_with_samples(&mut self, values: &mut [f64]) {
+    pub(crate) fn apply_to_bucket_with_samples(&mut self, values: &mut [f64]) {
         self.past_leading_run = true;
         let value = self.value_of(values);
         if value.is_nan() {
@@ -122,7 +143,7 @@ impl LastCarry {
         }
     }
 
-    fn apply_to_gap(&mut self, values: &mut [f64]) {
+    pub(crate) fn apply_to_gap(&mut self, values: &mut [f64]) {
         let value = if !self.past_leading_run {
             if self.reverse { self.seed } else { self.held }
         } else if self.held.is_nan() {
@@ -154,6 +175,53 @@ impl LastCarry {
     }
 }
 
+/// Reverse `last` only: rows waiting on the next bucket's value, and how many at the front of
+/// the queue have it. Shared by every row stream that feeds a [`LastCarry`].
+#[derive(Debug, Default)]
+pub(crate) struct PendingRows {
+    pending: VecDeque<MultiSample>,
+    ready: usize,
+}
+
+impl PendingRows {
+    pub(crate) fn has_ready(&self) -> bool {
+        self.ready > 0
+    }
+
+    /// Takes the next row of the stream. `keep` is the stream's tail limit.
+    pub(crate) fn offer(&mut self, row: MultiSample, carry: &mut LastCarry, keep: Option<usize>) {
+        if std::mem::take(&mut carry.unresolved) {
+            self.pending.push_back(row);
+            // Every row queued here is unresolved (`ready` is 0), and one with `keep` newer
+            // rows behind it cannot reach the stream's last `keep`, so a long NaN run holds
+            // no more than that rather than all of itself.
+            if let Some(keep) = keep
+                && self.pending.len() > keep
+            {
+                self.pending.pop_front();
+            }
+            return;
+        }
+        let value = carry.value_of(&row.values);
+        for waiting in self.pending.iter_mut() {
+            carry.fill(&mut waiting.values, value);
+        }
+        self.pending.push_back(row);
+        self.ready = self.pending.len();
+    }
+
+    /// No later bucket exists, so a scan starting here held nothing: the rows stay NaN.
+    pub(crate) fn finish(&mut self) {
+        self.ready = self.pending.len();
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<MultiSample> {
+        let row = self.pending.pop_front()?;
+        self.ready -= 1;
+        Some(row)
+    }
+}
+
 /// Helper class for minimizing monomorphization overhead for AggregationIterator.
 /// Holds one aggregator per AGGREGATION list entry; all share the bucket bookkeeping,
 /// so a query performs a single scan with N accumulator updates per sample.
@@ -179,18 +247,25 @@ struct AggregationHelper {
     last_carry: Option<LastCarry>,
 }
 
+/// The aggregator of one list entry, with the bucket window a `rate` entry divides by.
+pub(crate) fn column_aggregator(
+    config: &AggregatorConfig,
+    options: &AggregationOptions,
+) -> Aggregator {
+    let mut aggregator = config.create_aggregator();
+    if let Aggregator::Rate(rate) = &mut aggregator {
+        rate.set_window_ms(options.bucket_duration);
+    }
+    aggregator
+}
+
 impl AggregationHelper {
     pub(crate) fn new(options: &AggregationOptions, align_timestamp: Timestamp) -> Self {
-        let mut aggregators = options.create_aggregators();
+        let aggregators = options.create_aggregators();
         debug_assert!(
             aggregators.len() <= MAX_AGGREGATIONS,
             "the accepted bitmap holds MAX_AGGREGATIONS aggregators"
         );
-        for aggregator in aggregators.iter_mut() {
-            if let Aggregator::Rate(r) = aggregator {
-                r.set_window_ms(options.bucket_duration);
-            }
-        }
 
         Self {
             accepted: 0,
@@ -366,9 +441,18 @@ impl AggregationHelper {
     /// BUCKETTIMESTAMP adjustment (RTS normalizes before, not after: the mid of
     /// a `[-750, 250)` bucket reports 500, not 0).
     fn render_timestamp(&self, bucket_start: Timestamp) -> Timestamp {
-        self.bucket_ts
-            .calculate(bucket_start.max(0), self.bucket_duration)
+        render_bucket_timestamp(self.bucket_ts, bucket_start, self.bucket_duration)
     }
+}
+
+/// Reply timestamp for a bucket: clamp the start to 0 first, then apply the BUCKETTIMESTAMP
+/// adjustment.
+pub(crate) fn render_bucket_timestamp(
+    bucket_ts: BucketTimestamp,
+    bucket_start: Timestamp,
+    width: u64,
+) -> Timestamp {
+    bucket_ts.calculate(bucket_start.max(0), width)
 }
 
 /// True (unclamped) start of the bucket holding `ts`, for a grid aligned on
@@ -461,10 +545,7 @@ pub struct MultiAggregateIterator<T: Iterator<Item = Sample>> {
     empty_buckets: EmptyBucketRun,
     init: bool,
     empty_fill: EmptyFillBounds,
-    /// Reverse `last` only: rows waiting on the next bucket's value, and how many at the front
-    /// of the queue have it.
-    pending: VecDeque<MultiSample>,
-    ready: usize,
+    pending: PendingRows,
 }
 
 impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
@@ -485,8 +566,7 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
     ) -> Self {
         let mut aggregator = AggregationHelper::new(options, aligned_timestamp);
         if let Some(carry) = aggregator.last_carry.as_mut() {
-            carry.lookback = empty_fill.carry_lookback;
-            carry.reverse = empty_fill.carry_reverse;
+            carry.set_fill(&empty_fill);
         }
         Self {
             inner,
@@ -494,8 +574,7 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
             empty_buckets: EmptyBucketRun::default(),
             init: false,
             empty_fill,
-            pending: VecDeque::new(),
-            ready: 0,
+            pending: PendingRows::default(),
         }
     }
 
@@ -668,36 +747,15 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
 impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
     /// Hold back buckets a reverse `last` cannot answer yet until the next bucket can.
     fn next_resolved_row(&mut self) -> Option<MultiSample> {
-        while self.ready == 0 {
+        while !self.pending.has_ready() {
             let Some(row) = self.next_row() else {
-                // No later bucket exists, so a scan starting here held nothing: they stay NaN.
-                self.ready = self.pending.len();
+                self.pending.finish();
                 break;
             };
             let carry = self.aggregator.last_carry.as_mut()?;
-            if std::mem::take(&mut carry.unresolved) {
-                self.pending.push_back(row);
-                // Every row queued here is unresolved (`ready` is 0), and one with `keep` newer
-                // rows behind it cannot reach the stream's last `keep`, so a long NaN run holds
-                // no more than that rather than all of itself.
-                if let Some(keep) = self.empty_fill.tail_limit
-                    && self.pending.len() > keep
-                {
-                    self.pending.pop_front();
-                }
-                continue;
-            }
-            let value = carry.value_of(&row.values);
-            for waiting in self.pending.iter_mut() {
-                carry.fill(&mut waiting.values, value);
-            }
-            self.pending.push_back(row);
-            self.ready = self.pending.len();
+            self.pending.offer(row, carry, self.empty_fill.tail_limit);
         }
-
-        let row = self.pending.pop_front()?;
-        self.ready -= 1;
-        Some(row)
+        self.pending.pop()
     }
 
     fn next_row(&mut self) -> Option<MultiSample> {
@@ -787,9 +845,7 @@ impl<T: Iterator<Item = Sample>> Iterator for AggregateIterator<T> {
     type Item = Sample;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let row = self.inner.next()?;
-        debug_assert_eq!(row.values.len(), 1);
-        Some(Sample::new(row.timestamp, row.values[0]))
+        self.inner.next().map(Sample::from)
     }
 }
 
@@ -1443,9 +1499,9 @@ mod tests {
             );
             let first = iter.next().expect("a row");
             assert!(
-                iter.pending.len() <= keep,
+                iter.pending.pending.len() <= keep,
                 "keep={keep}: {} rows still queued",
-                iter.pending.len()
+                iter.pending.pending.len()
             );
             let limited: Vec<MultiSample> = std::iter::once(first).chain(iter).collect();
 

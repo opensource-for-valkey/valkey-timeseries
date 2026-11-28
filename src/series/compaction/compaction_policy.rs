@@ -3,6 +3,7 @@ use crate::commands::command_parser::{parse_inline_condition, split_aggregator_c
 use crate::common::Timestamp;
 use crate::common::logging::log_warning;
 use crate::common::metrics::WarningLimit;
+use crate::error_consts;
 use crate::parser::parse_policy_duration_ms;
 use crate::series::request_types::AggregatorConfig;
 use crate::series::{COMPACTION_POLICY_SKIPS, CompactionRule, SeriesLink};
@@ -334,6 +335,9 @@ fn parse_compaction_policy(val: &str) -> ValkeyResult<CompactionPolicy> {
 fn parse_policy_aggregator(val: &str) -> ValkeyResult<AggregatorConfig> {
     let (name, cond_str) = split_aggregator_condition(val)?;
     let mut aggregation = AggregationType::try_from(name)?;
+    if aggregation == AggregationType::Twa {
+        return Err(ValkeyError::Str(error_consts::UNKNOWN_AGGREGATION_TYPE));
+    }
     let condition = cond_str.map(parse_inline_condition).transpose()?;
     if aggregation.is_filtered() && condition.is_none() {
         let name = aggregation.name();
@@ -1125,7 +1129,7 @@ mod rts_grammar_parity {
 
     /// RTS 8.6 accepts every one of these policy strings (verified black-box
     /// against the pinned reference image; compat plan §7.1). `twa` variants
-    /// are excluded — the TWA aggregator itself is not implemented yet.
+    /// are excluded: `twa` is not supported in compaction rules yet.
     #[test]
     fn accepts_rts_grammar() {
         for s in [
