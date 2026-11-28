@@ -469,6 +469,23 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
             f"Expected 'node' or 'node_id' in subsequence results, got {values}"
         )
 
+    def test_labelnames_caps_search_terms(self):
+        """A request may carry at most 32 SEARCH terms, counted across repeated SEARCH keywords."""
+        self.setup_fuzzy_test_data(self.client)
+
+        terms = [f'zz{i}' for i in range(32)]
+        terms[0] = 'node'
+        result = self._exec_fuzzy('SEARCH', *terms, 'SORTBY', 'value')
+        assert b'node' in [lv.value for lv in result.results]
+
+        too_many = 'TSDB: too many SEARCH terms \\(maximum 32\\)'
+        with pytest.raises(Exception, match=too_many):
+            self.client.execute_command('TS.LABELNAMES', 'SEARCH', *terms, 'extra')
+        with pytest.raises(Exception, match=too_many):
+            self.client.execute_command(
+                'TS.LABELNAMES', 'SEARCH', *terms[:16], 'SEARCH', *terms[16:], 'extra',
+            )
+
     def test_labelnames_rejects_noop_fuzzy_algorithm(self):
         """`noop` is an internal default, not a FUZZY_ALGORITHM a client may choose."""
         self.setup_fuzzy_test_data(self.client)

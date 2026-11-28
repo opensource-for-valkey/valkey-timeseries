@@ -111,6 +111,10 @@ impl LabelNameSearchArgs {
         if !self.search_expr.is_empty() && !self.search_terms.is_empty() {
             return Err(ValkeyError::Str(SEARCH_AND_SEARCH_EXPR_EXCLUSIVE));
         }
+        // Checked again here, not only while parsing, so a fan-out request is bounded too.
+        if self.search_terms.len() > MAX_SEARCH_TERMS {
+            return Err(too_many_search_terms());
+        }
         Ok(())
     }
 
@@ -132,6 +136,17 @@ impl LabelNameSearchArgs {
 
 const SEARCH_AND_SEARCH_EXPR_EXCLUSIVE: &str =
     "TSDB: SEARCH and SEARCH_EXPR are mutually exclusive";
+
+/// The most `SEARCH` terms one request may carry, across repeated `SEARCH` keywords. Each term
+/// adds a filter that every candidate is scored against, so the count bounds per-value work.
+/// The same cap as a `SEARCH_EXPR`'s terms, and as Prometheus's `search[]` terms.
+pub(crate) const MAX_SEARCH_TERMS: usize = search_expr::MAX_EXPRESSION_TERMS;
+
+fn too_many_search_terms() -> ValkeyError {
+    ValkeyError::String(format!(
+        "TSDB: too many SEARCH terms (maximum {MAX_SEARCH_TERMS})"
+    ))
+}
 
 fn search_expr_error(err: search_expr::SearchExprError) -> ValkeyError {
     ValkeyError::String(format!("TSDB: {err}"))
@@ -244,6 +259,9 @@ pub(super) fn parse_label_name_search_args(
                 while let Some(next) = args.peek() {
                     if is_search_token(next.as_slice()) {
                         break;
+                    }
+                    if parsed.search_terms.len() == MAX_SEARCH_TERMS {
+                        return Err(too_many_search_terms());
                     }
                     let next_arg = args.next_arg()?;
                     parsed.search_terms.push(next_arg.to_string_lossy());
@@ -689,6 +707,16 @@ mod tests {
         let mut args = expr_args("cpu");
         args.search_terms = vec!["node".to_string()];
         assert!(args.build_search_hints().is_err());
+    }
+
+    #[test]
+    fn search_terms_are_capped() {
+        let terms = |n: usize| LabelNameSearchArgs {
+            search_terms: (0..n).map(|i| format!("t{i}")).collect(),
+            ..Default::default()
+        };
+        assert!(terms(MAX_SEARCH_TERMS).build_search_hints().is_ok());
+        assert!(terms(MAX_SEARCH_TERMS + 1).build_search_hints().is_err());
     }
 
     #[test]
