@@ -5,6 +5,10 @@ bounded background workers when estimated work is large. `TS.QUERYINDEX` and
 `TS.CARD FILTER_BY_RANGE` share these workers for reads estimated to exceed 512 series. Small requests, transactions and
 scripts run inline, as do standalone `TS.CARD` counts without a range filter.
 
+`TS.LABELNAMES`, `TS.LABELVALUES` and `TS.METRICNAMES` take either `SEARCH` terms or one
+`SEARCH_EXPR` boolean expression (`AND`, `OR`, `NOT`, parentheses); the two are mutually exclusive.
+Without `SORTBY` they order results by value ascending, even with a search; `SORTBY score` ranks matches.
+
 Ranked label-value and metric-name searches apply `LIMIT` after ranking; equal scores or
 cardinalities are ordered by value ascending.
 

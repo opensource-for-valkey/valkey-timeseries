@@ -78,14 +78,17 @@ message LabelSearchRequest {
   LabelSearchType request_type = 1;
   string label = 2;
   repeated string search_terms = 3;
-  double fuzz_threshold = 4;
-  FuzzySearchAlgorithm fuzz_algorithm = 5;
-  bool ignore_case = 6;
-  bool include_metadata = 7;
-  MetaDateRangeFilter range = 8;
-  repeated SeriesSelector filters = 9;
-  LabelResultsSortOrder sort_order = 10;
-  uint32 limit = 11;
+  // A boolean search expression; empty for none. Exclusive with search_terms.
+  string search_expr = 4;
+  // FUZZY_THRESHOLD as a whole percentage in [0, 100].
+  uint32 fuzz_threshold = 5;
+  FuzzySearchAlgorithm fuzz_algorithm = 6;
+  bool ignore_case = 7;
+  bool include_metadata = 8;
+  MetaDateRangeFilter range = 9;
+  repeated SeriesSelector filters = 10;
+  LabelResultsSortOrder sort_order = 11;
+  uint32 limit = 12;
 }
 
 message StatsRequest {

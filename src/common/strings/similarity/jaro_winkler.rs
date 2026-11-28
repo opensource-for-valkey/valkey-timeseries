@@ -43,9 +43,9 @@ const SHORT_MAX_LEN: usize = 128;
 ///
 /// # Examples
 ///
-/// ```
-/// use valkey_timeseries::common::strings::jaro_winkler;
+/// Not run as a doctest: this function is crate-private. The unit tests cover the same cases.
 ///
+/// ```ignore
 /// assert_eq!(jaro_winkler("martha", "marhta"), 0.9611111);
 /// assert_eq!(jaro_winkler("", "words"), 0.0);
 /// assert_eq!(jaro_winkler("same", "same"), 1.0);
@@ -385,6 +385,20 @@ fn jaro(matching: usize, transpositions: usize, s1_len: usize, s2_len: usize) ->
 
 fn matching_distance(s1_len: usize, s2_len: usize) -> usize {
     (s1_len.max(s2_len) / 2).saturating_sub(1)
+}
+
+pub struct JaroWinklerMatcher {
+    pattern: String,
+}
+
+impl JaroWinklerMatcher {
+    pub fn new(pattern: String) -> Self {
+        Self { pattern }
+    }
+
+    pub fn score(&self, value: &str) -> f64 {
+        jaro_winkler(&self.pattern, value) as f64
+    }
 }
 
 #[cfg(test)]

@@ -32,7 +32,6 @@ pub use timeseries_index::*;
 pub(crate) mod asm;
 mod ids;
 mod key_buffer;
-mod label_filter;
 mod label_querier;
 pub(crate) mod persistence;
 #[cfg(test)]
@@ -42,7 +41,6 @@ pub(crate) mod server_events;
 mod timeseries_index_tests;
 
 pub use ids::next_timeseries_id;
-pub(crate) use label_filter::*;
 pub use label_querier::*;
 
 /// Map from db to TimeseriesIndex

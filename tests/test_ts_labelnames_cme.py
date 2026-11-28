@@ -318,3 +318,15 @@ class TestTsLabelNamesCME(ValkeyTimeSeriesClusterTestCase):
         values = LabelSearchResponse.parse(client.execute_command(
             'TS.LABELVALUES', 'job', 'FILTER', 'pick=yes', 'INCLUDE_METADATA'))
         assert [(lv.value, lv.cardinality) for lv in values.results] == [(b'api', 3)]
+
+    def test_labelnames_search_expr_fans_out(self):
+        """SEARCH_EXPR reaches every shard and the merged result honours it."""
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        client: Valkey = self.new_client_for_primary(0)
+
+        self.setup_test_data(cluster_client)
+
+        assert exec_sorted_values(client, 'SEARCH_EXPR', 'ts AND NOT (ts1 OR ts2)') == [
+            b'ts3', b'ts4', b'ts5', b'ts6', b'ts7', b'ts8', b'ts9',
+        ]
+        assert exec_sorted_values(client, 'SEARCH_EXPR', 'na OR ra') == [b'name', b'rack']

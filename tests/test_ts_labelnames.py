@@ -375,14 +375,23 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         assert b'bbb' in result
         assert b'ccc' in result
 
-    def test_labelnames_search_returns_highest_scores_first(self):
-        """Default ordering when SEARCH is specified should be by relevance
-        score descending."""
+    def test_labelnames_search_defaults_to_value_order(self):
+        """Without SORTBY, a SEARCH orders by value, as in the Prometheus search API."""
+        self.setup_fuzzy_test_data(self.client)
+
+        result = self._exec_fuzzy('SEARCH', 'met', 'INCLUDE_METADATA')
+        values = [lv.value for lv in result.results]
+        assert values == sorted(values)
+        assert set(values) >= {b'meta', b'metric', b'metrics'}
+
+    def test_labelnames_search_sortby_score_returns_highest_scores_first(self):
+        """SORTBY score orders by relevance score descending."""
         self.setup_fuzzy_test_data(self.client)
 
         # 'node' exactly matches the label name 'node'; 'node_id' is close
         result = self._exec_fuzzy(
             'SEARCH', 'node',
+            'SORTBY', 'score',
             'INCLUDE_METADATA',
         )
         print(f"SEARCH 'node' results with scores: {[(lv.value, lv.score) for lv in result.results]}")
@@ -419,17 +428,17 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         """A high FUZZ_THRESHOLD should restrict results to very close matches."""
         self.setup_fuzzy_test_data(self.client)
 
-        # threshold=0.99 should only accept near-perfect matches for 'metric'
+        # threshold=99 should only accept near-perfect matches for 'metric'
         result_strict = self._exec_fuzzy(
             'SEARCH', 'metric',
-            'FUZZY_THRESHOLD', '0.99',
+            'FUZZY_THRESHOLD', '99',
         )
         values_strict = {lv.value for lv in result_strict.results}
 
         # A lenient threshold should return more results
         result_lenient = self._exec_fuzzy(
             'SEARCH', 'metric',
-            'FUZZY_THRESHOLD', '0.5',
+            'FUZZY_THRESHOLD', '50',
         )
         values_lenient = {lv.value for lv in result_lenient.results}
 
@@ -446,7 +455,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         result = self._exec_fuzzy(
             'SEARCH', 'metirc',
             'FUZZY_ALGORITHM', 'jarowinkler',
-            'FUZZY_THRESHOLD', '0.5',
+            'FUZZY_THRESHOLD', '50',
         )
         values = [lv.value for lv in result.results]
         assert b'metric' in values or b'metrics' in values, (
@@ -462,12 +471,77 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         result = self._exec_fuzzy(
             'SEARCH', 'nde',
             'FUZZY_ALGORITHM', 'subsequence',
-            'FUZZY_THRESHOLD', '0.3',
+            'FUZZY_THRESHOLD', '30',
         )
         values = [lv.value for lv in result.results]
         assert any(v in values for v in [b'node', b'node_id']), (
             f"Expected 'node' or 'node_id' in subsequence results, got {values}"
         )
+
+    def test_labelnames_search_defaults_to_subsequence(self):
+        """Without FUZZY_ALGORITHM, SEARCH matches by subsequence, as Prometheus's search does."""
+        self.setup_fuzzy_test_data(self.client)
+
+        # 'nde' is not a substring of 'node', only a subsequence.
+        default = {lv.value for lv in self._exec_fuzzy('SEARCH', 'nde', 'SORTBY', 'value').results}
+        explicit = {lv.value for lv in self._exec_fuzzy(
+            'SEARCH', 'nde', 'FUZZY_ALGORITHM', 'subsequence', 'SORTBY', 'value').results}
+        assert b'node' in default
+        assert default == explicit
+
+        jaro_winkler = {lv.value for lv in self._exec_fuzzy(
+            'SEARCH', 'nde', 'FUZZY_ALGORITHM', 'jarowinkler', 'SORTBY', 'value').results}
+        assert b'node' not in jaro_winkler
+
+    def test_labelnames_fuzzy_threshold_is_a_whole_percentage(self):
+        """FUZZY_THRESHOLD takes a whole percentage in [0, 100]; scores stay in [0.0, 1.0]."""
+        self.setup_fuzzy_test_data(self.client)
+
+        for threshold in ('0', '80', '100'):
+            result = self._exec_fuzzy(
+                'SEARCH', 'metric', 'FUZZY_THRESHOLD', threshold, 'INCLUDE_METADATA',
+            )
+            assert result.results, threshold
+            for lv in result.results:
+                assert 0.0 <= lv.score <= 1.0, (threshold, lv.value, lv.score)
+
+        out_of_range = r'TSDB: FUZZY_THRESHOLD must be a whole number in \[0\.\.100\]'
+        for threshold in ('0.5', '1.0', '101', '-1', 'high'):
+            with pytest.raises(Exception, match=out_of_range):
+                self.client.execute_command(
+                    'TS.LABELNAMES', 'SEARCH', 'metric', 'FUZZY_THRESHOLD', threshold,
+                )
+
+    def test_labelnames_caps_search_terms(self):
+        """A request may carry at most 32 SEARCH terms, counted across repeated SEARCH keywords."""
+        self.setup_fuzzy_test_data(self.client)
+
+        terms = [f'zz{i}' for i in range(32)]
+        terms[0] = 'node'
+        result = self._exec_fuzzy('SEARCH', *terms, 'SORTBY', 'value')
+        assert b'node' in [lv.value for lv in result.results]
+
+        too_many = 'TSDB: too many SEARCH terms \\(maximum 32\\)'
+        with pytest.raises(Exception, match=too_many):
+            self.client.execute_command('TS.LABELNAMES', 'SEARCH', *terms, 'extra')
+        with pytest.raises(Exception, match=too_many):
+            self.client.execute_command(
+                'TS.LABELNAMES', 'SEARCH', *terms[:16], 'SEARCH', *terms[16:], 'extra',
+            )
+
+    def test_labelnames_rejects_noop_fuzzy_algorithm(self):
+        """`noop` is an internal default, not a FUZZY_ALGORITHM a client may choose."""
+        self.setup_fuzzy_test_data(self.client)
+
+        for algorithm in ('noop', 'NOOP', 'bogus'):
+            with pytest.raises(Exception, match=f'Unknown fuzzy algorithm: {algorithm}'):
+                self.client.execute_command(
+                    'TS.LABELNAMES', 'SEARCH', 'node',
+                    'FUZZY_ALGORITHM', algorithm, 'FUZZY_THRESHOLD', '50',
+                )
+        # Without a search, the algorithm is still parsed and refused.
+        with pytest.raises(Exception, match='Unknown fuzzy algorithm: noop'):
+            self.client.execute_command('TS.LABELNAMES', 'FUZZY_ALGORITHM', 'noop')
 
     def test_labelnames_search_ignore_case(self):
         """IGNORE_CASE true should match label names regardless of case."""
@@ -475,12 +549,12 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
 
         result_no_ignore = self._exec_fuzzy(
             'SEARCH', 'NODE',
-            'FUZZY_THRESHOLD', '0.9',
+            'FUZZY_THRESHOLD', '90',
         )
         result_ignore = self._exec_fuzzy(
             'SEARCH', 'NODE',
             'IGNORE_CASE', 
-            'FUZZY_THRESHOLD', '0.9',
+            'FUZZY_THRESHOLD', '90',
         )
         values_ignore = [lv.value for lv in result_ignore.results]
         values_no_ignore = [lv.value for lv in result_no_ignore.results]
@@ -500,7 +574,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
 
         result = self._exec_fuzzy(
             'SEARCH', 'me',
-            'FUZZY_THRESHOLD', '0.3',
+            'FUZZY_THRESHOLD', '30',
             'SORTBY', 'value', 'ASC',
         )
         values = [lv.value for lv in result.results]
@@ -514,7 +588,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
 
         result = self._exec_fuzzy(
             'SEARCH', 'me',
-            'FUZZY_THRESHOLD', '0.3',
+            'FUZZY_THRESHOLD', '30',
             'SORTBY', 'value', 'DESC',
         )
         values = [lv.value for lv in result.results]
@@ -528,7 +602,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
 
         result = self._exec_fuzzy(
             'SEARCH', 'n',
-            'FUZZY_THRESHOLD', '0.1',
+            'FUZZY_THRESHOLD', '10',
             'SORTBY', 'cardinality', 'ASC',
             'INCLUDE_METADATA',
         )
@@ -544,7 +618,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         # Only fts2 has env=staging; its label names are metrics, node_id, team, env
         result = self._exec_fuzzy(
             'SEARCH', 'node',
-            'FUZZY_THRESHOLD', '0.5',
+            'FUZZY_THRESHOLD', '50',
             'FILTER', 'env=staging',
         )
         values = [lv.value for lv in result.results]
@@ -563,7 +637,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
 
         result = self._exec_fuzzy(
             'SEARCH', 'e',
-            'FUZZY_THRESHOLD', '0.1',
+            'FUZZY_THRESHOLD', '10',
             'LIMIT', '2',
         )
         assert len(result.results) <= 2, (
@@ -578,7 +652,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         # high threshold
         result = self._exec_fuzzy(
             'SEARCH', 'zzzzzzzzz',
-            'FUZZY_THRESHOLD', '0.99',
+            'FUZZY_THRESHOLD', '99',
         )
         assert result.results == [], (
             f"Expected empty results for nonsense term, got {result.results}"
@@ -591,7 +665,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         # 'node' matches node/node_id; 'type' matches type
         result = self._exec_fuzzy(
             'SEARCH', 'node', 'type',
-            'FUZZY_THRESHOLD', '0.8',
+            'FUZZY_THRESHOLD', '80',
             'SORTBY', 'value', 'ASC',
         )
         values = [lv.value for lv in result.results]
@@ -627,3 +701,77 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         values = LabelSearchResponse.parse(self.client.execute_command(
             'TS.LABELVALUES', 'job', 'FILTER', 'pick=yes', 'INCLUDE_METADATA'))
         assert [(lv.value, lv.cardinality) for lv in values.results] == [(b'api', 1)]
+
+    # -------------------------------------------------------------------------
+    # Search expression tests
+    # -------------------------------------------------------------------------
+
+    def test_labelnames_search_expr_and_not(self):
+        """SEARCH_EXPR combines terms with AND/OR/NOT."""
+        self.setup_fuzzy_test_data(self.client)
+
+        result = self._exec_fuzzy('SEARCH_EXPR', 'node AND NOT id', 'SORTBY', 'value')
+        assert [lv.value for lv in result.results] == [b'node']
+
+        result = self._exec_fuzzy('SEARCH_EXPR', '(node OR team) AND NOT id', 'SORTBY', 'value')
+        assert [lv.value for lv in result.results] == [b'node', b'team']
+
+        result = self._exec_fuzzy('SEARCH_EXPR', 'met AND NOT (metric OR meta)', 'SORTBY', 'value')
+        assert result.results == []
+
+    def test_labelnames_search_expr_defaults_to_value_order(self):
+        """Without SORTBY, a SEARCH_EXPR orders by value, as SEARCH does."""
+        self.setup_fuzzy_test_data(self.client)
+
+        result = self._exec_fuzzy('SEARCH_EXPR', 'metric OR meta', 'INCLUDE_METADATA')
+        assert [lv.value for lv in result.results] == [b'meta', b'metric', b'metrics']
+
+        result = self._exec_fuzzy('SEARCH_EXPR', 'metric OR meta', 'SORTBY', 'score', 'INCLUDE_METADATA')
+        scores = [lv.score for lv in result.results]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_labelnames_search_expr_ignore_case(self):
+        self.setup_fuzzy_test_data(self.client)
+
+        result = self._exec_fuzzy('SEARCH_EXPR', 'NODE AND NOT ID', 'SORTBY', 'value')
+        assert result.results == []
+
+        result = self._exec_fuzzy('SEARCH_EXPR', 'NODE AND NOT ID', 'IGNORE_CASE', 'SORTBY', 'value')
+        assert [lv.value for lv in result.results] == [b'node']
+
+    def test_labelnames_search_expr_errors(self):
+        self.setup_fuzzy_test_data(self.client)
+
+        exclusive = 'TSDB: SEARCH and SEARCH_EXPR are mutually exclusive'
+        for args in (
+                ('SEARCH', 'node', 'SEARCH_EXPR', 'type'),
+                ('SEARCH_EXPR', 'type', 'SEARCH', 'node'),
+        ):
+            with pytest.raises(Exception, match=exclusive):
+                self.client.execute_command('TS.LABELNAMES', *args)
+
+        with pytest.raises(Exception, match='may be given only once'):
+            self.client.execute_command('TS.LABELNAMES', 'SEARCH_EXPR', 'a', 'SEARCH_EXPR', 'b')
+
+        with pytest.raises(Exception, match='missing SEARCH_EXPR value'):
+            self.client.execute_command('TS.LABELNAMES', 'SEARCH_EXPR')
+
+        with pytest.raises(Exception, match='may be given only once'):
+            self.client.execute_command('TS.LABELNAMES', 'SEARCH_EXPR', '', 'SEARCH_EXPR', 'b')
+
+        # Every accepting path must require a positive term.
+        for expr in ('NOT node', 'node AND', '(node', '   '):
+            with pytest.raises(Exception, match='search expression'):
+                self.client.execute_command('TS.LABELNAMES', 'SEARCH_EXPR', expr)
+
+    def test_labelnames_empty_search_expr_is_no_search(self):
+        """SEARCH_EXPR "" is no search expression, as an empty search_expr is in Prometheus."""
+        self.setup_fuzzy_test_data(self.client)
+
+        unfiltered = self._exec_fuzzy('SORTBY', 'value')
+        assert self._exec_fuzzy('SEARCH_EXPR', '', 'SORTBY', 'value').results == unfiltered.results
+
+        # With no expression left, SEARCH terms are not in conflict with it.
+        searched = self._exec_fuzzy('SEARCH', 'node', 'SORTBY', 'value')
+        for args in (('SEARCH_EXPR', '', 'SEARCH', 'node'), ('SEARCH', 'node', 'SEARCH_EXPR', '')):
+            assert self._exec_fuzzy(*args, 'SORTBY', 'value').results == searched.results

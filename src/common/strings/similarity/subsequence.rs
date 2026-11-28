@@ -23,7 +23,7 @@ const SUBSEQUENCE_NON_EXACT_SCORE_SCALE: f64 = 0.999;
 /// SubsequenceMatcher pre-computes the encoding of a fixed search pattern so
 /// that it can be scored against many candidate strings without repeating the
 /// ASCII check or char conversion on the pattern for every call. The first
-/// [`score`] call with a Unicode candidate lazily caches the pattern's char
+/// [`score`](Self::score) call with a Unicode candidate lazily caches the pattern's char
 /// vec in a thread-safe [`OnceLock`], allowing concurrent scoring via `&self`.
 pub struct SubsequenceMatcher {
     pattern: String,
