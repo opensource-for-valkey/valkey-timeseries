@@ -50,6 +50,8 @@ TS.METRICNAMES
 
 ### Notes
 
+- Without `SORTBY`, results are ordered by value ascending, with or without `SEARCH` or `SEARCH_EXPR`, as in
+  the Prometheus search API. To rank matches by relevance, pass `SORTBY score`; `score` sorts best first.
 - `SORTBY score DESC` and `SORTBY cardinality DESC` select the highest-ranked metric names
   before applying `LIMIT`. Equal scores or cardinalities are ordered by metric name ascending.
 - A metric name's `cardinality` counts the series with that name, as `TS.LABELVALUES __name__` does: every series

@@ -117,10 +117,10 @@ match, the value gets the best of those means. Negated terms do not contribute t
 ### 4. Relevance Sorting
 
 Results can be sorted alphabetically (`value`), by occurrence (`cardinality`), or by how well they matched the search
-terms (`score`). Without `SORTBY`, a request with `SEARCH` or `SEARCH_EXPR` sorts by `score`, best first, and any
-other request sorts by `value`.
+terms (`score`). Without `SORTBY`, every request sorts by `value`, ascending, even one with `SEARCH` or
+`SEARCH_EXPR`, as in the Prometheus search API. Pass `SORTBY score` to put the best matches first.
 When building drill-down menus or autocomplete fields, the most relevant or most frequently used labels should appear at
-the top.
+the top, so ask for `score` or `cardinality` explicitly.
 
 ### 5. Rich Metadata
 

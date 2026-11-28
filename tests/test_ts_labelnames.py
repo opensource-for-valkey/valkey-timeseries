@@ -375,14 +375,23 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         assert b'bbb' in result
         assert b'ccc' in result
 
-    def test_labelnames_search_returns_highest_scores_first(self):
-        """Default ordering when SEARCH is specified should be by relevance
-        score descending."""
+    def test_labelnames_search_defaults_to_value_order(self):
+        """Without SORTBY, a SEARCH orders by value, as in the Prometheus search API."""
+        self.setup_fuzzy_test_data(self.client)
+
+        result = self._exec_fuzzy('SEARCH', 'met', 'INCLUDE_METADATA')
+        values = [lv.value for lv in result.results]
+        assert values == sorted(values)
+        assert set(values) >= {b'meta', b'metric', b'metrics'}
+
+    def test_labelnames_search_sortby_score_returns_highest_scores_first(self):
+        """SORTBY score orders by relevance score descending."""
         self.setup_fuzzy_test_data(self.client)
 
         # 'node' exactly matches the label name 'node'; 'node_id' is close
         result = self._exec_fuzzy(
             'SEARCH', 'node',
+            'SORTBY', 'score',
             'INCLUDE_METADATA',
         )
         print(f"SEARCH 'node' results with scores: {[(lv.value, lv.score) for lv in result.results]}")
@@ -710,14 +719,16 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         result = self._exec_fuzzy('SEARCH_EXPR', 'met AND NOT (metric OR meta)', 'SORTBY', 'value')
         assert result.results == []
 
-    def test_labelnames_search_expr_defaults_to_score_order(self):
-        """Without SORTBY, a SEARCH_EXPR orders by relevance score, as SEARCH does."""
+    def test_labelnames_search_expr_defaults_to_value_order(self):
+        """Without SORTBY, a SEARCH_EXPR orders by value, as SEARCH does."""
         self.setup_fuzzy_test_data(self.client)
 
         result = self._exec_fuzzy('SEARCH_EXPR', 'metric OR meta', 'INCLUDE_METADATA')
+        assert [lv.value for lv in result.results] == [b'meta', b'metric', b'metrics']
+
+        result = self._exec_fuzzy('SEARCH_EXPR', 'metric OR meta', 'SORTBY', 'score', 'INCLUDE_METADATA')
         scores = [lv.score for lv in result.results]
         assert scores == sorted(scores, reverse=True)
-        assert {lv.value for lv in result.results} == {b'metric', b'metrics', b'meta'}
 
     def test_labelnames_search_expr_ignore_case(self):
         self.setup_fuzzy_test_data(self.client)

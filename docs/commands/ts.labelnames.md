@@ -61,6 +61,8 @@ TS.LABELNAMES
   batches. Small searches, and any search inside `MULTI`, a script or a module call, run inline.
   A background search is not a snapshot: it can observe changes made while it runs. When the
   workers' queue is full, the search fails with `TSDB: label search: too many queued jobs (limit 256)`.
+- Without `SORTBY`, results are ordered by value ascending, with or without `SEARCH` or `SEARCH_EXPR`, as in
+  the Prometheus search API. To rank matches by relevance, pass `SORTBY score`; `score` sorts best first.
 - `SORTBY score` currently supports `DESC` only.
 - `SORTBY value` orders by the label names themselves: `job` comes before `job2`.
 - A label name's `cardinality` (reported with `INCLUDE_METADATA`, and ranked by `SORTBY cardinality`) is the

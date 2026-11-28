@@ -162,6 +162,9 @@ ts_compaction` counts it in `ts_compaction_policy_skipped_total`.
 which are ORed together, or one `SEARCH_EXPR` boolean expression such as
 `"cpu AND NOT (idle OR steal)"`; see [Label and Metric Discovery](topics/label-discovery.md).
 
+Without `SORTBY`, results are ordered by value ascending, with or without a search, as in the Prometheus
+search API; `SORTBY score` ranks matches by relevance.
+
 Ranked label-value and metric-name searches select the best results before applying `LIMIT`.
 Descending score and cardinality orderings break ties by value ascending.
 

@@ -107,7 +107,7 @@ class TestTimeSeriesLabelValues(ValkeyTimeSeriesClusterTestCase):
         pipe.execute()
 
         for command in [('TS.LABELVALUES', 'instance'), ('TS.METRICNAMES',)]:
-            for ranking in [('SEARCH', 'rank'), ('SORTBY', 'cardinality', 'DESC')]:
+            for ranking in [('SEARCH', 'rank', 'SORTBY', 'score'), ('SORTBY', 'cardinality', 'DESC')]:
                 raw = client.execute_command(*command, *ranking, 'LIMIT', 3, 'INCLUDE_METADATA')
                 parsed = LabelSearchResponse.parse(raw)
                 assert [item.value for item in parsed.results] == [b'rank0000', b'rank0001', b'rank0002']

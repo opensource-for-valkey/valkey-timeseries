@@ -63,6 +63,8 @@ standalone server and does not filter label values or series keys.
   it. With `subsequence`, a value that starts with a term always matches, and others must contain the term's
   characters in order and score at least the threshold. A threshold of `100` is not an exact match. See
   [Label and Metric Discovery](../topics/label-discovery.md).
+- Without `SORTBY`, results are ordered by value ascending, with or without `SEARCH` or `SEARCH_EXPR`, as in
+  the Prometheus search API. To rank matches by relevance, pass `SORTBY score`; `score` sorts best first.
 - `SORTBY score DESC` and `SORTBY cardinality DESC` select the highest-ranked values before
   applying `LIMIT`. Equal scores or cardinalities are ordered by value ascending.
 - A value's `cardinality` (reported with `INCLUDE_METADATA`, and ranked by `SORTBY cardinality`) is the number of

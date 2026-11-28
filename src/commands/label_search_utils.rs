@@ -381,13 +381,9 @@ pub(super) fn parse_label_name_search_args(
     }
 
     if !sorting_specified {
-        // if the user specified a search term but didn't specify sorting, we default to sorting by relevance score
-        if parsed.has_search() {
-            parsed.sort_order = SearchResultOrdering::ScoreDesc;
-        } else {
-            // otherwise, we default to sorting by value ascending
-            parsed.sort_order = SearchResultOrdering::ValueAsc;
-        }
+        // Without SORTBY, results are ordered by value, with or without a search, as in the
+        // Prometheus search API. Ranking by relevance takes an explicit `SORTBY score`.
+        parsed.sort_order = SearchResultOrdering::ValueAsc;
     }
 
     if !algo_specified {
