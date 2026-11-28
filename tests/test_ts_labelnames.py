@@ -469,6 +469,20 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
             f"Expected 'node' or 'node_id' in subsequence results, got {values}"
         )
 
+    def test_labelnames_rejects_noop_fuzzy_algorithm(self):
+        """`noop` is an internal default, not a FUZZY_ALGORITHM a client may choose."""
+        self.setup_fuzzy_test_data(self.client)
+
+        for algorithm in ('noop', 'NOOP', 'bogus'):
+            with pytest.raises(Exception, match=f'Unknown fuzzy algorithm: {algorithm}'):
+                self.client.execute_command(
+                    'TS.LABELNAMES', 'SEARCH', 'node',
+                    'FUZZY_ALGORITHM', algorithm, 'FUZZY_THRESHOLD', '0.5',
+                )
+        # Without a search, the algorithm is still parsed and refused.
+        with pytest.raises(Exception, match='Unknown fuzzy algorithm: noop'):
+            self.client.execute_command('TS.LABELNAMES', 'FUZZY_ALGORITHM', 'noop')
+
     def test_labelnames_search_ignore_case(self):
         """IGNORE_CASE true should match label names regardless of case."""
         self.setup_fuzzy_test_data(self.client)

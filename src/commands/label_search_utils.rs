@@ -282,8 +282,15 @@ pub(super) fn parse_label_name_search_args(
             }
             LabelNameSearchToken::FuzzyAlgorithm => {
                 let value = args.next_str()?;
-                parsed.fuzzy_algorithm =
-                    FuzzyAlgorithm::try_from(value).map_err(ValkeyError::String)?;
+                let algorithm = FuzzyAlgorithm::try_from(value).map_err(ValkeyError::String)?;
+                // `NoOp` is the default for a request without a search, not a client choice:
+                // refuse it like any unknown name.
+                if algorithm == FuzzyAlgorithm::NoOp {
+                    return Err(ValkeyError::String(format!(
+                        "Unknown fuzzy algorithm: {value}"
+                    )));
+                }
+                parsed.fuzzy_algorithm = algorithm;
                 algo_specified = true;
             }
             LabelNameSearchToken::IgnoreCase => {
