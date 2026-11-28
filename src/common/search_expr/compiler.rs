@@ -147,7 +147,14 @@ impl Scalar {
                     return left;
                 }
                 let right = right.evaluate(value);
-                if !right.accepted || (left.accepted && left.mean() > right.mean()) {
+                // With equal counts, compare sums: two different sums can round to one mean,
+                // and an enclosing AND adds the sum.
+                let left_is_better = if left.count == right.count {
+                    left.sum > right.sum
+                } else {
+                    left.mean() > right.mean()
+                };
+                if !right.accepted || (left.accepted && left_is_better) {
                     return left;
                 }
                 right

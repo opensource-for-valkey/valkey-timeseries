@@ -958,3 +958,31 @@ proptest! {
         check_against_oracles(&expr);
     }
 }
+
+/// An OR whose operands have the same positive-term count must keep the larger sum, even when
+/// the two means round to the same `f64`: the enclosing AND adds the sum, not the mean.
+#[test]
+fn compile_or_keeps_the_larger_sum_when_means_tie() {
+    let half = 0.5_f64;
+    let c = f64::from_bits(half.to_bits() + 4);
+    let f = f64::from_bits(half.to_bits() + 2);
+    // The premise: the two branches' sums differ, but their means do not.
+    let (left, right) = (half + half + c, half + half + f);
+    assert!(left > right);
+    assert_eq!(left / 3.0, right / 3.0);
+
+    let scores = [
+        ("a", half),
+        ("b", half),
+        ("c", c),
+        ("d", half),
+        ("e", half),
+        ("f", f),
+        ("g", 0.0),
+    ];
+    let filter = compile_contains("((a AND b AND c) OR (d AND e AND f)) AND g", &scores);
+    assert_alternatives(&filter, false);
+    let (accepted, score) = filter.accept("abcdefg");
+    assert!(accepted);
+    assert_eq!(score, (left + 0.0) / 4.0);
+}
