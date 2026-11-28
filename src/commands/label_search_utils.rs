@@ -34,7 +34,8 @@ pub(crate) struct LabelNameSearchArgs {
     pub(crate) search_type: LabelSearchType,
     pub(crate) label: Option<String>,
     pub(crate) search_terms: Vec<String>,
-    /// A boolean search expression (`SEARCH_EXPR`), or empty for none. Exclusive with
+    /// A boolean search expression (`SEARCH_EXPR`), or empty for none: `SEARCH_EXPR ""` is
+    /// no search expression, as an empty `search_expr` is in Prometheus. Exclusive with
     /// `search_terms`.
     pub(crate) search_expr: String,
     /// `FUZZY_THRESHOLD` as a whole percentage in `[0, 100]`, as Prometheus takes it. The term
@@ -241,6 +242,7 @@ pub(super) fn parse_label_name_search_args(
     let mut parsed = LabelNameSearchArgs::default();
     let mut sorting_specified = false;
     let mut algo_specified = false;
+    let mut search_expr_given = false;
 
     if search_type == LabelSearchType::Value {
         // For label value search, we require the label name to be specified as the first argument
@@ -283,16 +285,22 @@ pub(super) fn parse_label_name_search_args(
                 }
             }
             LabelNameSearchToken::SearchExpr => {
-                if !parsed.search_terms.is_empty() {
-                    return Err(ValkeyError::Str(SEARCH_AND_SEARCH_EXPR_EXCLUSIVE));
-                }
-                if !parsed.search_expr.is_empty() {
+                if search_expr_given {
                     return Err(ValkeyError::Str("TSDB: SEARCH_EXPR may be given only once"));
                 }
+                search_expr_given = true;
                 let value = args
                     .next_arg()
                     .map_err(|_| ValkeyError::Str("TSDB: missing SEARCH_EXPR value"))?
                     .to_string_lossy();
+                // An empty expression is no expression, as in Prometheus: the request searches
+                // as if SEARCH_EXPR were absent, and may carry SEARCH terms instead.
+                if value.is_empty() {
+                    continue;
+                }
+                if !parsed.search_terms.is_empty() {
+                    return Err(ValkeyError::Str(SEARCH_AND_SEARCH_EXPR_EXCLUSIVE));
+                }
                 // Refused here rather than on each shard, before a cluster search fans out.
                 parse_search_expr(&value)?;
                 parsed.search_expr = value;
@@ -747,8 +755,13 @@ mod tests {
         for input in ["NOT cpu", "cpu AND", "(cpu"] {
             assert!(expr_args(input).build_search_hints().is_err(), "{input:?}");
         }
-        // An empty `search_expr` field means none, but `SEARCH_EXPR ""` is refused.
-        assert!(parse_search_expr("").is_err());
+    }
+
+    #[test]
+    fn empty_search_expr_is_no_search() {
+        let args = expr_args("");
+        assert!(!args.has_search());
+        assert!(args.build_search_hints().unwrap().filter.is_none());
     }
 
     #[test]

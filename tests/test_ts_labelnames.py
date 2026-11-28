@@ -756,7 +756,22 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(Exception, match='missing SEARCH_EXPR value'):
             self.client.execute_command('TS.LABELNAMES', 'SEARCH_EXPR')
 
+        with pytest.raises(Exception, match='may be given only once'):
+            self.client.execute_command('TS.LABELNAMES', 'SEARCH_EXPR', '', 'SEARCH_EXPR', 'b')
+
         # Every accepting path must require a positive term.
-        for expr in ('NOT node', 'node AND', '(node', ''):
+        for expr in ('NOT node', 'node AND', '(node', '   '):
             with pytest.raises(Exception, match='search expression'):
                 self.client.execute_command('TS.LABELNAMES', 'SEARCH_EXPR', expr)
+
+    def test_labelnames_empty_search_expr_is_no_search(self):
+        """SEARCH_EXPR "" is no search expression, as an empty search_expr is in Prometheus."""
+        self.setup_fuzzy_test_data(self.client)
+
+        unfiltered = self._exec_fuzzy('SORTBY', 'value')
+        assert self._exec_fuzzy('SEARCH_EXPR', '', 'SORTBY', 'value').results == unfiltered.results
+
+        # With no expression left, SEARCH terms are not in conflict with it.
+        searched = self._exec_fuzzy('SEARCH', 'node', 'SORTBY', 'value')
+        for args in (('SEARCH_EXPR', '', 'SEARCH', 'node'), ('SEARCH', 'node', 'SEARCH_EXPR', '')):
+            assert self._exec_fuzzy(*args, 'SORTBY', 'value').results == searched.results

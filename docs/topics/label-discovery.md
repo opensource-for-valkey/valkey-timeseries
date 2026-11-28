@@ -107,8 +107,10 @@ match, the value gets the best of those means. Negated terms do not contribute t
 
 * An expression is limited to 4096 bytes, 32 terms and 16 levels of nesting, where each `NOT` and each parenthesised
   group adds one level.
-* `SEARCH` and `SEARCH_EXPR` are mutually exclusive, and `SEARCH_EXPR` may be given only once. An empty expression is
-  refused.
+* `SEARCH` and `SEARCH_EXPR` are mutually exclusive, and `SEARCH_EXPR` may be given only once.
+* An empty expression, `SEARCH_EXPR ""`, is treated as no expression at all, as in the Prometheus search API: the
+  request is not filtered by a search, or is filtered by its `SEARCH` terms if it has any. An expression of only
+  spaces is an error.
 * An invalid expression fails with an error that starts with `TSDB: search expression:` and gives the byte position of
   the problem, for example `TSDB: search expression: unterminated quoted term at position 4`.
 * In a cluster, the coordinator checks the expression before fanning out, so an invalid expression fails once instead

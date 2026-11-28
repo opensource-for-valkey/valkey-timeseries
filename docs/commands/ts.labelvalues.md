@@ -54,7 +54,8 @@ standalone server and does not filter label values or series keys.
   `"and"` is searched for literally. Positive terms match as `SEARCH` terms do, honouring `FUZZY_ALGORITHM`,
   `FUZZY_THRESHOLD` and `IGNORE_CASE`; negated terms match as plain substrings. Every accepting path must require a
   positive term, so `NOT cpu` alone is refused. A match scores the best mean of its positive terms' scores. An
-  expression is limited to 4096 bytes, 32 terms and 16 levels of nesting. See
+  expression is limited to 4096 bytes, 32 terms and 16 levels of nesting. An empty expression is no
+  expression, as in Prometheus. See
   [Boolean Search Expressions](../topics/label-discovery.md#3-boolean-search-expressions).
 - `FUZZY_ALGORITHM` accepts `subsequence` and `jarowinkler`. Defaults to `subsequence`.
 - `FUZZY_THRESHOLD` is a whole percentage in `[0, 100]` and defaults to `0`; a threshold of `N` requires a fuzzy
