@@ -24,8 +24,9 @@ impl StringFilter for NoOpSearchMatcher {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum FuzzyAlgorithm {
-    #[default]
     JaroWinkler,
+    /// The default, as in the Prometheus search API.
+    #[default]
     Subsequence,
     NoOp,
 }

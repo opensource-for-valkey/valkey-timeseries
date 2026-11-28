@@ -34,9 +34,9 @@ This eliminates the need to download unnecessary label data to the client just t
 
 ### 2. Fuzzy Matching and Typo Tolerance
 
-The `SEARCH` argument takes one or more search terms, and a value matches if it matches any of them. You can enable
-fuzzy matching using algorithms like `jarowinkler` or `subsequence`, and tune how strict the match should be with
-`FUZZY_THRESHOLD`. Users frequently mistype metric names or only remember parts of a label (e.g., typing "mem" when
+The `SEARCH` argument takes one or more search terms, and a value matches if it matches any of them. Matching is
+fuzzy by default: without `FUZZY_ALGORITHM`, terms match by `subsequence`, as in the Prometheus search API. Choose
+`jarowinkler` instead with `FUZZY_ALGORITHM`, and tune how strict the match should be with `FUZZY_THRESHOLD`. Users frequently mistype metric names or only remember parts of a label (e.g., typing "mem" when
 searching for "memory_usage"). Fuzzy matching provides highly relevant autocomplete suggestions instantly.
 
 A request may carry at most 32 `SEARCH` terms, counting every `SEARCH` keyword in it. To require or exclude terms
@@ -44,12 +44,13 @@ rather than accept any of them, use a [boolean search expression](#3-boolean-sea
 
 #### Supported Algorithms
 
+* **Subsequence (`subsequence`, the default)**: Matches results where the search term exists as a subsequence (the
+  characters appear in the target string in the same relative order, but not necessarily contiguously). For example,
+  searching `nde` would match `node`. This is useful for "fuzzy" shorthand typing. At the default threshold of `0` it
+  is permissive: `cpu` also matches `c_p_u_total`. Raise `FUZZY_THRESHOLD` to prefer contiguous matches.
 * **Jaro-Winkler (`jarowinkler`)**: Specifically designed for short strings like names and labels. It measures the edit
   distance between strings, giving more weight to strings that match from the beginning. This is ideal for handling
-  typos or character transpositions.
-* **Subsequence (`subsequence`)**: Matches results where the search term exists as a subsequence (the characters appear
-  in the target string in the same relative order, but not necessarily contiguously). For example, searching `nde` would
-  match `node`. This is useful for "fuzzy" shorthand typing.
+  typos or character transpositions. At the default threshold of `0` it matches only values that contain the term.
 
 How a term matches depends on the algorithm and on `FUZZY_THRESHOLD`, a whole percentage from `0` to `100` (default
 `0`), as in the Prometheus search API. Scores are always between `0.0` and `1.0`, and a threshold of `N` requires a
@@ -142,7 +143,7 @@ All discovery commands share a similar syntax profile:
 TS.<COMMAND> [label]
   [SEARCH term [term ...] | SEARCH_EXPR expression]
   [FUZZY_THRESHOLD threshold]
-  [FUZZY_ALGORITHM jarowinkler|subsequence]
+  [FUZZY_ALGORITHM subsequence|jarowinkler]
   [IGNORE_CASE]
   [INCLUDE_METADATA]
   [SORTBY <value|score|cardinality> [ASC|DESC]]

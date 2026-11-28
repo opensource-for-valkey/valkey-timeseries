@@ -469,6 +469,21 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
             f"Expected 'node' or 'node_id' in subsequence results, got {values}"
         )
 
+    def test_labelnames_search_defaults_to_subsequence(self):
+        """Without FUZZY_ALGORITHM, SEARCH matches by subsequence, as Prometheus's search does."""
+        self.setup_fuzzy_test_data(self.client)
+
+        # 'nde' is not a substring of 'node', only a subsequence.
+        default = {lv.value for lv in self._exec_fuzzy('SEARCH', 'nde', 'SORTBY', 'value').results}
+        explicit = {lv.value for lv in self._exec_fuzzy(
+            'SEARCH', 'nde', 'FUZZY_ALGORITHM', 'subsequence', 'SORTBY', 'value').results}
+        assert b'node' in default
+        assert default == explicit
+
+        jaro_winkler = {lv.value for lv in self._exec_fuzzy(
+            'SEARCH', 'nde', 'FUZZY_ALGORITHM', 'jarowinkler', 'SORTBY', 'value').results}
+        assert b'node' not in jaro_winkler
+
     def test_labelnames_fuzzy_threshold_is_a_whole_percentage(self):
         """FUZZY_THRESHOLD takes a whole percentage in [0, 100]; scores stay in [0.0, 1.0]."""
         self.setup_fuzzy_test_data(self.client)

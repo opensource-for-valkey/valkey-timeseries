@@ -9,7 +9,7 @@ acl_categories!(TS_LABELVALUES, "ts.labelvalues", "read timeseries");
 /// TS.LABELVALUES label
 /// [SEARCH term [term...]]
 /// [FUZZY_THRESHOLD 0..100]
-/// [FUZZY_ALGORITHM jarowinkler|subsequence]
+/// [FUZZY_ALGORITHM subsequence|jarowinkler]
 /// [IGNORE_CASE]
 /// [INCLUDE_METADATA]
 /// [SORTBY <value|score|cardinality> [ASC|DESC]]

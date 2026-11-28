@@ -10,7 +10,7 @@ TS.LABELNAMES
   [FILTER_BY_RANGE [NOT] fromTimestamp toTimestamp]
   [SEARCH term [term ...] | SEARCH_EXPR expression]
   [FUZZY_THRESHOLD threshold]
-  [FUZZY_ALGORITHM jarowinkler|subsequence]
+  [FUZZY_ALGORITHM subsequence|jarowinkler]
   [IGNORE_CASE]
   [INCLUDE_METADATA]
   [SORTBY <value|score|cardinality> [ASC|DESC]]
@@ -31,7 +31,7 @@ TS.LABELNAMES
   positive term, so `NOT cpu` alone is refused. A match scores the best mean of its positive terms' scores. An
   expression is limited to 4096 bytes, 32 terms and 16 levels of nesting. See
   [Boolean Search Expressions](../topics/label-discovery.md#3-boolean-search-expressions).
-- `FUZZY_ALGORITHM` the fuzzy matching algorithm. Accepts `jarowinkler` and `subsequence`. Defaults to `jarowinkler`.
+- `FUZZY_ALGORITHM` the fuzzy matching algorithm. Accepts `subsequence` and `jarowinkler`. Defaults to `subsequence`.
 - `FUZZY_THRESHOLD` is a whole percentage in `[0, 100]` and defaults to `0`; a threshold of `N` requires a fuzzy
   score of at least `N / 100`, and scores stay in `[0.0, 1.0]`. With `jarowinkler`, a value that contains a term
   always matches, and a threshold above `0` also accepts values whose Jaro-Winkler similarity to the term reaches

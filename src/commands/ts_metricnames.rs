@@ -6,7 +6,7 @@ acl_categories!(TS_METRICNAMES, "ts.metricnames", "read timeseries");
 /// TS.METRICNAMES
 /// [SEARCH term [term...]]
 /// [FUZZY_THRESHOLD 0..100]
-/// [FUZZY_ALGORITHM jarowinkler|subsequence]
+/// [FUZZY_ALGORITHM subsequence|jarowinkler]
 /// [IGNORE_CASE]
 /// [INCLUDE_METADATA]
 /// [SORTBY <value|score|cardinality> [ASC|DESC]]

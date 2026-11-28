@@ -57,7 +57,7 @@ impl Default for LabelNameSearchArgs {
             search_terms: Vec::new(),
             search_expr: String::new(),
             fuzzy_threshold: 0,
-            fuzzy_algorithm: FuzzyAlgorithm::JaroWinkler,
+            fuzzy_algorithm: FuzzyAlgorithm::Subsequence,
             ignore_case: false,
             include_metadata: false,
             sort_order: SearchResultOrdering::ValueAsc,
@@ -392,8 +392,8 @@ pub(super) fn parse_label_name_search_args(
 
     if !algo_specified {
         if parsed.has_search() {
-            // if the user specified search terms but didn't specify an algorithm, we default to JaroWinkler
-            parsed.fuzzy_algorithm = FuzzyAlgorithm::JaroWinkler;
+            // A search without FUZZY_ALGORITHM matches by subsequence, as Prometheus's does.
+            parsed.fuzzy_algorithm = FuzzyAlgorithm::Subsequence;
         } else {
             // if no search terms, the algorithm doesn't matter since it won't be used, so we can default to NoOp
             parsed.fuzzy_algorithm = FuzzyAlgorithm::NoOp;
